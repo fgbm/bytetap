@@ -3,9 +3,10 @@
 //! Ошибка сообщается с номером строки. Последняя строка может быть обрезана аварийным
 //! завершением или отключением питания (FR-20): читатель отличает её от битой строки,
 //! чтобы `bytetap-cli verify` считал её предупреждением. Признак обрыва строгий: строка без
-//! `\n`, на которой разбор JSON остановился из-за неожиданного конца ввода. Завершённая
-//! строка с синтаксической ошибкой и строка, где JSON цел, но не является событием формата,
-//! — ошибка разбора, где бы они ни стояли.
+//! `\n`, на которой разбор JSON остановился из-за неожиданного конца ввода, или строка без
+//! `\n`, оборванная посреди многобайтного символа UTF-8. Завершённая строка с синтаксической
+//! ошибкой и строка, где JSON цел, но не является событием формата, — ошибка разбора, где бы
+//! они ни стояли.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -127,9 +128,15 @@ impl<R: BufRead> Iterator for JournalReader<R> {
         let text = match std::str::from_utf8(&buffer) {
             Ok(text) => text,
             Err(err) => {
-                return Some(Err(
-                    self.error(LineErrorKind::Parse, format!("строка не UTF-8: {err}"))
-                ));
+                // Незавершённая последняя строка могла быть оборвана посреди многобайтного
+                // символа UTF-8: `error_len() == None` значит «ввод кончился на неполной
+                // последовательности», а не «байты не UTF-8».
+                let kind = if !terminated && err.error_len().is_none() {
+                    LineErrorKind::Truncated
+                } else {
+                    LineErrorKind::Parse
+                };
+                return Some(Err(self.error(kind, format!("строка не UTF-8: {err}"))));
             }
         };
         let value: Value = match serde_json::from_str(text) {
@@ -258,6 +265,34 @@ mod tests {
         let text = format!("{SESSION}\n{{\"type\":\"note\",\"t\":\"2026\n");
         let error = reader(&text).last().unwrap().unwrap_err();
         assert_eq!(error.kind, LineErrorKind::Parse, "{error}");
+    }
+
+    #[test]
+    fn a_last_line_cut_inside_a_utf8_character_is_a_truncation() {
+        // Строка без `\n`, оборванная посреди символа «П» (0xD0 0x9F): обрыв, а не Parse.
+        let mut bytes = format!("{SESSION}\n").into_bytes();
+        bytes.extend_from_slice(b"{\"type\":\"note\",\"t\":\"t\",\"text\":\"\xD0");
+        let items: Vec<Result<JournalLine, LineError>> =
+            JournalReader::new(Cursor::new(bytes)).collect();
+        assert_eq!(items.len(), 2);
+        let error = items[1].as_ref().unwrap_err();
+        assert_eq!(error.line, 2);
+        assert_eq!(error.kind, LineErrorKind::Truncated, "{error}");
+    }
+
+    #[test]
+    fn an_unterminated_line_with_broken_utf8_in_the_middle_is_an_error() {
+        // Ввод не кончился на неполной последовательности: байт испорчен в середине строки.
+        let mut bytes = format!("{SESSION}\n").into_bytes();
+        bytes.extend_from_slice(b"{\"type\":\"note\",\"t\":\"t\",\"text\":\"\xD0\xD0\"}");
+        let items: Vec<Result<JournalLine, LineError>> =
+            JournalReader::new(Cursor::new(bytes)).collect();
+        assert_eq!(
+            items[1].as_ref().unwrap_err().kind,
+            LineErrorKind::Parse,
+            "{:?}",
+            items[1]
+        );
     }
 
     #[test]
