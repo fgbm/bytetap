@@ -34,7 +34,11 @@ export interface Bridge {
    * поток закрывается вместе с командой `stopSession`.
    */
   startSession(cfg: SessionConfig, onBatch: (batch: FeedBatch) => void): Promise<StartInfo>;
-  stopSession(): Promise<SessionSummary>;
+  /**
+   * Останавливает сессию. `generation` — поколение из `StartInfo`: мост остановит только
+   * свою сессию, а сессию, запущенную после перезагрузки страницы, не тронет (NFR-5).
+   */
+  stopSession(generation?: number): Promise<SessionSummary>;
   addSessionNote(text: string): Promise<void>;
   openJournal(path: string): Promise<JournalSummary>;
   readJournal(path: string, from: number, count: number): Promise<FeedEvent[]>;

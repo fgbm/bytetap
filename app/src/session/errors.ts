@@ -22,6 +22,8 @@ export const FAILURE_KEYS: Record<JournalFailureCode, string> = {
   disk_full: "banner.journalFailureReasons.disk_full",
   permission_denied: "banner.journalFailureReasons.permission_denied",
   not_found: "banner.journalFailureReasons.not_found",
+  network: "banner.journalFailureReasons.network",
+  busy: "banner.journalFailureReasons.busy",
   timeout: "banner.journalFailureReasons.timeout",
   io: "banner.journalFailureReasons.io",
 };

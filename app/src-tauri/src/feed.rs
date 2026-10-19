@@ -5,7 +5,9 @@
 //! `a2l` / `l2a`, байты — base64. Строки журнала `session` и `session_end` в ленту не идут:
 //! заголовок интерфейс показывает отдельно, а итоги — из ответа `stop_session`.
 
-use bytetap_core::journal::{Dir, Event};
+use std::io;
+
+use bytetap_core::journal::{Dir, Event, JournalFailureReason, OsFamily};
 use serde::Serialize;
 
 /// Направление фрагмента: от анализатора к ЛИС (`a2l`) или от ЛИС к анализатору (`l2a`).
@@ -39,8 +41,8 @@ pub enum StopReason {
 
 /// Код причины отказа журнала: интерфейс переводит его, а `message` оставляет в подробностях.
 ///
-/// Ядро отдаёт причину текстом (`io_message`: вид ошибки и код ОС), поэтому вид ошибки
-/// восстанавливается здесь по этому тексту, один раз на весь мост.
+/// Вид отказа берётся из структуры причины ([`JournalFailureReason`]): вид ошибки и код ОС
+/// приходят из ядра числами, а не текстом, поэтому таблица не зависит от языка системы.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JournalFailureCode {
@@ -50,6 +52,10 @@ pub enum JournalFailureCode {
     PermissionDenied,
     /// Файл или папка исчезли.
     NotFound,
+    /// Сетевой диск недоступен: обрыв связи или удалённый узел пропал.
+    Network,
+    /// Файл занят другой программой.
+    Busy,
     /// Фиксация не завершилась за отведённое время.
     Timeout,
     /// Всё остальное: сбой устройства, сброс, ошибка записи.
@@ -57,38 +63,70 @@ pub enum JournalFailureCode {
 }
 
 impl JournalFailureCode {
-    /// Код из контракта моста: `disk_full` | `permission_denied` | `not_found` | `timeout` | `io`.
+    /// Код из контракта моста: `disk_full` | `permission_denied` | `not_found` |
+    /// `network` | `busy` | `timeout` | `io`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::DiskFull => "disk_full",
             Self::PermissionDenied => "permission_denied",
             Self::NotFound => "not_found",
+            Self::Network => "network",
+            Self::Busy => "busy",
             Self::Timeout => "timeout",
             Self::Io => "io",
         }
     }
 
-    /// Вид отказа по причине от ядра.
+    /// Вид отказа по причине от ядра: сначала код ОС, затем вид ошибки.
+    ///
+    /// Один и тот же номер в Windows и Unix значит разное (5 — «нет доступа» в Windows
+    /// и `EIO` в Linux), поэтому таблица выбирается по семейству ОС из причины.
     #[must_use]
-    pub fn from_reason(reason: &str) -> Self {
-        let reason = reason.to_lowercase();
-        let has = |needle: &str| reason.contains(needle);
-        if has("storage full")
-            || has("no space")
-            || has("os error 112")
-            || has("os error 28")
-            || has("disk full")
-        {
-            Self::DiskFull
-        } else if has("permission denied") || has("os error 5") || has("access is denied") {
-            Self::PermissionDenied
-        } else if has("not found") || has("os error 2") || has("os error 3") {
-            Self::NotFound
-        } else if has("not flushed") || has("timed out") || has("timeout") {
-            Self::Timeout
-        } else {
-            Self::Io
+    pub fn from_failure(reason: &JournalFailureReason) -> Self {
+        match reason.raw_os_error() {
+            Some(code) => Self::from_os_code(reason.os(), code),
+            None => Self::from_kind(reason.kind()),
+        }
+    }
+
+    /// Вид по виду ошибки: работает, когда код ОС неизвестен — у своих сообщений программы.
+    fn from_kind(kind: io::ErrorKind) -> Self {
+        match kind {
+            io::ErrorKind::StorageFull => Self::DiskFull,
+            io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            io::ErrorKind::NotFound => Self::NotFound,
+            io::ErrorKind::TimedOut => Self::Timeout,
+            _ => Self::Io,
+        }
+    }
+
+    /// Вид по номеру ошибки ОС: неизвестный номер уточняется видом ошибки, иначе `io`.
+    fn from_os_code(os: OsFamily, code: i32) -> Self {
+        match os {
+            OsFamily::Windows => match code {
+                // ERROR_DISK_FULL и ERROR_HANDLE_DISK_FULL.
+                112 | 39 => Self::DiskFull,
+                // ERROR_ACCESS_DENIED.
+                5 => Self::PermissionDenied,
+                // ERROR_FILE_NOT_FOUND и ERROR_PATH_NOT_FOUND.
+                2 | 3 => Self::NotFound,
+                // ERROR_BAD_NETPATH, ERROR_DEV_NOT_EXIST, ERROR_UNEXP_NET_ERR, ERROR_NETNAME_DELETED.
+                53 | 55 | 59 | 64 => Self::Network,
+                // ERROR_SHARING_VIOLATION и ERROR_LOCK_VIOLATION.
+                32 | 33 => Self::Busy,
+                // Неизвестный номер: вид ошибки всё равно подсказывает «нет места» и «нет прав».
+                _ => Self::from_kind(io::Error::from_raw_os_error(code).kind()),
+            },
+            OsFamily::Unix => match code {
+                // ENOSPC.
+                28 => Self::DiskFull,
+                // EACCES и EPERM.
+                13 | 1 => Self::PermissionDenied,
+                // ENOENT.
+                2 => Self::NotFound,
+                _ => Self::from_kind(io::Error::from_raw_os_error(code).kind()),
+            },
         }
     }
 }
@@ -402,38 +440,66 @@ mod tests {
         );
     }
 
+    /// Причина отказа по коду ОС: тест собирает её для любой системы.
+    fn reason(os: OsFamily, code: i32) -> JournalFailureReason {
+        let kind = match (os, code) {
+            (OsFamily::Unix, 28) => io::ErrorKind::StorageFull,
+            (OsFamily::Unix, 13 | 1) => io::ErrorKind::PermissionDenied,
+            (OsFamily::Unix, 2) => io::ErrorKind::NotFound,
+            _ => io::ErrorKind::Other,
+        };
+        JournalFailureReason::from_code(kind, Some(code), os)
+    }
+
     #[test]
     fn a_journal_failure_reason_becomes_a_code_for_the_interface() {
+        let windows = |code| JournalFailureCode::from_failure(&reason(OsFamily::Windows, code));
+        // Windows: диск полон, доступ запрещён, файла нет.
+        assert_eq!(windows(112), JournalFailureCode::DiskFull);
+        assert_eq!(windows(39), JournalFailureCode::DiskFull);
+        assert_eq!(windows(5), JournalFailureCode::PermissionDenied);
+        assert_eq!(windows(2), JournalFailureCode::NotFound);
+        assert_eq!(windows(3), JournalFailureCode::NotFound);
+        // Сеть и занятый файл — отдельные причины: подсказка в баннере разная.
+        assert_eq!(windows(53), JournalFailureCode::Network);
+        assert_eq!(windows(55), JournalFailureCode::Network);
+        assert_eq!(windows(59), JournalFailureCode::Network);
+        assert_eq!(windows(64), JournalFailureCode::Network);
+        assert_eq!(windows(32), JournalFailureCode::Busy);
+        assert_eq!(windows(33), JournalFailureCode::Busy);
+
+        let unix = |code| JournalFailureCode::from_failure(&reason(OsFamily::Unix, code));
+        assert_eq!(unix(28), JournalFailureCode::DiskFull, "ENOSPC");
+        assert_eq!(unix(13), JournalFailureCode::PermissionDenied, "EACCES");
+        assert_eq!(unix(1), JournalFailureCode::PermissionDenied, "EPERM");
+        assert_eq!(unix(2), JournalFailureCode::NotFound, "ENOENT");
+        // 5 в Linux — EIO, а не «нет доступа»: номер без семейства ОС ничего не значит.
+        assert_eq!(unix(5), JournalFailureCode::Io, "EIO");
+        // Номер Windows в Linux — неизвестный: сеть и занятость там другие.
+        assert_eq!(unix(53), JournalFailureCode::Io);
+
+        // Ошибка без кода ОС: вид берётся из вида ошибки.
+        let timeout = JournalFailureReason::from_error(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "journal not flushed: the writer did not stop within 10s",
+        ));
         assert_eq!(
-            JournalFailureCode::from_reason("storage full (os error 112)"),
-            JournalFailureCode::DiskFull
-        );
-        assert_eq!(
-            JournalFailureCode::from_reason("no space left on device (os error 28)"),
-            JournalFailureCode::DiskFull
-        );
-        assert_eq!(
-            JournalFailureCode::from_reason("permission denied (os error 5)"),
-            JournalFailureCode::PermissionDenied
-        );
-        assert_eq!(
-            JournalFailureCode::from_reason("entity not found (os error 3)"),
-            JournalFailureCode::NotFound
-        );
-        assert_eq!(
-            JournalFailureCode::from_reason(
-                "journal not flushed: the writer did not stop within 10s"
-            ),
+            JournalFailureCode::from_failure(&timeout),
             JournalFailureCode::Timeout
         );
+        let other =
+            JournalFailureReason::from_message("test hook: the journal device refused the write");
         assert_eq!(
-            JournalFailureCode::from_reason("test hook: the journal device refused the write"),
+            JournalFailureCode::from_failure(&other),
             JournalFailureCode::Io
         );
+
         for (code, name) in [
             (JournalFailureCode::DiskFull, "disk_full"),
             (JournalFailureCode::PermissionDenied, "permission_denied"),
             (JournalFailureCode::NotFound, "not_found"),
+            (JournalFailureCode::Network, "network"),
+            (JournalFailureCode::Busy, "busy"),
             (JournalFailureCode::Timeout, "timeout"),
             (JournalFailureCode::Io, "io"),
         ] {

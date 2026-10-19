@@ -99,6 +99,10 @@ fn close_after_stopping(window: &tauri::Window, api: &tauri::CloseRequestApi) {
         let stopped = window.state::<AppState>().sessions.stop_if_running().await;
         if let Err(err) = stopped {
             warn_journal_incomplete(window.app_handle(), &err.message);
+            // Остановка не уложилась в предел: `close` снова упёрся бы в этот же
+            // обработчик, и окно осталось бы висеть. `destroy` не спрашивает разрешения.
+            let _ = window.destroy();
+            return;
         }
         let _ = window.close();
     });

@@ -38,6 +38,8 @@ pub struct Interface {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartInfo {
+    /// Номер поколения сессии: по нему «Стоп» попадает только в свою сессию (NFR-5).
+    pub generation: u64,
     /// Путь к созданному файлу журнала.
     pub journal_path: String,
     /// Фактический адрес и порт слушателя: при порте 0 его выбрала система.
@@ -113,4 +115,9 @@ pub struct JournalSummary {
     pub stats: SessionStats,
     /// Плотность байтов для трассы.
     pub density: Density,
+    /// Индекс первого события в каждой из 601 границы корзин плотности.
+    ///
+    /// По нему интерфейс переводит долю времени на трассе в номер события и обратно:
+    /// рамка видимой области и переход к месту считаются по времени, а не по строкам (AC9).
+    pub first_event: Vec<usize>,
 }

@@ -22,6 +22,7 @@ import {
   type StartInfo,
 } from "./types";
 import { base64ByteLength } from "../feed/bytes";
+import { DENSITY_BINS } from "../trace/model";
 
 export const MOCK_INTERFACES: InterfaceInfo[] = [
   { name: "Ethernet", addr: "192.168.1.10" },
@@ -29,6 +30,9 @@ export const MOCK_INTERFACES: InterfaceInfo[] = [
 ];
 
 const MOCK_LOG_DIR = "C:\\Users\\operator\\Documents\\bytetap";
+
+/** Номер поколения заглушки: растёт на каждый старт, как в мосте. */
+let lastGeneration = 0;
 const TICK_MS = 500;
 const JOURNAL_FAILURE_AFTER_STEPS = 14;
 
@@ -484,6 +488,7 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
       const target: MockSession = {
         cfg,
         startInfo: {
+          generation: 0,
           journalPath,
           localAddr: `${host}:${cfg.listenPort}`,
           startedAt: startedAt.toISOString(),
@@ -500,6 +505,8 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
         onBatch,
         failed: false,
       };
+      lastGeneration += 1;
+      target.startInfo.generation = lastGeneration;
       session = target;
 
       target.timer = setInterval(() => {
@@ -515,9 +522,14 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
       return target.startInfo;
     },
 
-    async stopSession() {
+    async stopSession(generation) {
       const target = session;
       if (!target) throw new BridgeError("io", "сессия не запущена");
+      // Чужое поколение — страница пережила перезапуск сессии: её «Стоп» не должен
+      // останавливать чужую запись (NFR-5).
+      if (generation !== undefined && generation !== target.startInfo.generation) {
+        throw new BridgeError("io", "эта сессия уже закончилась: остановлена другая");
+      }
       if (target.timer) clearInterval(target.timer);
       target.timer = null;
       session = null;
@@ -549,6 +561,11 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
       const density = Array.from({ length: 600 }, (_, index) =>
         Math.round(Math.abs(Math.sin(index / 17)) * 400),
       );
+      const events = MOCK_JOURNAL_EVENTS + journalNotes.length;
+      // События заглушки идут ровно по времени: первое событие корзины — её начало.
+      const firstEvent = Array.from({ length: DENSITY_BINS + 1 }, (_, point) =>
+        Math.min(events, Math.round((point / DENSITY_BINS) * events)),
+      );
       return {
         path,
         header: {
@@ -562,10 +579,11 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
           note: "3 пробы, 1 запрос",
           host: { os: "Windows 11 23H2" },
         },
-        events: MOCK_JOURNAL_EVENTS + journalNotes.length,
+        events,
         durationUs: MOCK_JOURNAL_DURATION_US,
         stats: { connections: 15, bytesAnalyzerToLis: 10_240, bytesLisToAnalyzer: 512 },
         density: { a2l: density, l2a: density.map((value) => Math.round(value / 3)) },
+        firstEvent,
       } satisfies JournalSummary;
     },
 

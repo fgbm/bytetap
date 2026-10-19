@@ -25,6 +25,8 @@ export interface SessionConfig {
 }
 
 export interface StartInfo {
+  /** Номер поколения сессии: «Стоп» попадает только в свою сессию (NFR-5). */
+  generation: number;
   journalPath: string;
   localAddr: string;
   startedAt: string;
@@ -160,6 +162,13 @@ export interface JournalSummary {
   stats: SessionStats;
   /** Плотность байтов на 600 корзин — из неё рисуется трасса всей сессии. */
   density: { a2l: number[]; l2a: number[] };
+  /**
+   * Индекс первого события в каждой из 601 точки корзин (AC9).
+   *
+   * По нему рамка видимой области и переход из трассы считаются по времени,
+   * а не по номерам строк.
+   */
+  firstEvent: number[];
 }
 
 /** Причина отказа журнала: код из моста, интерфейс переводит её через `ru.json`. */
@@ -167,6 +176,8 @@ export type JournalFailureCode =
   | "disk_full"
   | "permission_denied"
   | "not_found"
+  | "network"
+  | "busy"
   | "timeout"
   | "io";
 

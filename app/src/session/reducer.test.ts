@@ -4,7 +4,12 @@ import { defaultConfig } from "../settings/settings";
 import { initialSessionState, reduceSession, type SessionState } from "./reducer";
 
 const startedAt = new Date(2026, 9, 19, 10, 15, 0).toISOString();
-const startedInfo = { journalPath: "C:\\journals\\a.jsonl", localAddr: "0.0.0.0:5000", startedAt };
+const startedInfo = {
+  generation: 1,
+  journalPath: "C:\\journals\\a.jsonl",
+  localAddr: "0.0.0.0:5000",
+  startedAt,
+};
 const config: SessionConfig = defaultConfig("C:\\journals");
 
 function recording(): SessionState {
@@ -25,7 +30,7 @@ describe("reduceSession", () => {
 
     const recordingState = reduceSession(starting, {
       type: "started",
-      info: { journalPath: "j", localAddr: "0.0.0.0:5000", startedAt },
+      info: { generation: 1, journalPath: "j", localAddr: "0.0.0.0:5000", startedAt },
       config,
     });
     expect(recordingState.status).toBe("recording");
@@ -175,6 +180,7 @@ describe("reduceSession", () => {
       durationUs: 1,
       stats: { connections: 4, bytesAnalyzerToLis: 300, bytesLisToAnalyzer: 40 },
       density: { a2l: [], l2a: [] },
+      firstEvent: [],
     };
     const viewing = reduceSession(initialSessionState(), { type: "journal_opened", journal });
     expect(viewing.status).toBe("viewing");
@@ -197,6 +203,7 @@ describe("reduceSession", () => {
       durationUs: 0,
       stats: { connections: 0, bytesAnalyzerToLis: 0, bytesLisToAnalyzer: 0 },
       density: { a2l: [], l2a: [] },
+      firstEvent: [],
     };
     const viewing = reduceSession(initialSessionState(), { type: "journal_opened", journal });
     const starting = reduceSession(viewing, { type: "start_requested" });

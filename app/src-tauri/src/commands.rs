@@ -88,12 +88,19 @@ pub async fn start_session(
 
 /// Останавливает запись и возвращает итоги (FR-25, NFR-5).
 ///
+/// `generation` — поколение сессии из `StartInfo`: страница останавливает только ту сессию,
+/// которую запустила сама. Без номера останавливается любая — так закрывают окно.
+///
 /// # Errors
 ///
-/// `journal`, если журнал отказал: записанное до сбоя сохранено; `io` — если записи не было.
+/// `journal`, если журнал отказал: записанное до сбоя сохранено; `io` — если записи не было
+/// или поколение чужое (сессию перезапустили).
 #[tauri::command]
-pub async fn stop_session(state: State<'_, AppState>) -> Result<SessionSummary, CommandError> {
-    state.sessions.stop().await
+pub async fn stop_session(
+    generation: Option<u64>,
+    state: State<'_, AppState>,
+) -> Result<SessionSummary, CommandError> {
+    state.sessions.stop(generation).await
 }
 
 /// Комментарий в идущую сессию (FR-23).

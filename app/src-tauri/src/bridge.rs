@@ -8,6 +8,7 @@
 use std::io::Read as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -170,9 +171,9 @@ impl ActiveSession {
             }
         }
         let stats = result.map_err(|err| match journal_failure_reason(&err) {
-            Some(reason) => CommandError::new(ErrorCode::Journal, reason.to_owned()).with_param(
+            Some(reason) => CommandError::new(ErrorCode::Journal, reason.to_string()).with_param(
                 "failure",
-                crate::feed::JournalFailureCode::from_reason(reason).as_str(),
+                crate::feed::JournalFailureCode::from_failure(reason).as_str(),
             ),
             None => CommandError::from_io(&err),
         })?;
@@ -201,6 +202,7 @@ pub async fn start_session(
     config: BridgeConfig,
     sink: Arc<dyn FeedSink>,
     flush: Duration,
+    generation: u64,
 ) -> Result<(ActiveSession, StartInfo), CommandError> {
     std::fs::create_dir_all(&config.log_dir).map_err(|err| {
         CommandError::from_io_with(ErrorCode::LogDir, &err)
@@ -231,6 +233,7 @@ pub async fn start_session(
         flush,
     ));
     let info = StartInfo {
+        generation,
         journal_path: journal_path.to_string_lossy().into_owned(),
         local_addr: handle.local_addr().to_string(),
         started_at,
@@ -276,6 +279,8 @@ pub const STOP_WAIT: Duration = Duration::from_secs(15);
 #[derive(Default, Clone)]
 pub struct Sessions {
     slot: Arc<Mutex<Slot>>,
+    /// Счётчик поколений: каждая сессия получает свой номер, растущий на каждом старте.
+    generation: Arc<AtomicU64>,
 }
 
 /// Сброс `Busy` при панике: замок не должен остаться занятым навсегда.
@@ -352,6 +357,7 @@ impl Sessions {
                 }
             }
         };
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let mut guard = BusyGuard::new(&self.slot);
         if let Some(session) = stale {
             // Дожидаемся ленты старой сессии в фоне: `stopped` должна уйти в её канал.
@@ -360,7 +366,7 @@ impl Sessions {
             });
         }
         let started = match config.into_bridge() {
-            Ok(config) => start_session(config, sink, FLUSH_INTERVAL).await,
+            Ok(config) => start_session(config, sink, FLUSH_INTERVAL, generation).await,
             Err(err) => Err(err),
         };
         let mut slot = self.lock();
@@ -385,7 +391,10 @@ impl Sessions {
     ///
     /// Слот освобождается без участия интерфейса: перезагруженная страница не должна
     /// оставлять мост занятым. Вызов `stop_session` из интерфейса после этого безвреден.
-    fn stop_after_failure(&self, mut failure: watch::Receiver<Option<String>>) {
+    fn stop_after_failure(
+        &self,
+        mut failure: watch::Receiver<Option<bytetap_core::journal::JournalFailureReason>>,
+    ) {
         let sessions = self.clone();
         tokio::spawn(async move {
             loop {
@@ -397,21 +406,35 @@ impl Sessions {
                     return;
                 }
             }
-            let _ = sessions.stop().await;
+            let _ = sessions.stop(None).await;
         });
     }
 
     /// Останавливает сессию и возвращает итоги.
     ///
+    /// `generation` — номер поколения из [`StartInfo`] того, кто просит остановку. `None`
+    /// останавливает любую сессию: так работает закрытие окна. Чужое поколение — это
+    /// страница, которая пережила перезапуск сессии, и она не должна останавливать новую.
+    ///
     /// # Errors
     ///
     /// `journal`, если журнал отказал: записанное до сбоя сохранено, но `session_end`
-    /// в файле может не быть. `io` — если записи не было.
-    pub async fn stop(&self) -> Result<SessionSummary, CommandError> {
+    /// в файле может не быть. `io` — если записи не было или поколение чужое.
+    pub async fn stop(&self, generation: Option<u64>) -> Result<SessionSummary, CommandError> {
         let (session, mut guard) = {
             let mut slot = self.lock();
             match std::mem::replace(&mut *slot, Slot::Busy) {
-                Slot::Running(session) => (session, BusyGuard::new(&self.slot)),
+                Slot::Running(session) if matches_generation(&session.info, generation) => {
+                    (session, BusyGuard::new(&self.slot))
+                }
+                Slot::Running(session) => {
+                    // Чужое поколение: новая сессия остаётся работать, слот возвращается.
+                    *slot = Slot::Running(session);
+                    return Err(CommandError::new(
+                        ErrorCode::Io,
+                        "эта сессия уже закончилась: остановлена другая",
+                    ));
+                }
                 other => {
                     let error = match other {
                         Slot::Busy => {
@@ -453,7 +476,7 @@ impl Sessions {
             match state {
                 0 => return Ok(()),
                 1 => {
-                    let _ = self.stop().await;
+                    let _ = self.stop(None).await;
                     return Ok(());
                 }
                 _ => {}
@@ -489,6 +512,13 @@ impl Sessions {
             )),
         }
     }
+}
+
+/// Просит ли остановку владелец этого поколения сессии.
+///
+/// `None` — остановка без номера: закрытие окна и выход приложения останавливают любую.
+fn matches_generation(info: &StartInfo, generation: Option<u64>) -> bool {
+    generation.is_none_or(|asked| asked == info.generation)
 }
 
 /// Ошибка повторного старта.
@@ -573,7 +603,7 @@ mod tests {
                 .any(|event| matches!(event, FeedEvent::Note { .. }))
         })
         .await;
-        let summary = sessions.stop().await.expect("остановка");
+        let summary = sessions.stop(None).await.expect("остановка");
 
         assert_eq!(summary.stats.connections, 1);
         assert_eq!(summary.stats.bytes_analyzer_to_lis, 12);
@@ -613,7 +643,7 @@ mod tests {
             .start(config(dir.path(), 0), sink.clone())
             .await
             .expect("повторный старт");
-        sessions.stop().await.expect("повторная остановка");
+        sessions.stop(None).await.expect("повторная остановка");
         assert_ne!(again.journal_path, info.journal_path, "новый файл журнала");
     }
 
@@ -634,7 +664,53 @@ mod tests {
             .expect_err("второй старт запрещён");
         assert_eq!(error.code, ErrorCode::AlreadyRunning);
 
-        sessions.stop().await.expect("остановка");
+        sessions.stop(None).await.expect("остановка");
+        assert!(!sessions.is_running());
+    }
+
+    /// «Стоп» из чужой страницы не трогает сессию, запущенную после её перезагрузки (NFR-5).
+    #[tokio::test]
+    async fn a_stale_generation_does_not_stop_a_newer_session() {
+        let _serial = serial().await;
+        let dir = tempfile::tempdir().expect("временная папка");
+        let sink = Arc::new(TestSink::default());
+        let sessions = Sessions::default();
+
+        let first = sessions
+            .start(config(dir.path(), 0), sink.clone())
+            .await
+            .expect("первый старт");
+        sessions
+            .stop(Some(first.generation))
+            .await
+            .expect("своё поколение останавливает");
+        let second = sessions
+            .start(config(dir.path(), 0), sink.clone())
+            .await
+            .expect("второй старт");
+        assert!(
+            second.generation > first.generation,
+            "номер поколения растёт: {} → {}",
+            first.generation,
+            second.generation
+        );
+
+        let error = sessions
+            .stop(Some(first.generation))
+            .await
+            .expect_err("старое поколение не останавливает новую сессию");
+        assert_eq!(error.code, ErrorCode::Io);
+        assert!(sessions.is_running(), "новая сессия продолжает писать");
+        assert_eq!(
+            sessions.status().map(|info| info.generation),
+            Some(second.generation),
+            "состояние отдаёт поколение своей сессии"
+        );
+
+        sessions
+            .stop(Some(second.generation))
+            .await
+            .expect("своё поколение останавливает и вторую");
         assert!(!sessions.is_running());
     }
 
@@ -670,7 +746,7 @@ mod tests {
             .await
             .expect("свободный порт");
         assert!(!info.local_addr.is_empty());
-        sessions.stop().await.expect("остановка");
+        sessions.stop(None).await.expect("остановка");
     }
 
     #[tokio::test]
@@ -782,7 +858,7 @@ mod tests {
             "автоответчик подтвердил оба сообщения"
         );
 
-        let summary = sessions.stop().await.expect("остановка");
+        let summary = sessions.stop(None).await.expect("остановка");
         assert_eq!(summary.stats.connections, 1);
         assert!(summary.stats.bytes_analyzer_to_lis > 0);
         assert!(summary.stats.bytes_lis_to_analyzer > 0);
@@ -920,14 +996,17 @@ mod tests {
         assert!(!sessions.is_running(), "мост освободил слот сам");
         assert!(sessions.status().is_none());
         // Вызов интерфейса после отказа безвреден: ошибка ожидаема.
-        assert!(sessions.stop().await.is_err(), "останавливать уже нечего");
+        assert!(
+            sessions.stop(None).await.is_err(),
+            "останавливать уже нечего"
+        );
 
         let again = sessions
             .start(config(dir.path(), 0), sink.clone())
             .await
             .expect("новый старт после отказа");
         assert_ne!(again.journal_path, info.journal_path, "новый файл журнала");
-        sessions.stop().await.expect("остановка");
+        sessions.stop(None).await.expect("остановка");
     }
 
     /// Отказ на финальной фиксации: лента заканчивается `journal_failure`, команда — ошибкой.
@@ -968,7 +1047,7 @@ mod tests {
         }
 
         let error = sessions
-            .stop()
+            .stop(None)
             .await
             .expect_err("остановка не дождалась журнала");
         TEST_SYNC_DELAY_MS.store(0, Ordering::Relaxed);

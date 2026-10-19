@@ -75,7 +75,7 @@ export function createTauriBridge(): Bridge {
       return call<StartInfo>("start_session", { cfg, channel });
     },
 
-    stopSession: () => call<SessionSummary>("stop_session"),
+    stopSession: (generation) => call<SessionSummary>("stop_session", { generation }),
     addSessionNote: (text) => call<void>("add_session_note", { text }),
 
     openJournal: (path) => call<JournalSummary>("open_journal", { path }),

@@ -23,6 +23,15 @@ use crate::feed::FeedEvent;
 /// Сколько корзин в гистограмме плотности: столько точек рисует трасса всей сессии.
 pub const DENSITY_BUCKETS: usize = 600;
 
+/// Сколько точек в таблице «первое событие корзины»: корзины и правый край сессии.
+pub const FIRST_EVENT_POINTS: usize = DENSITY_BUCKETS + 1;
+
+/// Сколько байт заголовка сверяет доиндексация: файл на этом пути могли заменить.
+///
+/// Хеш первых килобайт и перевод строки на прежнем конце файла показывают, что доиндексируется
+/// тот же журнал, а не другой файл, у которого случайно совпало начало.
+pub const HEADER_CHECK_BYTES: u64 = 4 * 1024;
+
 /// Сколько строк максимум отдаёт одна страница журнала.
 ///
 /// Интерфейс просит по 500 строк; больший `count` из команды обрезается: страница
@@ -48,6 +57,12 @@ pub struct JournalIndex {
     /// Длина каждого события ленты в байтах: у `data` — фрагмент, у служебных — 0.
     /// По ней лента считает высоты HEX-строк, не читая файл (AC5).
     lens: Vec<u64>,
+    /// Время каждого события ленты по монотонным часам: из него строится таблица корзин.
+    times: Vec<u64>,
+    /// Индекс первого события в каждой точке таблицы корзин (AC9).
+    first_event: Vec<usize>,
+    /// Хеш первых [`HEADER_CHECK_BYTES`] байт: по нему видно, что файл тот же.
+    header_hash: u64,
     duration_us: u64,
     stats: Stats,
     /// Итоги пришли из `session_end`: счётчики по событиям больше не накапливаются.
@@ -74,6 +89,7 @@ struct Scan {
     header: Option<serde_json::Value>,
     offsets: Vec<u64>,
     lens: Vec<u64>,
+    times: Vec<u64>,
     samples: Vec<Sample>,
     duration_us: u64,
     stats: Stats,
@@ -109,6 +125,7 @@ impl JournalIndex {
             header: previous.header.clone(),
             offsets: previous.offsets.clone(),
             lens: previous.lens.clone(),
+            times: previous.times.clone(),
             samples: previous.samples.clone(),
             duration_us: previous.duration_us,
             stats: previous.stats.clone(),
@@ -132,10 +149,15 @@ impl JournalIndex {
             )
             .with_param("path", path.to_string_lossy())
         })?;
+        let header_hash = header_hash(path).map_err(|err| open_error(&err, path))?;
+        let first_event = first_events(&scan.times, scan.duration_us);
         Ok(Self {
             header: Some(header),
             offsets: scan.offsets,
             lens: scan.lens,
+            times: scan.times,
+            first_event,
+            header_hash,
             duration_us: scan.duration_us,
             stats: scan.stats,
             stats_from_end: scan.stats_from_end,
@@ -155,6 +177,7 @@ impl JournalIndex {
             duration_us: self.duration_us,
             stats: self.stats.clone().into(),
             density: self.density.clone(),
+            first_event: self.first_event.clone(),
         }
     }
 
@@ -220,6 +243,8 @@ fn scan_into(path: &Path, start: u64, limit: u64, scan: &mut Scan) -> Result<(),
     }
     let mut offset = start;
     let mut buffer = Vec::new();
+    // Последнее известное время: доиндексация продолжает ряд, а не начинает его заново.
+    let mut last = scan.times.last().copied().unwrap_or(0);
     loop {
         buffer.clear();
         let Some((read, fits)) =
@@ -246,6 +271,7 @@ fn scan_into(path: &Path, start: u64, limit: u64, scan: &mut Scan) -> Result<(),
         let Ok(event) = Event::deserialize(&value) else {
             continue;
         };
+        let mono_us = event_time(&event);
         let mut len = 0u64;
         match event {
             Event::Session(_) => {
@@ -293,11 +319,28 @@ fn scan_into(path: &Path, start: u64, limit: u64, scan: &mut Scan) -> Result<(),
                 }
             }
         }
+        // Время растёт вместе с событиями; у комментария без `mono_us` оно прежнее.
+        let time = mono_us.unwrap_or(last).max(last);
+        last = time;
+        scan.times.push(time);
         scan.offsets.push(line_start);
         scan.lens.push(len);
     }
     scan.len = offset;
     Ok(())
+}
+
+/// Корзина плотности для момента `mono_us` на сессии длиной `duration_us`.
+fn bucket_of(mono_us: u64, duration_us: u64) -> usize {
+    // Последний фрагмент попадает в последнюю корзину, а не за её край.
+    // Сессия без длительности (`duration_us == 0`) — всё в первую корзину.
+    mono_us
+        .min(duration_us)
+        .saturating_mul(DENSITY_BUCKETS as u64)
+        .checked_div(duration_us)
+        .and_then(|bucket| usize::try_from(bucket).ok())
+        .unwrap_or(0)
+        .min(DENSITY_BUCKETS - 1)
 }
 
 /// Гистограмма плотности: байты по направлениям на [`DENSITY_BUCKETS`] корзин.
@@ -306,18 +349,8 @@ fn density(samples: &[Sample], duration_us: u64) -> Density {
         a2l: vec![0; DENSITY_BUCKETS],
         l2a: vec![0; DENSITY_BUCKETS],
     };
-    let last = DENSITY_BUCKETS - 1;
     for sample in samples {
-        // Последний фрагмент попадает в последнюю корзину, а не за её край.
-        // Сессия без длительности (`duration_us == 0`) — всё в первую корзину.
-        let bucket = sample
-            .mono_us
-            .min(duration_us)
-            .saturating_mul(DENSITY_BUCKETS as u64)
-            .checked_div(duration_us)
-            .and_then(|bucket| usize::try_from(bucket).ok())
-            .unwrap_or(0)
-            .min(last);
+        let bucket = bucket_of(sample.mono_us, duration_us);
         let track = match sample.dir {
             Dir::AnalyzerToLis => &mut density.a2l,
             Dir::LisToAnalyzer => &mut density.l2a,
@@ -325,6 +358,73 @@ fn density(samples: &[Sample], duration_us: u64) -> Density {
         track[bucket] += sample.len;
     }
     density
+}
+
+/// Индекс первого события в каждой точке таблицы корзин (AC9).
+///
+/// `starts[b]` — номер первого события, попавшего в корзину `b` или правее; последняя
+/// точка (600) равна числу событий: за правым краем сессии событий нет. По таблице трасса
+/// переводит долю времени в номер события (щелчок и перетаскивание) и номер события
+/// в долю времени (рамка видимой области), не читая страницы журнала.
+fn first_events(times: &[u64], duration_us: u64) -> Vec<usize> {
+    let mut starts = vec![times.len(); FIRST_EVENT_POINTS];
+    let mut point = 0;
+    for (event, &time) in times.iter().enumerate() {
+        let bucket = bucket_of(time, duration_us);
+        while point <= bucket {
+            starts[point] = event;
+            point += 1;
+        }
+    }
+    starts
+}
+
+/// Время события по монотонным часам; `None` — у события времени нет.
+fn event_time(event: &Event) -> Option<u64> {
+    match event {
+        Event::Data(data) => Some(data.mono_us),
+        Event::Open(open) => Some(open.mono_us),
+        Event::Close(close) => Some(close.mono_us),
+        Event::Error(error) => Some(error.mono_us),
+        Event::Info(info) => Some(info.mono_us),
+        Event::Note(note) => note.mono_us,
+        Event::Session(_) | Event::SessionEnd(_) => None,
+    }
+}
+
+/// Хеш первых [`HEADER_CHECK_BYTES`] байт файла: заголовок журнала с его началом.
+fn header_hash(path: &Path) -> io::Result<u64> {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    BufReader::new(file)
+        .take(HEADER_CHECK_BYTES)
+        .read_to_end(&mut bytes)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+/// Доиндексируется ли тот же журнал: начало файла совпало, а прежний конец — на границе строк.
+fn continuation(path: &Path, index: &JournalIndex) -> bool {
+    if index.len == 0 {
+        return false;
+    }
+    let Ok(hash) = header_hash(path) else {
+        return false;
+    };
+    if hash != index.header_hash {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(io::SeekFrom::Start(index.len - 1)).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    matches!(file.read_exact(&mut byte), Ok(()) if byte[0] == b'\n')
 }
 
 /// Кеш индексов журналов: LRU на [`MAX_INDEXED`] путей.
@@ -437,12 +537,18 @@ impl JournalCache {
     }
 }
 
-/// Собирает индекс: выросший файл доиндексируется, остальное собирается заново.
+/// Собирает индекс: выросший тот же файл доиндексируется, остальное собирается заново.
+///
+/// Файл на прежнем пути мог быть заменён другим журналом: тогда прежние смещения указывают
+/// в чужие строки, и доиндексация склеила бы два разных журнала. Проверка — по началу файла
+/// и по переводу строки на прежнем конце ([`continuation`]).
 fn index_now(path: &Path, previous: Option<&JournalIndex>) -> Result<JournalIndex, CommandError> {
     let metadata = std::fs::metadata(path).map_err(|err| open_error(&err, path))?;
     match previous {
-        // Файл стал короче — его переписали: индекс с нуля.
-        Some(previous) if metadata.len() >= previous.len => JournalIndex::extend(path, previous),
+        Some(previous) if metadata.len() >= previous.len && continuation(path, previous) => {
+            JournalIndex::extend(path, previous)
+        }
+        // Файл стал короче, заменён или обрезан посреди строки — индекс с нуля.
         _ => JournalIndex::build(path),
     }
 }
@@ -850,6 +956,113 @@ mod tests {
         assert_eq!(
             summary.density.l2a[599], 20,
             "последняя корзина, не за краем"
+        );
+    }
+
+    /// Журнал по указанному пути: заголовок с моделью анализатора и фрагменты по моментам.
+    fn write_journal(path: &Path, analyzer: &str, samples: &[(u64, Dir, usize)]) {
+        let mut header = Session::new(
+            Mode::TcpServer,
+            Autoresponder::None,
+            json!({"listen": "127.0.0.1:5000"}),
+            Host {
+                os: "Linux".to_owned(),
+            },
+        );
+        header.analyzer = Some(analyzer.to_owned());
+        let mut text = serde_json::to_string(&Event::Session(header)).unwrap();
+        text.push('\n');
+        for (index, (mono_us, dir, len)) in samples.iter().enumerate() {
+            let event = Event::Data(Data::new(
+                "2026-10-19T10:15:03.000000+03:00",
+                *mono_us,
+                u32::try_from(index).unwrap() + 1,
+                *dir,
+                false,
+                &vec![b'A'; *len],
+            ));
+            text.push_str(&serde_json::to_string(&event).unwrap());
+            text.push('\n');
+        }
+        std::fs::write(path, text).expect("журнал");
+    }
+
+    #[tokio::test]
+    async fn the_bucket_table_maps_a_time_fraction_to_the_first_event_of_it() {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let path = dir.path().join("batches.jsonl");
+        // Две пачки: первая секунда сессии и последняя; между ними событий нет.
+        write_journal(
+            &path,
+            "ANALYZER",
+            &[
+                (0, Dir::AnalyzerToLis, 10),
+                (500_000, Dir::AnalyzerToLis, 10),
+                (99_000_000, Dir::LisToAnalyzer, 20),
+                (99_500_000, Dir::LisToAnalyzer, 20),
+            ],
+        );
+        let summary = open(&path, &JournalCache::default()).await.expect("сводка");
+
+        assert_eq!(summary.events, 4);
+        assert_eq!(
+            summary.first_event.len(),
+            FIRST_EVENT_POINTS,
+            "601 точка: корзины и правый край сессии"
+        );
+        assert_eq!(summary.first_event[0], 0, "начало — первая пачка");
+        assert_eq!(
+            summary.first_event[FIRST_EVENT_POINTS - 1],
+            4,
+            "за правым краем событий нет"
+        );
+        // Щелчок по трассе на 0.99 времени: первое событие корзины — вторая пачка.
+        let point = (0.99 * DENSITY_BUCKETS as f64) as usize;
+        assert_eq!(
+            summary.first_event[point], 2,
+            "доля 0.99 попадает во вторую пачку, а не в конец первой"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_replaced_on_the_same_path_is_indexed_from_the_start() {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let path = dir.path().join("swapped.jsonl");
+        let cache = JournalCache::default();
+        write_journal(&path, "ANALYZER A", &[(0, Dir::AnalyzerToLis, 10)]);
+        assert_eq!(open(&path, &cache).await.expect("первый журнал").events, 1);
+        let first = cache.index(&path).await.expect("индекс первого журнала");
+
+        // На том же пути другой, более длинный журнал: прежние смещения ему не подходят.
+        write_journal(
+            &path,
+            "ANALYZER B",
+            &[
+                (0, Dir::AnalyzerToLis, 20),
+                (10, Dir::AnalyzerToLis, 20),
+                (20, Dir::LisToAnalyzer, 20),
+            ],
+        );
+        let swapped = open(&path, &cache).await.expect("второй журнал");
+
+        assert_eq!(
+            swapped.header["analyzer"], "ANALYZER B",
+            "заголовок взят из нового файла, а не из прежнего индекса"
+        );
+        assert_eq!(swapped.events, 3, "индекс собран с начала файла");
+        assert_eq!(
+            swapped.stats,
+            SessionStats {
+                connections: 0,
+                bytes_analyzer_to_lis: 40,
+                bytes_lis_to_analyzer: 20,
+            },
+            "счётчики нового файла, без остатка прежнего"
+        );
+        let second = cache.index(&path).await.expect("индекс второго журнала");
+        assert_ne!(
+            second.header_hash, first.header_hash,
+            "хеш заголовка отличает подменённый файл"
         );
     }
 

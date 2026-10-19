@@ -79,6 +79,8 @@ function failureCodeOf(error: unknown): JournalFailureCode {
     "disk_full",
     "permission_denied",
     "not_found",
+    "network",
+    "busy",
     "timeout",
     "io",
   ];
@@ -86,6 +88,8 @@ function failureCodeOf(error: unknown): JournalFailureCode {
 }
 
 function onBatch(batch: FeedBatch): void {
+  // Поколение берётся до `journal_failed`: это действие обнуляет `startInfo`.
+  const generation = state.value.startInfo?.generation;
   dispatch({ type: "batch", batch });
   appendEvents(batch.events);
 
@@ -100,8 +104,9 @@ function onBatch(batch: FeedBatch): void {
       message: stopped.message ?? "",
     });
     // Ядро уже остановило сессию, а мост сам освобождает слот; вызов остаётся
-    // безвредным и на случай старого моста. Ошибка ожидаема: причина в баннере (NFR-5).
-    void bridge.stopSession().catch(() => undefined);
+    // безвредным и на случай старого моста. Поколение — своё: чужую сессию не трогаем.
+    // Ошибка ожидаема: причина в баннере (NFR-5).
+    void bridge.stopSession(generation).catch(() => undefined);
   }
 }
 
@@ -124,7 +129,8 @@ async function stop(): Promise<void> {
   if (state.value.status !== "recording") return;
   dispatch({ type: "stop_requested" });
   try {
-    const summary = await bridge.stopSession();
+    // Своё поколение: сессию, которую запустили после перезагрузки, «Стоп» не тронет.
+    const summary = await bridge.stopSession(state.value.startInfo?.generation);
     dispatch({ type: "stopped", summary });
   } catch (error) {
     // Отказ журнала на финальной фиксации: это тот же баннер AC15, а не ошибка команды.
@@ -148,7 +154,9 @@ async function stop(): Promise<void> {
  */
 async function stopAny(): Promise<void> {
   try {
-    const summary = await bridge.stopSession();
+    // Баннер «сессия уже идёт»: поколение известно из `session_status`, но остановка
+    // разрешена и без него — страница могла не получить `StartInfo`.
+    const summary = await bridge.stopSession(state.value.startInfo?.generation);
     dispatch({ type: "stopped", summary });
   } catch (error) {
     dispatch({ type: "command_failed", error: toSessionError(error) });
@@ -214,6 +222,7 @@ async function appendJournalNote(text: string): Promise<void> {
   try {
     await bridge.appendNote(journal.path, text);
     const summary = await bridge.openJournal(journal.path);
+    // `extend` сам перечитывает последнюю страницу: новый комментарий виден сразу (FR-23).
     journalFeed.value.extend(summary.events);
     dispatch({ type: "journal_opened", journal: summary });
   } catch (error) {

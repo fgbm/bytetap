@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytetap_core::journal::JournalFailureReason;
 use bytetap_core::session::{SessionCounters, SessionEvent};
 use tokio::sync::{broadcast, watch};
 
@@ -112,7 +113,7 @@ pub enum PumpEnd {
 /// не дожидаясь следующего события: анализатор мог замолчать.
 pub async fn pump(
     mut events: broadcast::Receiver<SessionEvent>,
-    mut failure: watch::Receiver<Option<String>>,
+    mut failure: watch::Receiver<Option<JournalFailureReason>>,
     counters: SessionCounters,
     sink: Arc<dyn FeedSink>,
     flush: Duration,
@@ -137,11 +138,13 @@ pub async fn pump(
                 // раньше `stopped`, а не после него (FR-25).
                 drain(&mut events, &mut batcher);
                 batcher.set_stats(counters.snapshot().into());
-                let reason = failure.borrow().clone().unwrap_or_default();
+                let reason = failure.borrow().clone().unwrap_or_else(|| {
+                    JournalFailureReason::from_message("journal writer stopped")
+                });
                 batcher.push(FeedEvent::Stopped {
                     reason: StopReason::JournalFailure,
-                    code: Some(JournalFailureCode::from_reason(&reason)),
-                    message: Some(reason),
+                    code: Some(JournalFailureCode::from_failure(&reason)),
+                    message: Some(reason.to_string()),
                 });
                 flush_batch(&mut batcher, sink.as_ref());
                 return PumpEnd::JournalFailure;
@@ -170,7 +173,7 @@ fn drain(events: &mut broadcast::Receiver<SessionEvent>, batcher: &mut Batcher) 
 }
 
 /// Ждёт отказа журнала; без отказа (и после выгрузки сессии) не завершается.
-async fn wait_for_failure(failure: &mut watch::Receiver<Option<String>>) {
+async fn wait_for_failure(failure: &mut watch::Receiver<Option<JournalFailureReason>>) {
     if failure.borrow_and_update().is_some() {
         return;
     }
@@ -209,12 +212,12 @@ pub fn user_stopped_batch() -> FeedBatch {
 /// Такой отказ виден только по [`bytetap_core::session::SessionHandle::stop`]: сессия уже
 /// не отвечает, а лента должна закончиться той же причиной, что и ошибка команды.
 #[must_use]
-pub fn journal_failed_batch(reason: &str) -> FeedBatch {
+pub fn journal_failed_batch(reason: &JournalFailureReason) -> FeedBatch {
     FeedBatch {
         events: vec![FeedEvent::Stopped {
             reason: StopReason::JournalFailure,
-            code: Some(JournalFailureCode::from_reason(reason)),
-            message: Some(reason.to_owned()),
+            code: Some(JournalFailureCode::from_failure(reason)),
+            message: Some(reason.to_string()),
         }],
         dropped: 0,
         stats: SessionStats::default(),
@@ -268,7 +271,7 @@ pub(crate) mod test_sink {
 
 #[cfg(test)]
 mod tests {
-    use bytetap_core::journal::{Autoresponder, Event, Mode, Note, Session};
+    use bytetap_core::journal::{Autoresponder, Event, Mode, Note, OsFamily, Session};
 
     use super::test_sink::TestSink;
     use super::*;
@@ -430,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn pump_ends_the_feed_with_a_stopped_event_on_a_journal_failure() {
         let (sender, receiver) = broadcast::channel(16);
-        let (failure_sender, failure) = watch::channel::<Option<String>>(None);
+        let (failure_sender, failure) = watch::channel::<Option<JournalFailureReason>>(None);
         let sink = Arc::new(TestSink::default());
         let task = {
             let sink = Arc::clone(&sink);
@@ -452,9 +455,13 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        failure_sender
-            .send(Some("disk full".to_owned()))
-            .expect("подписчик отказа");
+        let reason = JournalFailureReason::from_code(
+            std::io::ErrorKind::Other,
+            Some(112),
+            OsFamily::Windows,
+        );
+        let message = reason.to_string();
+        failure_sender.send(Some(reason)).expect("подписчик отказа");
 
         let end = tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -469,7 +476,7 @@ mod tests {
             Some(&FeedEvent::Stopped {
                 reason: StopReason::JournalFailure,
                 code: Some(JournalFailureCode::DiskFull),
-                message: Some("disk full".to_owned()),
+                message: Some(message),
             })
         );
     }
@@ -477,15 +484,19 @@ mod tests {
     #[tokio::test]
     async fn a_journal_failure_drains_the_queue_before_stopped() {
         let (sender, receiver) = broadcast::channel(16);
-        let (failure_sender, failure) = watch::channel::<Option<String>>(None);
+        let (failure_sender, failure) = watch::channel::<Option<JournalFailureReason>>(None);
         let sink = Arc::new(TestSink::default());
         // События уже в канале, но лента их ещё не забрала, а отказ виден сразу.
         for index in 0..3 {
             sender.send(session_note(index)).expect("подписчик");
         }
-        failure_sender
-            .send(Some("storage full (os error 112)".to_owned()))
-            .expect("отказ");
+        let reason = JournalFailureReason::from_code(
+            std::io::ErrorKind::StorageFull,
+            Some(112),
+            OsFamily::Windows,
+        );
+        let message = reason.to_string();
+        failure_sender.send(Some(reason)).expect("отказ");
 
         let end = tokio::time::timeout(
             Duration::from_secs(1),
@@ -512,7 +523,7 @@ mod tests {
             Some(&FeedEvent::Stopped {
                 reason: StopReason::JournalFailure,
                 code: Some(JournalFailureCode::DiskFull),
-                message: Some("storage full (os error 112)".to_owned()),
+                message: Some(message),
             })
         );
     }
