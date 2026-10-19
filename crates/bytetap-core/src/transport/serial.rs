@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future as _;
 use std::io;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as sync_mpsc;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -49,6 +49,19 @@ const READ_POLL: Duration = Duration::from_millis(50);
 /// Сессия читает сразу, очередь нужна только на разнице планировщиков. Полная очередь
 /// не теряет данные: поток ждёт места и проверяет остановку.
 const READ_QUEUE: usize = 64;
+
+/// Сколько ждёт одна запись в порт, прежде чем ответ считается неотправленным (FR-9).
+///
+/// Драйвер может не принять байты сразу — `Ok(0)` или таймаут порта не значат потерю:
+/// запись повторяется, пока не примут или не выйдет этот срок. Дольше ждать незачем:
+/// анализатор к тому времени уже не дождётся `ACK`, и честнее закрыть соединение.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Пауза перед повтором записи, которую порт не принял: цикл не крутится вхолостую.
+const WRITE_PAUSE: Duration = Duration::from_millis(5);
+
+/// Сколько ждёт поток места в полной очереди к сессии, прежде чем проверить остановку.
+const QUEUE_PAUSE: Duration = Duration::from_millis(2);
 
 /// Чётность (FR-11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -513,7 +526,7 @@ pub async fn open(settings: &SerialSettings) -> io::Result<SerialConnection> {
     let settings = settings.clone();
     tokio::task::spawn_blocking(move || open_blocking(&settings))
         .await
-        .map_err(|err| io::Error::other(format!("поток открытия порта упал: {err}")))?
+        .map_err(|err| io::Error::other(format!("the port open thread failed: {err}")))?
 }
 
 fn open_blocking(settings: &SerialSettings) -> io::Result<SerialConnection> {
@@ -697,7 +710,7 @@ fn start_threads(
                 finish_thread(&alive, &closed);
             }
         })
-        .map_err(|err| io::Error::other(format!("поток порта не запустился: {err}")))?;
+        .map_err(|err| io::Error::other(format!("the port thread did not start: {err}")))?;
 
     let writer_name = name.to_owned();
     let writer_thread = std::thread::Builder::new()
@@ -720,7 +733,7 @@ fn start_threads(
             // Соединение не создаётся: отдаём ошибку, а поток дойдёт сам.
             drop(reader_thread);
             return Err(io::Error::other(format!(
-                "поток порта не запустился: {err}"
+                "the port thread did not start: {err}"
             )));
         }
     };
@@ -801,6 +814,22 @@ fn finish_thread(alive: &AtomicUsize, closed: &PortClosed) {
     }
 }
 
+/// Кладёт в очередь к сессии, дожидаясь места: полная очередь не теряет ни фрагмент,
+/// ни ошибку чтения.
+///
+/// `make` вызывается на каждую попытку: `io::Error` не клонируется, а очередь принимает
+/// значение только целиком. Возвращает `false`, если поток остановлен или канал закрыт.
+fn send_waiting<T>(queue: &mpsc::Sender<T>, stop: &AtomicBool, make: impl Fn() -> T) -> bool {
+    while !stop.load(Ordering::Relaxed) {
+        match queue.try_send(make()) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Full(_)) => std::thread::sleep(QUEUE_PAUSE),
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    }
+    false
+}
+
 /// Поток чтения: читает с таймаутом и отправляет фрагменты сессии.
 fn run_reader(
     mut port: Box<dyn serialport::SerialPort>,
@@ -819,20 +848,16 @@ fn run_reader(
             Ok(len) => {
                 let chunk = buffer[..len].to_vec();
                 // Полная очередь не теряет фрагмент: ждём места, но замечаем остановку.
-                while !stop.load(Ordering::Relaxed) {
-                    match reads.try_send(Ok(chunk.clone())) {
-                        Ok(()) => break,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            std::thread::sleep(Duration::from_millis(2));
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => return,
-                    }
+                if !send_waiting(&reads, stop, || Ok(chunk.clone())) {
+                    return;
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
-            // Отключённый адаптер: отдаём ошибку сессии, соединение закрывается.
+            // Отключённый адаптер: ошибка идёт сессии, соединение закрывается. Место в
+            // очереди ждём так же, как для данных: иначе ошибка пропала бы, а сессия
+            // увидела бы только конец потока.
             Err(err) => {
-                let _ = reads.try_send(Err(io_error(name, &err)));
+                let _ = send_waiting(&reads, stop, || Err(io_error(name, &err)));
                 return;
             }
         }
@@ -843,6 +868,50 @@ fn run_reader(
 struct WriteCommand {
     bytes: Vec<u8>,
     done: tokio::sync::oneshot::Sender<io::Result<()>>,
+}
+
+/// Пишет байты в порт, повторяя попытку, пока драйвер их не примет.
+///
+/// `Ok(0)` и таймаут порта — не потеря, а занятый драйвер: попытка повторяется, пока не
+/// выйдет [`WRITE_TIMEOUT`] или не выставят флаг остановки. Таймаут порта не говорит,
+/// сколько байт драйвер всё же взял: повтор может продублировать ответ, но зависший ответ
+/// хуже — анализатор не получит `ACK` и не узнает, что с ним стало.
+fn write_bytes(
+    port: &mut dyn serialport::SerialPort,
+    name: &str,
+    bytes: &[u8],
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + WRITE_TIMEOUT;
+    let mut written = 0;
+    while written < bytes.len() {
+        if stop.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!(
+                    "serial port {name}: the write is stopped at {written} of {} bytes",
+                    bytes.len()
+                ),
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "serial port {name} did not take the answer in {} s: {written} of {} bytes written",
+                    WRITE_TIMEOUT.as_secs(),
+                    bytes.len()
+                ),
+            ));
+        }
+        match port.write(&bytes[written..]) {
+            Ok(0) => std::thread::sleep(WRITE_PAUSE),
+            Ok(len) => written += len,
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => std::thread::sleep(WRITE_PAUSE),
+            Err(err) => return Err(io_error(name, &err)),
+        }
+    }
+    Ok(())
 }
 
 /// Поток записи: пишет ответы в порт и возвращает результат записи [`SerialConnection`].
@@ -861,9 +930,7 @@ fn run_writer(
         }
         match writes.recv_timeout(READ_POLL) {
             Ok(command) => {
-                let result = port
-                    .write_all(&command.bytes)
-                    .map_err(|err| io_error(name, &err));
+                let result = write_bytes(port.as_mut(), name, &command.bytes, stop);
                 let failed = result.is_err();
                 // Результат уходит в `poll_write`: ответ не считается отправленным, пока
                 // порт не принял байты.
@@ -949,7 +1016,7 @@ impl AsyncRead for SerialConnection {
                 } else {
                     std::task::Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "поток порта завершился",
+                        "the serial port thread has finished",
                     )))
                 }
             }
@@ -1119,6 +1186,7 @@ fn port_error(port: &str, err: &serialport::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
+    use std::collections::VecDeque;
 
     use super::*;
 
@@ -1316,13 +1384,15 @@ mod tests {
         assert_eq!(read, b"\x06");
     }
 
-    /// Что делает фейковая запись: висит или отказывает.
+    /// Что делает фейковая запись: висит, отказывает или не берёт байты с первого раза.
     #[derive(Clone, Copy)]
     enum FakeWrite {
         /// Висит, пока тест не разрешит: так ведёт себя зависший драйвер.
         Block,
         /// Отказывает, как выдернутый адаптер.
         Fail,
+        /// Сначала `Ok(0)`, потом таймаут порта, дальше пишет: занятый драйвер.
+        Busy,
     }
 
     /// Фейковый порт поверх `serialport::SerialPort`: без железа и без pty.
@@ -1336,6 +1406,10 @@ mod tests {
         released: Mutex<bool>,
         ready: std::sync::Condvar,
         written: Mutex<Vec<u8>>,
+        /// Сколько раз порт позвали на запись: по счёту отвечает [`FakeWrite::Busy`].
+        attempts: Mutex<usize>,
+        /// Заданные чтения по порядку: фрагмент или ошибка; когда очередь пуста, порт молчит.
+        reads: Mutex<VecDeque<io::Result<Vec<u8>>>>,
     }
 
     impl FakeState {
@@ -1344,7 +1418,14 @@ mod tests {
                 released: Mutex::new(false),
                 ready: std::sync::Condvar::new(),
                 written: Mutex::new(Vec::new()),
+                attempts: Mutex::new(0),
+                reads: Mutex::new(VecDeque::new()),
             })
+        }
+
+        /// Задаёт следующее чтение: фрагмент или отказ порта.
+        fn script_read(&self, result: io::Result<Vec<u8>>) {
+            self.reads.lock().expect("замок").push_back(result);
         }
 
         /// Разрешает зависшую запись: поток писателя дописывает байты и выходит.
@@ -1379,10 +1460,21 @@ mod tests {
     }
 
     impl io::Read for FakePort {
-        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-            // Как порт с таймаутом: управление возвращается, данных нет.
-            std::thread::sleep(READ_POLL);
-            Err(io::Error::from(io::ErrorKind::TimedOut))
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let scripted = self.state.reads.lock().expect("замок").pop_front();
+            match scripted {
+                Some(Ok(chunk)) => {
+                    let len = chunk.len().min(buf.len());
+                    buf[..len].copy_from_slice(&chunk[..len]);
+                    Ok(len)
+                }
+                Some(Err(err)) => Err(err),
+                // Как порт с таймаутом: управление возвращается, данных нет.
+                None => {
+                    std::thread::sleep(READ_POLL);
+                    Err(io::Error::from(io::ErrorKind::TimedOut))
+                }
+            }
         }
     }
 
@@ -1393,6 +1485,23 @@ mod tests {
                     io::ErrorKind::BrokenPipe,
                     "the adapter is gone",
                 )),
+                FakeWrite::Busy => {
+                    let mut attempts = self.state.attempts.lock().expect("замок");
+                    *attempts += 1;
+                    match *attempts {
+                        1 => Ok(0),
+                        2 => Err(io::Error::from(io::ErrorKind::TimedOut)),
+                        _ => {
+                            drop(attempts);
+                            self.state
+                                .written
+                                .lock()
+                                .expect("замок")
+                                .extend_from_slice(buf);
+                            Ok(buf.len())
+                        }
+                    }
+                }
                 FakeWrite::Block => {
                     self.state.blocked();
                     self.state
@@ -1515,6 +1624,61 @@ mod tests {
         fn clear_break(&self) -> serialport::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn a_port_that_does_not_take_the_answer_at_once_is_written_again() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // `Ok(0)` и таймаут порта — не потеря: ответ дописывается целиком.
+        let state = FakeState::new();
+        let (reader, writer) = fake_pair(&state, FakeWrite::Busy);
+        let mut connection = start_threads(reader, writer, "FAKE-BUSY").expect("потоки порта");
+
+        connection
+            .write_all(b"answer")
+            .await
+            .expect("запись повторена");
+        assert_eq!(
+            *state.written.lock().expect("замок"),
+            b"answer",
+            "байты дописаны целиком"
+        );
+        connection.shutdown().await.expect("остановка");
+    }
+
+    #[test]
+    fn a_read_error_is_not_lost_when_the_queue_is_full() {
+        // Очередь уже полна: без ожидания места ошибка чтения пропала бы, и сессия
+        // увидела бы только конец потока.
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(Ok(b"filler".to_vec())).expect("очередь полна");
+        let state = FakeState::new();
+        state.script_read(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "the adapter is gone",
+        )));
+        let (reader, _writer) = fake_pair(&state, FakeWrite::Fail);
+        let stop = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            let reading = scope.spawn(move || run_reader(reader, "FAKE-READ-ERR", tx, &stop));
+            // Забираем заполнитель: место освобождается, и ошибка доходит до сессии.
+            let filler = rx
+                .blocking_recv()
+                .expect("первый элемент")
+                .expect("фрагмент");
+            assert_eq!(filler, b"filler");
+            let error = rx
+                .blocking_recv()
+                .expect("ошибка не потеряна")
+                .expect_err("ошибка порта");
+            assert!(
+                error.to_string().contains("serial port FAKE-READ-ERR"),
+                "ошибка порта по-английски: {error}"
+            );
+            reading.join().expect("поток чтения");
+        });
     }
 
     #[tokio::test]

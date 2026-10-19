@@ -21,6 +21,9 @@
 //!
 //! Контрольная сумма — сумма байтов от `FN` до `ETX`/`ETB` включительно по модулю 256, две
 //! hex-цифры. На приём допускается нижний регистр, в сообщении о неверной сумме — верхний.
+//! Негодная сумма приёму не мешает: по умолчанию кадр подтверждается и считается принятым
+//! целиком — номер сдвигается, `ETB` открывает запись, — а ошибка идёт в журнал. Второй знак
+//! негодной суммы поглощается: мусором вне кадра он не считается.
 //!
 //! Правила, которые не ломают обмен, а только попадают в журнал:
 //!
@@ -104,6 +107,8 @@ enum State {
     ChecksumHigh,
     /// Первый знак принят, ждём второй.
     ChecksumLow,
+    /// Первый знак суммы не hex: кадр уже отвечен, второй знак только поглощается.
+    ChecksumSkip,
 }
 
 /// Автоответчик ASTM E1381 (FR-17): профиль `astm_e1381`.
@@ -202,7 +207,9 @@ impl Astm {
     fn expire(&mut self, actions: &mut Vec<Action>) {
         let seconds = FRAME_TIMEOUT.as_secs();
         match self.state {
-            State::Idle => {
+            State::Idle | State::ChecksumSkip => {
+                // `ChecksumSkip` — кадр уже отвечен с негодной суммой: в нём терять нечего,
+                // но запись после `ETB` могла ждать продолжения и не должна пропасть молча.
                 if self.awaiting_frame {
                     // Кадра не было вовсе: терять нечего, прибор просто замолчал после `ENQ`.
                     actions.push(
@@ -360,10 +367,6 @@ impl Astm {
 
     /// Разбирает байт внутри кадра.
     fn accept_in_frame(&mut self, byte: u8, now: Now, actions: &mut Vec<Action>) {
-        // Байт сразу после `STX` — номер кадра, даже если он совпадает с управляющим:
-        // номера `'2'`…`'5'` (ASCII) — обычные знаки, а не `STX`, `ETX`, `EOT` и `ENQ`.
-        let number_position = self.frame.is_empty();
-        let terminator = !number_position && (byte == ETX || byte == ETB);
         if self.frame.len() >= self.frame_limit {
             actions.push(
                 ResponderEvent::Error {
@@ -383,16 +386,20 @@ impl Astm {
             self.outside += 1;
             return;
         }
-        self.frame.push(byte);
-        if number_position && !is_frame_number(byte) {
-            // Номер кадра — ASCII-цифра: любой другой байт после `STX` номером не является.
+        if self.frame.is_empty() && !is_frame_number(byte) {
+            // Номер кадра — ASCII-цифра: любой другой байт первым в кадре номером не является.
             // Рамку дочитываем до суммы, чтобы ответить `NAK` и не потерять её границы.
             self.bad_number = true;
         }
+        self.frame.push(byte);
         self.idle_since = Some(now);
-        if terminator {
+        if byte == ETX || byte == ETB {
             self.state = State::ChecksumHigh;
-        } else if self.frame.len() + FRAME_OVERHEAD > E1381_FRAME_MAX && !self.long_frame {
+        }
+        // Предел E1381 — весь кадр от `STX` до `LF`; сумма, `CR` и `LF` всегда те же четыре
+        // байта, поэтому длина видна уже по сложенному телу. Проверка не зависит от того,
+        // терминатор это или знак записи: иначе кадр ровно на границе проходил бы молча.
+        if self.frame.len() + FRAME_OVERHEAD > E1381_FRAME_MAX && !self.long_frame {
             // Кадр не по стандарту, но данные нужны: сообщаем и принимаем дальше.
             self.long_frame = true;
             actions.push(
@@ -489,13 +496,8 @@ impl Astm {
     }
 
     /// Знак контрольной суммы не hex: рамка негодна, ответ — по настройке.
-    fn bad_checksum_digit(
-        &mut self,
-        byte: u8,
-        position: &str,
-        now: Now,
-        actions: &mut Vec<Action>,
-    ) {
+    fn bad_checksum_digit(&mut self, byte: u8, first: bool, now: Now, actions: &mut Vec<Action>) {
+        let position = if first { "first" } else { "second" };
         actions.push(
             ResponderEvent::Error {
                 message: format!(
@@ -505,25 +507,42 @@ impl Astm {
             }
             .into(),
         );
-        // Рамка негодна, но цель — получить данные: по умолчанию `ACK`, как и при неверной
-        // сумме (FR-17). `NAK` — только в режиме «NAK на неверную сумму».
-        let answer = if self.nak_on_bad_checksum { NAK } else { ACK };
-        self.answer(answer, actions);
-        self.state = State::Idle;
+        // Номер и продолжение записи нужны, чтобы в режиме `ACK` кадр был принят целиком,
+        // как и при неверной сумме: иначе номер не сдвинулся бы и следующий кадр выглядел
+        // бы нарушением порядка.
+        let number = self.frame[0];
+        let continues = self.frame.last() == Some(&ETB);
+        let bad_number = self.bad_number;
         self.frame.clear();
         self.long_frame = false;
         self.bad_number = false;
         self.awaiting_frame = false;
-        // Ждём повтор кадра или следующего: номер не сдвигается.
-        self.idle_since = Some(now);
+        self.state = State::Idle;
+        // Рамка негодна, но цель — получить данные: по умолчанию `ACK`, как и при неверной
+        // сумме (FR-17). `NAK` — только в режиме «NAK на неверную сумму».
+        if self.nak_on_bad_checksum {
+            self.answer(NAK, actions);
+            // Ждём повтор кадра: номер не сдвигается.
+            self.idle_since = Some(now);
+        } else {
+            self.answer(ACK, actions);
+            if bad_number {
+                // Номера нет: сдвигать нечего — кадр не принят, как и в `complete_frame`.
+                self.idle_since = None;
+            } else {
+                self.accepted(number, continues, now);
+            }
+        }
+        if first {
+            // Второй знак суммы ещё придёт: он уже ничего не решает и не должен попасть
+            // в мусор вне кадра.
+            self.state = State::ChecksumSkip;
+        }
     }
 
     /// Обрабатывает один байт потока.
     fn accept(&mut self, byte: u8, now: Now, actions: &mut Vec<Action>) {
-        // Сразу после `STX` идёт номер кадра: управляющим байтом он не считается, иначе
-        // кадры с номерами 2…5 (те же байты, что `STX`, `ETX`, `EOT`, `ENQ`) разваливались бы.
-        let number_position = self.state == State::Frame && self.frame.is_empty();
-        if self.state != State::Idle && !number_position {
+        if self.state != State::Idle {
             // Управляющие байты начала и конца передачи обрывают недособранный кадр.
             match byte {
                 EOT => {
@@ -573,12 +592,14 @@ impl Astm {
                     self.state = State::ChecksumLow;
                     self.idle_since = Some(now);
                 }
-                None => self.bad_checksum_digit(byte, "first", now, actions),
+                None => self.bad_checksum_digit(byte, true, now, actions),
             },
             State::ChecksumLow => match hex_digit(byte) {
                 Some(digit) => self.complete_frame((self.high << 4) | digit, now, actions),
-                None => self.bad_checksum_digit(byte, "second", now, actions),
+                None => self.bad_checksum_digit(byte, false, now, actions),
             },
+            // Второй знак суммы после негодного первого: кадр уже отвечен, знак не нужен.
+            State::ChecksumSkip => self.state = State::Idle,
         }
     }
 }
@@ -647,7 +668,7 @@ impl Responder for Astm {
                 }
                 .into(),
             ),
-            State::Idle => {
+            State::Idle | State::ChecksumSkip => {
                 if self.record_open {
                     // Соединение закрылось посреди записи: недописанное не теряется молча.
                     actions.push(
@@ -865,6 +886,52 @@ mod tests {
     }
 
     #[test]
+    fn a_non_hex_checksum_in_ack_mode_takes_the_frame_and_keeps_the_order() {
+        // Кадр '1' с суммой `GB`: `ACK` значит «принят», поэтому номер сдвигается — иначе
+        // следующий кадр '2' выглядел бы нарушением порядка. Второй знак суммы — не мусор.
+        let mut responder = Astm::new();
+        let actions = feed(&mut responder, b"\x021x\x03GB\r\n");
+        assert_eq!(sends(&actions), vec![vec![ACK]]);
+        assert!(
+            matches!(&events(&actions)[..], [ResponderEvent::Error { message, .. }]
+                if message.contains("not hexadecimal")),
+            "одно сообщение о сумме: {actions:?}"
+        );
+        assert_eq!(
+            responder.expected_frame_number(),
+            b'2',
+            "кадр принят: номер сдвинут"
+        );
+
+        let actions = feed(&mut responder, &framed(b'2', b"P|1\r", ETX));
+        assert_eq!(sends(&actions), vec![vec![ACK]]);
+        assert!(
+            events(&actions).is_empty(),
+            "ни info о порядке, ни info о мусоре: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn an_etb_frame_with_a_non_hex_checksum_keeps_the_record_open() {
+        // Кадр с `ETB` принят, но запись ждёт продолжения: молчание после него — потеря.
+        let mut responder = Astm::new();
+        let actions = feed(&mut responder, b"\x021H|\\^&\r\x17GB\r\n");
+        assert_eq!(sends(&actions), vec![vec![ACK]]);
+        assert_eq!(responder.expected_frame_number(), b'2');
+        assert!(
+            responder.poll_timeout(now()).is_some(),
+            "запись открыта: срок продолжения идёт"
+        );
+
+        let actions = responder.feed(&[], later(30));
+        assert!(
+            matches!(&actions[..], [Action::Event(ResponderEvent::Info { message, .. })]
+                if message.contains("incomplete ASTM record")),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
     fn etb_frames_continue_the_record_and_keep_the_frame_numbers() {
         let mut responder = Astm::new();
         let stream = [
@@ -1077,6 +1144,36 @@ mod tests {
     }
 
     #[test]
+    fn a_control_byte_right_after_stx_is_not_a_frame_number() {
+        // Обхода «управляющий байт сразу после `STX` — номер» нет: `EOT` остаётся `EOT`
+        // и заканчивает передачу, а пустой кадр не ждёт суммы.
+        let mut responder = Astm::new();
+        assert!(
+            feed(&mut responder, &[STX, EOT]).is_empty(),
+            "на EOT ответа нет"
+        );
+        assert_eq!(responder.expected_frame_number(), b'1');
+        assert!(
+            responder.finish(now()).is_empty(),
+            "пустой кадр сброшен, а не оставлен недособранным"
+        );
+        assert_eq!(responder.poll_timeout(now()), None, "сроков не осталось");
+    }
+
+    #[test]
+    fn a_second_stx_starts_the_frame_anew() {
+        // `STX STX '1'…`: второй `STX` — начало кадра, а не номер. Потерять нечего:
+        // тело первого кадра пусто, поэтому и события нет.
+        let mut responder = Astm::new();
+        let mut stream = vec![STX];
+        stream.extend_from_slice(&framed(b'1', b"P|1\r", ETX));
+        let actions = feed(&mut responder, &stream);
+        assert_eq!(sends(&actions), vec![vec![ACK]]);
+        assert!(events(&actions).is_empty(), "{actions:?}");
+        assert_eq!(responder.expected_frame_number(), b'2');
+    }
+
+    #[test]
     fn an_unknown_protocol_byte_is_not_answered() {
         // «Авто» решает по первому байту, но сам ASTM на 0x0B не отвечает: это чужой протокол.
         let mut responder = Astm::new();
@@ -1094,6 +1191,29 @@ mod tests {
             matches!(&events(&actions)[..], [ResponderEvent::Info { message, .. }]
                 if message.contains("longer than the E1381 limit")),
             "одно сообщение на кадр, не на байт: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn the_e1381_limit_is_a_247_byte_frame_from_stx_to_lf() {
+        // От `STX` до `LF` кадр — это `STX`, номер, текст, `ETX`, две цифры суммы, `CR` и `LF`:
+        // 1 + 1 + текст + 1 + 2 + 1 + 1 = текст + 7, то есть 240 знаков — ровно 247 байт,
+        // а 241 знак — уже 248. Сообщение должно появиться ровно на превышении.
+        let mut responder = Astm::new();
+        let actions = feed(&mut responder, &framed(b'1', &[b'P'; 240], ETX));
+        assert_eq!(sends(&actions), vec![vec![ACK]]);
+        assert!(
+            events(&actions).is_empty(),
+            "240 знаков — в пределе: {actions:?}"
+        );
+
+        let mut responder = Astm::new();
+        let actions = feed(&mut responder, &framed(b'1', &[b'P'; 241], ETX));
+        assert_eq!(sends(&actions), vec![vec![ACK]]);
+        assert!(
+            matches!(&events(&actions)[..], [ResponderEvent::Info { message, .. }]
+                if message.contains("longer than the E1381 limit")),
+            "241 знак — кадр длиннее: {actions:?}"
         );
     }
 
