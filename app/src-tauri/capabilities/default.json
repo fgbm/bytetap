@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Базовые разрешения окна-заглушки: плагинов и сетевых API у приложения нет (FR-33).",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": []
 }
