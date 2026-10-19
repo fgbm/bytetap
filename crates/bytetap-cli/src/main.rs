@@ -5,9 +5,11 @@
 //! комментарий инженера.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use base64::Engine as _;
 use bytetap_core::journal::{
@@ -21,8 +23,32 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
 
+/// Печатает строку в stdout и не падает, если вывод уже закрыт.
+///
+/// `println!` паникует на ошибке записи: `bytetap-cli capture | head -1` закрывает трубу,
+/// и паника вместо штатной остановки оставила бы журнал без `session_end`. Ошибка вывода
+/// здесь ничего не меняет — сообщать о ней некому.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
+/// То же для stderr: сообщение об ошибке не должно само превращаться в панику.
+macro_rules! warn {
+    ($($arg:tt)*) => {{
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 /// Сколько знаков поля `text` показывает лента `capture`.
 const FEED_WIDTH: usize = 120;
+
+/// Сколько процесс ждёт завершения задач runtime после остановки сессии.
+///
+/// Поток записи журнала может застрять в `sync_data`; выход из программы не должен ждать
+/// его вечно. Предел совпадает с ожиданием журнала при остановке сессии.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// JSON Schema формата, вшита в бинарь: проверка не зависит от файлов рядом и от сети (FR-24).
 const SCHEMA: &str = include_str!("../../../docs/public/schema/bytetap-session-1.schema.json");
@@ -122,7 +148,7 @@ fn capture(
     {
         Ok(runtime) => runtime,
         Err(err) => {
-            eprintln!("ошибка: не удалось запустить runtime: {err}");
+            warn!("ошибка: не удалось запустить runtime: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -149,25 +175,25 @@ fn capture(
             .map_err(CaptureError::Start)?;
         let path = handle.journal_path().to_path_buf();
         let mut failure = handle.journal_failure();
-        println!("Журнал: {}", path.display());
-        println!("Слушаю {} (Ctrl+C — остановка)", handle.local_addr());
+        say!("Журнал: {}", path.display());
+        say!("Слушаю {} (Ctrl+C — остановка)", handle.local_addr());
         if let Some(warning) = handle.log_dir_warning() {
-            println!("Внимание: {warning}");
+            say!("Внимание: {warning}");
         }
-        println!("Лента:");
+        say!("Лента:");
 
         let interrupt = shutdown_signal();
         tokio::pin!(interrupt);
         loop {
             tokio::select! {
                 _ = &mut interrupt => {
-                    println!("\nОстановка…");
+                    say!("\nОстановка…");
                     break;
                 }
                 _ = wait_for_journal_failure(&mut failure) => break,
                 received = events.recv() => match received {
                     Ok(event) => print_event(&event),
-                    Err(RecvError::Lagged(skipped)) => println!(
+                    Err(RecvError::Lagged(skipped)) => say!(
                         "… лента отстала: пропущено событий {skipped}, в журнале они есть"
                     ),
                     Err(RecvError::Closed) => break,
@@ -188,7 +214,7 @@ fn capture(
         while let Ok(event) = events.try_recv() {
             print_event(&event);
         }
-        println!(
+        say!(
             "Соединений: {}, байты: {} {}, {} {}",
             stats.connections,
             Dir::AnalyzerToLis.as_str(),
@@ -196,24 +222,26 @@ fn capture(
             Dir::LisToAnalyzer.as_str(),
             stats.bytes_lis_to_analyzer
         );
-        println!("Журнал: {}", path.display());
+        say!("Журнал: {}", path.display());
         Ok(())
     });
+    // Задачи runtime не должны держать выход: поток записи журнала мог застрять.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(CaptureError::Journal(reason)) => {
-            eprintln!(
+            warn!(
                 "Запись в журнал прервана: {reason}. Сессия остановлена, анализатор не получил подтверждений после сбоя."
             );
             ExitCode::FAILURE
         }
         Err(CaptureError::Start(err)) => {
-            eprintln!("Не удалось начать сессию: {err}");
+            warn!("Не удалось начать сессию: {err}");
             ExitCode::FAILURE
         }
         Err(CaptureError::Stop(err)) => {
-            eprintln!("ошибка: запись прервана: {err}");
+            warn!("ошибка: запись прервана: {err}");
             ExitCode::FAILURE
         }
     }
@@ -243,44 +271,79 @@ async fn wait_for_journal_failure(failure: &mut watch::Receiver<Option<String>>)
 /// Кроме `Ctrl+C` это SIGTERM и SIGHUP на Unix (служба, закрытая консоль) и
 /// `ctrl_close`/`ctrl_break` на Windows: консольное окно закрывается так же штатно,
 /// и журнал должен получить `session_end`.
+///
+/// SIGHUP становится остановкой, только если процесс не игнорировал его при старте:
+/// `nohup` и демоны оставляют SIGHUP проигнорированным намеренно, и перехват такого
+/// сигнала означал бы остановку записи при закрытии терминала, которого программу
+/// просили пережить.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
 
-        if let (Ok(mut terminate), Ok(mut hangup)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::hangup()),
-        ) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
-                _ = hangup.recv() => {}
-            }
-            return;
+        let mut terminate = signal(SignalKind::terminate()).ok();
+        let mut hangup = if sighup_was_ignored() {
+            None
+        } else {
+            signal(SignalKind::hangup()).ok()
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = next_signal(&mut terminate) => {}
+            _ = next_signal(&mut hangup) => {}
         }
     }
     #[cfg(windows)]
     {
         use tokio::signal::windows;
 
-        if let (Ok(mut close), Ok(mut interrupt)) = (windows::ctrl_close(), windows::ctrl_break()) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = close.recv() => {}
-                _ = interrupt.recv() => {}
+        match (windows::ctrl_close(), windows::ctrl_break()) {
+            (Ok(mut close), Ok(mut interrupt)) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = close.recv() => {}
+                    _ = interrupt.recv() => {}
+                }
             }
-            return;
+            // Обработчики консольных событий не поставились: остаётся `Ctrl+C`.
+            _ => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
         }
     }
-    // Обработчики дополнительных сигналов не поставились: остаётся `Ctrl+C`.
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Ждёт сигнал, если он вообще отслеживается; иначе не наступает никогда.
+#[cfg(unix)]
+async fn next_signal(signal: &mut Option<tokio::signal::unix::Signal>) {
+    match signal {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// `true`, если SIGHUP был проигнорирован при старте процесса (`SIG_IGN`).
+#[cfg(unix)]
+fn sighup_was_ignored() -> bool {
+    // SAFETY: `sigaction` только читает текущую раскладку (`null` вместо новой), а
+    // нулевая структура — допустимое начальное значение для вывода.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        let read = libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut current);
+        read == 0 && current.sa_sigaction == libc::SIG_IGN
+    }
 }
 
 /// Строка ленты для события (M1-AC15, FR-26).
 fn print_event(event: &Event) {
     match event {
-        Event::Open(open) => println!(
+        Event::Open(open) => say!(
             "{} ── #{} подключён {}",
             feed_time(&open.t),
             open.conn,
@@ -292,14 +355,14 @@ fn print_event(event: &Event) {
                 Dir::LisToAnalyzer => "←",
             };
             let mark = if data.synthetic { " [авто]" } else { "" };
-            println!(
+            say!(
                 "{} {arrow} #{}{mark} {}",
                 feed_time(&data.t),
                 data.conn,
                 shorten(&data.text)
             );
         }
-        Event::Close(close) => println!(
+        Event::Close(close) => say!(
             "{} ── #{} закрыт: {} ({})",
             feed_time(&close.t),
             close.conn,
@@ -307,12 +370,12 @@ fn print_event(event: &Event) {
             close.reason
         ),
         Event::Error(error) => match error.conn {
-            Some(conn) => println!("{} !! #{} {}", feed_time(&error.t), conn, error.message),
-            None => println!("{} !! {}", feed_time(&error.t), error.message),
+            Some(conn) => say!("{} !! #{} {}", feed_time(&error.t), conn, error.message),
+            None => say!("{} !! {}", feed_time(&error.t), error.message),
         },
         Event::Info(info) => match info.conn {
-            Some(conn) => println!("{} .. #{} {}", feed_time(&info.t), conn, info.message),
-            None => println!("{} .. {}", feed_time(&info.t), info.message),
+            Some(conn) => say!("{} .. #{} {}", feed_time(&info.t), conn, info.message),
+            None => say!("{} .. {}", feed_time(&info.t), info.message),
         },
         Event::Session(_) | Event::Note(_) | Event::SessionEnd(_) => {}
     }
@@ -341,14 +404,14 @@ fn verify(file: &Path) -> ExitCode {
     let schema: Value = match serde_json::from_str(SCHEMA) {
         Ok(schema) => schema,
         Err(err) => {
-            eprintln!("ошибка: вшитая схема формата не разобралась: {err}");
+            warn!("ошибка: вшитая схема формата не разобралась: {err}");
             return ExitCode::FAILURE;
         }
     };
     let validator = match jsonschema::validator_for(&schema) {
         Ok(validator) => validator,
         Err(err) => {
-            eprintln!("ошибка: вшитая схема формата не принята движком: {err}");
+            warn!("ошибка: вшитая схема формата не принята движком: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -356,7 +419,7 @@ fn verify(file: &Path) -> ExitCode {
     let reader = match journal::JournalReader::open(file) {
         Ok(reader) => reader,
         Err(err) => {
-            eprintln!("ошибка: не удалось открыть {}: {err}", file.display());
+            warn!("ошибка: не удалось открыть {}: {err}", file.display());
             return ExitCode::FAILURE;
         }
     };
@@ -384,7 +447,7 @@ fn verify(file: &Path) -> ExitCode {
                 // После итогов сессии файл может дополняться только комментариями.
                 if ended && !matches!(line.event, Event::Note(_)) {
                     errors += 1;
-                    eprintln!(
+                    warn!(
                         "ошибка: строка {}: после session_end допустим только note",
                         line.number
                     );
@@ -396,7 +459,7 @@ fn verify(file: &Path) -> ExitCode {
                         connections.insert(data.conn);
                         if let Err(message) = check_data(data) {
                             errors += 1;
-                            eprintln!("ошибка: строка {}: {message}", line.number);
+                            warn!("ошибка: строка {}: {message}", line.number);
                         }
                     }
                     Event::Open(open) => {
@@ -410,54 +473,52 @@ fn verify(file: &Path) -> ExitCode {
                 }
                 if let Err(error) = validator.validate(&line.value) {
                     errors += 1;
-                    eprintln!("ошибка: строка {}: {error}", line.number);
+                    warn!("ошибка: строка {}: {error}", line.number);
                 }
             }
             Err(error) if error.kind == LineErrorKind::Truncated => {
-                eprintln!(
+                warn!(
                     "предупреждение: строка {} обрезана — потеря при аварийном завершении",
                     error.line
                 );
             }
             Err(error) => {
                 errors += 1;
-                eprintln!("ошибка: строка {}: {}", error.line, error.message);
+                warn!("ошибка: строка {}: {}", error.line, error.message);
             }
         }
     }
 
     if first_kind != Some("session") {
         errors += 1;
-        eprintln!("ошибка: первая строка файла должна быть заголовком `session`");
+        warn!("ошибка: первая строка файла должна быть заголовком `session`");
     }
     if sessions != 1 {
         errors += 1;
-        eprintln!(
-            "ошибка: в журнале должен быть ровно один заголовок `session`, найдено {sessions}"
-        );
+        warn!("ошибка: в журнале должен быть ровно один заголовок `session`, найдено {sessions}");
     }
 
-    println!("Журнал: {}", file.display());
-    println!("Строк: {lines}");
+    say!("Журнал: {}", file.display());
+    say!("Строк: {lines}");
     let kinds: Vec<String> = KINDS
         .iter()
         .map(|kind| format!("{kind} {}", counts.get(kind).copied().unwrap_or(0)))
         .collect();
-    println!("События: {}", kinds.join(", "));
-    println!(
+    say!("События: {}", kinds.join(", "));
+    say!(
         "Байты: {} {}, {} {}",
         Dir::AnalyzerToLis.as_str(),
         bytes.get(Dir::AnalyzerToLis.as_str()).copied().unwrap_or(0),
         Dir::LisToAnalyzer.as_str(),
         bytes.get(Dir::LisToAnalyzer.as_str()).copied().unwrap_or(0)
     );
-    println!("Соединения: {}", connections.len());
+    say!("Соединения: {}", connections.len());
 
     if errors > 0 {
-        eprintln!("проверка не пройдена: ошибок {errors}");
+        warn!("проверка не пройдена: ошибок {errors}");
         return ExitCode::FAILURE;
     }
-    println!("Проверка пройдена.");
+    say!("Проверка пройдена.");
     ExitCode::SUCCESS
 }
 
@@ -491,11 +552,11 @@ fn note(file: &Path, text: &str) -> ExitCode {
     };
     match journal::append_note(file, &note) {
         Ok(()) => {
-            println!("Комментарий дописан: {}", file.display());
+            say!("Комментарий дописан: {}", file.display());
             ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("ошибка: не удалось дописать комментарий: {err}");
+            warn!("ошибка: не удалось дописать комментарий: {err}");
             ExitCode::FAILURE
         }
     }
@@ -511,7 +572,7 @@ fn stress_journal(out: &Path, max_seconds: u64) -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(err) => {
-            eprintln!("ошибка: не удалось запустить runtime: {err}");
+            warn!("ошибка: не удалось запустить runtime: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -554,10 +615,13 @@ fn stress_journal(out: &Path, max_seconds: u64) -> ExitCode {
         }
     });
 
+    // Нагрузочная запись тоже не должна держать выход, если фиксация застряла.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("ошибка: нагрузочная запись прервана: {err}");
+            warn!("ошибка: нагрузочная запись прервана: {err}");
             ExitCode::FAILURE
         }
     }
@@ -643,5 +707,42 @@ mod tests {
         let short = shorten(&long);
         assert_eq!(short.chars().count(), FEED_WIDTH + 1);
         assert!(short.ends_with('…'));
+    }
+
+    /// SIGHUP, унаследованный проигнорированным, виден проверке, а обычный — нет.
+    #[cfg(unix)]
+    #[test]
+    fn an_ignored_sighup_is_told_from_a_handled_one() {
+        // SAFETY: раскладка читается, подменяется на SIG_IGN и возвращается на место
+        // до конца теста; других процессов это не касается.
+        unsafe {
+            let mut original: libc::sigaction = std::mem::zeroed();
+            assert_eq!(
+                libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut original),
+                0,
+                "раскладка SIGHUP читается"
+            );
+            let was_ignored = sighup_was_ignored();
+
+            let mut ignored: libc::sigaction = std::mem::zeroed();
+            ignored.sa_sigaction = libc::SIG_IGN;
+            assert_eq!(
+                libc::sigaction(libc::SIGHUP, &ignored, std::ptr::null_mut()),
+                0
+            );
+            let detected = sighup_was_ignored();
+
+            assert_eq!(
+                libc::sigaction(libc::SIGHUP, &original, std::ptr::null_mut()),
+                0,
+                "исходный обработчик возвращён"
+            );
+            assert!(detected, "SIG_IGN распознан");
+            assert_eq!(
+                sighup_was_ignored(),
+                was_ignored,
+                "исходная раскладка на месте"
+            );
+        }
     }
 }
