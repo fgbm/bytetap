@@ -61,6 +61,7 @@ export default defineConfig({
               ],
             },
             { text: "Архитектура", link: "/dev/architecture" },
+            { text: "Дизайн-система", link: "/dev/design" },
             { text: "Тестирование", link: "/dev/testing" },
             { text: "Релизы", link: "/dev/releases" },
             { text: "ADR", link: "/dev/adr/" },

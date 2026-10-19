@@ -6,6 +6,7 @@
 - [Дорожная карта](/dev/roadmap)
 - [Этапы](/dev/stages/) — планы этапов и критерии приёмки
 - [Архитектура](/dev/architecture)
+- [Дизайн-система](/dev/design)
 - [Тестирование](/dev/testing)
 - [Релизы](/dev/releases)
 - [ADR](/dev/adr/)
