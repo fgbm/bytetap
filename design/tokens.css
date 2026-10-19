@@ -1,0 +1,151 @@
+/*
+ * Дизайн-токены bytetap — единственный источник значений для приложения и сайта.
+ *
+ * Тема задаётся атрибутом `data-theme="light|dark"` на <html>; без атрибута действует
+ * системная тема через `prefers-color-scheme`. VitePress ставит на <html> класс `dark`,
+ * поэтому тёмные значения продублированы и для селектора `html.dark`.
+ *
+ * Принципы и таблица значений — docs/dev/design.md.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Шрифты */
+  --bt-font-ui: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --bt-font-mono: "IBM Plex Mono", "Cascadia Mono", Consolas, monospace;
+
+  /* Кегли */
+  --bt-text-2xs: 11px;
+  --bt-text-xs: 12px;
+  --bt-text-sm: 13px;
+  --bt-text-base: 14px;
+  --bt-text-md: 16px;
+  --bt-text-lg: 20px;
+  --bt-text-xl: 28px;
+  --bt-text-data: 12.5px;
+
+  /* Отступы */
+  --bt-space-1: 4px;
+  --bt-space-2: 8px;
+  --bt-space-3: 12px;
+  --bt-space-4: 16px;
+  --bt-space-5: 24px;
+  --bt-space-6: 32px;
+
+  /* Радиусы */
+  --bt-radius-chip: 4px;
+  --bt-radius-control: 6px;
+  --bt-radius-panel: 10px;
+  --bt-radius-record: 999px;
+
+  /* Лента обмена */
+  --bt-lane-height: 28px;
+  --bt-dir-width: 3px;
+
+  /* Движение: длительности, при prefers-reduced-motion обнуляются */
+  --bt-flash-duration: 1.4s;
+  --bt-pulse-duration: 1.6s;
+
+  /* Штриховка автоответа: доля цвета текста в заливке */
+  --bt-hatch-opacity: 9%;
+
+  /* Светлая тема «Белая» */
+  --bt-surface-0: #ffffff;
+  --bt-surface-1: #f6f7f9;
+  --bt-trace-bg: #f6f7f9;
+  --bt-border: #e2e5e9;
+  --bt-border-faint: #eef0f2;
+  --bt-text: #0f1418;
+  --bt-text-muted: #5f6873;
+  --bt-dir-a2l: #0a7d4f;
+  --bt-dir-l2a: #b4530a;
+  --bt-ctrl: #2f3fbf;
+  --bt-ctrl-bg: #eceffd;
+  --bt-danger: #c01f2f;
+  --bt-rec: #ef3b2d;
+  --bt-rec-bg: #0f1418;
+  --bt-rec-fg: #ffffff;
+  --bt-accent: #2f3fbf;
+  --bt-hatch: rgb(15 20 24 / 9%);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    /* Тёмная тема «Осциллограф» */
+    --bt-surface-0: #0d1013;
+    --bt-surface-1: #13181d;
+    --bt-trace-bg: #0a0d10;
+    --bt-border: #252d36;
+    --bt-border-faint: #1a2027;
+    --bt-text: #dde4ea;
+    --bt-text-muted: #7d8995;
+    --bt-dir-a2l: #3ee08f;
+    --bt-dir-l2a: #ffb23e;
+    --bt-ctrl: #8fb4ff;
+    --bt-ctrl-bg: #1b2638;
+    --bt-danger: #ff6464;
+    --bt-rec: #ff4d4d;
+    --bt-rec-bg: #2a1416;
+    --bt-rec-fg: #ffc2c2;
+    --bt-accent: #8fb4ff;
+    --bt-hatch: rgb(221 228 234 / 9%);
+  }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* Светлая тема «Белая» */
+  --bt-surface-0: #ffffff;
+  --bt-surface-1: #f6f7f9;
+  --bt-trace-bg: #f6f7f9;
+  --bt-border: #e2e5e9;
+  --bt-border-faint: #eef0f2;
+  --bt-text: #0f1418;
+  --bt-text-muted: #5f6873;
+  --bt-dir-a2l: #0a7d4f;
+  --bt-dir-l2a: #b4530a;
+  --bt-ctrl: #2f3fbf;
+  --bt-ctrl-bg: #eceffd;
+  --bt-danger: #c01f2f;
+  --bt-rec: #ef3b2d;
+  --bt-rec-bg: #0f1418;
+  --bt-rec-fg: #ffffff;
+  --bt-accent: #2f3fbf;
+  --bt-hatch: rgb(15 20 24 / 9%);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+/* VitePress ставит class="dark" на <html>, не трогая data-theme. */
+:root[data-theme="dark"],
+html.dark {
+  /* Тёмная тема «Осциллограф» */
+  --bt-surface-0: #0d1013;
+  --bt-surface-1: #13181d;
+  --bt-trace-bg: #0a0d10;
+  --bt-border: #252d36;
+  --bt-border-faint: #1a2027;
+  --bt-text: #dde4ea;
+  --bt-text-muted: #7d8995;
+  --bt-dir-a2l: #3ee08f;
+  --bt-dir-l2a: #ffb23e;
+  --bt-ctrl: #8fb4ff;
+  --bt-ctrl-bg: #1b2638;
+  --bt-danger: #ff6464;
+  --bt-rec: #ff4d4d;
+  --bt-rec-bg: #2a1416;
+  --bt-rec-fg: #ffc2c2;
+  --bt-accent: #8fb4ff;
+  --bt-hatch: rgb(221 228 234 / 9%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --bt-flash-duration: 0s;
+    --bt-pulse-duration: 0s;
+  }
+}
