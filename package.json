@@ -1,0 +1,25 @@
+{
+  "name": "bytetap",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Запись «сырого» обмена между лабораторным анализатором и ЛИС",
+  "license": "MIT",
+  "workspaces": [
+    "app",
+    "docs"
+  ],
+  "overrides": {
+    "typescript": "^6.0.3"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  },
+  "scripts": {
+    "dev": "npm run dev --workspace app",
+    "build": "npm run build --workspace app",
+    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && npm run check --workspace app && npm run test --workspace app",
+    "docs:dev": "npm run dev --workspace docs",
+    "docs:build": "npm run build --workspace docs",
+    "tauri": "npm run tauri --workspace app --"
+  }
+}

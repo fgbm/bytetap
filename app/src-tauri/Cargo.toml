@@ -1,0 +1,18 @@
+[package]
+name = "bytetap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Настольное приложение bytetap: запись «сырого» обмена анализатора с ЛИС"
+
+[lib]
+name = "bytetap_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+bytetap-core.workspace = true
+tauri = { version = "2.12", features = [] }
