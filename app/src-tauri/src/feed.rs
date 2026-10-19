@@ -85,12 +85,12 @@ impl JournalFailureCode {
     #[must_use]
     pub fn from_failure(reason: &JournalFailureReason) -> Self {
         match reason.raw_os_error() {
-            Some(code) => Self::from_os_code(reason.os(), code),
+            Some(code) => Self::from_os_code(reason, code),
             None => Self::from_kind(reason.kind()),
         }
     }
 
-    /// Вид по виду ошибки: работает, когда код ОС неизвестен — у своих сообщений программы.
+    /// Вид по виду ошибки: работает, когда кода ОС нет — у своих сообщений программы.
     fn from_kind(kind: io::ErrorKind) -> Self {
         match kind {
             io::ErrorKind::StorageFull => Self::DiskFull,
@@ -103,10 +103,10 @@ impl JournalFailureCode {
 
     /// Вид по номеру ошибки ОС: номер чужого семейства значит не то, что в этом.
     ///
-    /// Неизвестный номер — `io`: вид ошибки здесь не подсказка, потому что он вычислен
-    /// на этой машине, а номер пришёл из причины, помеченной другим семейством ОС.
-    fn from_os_code(os: OsFamily, code: i32) -> Self {
-        match os {
+    /// Номера нет в таблице — вид ошибки из причины ещё подсказка: `TimedOut` с кодом
+    /// 121 (`ERROR_SEM_TIMEOUT`) на Windows — таймаут, а не сбой ввода-вывода.
+    fn from_os_code(reason: &JournalFailureReason, code: i32) -> Self {
+        match reason.os() {
             OsFamily::Windows => match code {
                 // ERROR_DISK_FULL и ERROR_HANDLE_DISK_FULL.
                 112 | 39 => Self::DiskFull,
@@ -118,7 +118,7 @@ impl JournalFailureCode {
                 53 | 55 | 59 | 64 => Self::Network,
                 // ERROR_SHARING_VIOLATION и ERROR_LOCK_VIOLATION.
                 32 | 33 => Self::Busy,
-                _ => Self::Io,
+                _ => Self::from_kind(reason.kind()),
             },
             OsFamily::Unix => match code {
                 // ENOSPC.
@@ -127,7 +127,7 @@ impl JournalFailureCode {
                 13 | 1 => Self::PermissionDenied,
                 // ENOENT.
                 2 => Self::NotFound,
-                _ => Self::Io,
+                _ => Self::from_kind(reason.kind()),
             },
         }
     }
@@ -473,6 +473,15 @@ mod tests {
         assert_eq!(unix(5), JournalFailureCode::Io, "EIO");
         // Номер Windows в Linux — неизвестный: сеть и занятость там другие.
         assert_eq!(unix(53), JournalFailureCode::Io);
+
+        // Номер своей ОС, которого нет в таблице: вид ошибки ещё подсказка.
+        // 121 на Windows — ERROR_SEM_TIMEOUT, и баннер должен сказать «таймаут», не «сбой».
+        let sem_timeout =
+            JournalFailureReason::from_code(io::ErrorKind::TimedOut, Some(121), OsFamily::Windows);
+        assert_eq!(
+            JournalFailureCode::from_failure(&sem_timeout),
+            JournalFailureCode::Timeout
+        );
 
         // Ошибка без кода ОС: вид берётся из вида ошибки.
         let timeout = JournalFailureReason::from_error(&io::Error::new(
