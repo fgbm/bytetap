@@ -1,0 +1,15 @@
+[package]
+name = "bytetap-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Консольная версия bytetap"
+
+[[bin]]
+name = "bytetap-cli"
+path = "src/main.rs"
+
+[dependencies]
+bytetap-core.workspace = true
+clap.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "bytetap-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Тестовые помощники для crates bytetap"
+publish = false
+
+[dependencies]
