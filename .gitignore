@@ -7,3 +7,10 @@ dist/
 .DS_Store
 .vscode/
 .idea/
+
+# VitePress
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+
+# Tauri
+app/src-tauri/gen/schemas/
