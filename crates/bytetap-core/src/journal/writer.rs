@@ -55,6 +55,18 @@ pub static TEST_SYNC_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "test-hooks")]
 pub static TEST_SYNC_DELAYS: AtomicU64 = AtomicU64::new(0);
 
+/// Тестовый хук: после стольких событий писатель отказывает, как сломанный диск.
+///
+/// `u64::MAX` — хук выключен. Считаются события, дошедшие до пачки; заголовок `session`
+/// пишется синхронно и не считается. Нужен тесту остановки сессии при отказе журнала
+/// (ADR 0001, «Ошибка записи»).
+#[cfg(feature = "test-hooks")]
+pub static TEST_FAIL_AFTER_EVENTS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Сколько событий хук [`TEST_FAIL_AFTER_EVENTS`] уже пропустил в пачки.
+#[cfg(feature = "test-hooks")]
+static TEST_EVENTS_IN_BATCHES: AtomicU64 = AtomicU64::new(0);
+
 /// Задержка перед фиксацией пачки, если тест её запросил.
 #[cfg(feature = "test-hooks")]
 fn test_hook_delay() {
@@ -67,6 +79,25 @@ fn test_hook_delay() {
 
 #[cfg(not(feature = "test-hooks"))]
 fn test_hook_delay() {}
+
+/// Отказ записи, запрошенный хуком [`TEST_FAIL_AFTER_EVENTS`].
+#[cfg(feature = "test-hooks")]
+fn test_hook_failure(events: usize) -> Option<io::Error> {
+    let limit = TEST_FAIL_AFTER_EVENTS.load(Ordering::Relaxed);
+    if limit == u64::MAX {
+        return None;
+    }
+    let events = u64::try_from(events).unwrap_or(u64::MAX);
+    let total = TEST_EVENTS_IN_BATCHES
+        .fetch_add(events, Ordering::Relaxed)
+        .saturating_add(events);
+    (total > limit).then(|| io::Error::other("test hook: the journal device refused the write"))
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn test_hook_failure(_events: usize) -> Option<io::Error> {
+    None
+}
 
 /// Дескриптор писателя журнала.
 ///
@@ -164,6 +195,15 @@ impl Journal {
         self.pending.load(Ordering::Relaxed)
     }
 
+    /// Причина отказа писателя, если он уже остановился после ошибки записи.
+    ///
+    /// `record` после отказа возвращает `false`, а сессия берёт причину отсюда и
+    /// останавливается (ADR 0001, «Ошибка записи»).
+    #[must_use]
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().ok().and_then(|failure| failure.clone())
+    }
+
     /// Дожидается, пока всё отправленное окажется на диске.
     pub async fn flush(&self) -> io::Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -236,7 +276,8 @@ pub fn default_log_dir() -> Option<PathBuf> {
 /// OneDrive ищется по компонентам пути (`OneDrive`, `OneDrive - Contoso`).
 #[must_use]
 pub fn log_dir_warning(path: impl AsRef<Path>) -> Option<String> {
-    let path = path.as_ref();
+    let path = warning_path(path.as_ref());
+    let path = path.as_path();
     if is_remote_path(path) {
         return Some(format!(
             "папка журналов {} — сетевой путь: журналы с данными пациентов останутся на другом компьютере",
@@ -255,6 +296,30 @@ pub fn log_dir_warning(path: impl AsRef<Path>) -> Option<String> {
             path.display()
         )
     })
+}
+
+/// Путь, по которому проверяется предупреждение о папке журналов.
+///
+/// Относительный путь сначала приводится к абсолютному: `--log-dir logs` или `.` при
+/// работе из папки OneDrive должны давать предупреждение, а по компонентам `logs` его
+/// не видно. Windows-записи (UNC, `\\?\`, буква диска) разбираются по тексту и остаются
+/// как есть: на Unix такой путь выглядит относительным, и `absolute` приклеил бы к нему
+/// текущую папку, сломав распознавание сети.
+fn warning_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    let drive_letter = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let windows_style = text.starts_with(r"\\")
+        || text.starts_with("//")
+        || drive_letter
+        || matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        );
+    if windows_style {
+        return path.to_path_buf();
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// `true`, если папка лежит на другом компьютере.
@@ -371,11 +436,14 @@ fn open_for_note(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Ошибка «журнал занят идущей сессией»: `WouldBlock` — на обеих ОС.
+/// Ошибка «журнал занят»: `WouldBlock` — на обеих ОС.
+///
+/// Так `note` отвечает и на идущую сессию, и на файл, который держит другая программа:
+/// для инженера это одно и то же — сейчас дописать нельзя.
 fn journal_busy_error() -> io::Error {
     io::Error::new(
         ErrorKind::WouldBlock,
-        "журнал ещё пишется, дождитесь остановки сессии",
+        "файл занят: идёт сессия или его держит другая программа",
     )
 }
 
@@ -546,13 +614,18 @@ async fn run(
         let events = batch.events;
         // Ошибка сериализации одного события не выбрасывает всю пачку: остальные строки
         // пишутся, а причина запоминается и уходит ожидающим.
-        let mut outcome = Ok(());
+        let mut outcome: io::Result<()> = Ok(());
         if let Some(err) = batch.error.take() {
             remember(&failure, &err);
             outcome = Err(err);
         }
         let mut fatal = false;
-        if !batch.bytes.is_empty() {
+        if let Some(err) = test_hook_failure(events) {
+            remember(&failure, &err);
+            outcome = Err(err);
+            fatal = true;
+        }
+        if !fatal && !batch.bytes.is_empty() {
             let writer = file.take().expect("файл принадлежит задаче-писателю");
             match append(writer, std::mem::take(&mut batch.bytes)).await {
                 Ok(writer) => file = Some(writer),
@@ -653,7 +726,7 @@ mod tests {
     ///
     /// На Windows дескриптор журнала освобождается вместе с задачей-писателем, но антивирус
     /// или индексатор могут задержать это на доли секунды. До пяти повторов по 100 мс
-    /// проверку не ослабляют: отказ «журнал ещё пишется» по-прежнему виден сразу, а ждём
+    /// проверку не ослабляют: отказ «файл занят» по-прежнему виден сразу, а ждём
     /// мы только освобождения файла после `shutdown`.
     fn append_note_after_stop(path: &Path, text: &str) {
         for attempt in 0..5 {
@@ -786,7 +859,7 @@ mod tests {
         journal.flush().await.unwrap();
 
         let err = append_note(&path, &note("во время сессии")).unwrap_err();
-        assert!(err.to_string().contains("ещё пишется"), "{err}");
+        assert!(err.to_string().contains("файл занят"), "{err}");
 
         // Читать журнал идущей сессии можно: на этом стоят `verify`, Блокнот и будущий FR-29.
         let outcome = read_all(&path).expect("журнал читается на ходу");
@@ -933,6 +1006,42 @@ mod tests {
             let warning = log_dir_warning(path).unwrap_or_else(|| panic!("{path} — сетевой путь"));
             assert!(warning.contains("сетевой"), "{path}: {warning}");
         }
+    }
+
+    /// Текущая папка возвращается на место, даже если проверка упала.
+    struct CwdGuard(PathBuf);
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_relative_log_dir_is_checked_after_resolving_it() {
+        let base = temp_dir();
+        let onedrive = base.path().join("OneDrive").join("bytetap");
+        std::fs::create_dir_all(&onedrive).unwrap();
+        let _guard = CwdGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(&onedrive).unwrap();
+
+        // `.` сама по себе не содержит компоненты OneDrive: предупреждение видно только
+        // потому, что путь сначала приводится к абсолютному.
+        log_dir_warning(".").expect("`.` внутри OneDrive — это папка в OneDrive");
+    }
+
+    #[test]
+    fn a_windows_path_is_not_resolved_against_the_current_folder() {
+        // На Unix `C:\…` и `\\server\…` выглядят относительными: их нельзя приклеивать
+        // к текущей папке, иначе путь перестанет распознаваться по тексту.
+        for path in [r"\\fileserver\share\bytetap", r"C:\Users\user\Documents"] {
+            assert_eq!(warning_path(Path::new(path)), PathBuf::from(path));
+        }
+        let relative = Path::new("Documents").join("bytetap");
+        assert_eq!(
+            warning_path(&relative),
+            std::path::absolute(&relative).unwrap()
+        );
     }
 
     #[tokio::test]

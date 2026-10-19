@@ -319,6 +319,7 @@ async fn two_parallel_connections_are_numbered_apart() {
     let dir = tempfile::tempdir().expect("временная папка");
     let handle = start(dir.path()).await;
     let addr = handle.local_addr();
+    let mut events = handle.subscribe();
 
     let first = fixtures(&["analyzer_oru_r01.hl7", "analyzer_qry_q02.hl7"]);
     let second = fixtures(&["analyzer_custom_separators.hl7"]);
@@ -336,6 +337,32 @@ async fn two_parallel_connections_are_numbered_apart() {
     let second_report = second_report.expect("второе соединение");
     assert_eq!(first_report.connections, 1);
     assert_eq!(second_report.connections, 1);
+
+    // Лента до остановки: соединения должны перекрываться, а не идти одно за другим.
+    let mut order: Vec<(&'static str, u32)> = Vec::new();
+    while order.iter().filter(|&&(kind, _)| kind == "close").count() < 2 {
+        let event = timeout(Duration::from_secs(10), events.recv())
+            .await
+            .expect("событие в пределах таймаута")
+            .expect("канал подписчика жив");
+        match &*event {
+            Event::Open(open) => order.push(("open", open.conn)),
+            Event::Close(close) => order.push(("close", close.conn)),
+            _ => {}
+        }
+    }
+    let second_open = order
+        .iter()
+        .position(|&(kind, conn)| kind == "open" && conn == 2)
+        .expect("второе соединение открылось");
+    let first_close = order
+        .iter()
+        .position(|&(kind, conn)| kind == "close" && conn == 1)
+        .expect("первое соединение закрылось");
+    assert!(
+        second_open < first_close,
+        "соединения перекрываются: open #2 (событие {second_open}) раньше close #1 (событие {first_close}), лента {order:?}"
+    );
 
     let path = handle.journal_path().to_path_buf();
     let stats = handle.stop().await.expect("остановка");
@@ -361,6 +388,63 @@ async fn two_parallel_connections_are_numbered_apart() {
     let mut expected = vec![first_report.acks.concat(), second_report.acks.concat()];
     expected.sort();
     assert_eq!(answers, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_is_not_blocked_by_an_analyzer_that_does_not_read() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let handle = start(dir.path()).await;
+    let path = handle.journal_path().to_path_buf();
+
+    // Длинные поля `MSH` попадают в ACK: буферы сокета заполняются за несколько
+    // сообщений, и сервер блокируется на записи ответа, которую никто не читает.
+    let filler = "A".repeat(2048);
+    let message = format!(
+        "\u{b}MSH|^~\\&|{filler}|LAB|{filler}|LAB|20261019101500||ORU^R01|MSG0001|P|2.3.1\r\
+         PID|1||PATIENT^TEST\r\u{1c}\r"
+    )
+    .into_bytes();
+
+    let mut client = TcpStream::connect(handle.local_addr())
+        .await
+        .expect("подключение анализатора");
+    let writer = tokio::spawn(async move {
+        for _ in 0..50_000 {
+            if client.write_all(&message).await.is_err() {
+                break;
+            }
+        }
+        // Соединение остаётся открытым, ответы не читаются: именно это раньше
+        // не давало `stop` завершиться.
+        std::future::pending::<()>().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let stats = timeout(Duration::from_secs(10), handle.stop())
+        .await
+        .expect("остановка не должна зависать на не читающем клиенте")
+        .expect("остановка штатная");
+    writer.abort();
+    assert!(
+        stats.bytes_analyzer_to_lis > 0,
+        "сессия успела принять данные"
+    );
+
+    let lines = load(&path);
+    let journal_stats = check_journal(&lines, 1);
+    assert_eq!(stats, journal_stats);
+    let closed = lines
+        .iter()
+        .find_map(|(_, event)| match event {
+            Event::Close(close) => Some(close.clone()),
+            _ => None,
+        })
+        .expect("соединение закрыто событием close");
+    assert!(
+        ["stop", "timeout"].contains(&closed.reason.as_str()),
+        "причина закрытия — остановка или таймаут записи: {}",
+        closed.reason
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -398,16 +482,34 @@ async fn no_responder_records_the_exchange_and_notifies_subscribers() {
             break;
         }
     }
-    assert_eq!(kinds, ["open", "data", "close"], "лента в порядке обмена");
-    assert_eq!(fragments.len(), 1);
-    assert_eq!(fragments[0].dir, Dir::AnalyzerToLis);
-    assert!(!fragments[0].synthetic);
     assert_eq!(
-        base64::engine::general_purpose::STANDARD
-            .decode(&fragments[0].b64)
-            .expect("b64"),
-        message
+        kinds.first().copied(),
+        Some("open"),
+        "лента в порядке обмена"
     );
+    assert_eq!(
+        kinds.last().copied(),
+        Some("close"),
+        "лента в порядке обмена"
+    );
+    assert!(!fragments.is_empty(), "фрагмент анализатора записан");
+    assert!(
+        fragments
+            .iter()
+            .all(|fragment| fragment.dir == Dir::AnalyzerToLis)
+    );
+    assert!(fragments.iter().all(|fragment| !fragment.synthetic));
+    // Поток мог прийти одним фрагментом или несколькими: проверяется склейка, а не
+    // разбиение, потому что число фрагментов — свойство планировщика, а не сессии.
+    let mut received = Vec::new();
+    for fragment in &fragments {
+        received.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(&fragment.b64)
+                .expect("b64"),
+        );
+    }
+    assert_eq!(received, message, "склейка фрагментов равна отправленному");
 
     let path = handle.journal_path().to_path_buf();
     let stats = handle.stop().await.expect("остановка");

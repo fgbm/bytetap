@@ -14,19 +14,28 @@
 //! обслуживаются независимо, последовательные получают новый номер. Ошибка в соединении
 //! закрывает только его (NFR-5): сессия пишет `error`, `close` и продолжает слушать.
 //!
+//! Отказ журнала останавливает сессию: [`Journal::record`], вернувший `false`, значит, что
+//! события больше не попадают на диск. Сессия рассылает подписчикам `error` с причиной,
+//! перестаёт отвечать анализатору (ни одного ACK после отказа), закрывает соединения и
+//! завершается без `session_end`; [`SessionHandle::stop`] возвращает ошибку с причиной
+//! (ADR 0001, «Ошибка записи»).
+//!
 //! Автоответчик у каждого соединения свой ([`Responder`]), а источник `MSH-10` — общий на
 //! сессию ([`ControlIdSource`]): номера ответов не повторяются между соединениями.
 
+use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use chrono::{Local, SecondsFormat};
 use serde_json::json;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinSet;
+use tokio::time::timeout;
 
 use crate::journal::{
     Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, Host, InfoEvent, Journal, Mode,
@@ -46,6 +55,23 @@ const EVENT_BUFFER: usize = 1024;
 
 /// Размер буфера чтения сокета: один вызов чтения — один фрагмент журнала.
 const READ_BUFFER: usize = 16 * 1024;
+
+/// Сколько ждёт запись ответа в сокет, прежде чем соединение закроется с причиной `timeout`.
+///
+/// Клиент, который перестал читать, не должен держать сессию вечно: ответ на сообщение
+/// анализатора уходит в буфер сокета за микросекунды, а пять секунд — уже заведомо сбой
+/// приёма, а не медленный диск (журнал в пересылку не входит, NFR-6).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Сколько `run` ждёт задачи соединений после остановки, прежде чем прервать их.
+const CONNECTIONS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Первая пауза после ошибки `accept`.
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+
+/// Предел паузы после ошибки `accept`: порт, занятый чужой программой, не должен
+/// превращаться в поток событий `error` по тысяче в секунду (NFR-5).
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Настройки сессии: адрес, автоответчик, папка журналов, поля заголовка (FR-21).
 #[derive(Debug, Clone)]
@@ -121,7 +147,27 @@ impl Session {
     /// а ошибка открытия файла — ошибка старта. Вызывается внутри runtime `tokio`.
     ///
     /// Профили, которых нет в M1 (`astm_e1381`, `auto`), отвергаются до создания файла.
+    ///
+    /// # Errors
+    ///
+    /// Порт занят, папка журналов недоступна, журнал не создан.
     pub async fn start(config: SessionConfig) -> io::Result<SessionHandle> {
+        Self::start_with_feed(config)
+            .await
+            .map(|(handle, _)| handle)
+    }
+
+    /// То же, что [`Session::start`], но подписка на ленту создаётся до запуска задачи.
+    ///
+    /// Нужна `bytetap-cli capture`: иначе первые события (подключение анализатора сразу
+    /// после старта) могли бы разойтись до подписки и пропасть из ленты.
+    ///
+    /// # Errors
+    ///
+    /// Те же, что у [`Session::start`].
+    pub async fn start_with_feed(
+        config: SessionConfig,
+    ) -> io::Result<(SessionHandle, broadcast::Receiver<SessionEvent>)> {
         if !matches!(
             config.responder,
             Autoresponder::Hl7Mllp | Autoresponder::None
@@ -166,7 +212,9 @@ impl Session {
         let path = journal.path().to_path_buf();
 
         let (events, _) = broadcast::channel(EVENT_BUFFER);
+        let feed = events.subscribe();
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (failure_tx, failure_rx) = watch::channel(None);
         let shared = Arc::new(Shared {
             responder: config.responder,
             journal,
@@ -174,29 +222,36 @@ impl Session {
             events,
             ids: ControlIdSource::new(),
             counters: Arc::new(Counters::default()),
+            failure: failure_tx,
+            open: Mutex::new(HashSet::new()),
         });
-        let task = tokio::spawn(run(server, Arc::clone(&shared), stop_rx));
+        let task = tokio::spawn(run(server, Arc::clone(&shared), stop_rx, failure_rx));
 
-        Ok(SessionHandle {
+        let handle = SessionHandle {
             local_addr,
             path,
             warning,
             events: shared.events.clone(),
+            failure: shared.failure.subscribe(),
             stop: stop_tx,
             task: Some(task),
-        })
+        };
+        Ok((handle, feed))
     }
 }
 
 /// Дескриптор запущенной сессии.
 ///
-/// Живёт до [`SessionHandle::stop`] (или до выгрузки значения: тогда сессия тоже
-/// останавливается, но без ожидания итогов).
+/// Живёт до [`SessionHandle::stop`]. Без явной остановки при выгрузке значения
+/// отправляется только сигнал: задача сессии живёт в runtime, и если runtime к этому
+/// моменту уже остановлен, сигнал до неё не дойдёт, а `session_end` не запишется.
+/// Поэтому останавливать сессию нужно явно, пока runtime жив.
 pub struct SessionHandle {
     local_addr: SocketAddr,
     path: PathBuf,
     warning: Option<String>,
     events: broadcast::Sender<SessionEvent>,
+    failure: watch::Receiver<Option<String>>,
     stop: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<io::Result<Stats>>>,
 }
@@ -229,10 +284,23 @@ impl SessionHandle {
         self.events.subscribe()
     }
 
+    /// Отказ журнала: `Some(причина)`, если писатель перестал принимать события.
+    ///
+    /// По этой метке `capture` заканчивает ленту, не дожидаясь Ctrl+C: сессия уже
+    /// остановлена, и [`SessionHandle::stop`] вернёт ошибку с той же причиной.
+    #[must_use]
+    pub fn journal_failure(&self) -> watch::Receiver<Option<String>> {
+        self.failure.clone()
+    }
+
     /// Останавливает сессию штатно и возвращает её статистику (FR-22).
     ///
     /// Слушатель закрывается, соединения закрываются с событием `close`, в журнал пишется
     /// `session_end`, писатель журнала дописывает накопленное и фиксирует файл.
+    ///
+    /// # Errors
+    ///
+    /// Журнал отказал ([`journal_failure_reason`] даёт причину) или задача сессии упала.
     pub async fn stop(mut self) -> io::Result<Stats> {
         self.request_stop();
         let task = self
@@ -252,8 +320,9 @@ impl SessionHandle {
 
 impl Drop for SessionHandle {
     fn drop(&mut self) {
-        // Без `stop` сессия всё равно останавливается: слушатель закрывается, журнал
-        // дописывается, а ждать итогов некому.
+        // Без `stop` сессия всё равно получает сигнал остановки: слушатель закрывается,
+        // журнал дописывается, а ждать итогов некому. Сигнал дойдёт, только если runtime
+        // ещё жив: на `Drop` нельзя полагаться как на штатную остановку.
         self.request_stop();
     }
 }
@@ -268,6 +337,36 @@ impl std::fmt::Debug for SessionHandle {
     }
 }
 
+/// Отказ журнала: сессия остановлена, потому что события больше не записываются.
+#[derive(Debug)]
+struct JournalFailure {
+    reason: String,
+}
+
+impl std::fmt::Display for JournalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "запись в журнал прервана: {}", self.reason)
+    }
+}
+
+impl std::error::Error for JournalFailure {}
+
+/// Ошибка сессии с причиной отказа журнала.
+fn journal_failure_error(reason: String) -> io::Error {
+    io::Error::other(JournalFailure { reason })
+}
+
+/// Причина отказа журнала, если [`SessionHandle::stop`] вернул ошибку из-за него.
+///
+/// Нужна `bytetap-cli capture`, чтобы напечатать своё сообщение об остановке сессии,
+/// а не общую ошибку ввода-вывода.
+#[must_use]
+pub fn journal_failure_reason(err: &io::Error) -> Option<&str> {
+    err.get_ref()?
+        .downcast_ref::<JournalFailure>()
+        .map(|failure| failure.reason.as_str())
+}
+
 /// То, что нужно каждому соединению: журнал, часы, автоответчик, подписчики и счётчики.
 struct Shared {
     responder: Autoresponder,
@@ -276,6 +375,10 @@ struct Shared {
     events: broadcast::Sender<SessionEvent>,
     ids: ControlIdSource,
     counters: Arc<Counters>,
+    /// Причина отказа журнала: как только она появилась, сессия перестаёт отвечать.
+    failure: watch::Sender<Option<String>>,
+    /// Номера открытых соединений: `close` для них пишется даже после abort.
+    open: Mutex<HashSet<u32>>,
 }
 
 impl Shared {
@@ -283,19 +386,100 @@ impl Shared {
     ///
     /// Оба действия не ждут: канал журнала неограниченный, канал подписчиков теряет
     /// старые события у отставших. Порядок строк журнала — порядок вызовов.
+    /// `record`, вернувший `false`, означает отказ журнала: сессия останавливается.
     fn publish(&self, event: Event) {
-        self.journal.record(event.clone());
+        let recorded = self.journal.record(event.clone());
         // Ошибка означает лишь отсутствие подписчиков: сессия работает и без них.
         let _ = self.events.send(Arc::new(event));
+        if !recorded {
+            self.fail_journal();
+        }
     }
 
-    /// Ошибка уровня соединения: она закрывает только это соединение (NFR-5).
+    /// Ошибка и замечание уровня сессии или соединения (NFR-5).
+    ///
+    /// Сообщения в журнале — английские, независимо от источника: их читает и человек,
+    /// и поиск по журналу (`docs/reference/session-format.md`). Русский — только интерфейс.
     fn error(&self, conn: Option<u32>, message: impl Into<String>) {
         self.publish(Event::Error(ErrorEvent {
             t: now_rfc3339(),
             mono_us: self.clock.now_us(),
             conn,
             message: message.into(),
+        }));
+    }
+
+    fn info(&self, conn: Option<u32>, message: impl Into<String>) {
+        self.publish(Event::Info(InfoEvent {
+            t: now_rfc3339(),
+            mono_us: self.clock.now_us(),
+            conn,
+            message: message.into(),
+        }));
+    }
+
+    /// Первый `false` от писателя: сообщает подписчикам причину и будит соединения.
+    ///
+    /// В журнал `error` уже не попадёт — он и есть отказ, — поэтому событие уходит только
+    /// в ленту подписчиков.
+    fn fail_journal(&self) {
+        let reason = self
+            .journal
+            .failure()
+            .unwrap_or_else(|| "journal writer stopped".to_owned());
+        let first = self.failure.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(reason.clone());
+                true
+            }
+        });
+        if !first {
+            return;
+        }
+        let _ = self.events.send(Arc::new(Event::Error(ErrorEvent {
+            t: now_rfc3339(),
+            mono_us: self.clock.now_us(),
+            conn: None,
+            message: format!("journal write failed: {reason}; no ACKs are sent after the failure"),
+        })));
+    }
+
+    /// Пишет `close` ровно один раз: номер убирается из открытых под тем же замком.
+    fn close_conn(&self, conn: u32, by: ClosedBy, reason: &str) {
+        let Ok(mut open) = self.open.lock() else {
+            // Замок отравлен: терять `close` всё равно нельзя.
+            self.publish_close(conn, by, reason);
+            return;
+        };
+        if !open.remove(&conn) {
+            return;
+        }
+        self.publish_close(conn, by, reason);
+    }
+
+    /// Закрывает соединения, которые не успели закрыться сами после остановки.
+    ///
+    /// Вызывается после abort задач: `close` с причиной `stop` пишется всё равно, чтобы
+    /// в журнале не осталось `open` без пары.
+    fn close_leftover(&self) {
+        let leftover: Vec<u32> = match self.open.lock() {
+            Ok(mut open) => open.drain().collect(),
+            Err(_) => Vec::new(),
+        };
+        for conn in leftover {
+            self.publish_close(conn, ClosedBy::Bytetap, "stop");
+        }
+    }
+
+    fn publish_close(&self, conn: u32, by: ClosedBy, reason: &str) {
+        self.publish(Event::Close(Close {
+            t: now_rfc3339(),
+            mono_us: self.clock.now_us(),
+            conn,
+            by,
+            reason: reason.to_owned(),
         }));
     }
 }
@@ -333,18 +517,107 @@ impl Counters {
     }
 }
 
-/// Задача сессии: принимает соединения, пока не придёт остановка.
+/// Подряд идущие ошибки `accept`.
+///
+/// Одинаковые ошибки схлопываются: в журнал попадает одно событие `error`, а при
+/// восстановлении — одно `info` со счётчиком повторов. Иначе занятый порт давал бы
+/// две строки в секунду на весь журнал.
+#[derive(Debug, Default)]
+struct AcceptErrors {
+    current: Option<(String, u32)>,
+}
+
+/// Что записать о новой ошибке `accept`.
+#[derive(Debug)]
+enum AcceptReport {
+    /// Ошибка новая: нужен `error`.
+    First(String),
+    /// Ошибка сменилась: `info` о повторах прежней и `error` о новой.
+    Changed {
+        previous: String,
+        repeats: u32,
+        message: String,
+    },
+    /// Та же ошибка продолжается: писать нечего.
+    Repeated,
+}
+
+impl AcceptErrors {
+    /// Учитывает ошибку и говорит, что о ней писать.
+    fn failed(&mut self, message: String) -> AcceptReport {
+        match self.current.take() {
+            Some((previous, repeats)) if previous == message => {
+                self.current = Some((previous, repeats + 1));
+                AcceptReport::Repeated
+            }
+            Some((previous, repeats)) => {
+                self.current = Some((message.clone(), 0));
+                AcceptReport::Changed {
+                    previous,
+                    repeats,
+                    message,
+                }
+            }
+            None => {
+                self.current = Some((message.clone(), 0));
+                AcceptReport::First(message)
+            }
+        }
+    }
+
+    /// Приём восстановился: отчёт о схлопнутых повторах, если они были.
+    fn recovered(&mut self) -> Option<String> {
+        self.current.take().and_then(|(previous, repeats)| {
+            (repeats > 0)
+                .then(|| format!("accept recovered after {repeats} repeated failures: {previous}"))
+        })
+    }
+}
+
+/// Следующая пауза после ошибки `accept`: удвоение до [`ACCEPT_BACKOFF_MAX`].
+fn next_backoff(previous: Duration) -> Duration {
+    (previous * 2).min(ACCEPT_BACKOFF_MAX)
+}
+
+/// Ждёт остановки сессии (или выгрузки её дескриптора).
+async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
+    if *stop.borrow_and_update() {
+        return;
+    }
+    // Ошибка `changed` значит, что отправитель выгружен: сессии больше нет.
+    let _ = stop.changed().await;
+}
+
+/// Ждёт отказа журнала (или выгрузки дескриптора сессии).
+async fn wait_for_failure(failure: &mut watch::Receiver<Option<String>>) {
+    if failure.borrow_and_update().is_some() {
+        return;
+    }
+    let _ = failure.changed().await;
+}
+
+/// Задача сессии: принимает соединения, пока не придёт остановка или отказ журнала.
 async fn run(
     server: TcpServer,
     shared: Arc<Shared>,
     mut stop: watch::Receiver<bool>,
+    mut failure: watch::Receiver<Option<String>>,
 ) -> io::Result<Stats> {
     let mut tasks: JoinSet<()> = JoinSet::new();
+    let mut accept_errors = AcceptErrors::default();
+    let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
         tokio::select! {
             accepted = server.accept() => match accepted {
                 Ok(connection) => {
+                    if let Some(note) = accept_errors.recovered() {
+                        shared.info(None, note);
+                    }
+                    backoff = ACCEPT_BACKOFF_MIN;
                     let conn = shared.counters.next_conn();
+                    if let Ok(mut open) = shared.open.lock() {
+                        open.insert(conn);
+                    }
                     // `open` пишется здесь, а не в задаче соединения: так порядок строк
                     // совпадает с порядком номеров, и открытие не может оказаться после
                     // первых фрагментов этого же соединения.
@@ -357,38 +630,77 @@ async fn run(
                     }));
                     let shared = Arc::clone(&shared);
                     let mut conn_stop = stop.clone();
+                    let mut conn_failure = failure.clone();
                     tasks.spawn(async move {
-                        serve(connection, conn, &shared, &mut conn_stop).await;
+                        serve(connection, conn, &shared, &mut conn_stop, &mut conn_failure).await;
                     });
                 }
                 Err(err) => {
                     // Ошибка приёма не роняет сессию (NFR-5): пишем её и слушаем дальше.
-                    shared.error(None, format!("не удалось принять соединение: {err}"));
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let message = format!("accept failed: {err}");
+                    match accept_errors.failed(message) {
+                        AcceptReport::Repeated => {}
+                        AcceptReport::First(message) => shared.error(None, message),
+                        AcceptReport::Changed { previous, repeats, message } => {
+                            shared.info(
+                                None,
+                                format!(
+                                    "accept error changed after {repeats} repeats of the previous one: {previous}"
+                                ),
+                            );
+                            shared.error(None, message);
+                        }
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(backoff) => {}
+                        _ = wait_for_stop(&mut stop) => break,
+                        _ = wait_for_failure(&mut failure) => break,
+                    }
+                    backoff = next_backoff(backoff);
                 }
             },
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 let _ = joined;
             },
-            changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow_and_update() {
-                    break;
-                }
-            }
+            _ = wait_for_stop(&mut stop) => break,
+            _ = wait_for_failure(&mut failure) => break,
         }
     }
 
     // Слушатель закрыт вместе с `server`; соединения видят остановку и пишут `close`.
     drop(server);
-    while tasks.join_next().await.is_some() {}
+    let all_closed = timeout(CONNECTIONS_SHUTDOWN_TIMEOUT, async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if all_closed.is_err() {
+        // Соединение не закрылось за отведённое время: задачи прерываются, `close` для
+        // них пишется здесь, чтобы в журнале не осталось `open` без пары.
+        tasks.shutdown().await;
+        shared.close_leftover();
+    }
 
     let stats = shared.counters.snapshot();
+    let failed = failure
+        .borrow()
+        .clone()
+        .or_else(|| shared.failure.borrow().clone());
+    if let Some(reason) = failed {
+        // `session_end` не пишется: журнал уже не принимает строк.
+        let _ = shared.journal.shutdown().await;
+        return Err(journal_failure_error(reason));
+    }
+
     shared.publish(Event::SessionEnd(SessionEnd {
         t: now_rfc3339(),
         mono_us: shared.clock.now_us(),
         stats: stats.clone(),
     }));
-    shared.journal.shutdown().await?;
+    if let Err(err) = shared.journal.shutdown().await {
+        // Журнал отказал на последней пачке: `session_end` мог не записаться.
+        let reason = shared.journal.failure().unwrap_or_else(|| err.to_string());
+        return Err(journal_failure_error(reason));
+    }
     Ok(stats)
 }
 
@@ -398,16 +710,18 @@ async fn serve(
     conn: u32,
     shared: &Shared,
     stop: &mut watch::Receiver<bool>,
+    failure: &mut watch::Receiver<Option<String>>,
 ) {
     let mut responder = make_responder(shared.responder, &shared.ids);
     let mut buffer = vec![0u8; READ_BUFFER];
     let (by, reason) = loop {
+        if failure.borrow().is_some() {
+            break (ClosedBy::Bytetap, "stop");
+        }
         tokio::select! {
             biased;
-            changed = stop.changed() => {
-                let _ = changed;
-                break (ClosedBy::Bytetap, "stop");
-            }
+            _ = wait_for_stop(stop) => break (ClosedBy::Bytetap, "stop"),
+            _ = wait_for_failure(failure) => break (ClosedBy::Bytetap, "stop"),
             read = connection.read(&mut buffer) => match read {
                 Ok(0) => break (ClosedBy::Analyzer, "eof"),
                 Ok(len) => {
@@ -423,15 +737,22 @@ async fn serve(
                         false,
                         payload,
                     )));
-                    if let Some((by, reason)) =
-                        apply(shared, conn, &mut connection, responder.feed(payload, now)).await
+                    if let Some((by, reason)) = apply(
+                        shared,
+                        conn,
+                        &mut connection,
+                        responder.feed(payload, now),
+                        stop,
+                        failure,
+                    )
+                    .await
                     {
                         break (by, reason);
                     }
                 }
                 Err(err) => {
                     let (by, reason) = close_reason(&err);
-                    shared.error(Some(conn), format!("чтение из соединения: {err}"));
+                    shared.error(Some(conn), format!("connection read failed: {err}"));
                     break (by, reason);
                 }
             },
@@ -440,14 +761,8 @@ async fn serve(
 
     // Автоответчик не теряет недособранное состояние молча: отчёт идёт до `close`.
     let actions = responder.finish(timestamp().1);
-    let _ = apply(shared, conn, &mut connection, actions).await;
-    shared.publish(Event::Close(Close {
-        t: now_rfc3339(),
-        mono_us: shared.clock.now_us(),
-        conn,
-        by,
-        reason: reason.to_owned(),
-    }));
+    let _ = apply(shared, conn, &mut connection, actions, stop, failure).await;
+    shared.close_conn(conn, by, reason);
     connection.shutdown().await;
 }
 
@@ -462,21 +777,48 @@ fn make_responder(kind: Autoresponder, ids: &ControlIdSource) -> Box<dyn Respond
 /// Выполняет действия автоответчика по порядку: ответ — в сокет, затем в журнал.
 ///
 /// Ответ уходит в сокет до записи в журнал: событие `data` с `synthetic: true` появляется
-/// только для того, что действительно отправлено. Ошибка отправки закрывает соединение.
-/// Возвращает причину закрытия, если ответ отправить не удалось.
+/// только для того, что действительно отправлено. Запись в сокет идёт в `select!` с
+/// остановкой, отказом журнала и таймаутом [`WRITE_TIMEOUT`]: клиент, который перестал
+/// читать, не держит сессию. Возвращает причину закрытия, если ответ отправить не удалось.
 async fn apply(
     shared: &Shared,
     conn: u32,
     connection: &mut TcpConnection,
     actions: Vec<Action>,
+    stop: &mut watch::Receiver<bool>,
+    failure: &mut watch::Receiver<Option<String>>,
 ) -> Option<(ClosedBy, &'static str)> {
     for action in actions {
         match action {
             Action::Send(payload) => {
-                if let Err(err) = connection.write_all(&payload).await {
-                    let (by, reason) = close_reason(&err);
-                    shared.error(Some(conn), format!("отправка ответа: {err}"));
-                    return Some((by, reason));
+                // После отказа журнала ответов нет: анализатор должен узнать о сбое
+                // по таймауту, а не получить ACK, которого нет в журнале.
+                if failure.borrow().is_some() {
+                    return Some((ClosedBy::Bytetap, "stop"));
+                }
+                let write = async { timeout(WRITE_TIMEOUT, connection.write_all(&payload)).await };
+                tokio::select! {
+                    biased;
+                    _ = wait_for_stop(stop) => return Some((ClosedBy::Bytetap, "stop")),
+                    _ = wait_for_failure(failure) => return Some((ClosedBy::Bytetap, "stop")),
+                    outcome = write => match outcome {
+                        Err(_elapsed) => {
+                            shared.error(
+                                Some(conn),
+                                format!(
+                                    "answer write timed out after {} s",
+                                    WRITE_TIMEOUT.as_secs()
+                                ),
+                            );
+                            return Some((ClosedBy::Bytetap, "timeout"));
+                        }
+                        Ok(Err(err)) => {
+                            let (by, reason) = close_reason(&err);
+                            shared.error(Some(conn), format!("answer write failed: {err}"));
+                            return Some((by, reason));
+                        }
+                        Ok(Ok(())) => {}
+                    }
                 }
                 let (t, _) = timestamp();
                 shared
@@ -490,6 +832,9 @@ async fn apply(
                     true,
                     &payload,
                 )));
+                if failure.borrow().is_some() {
+                    return Some((ClosedBy::Bytetap, "stop"));
+                }
             }
             Action::Event(event) => {
                 let (t, _) = timestamp();
@@ -649,5 +994,79 @@ mod tests {
         let difference = (parsed - now).num_microseconds().unwrap_or_default().abs();
         assert!(difference <= 1_000, "{t} и {now}");
         assert_eq!(t.len(), "2026-10-19T10:15:00.123456+03:00".len());
+    }
+
+    #[test]
+    fn accept_backoff_grows_to_one_second() {
+        let mut pause = ACCEPT_BACKOFF_MIN;
+        assert_eq!(pause, Duration::from_millis(10), "первая пауза — 10 мс");
+        pause = next_backoff(pause);
+        assert_eq!(pause, Duration::from_millis(20));
+        pause = next_backoff(pause);
+        assert_eq!(pause, Duration::from_millis(40));
+        for _ in 0..10 {
+            pause = next_backoff(pause);
+        }
+        assert_eq!(pause, ACCEPT_BACKOFF_MAX, "предел паузы — 1 с");
+    }
+
+    #[test]
+    fn identical_accept_errors_collapse_into_one_event_and_a_counter() {
+        let mut errors = AcceptErrors::default();
+        match errors.failed("accept failed: нет мест".to_owned()) {
+            AcceptReport::First(message) => assert!(message.contains("нет мест"), "{message}"),
+            other => panic!("первая ошибка должна попасть в журнал: {other:?}"),
+        }
+        assert!(
+            matches!(
+                errors.failed("accept failed: нет мест".to_owned()),
+                AcceptReport::Repeated
+            ),
+            "повтор не пишется"
+        );
+        assert!(matches!(
+            errors.failed("accept failed: нет мест".to_owned()),
+            AcceptReport::Repeated
+        ));
+        assert_eq!(
+            errors.recovered().as_deref(),
+            Some("accept recovered after 2 repeated failures: accept failed: нет мест")
+        );
+        assert_eq!(
+            errors.recovered(),
+            None,
+            "восстановление сообщается один раз"
+        );
+    }
+
+    #[test]
+    fn a_different_accept_error_is_reported_with_the_previous_count() {
+        let mut errors = AcceptErrors::default();
+        let _ = errors.failed("first".to_owned());
+        let _ = errors.failed("first".to_owned());
+        match errors.failed("second".to_owned()) {
+            AcceptReport::Changed {
+                previous,
+                repeats,
+                message,
+            } => {
+                assert_eq!(previous, "first");
+                assert_eq!(repeats, 1);
+                assert_eq!(message, "second");
+            }
+            other => panic!("смена ошибки не сообщена: {other:?}"),
+        }
+        assert_eq!(errors.recovered(), None, "у новой ошибки повторов не было");
+    }
+
+    #[test]
+    fn journal_failure_error_keeps_its_reason() {
+        let err = journal_failure_error("диск недоступен".to_owned());
+        assert_eq!(journal_failure_reason(&err), Some("диск недоступен"));
+        assert!(err.to_string().contains("запись в журнал прервана"));
+        assert_eq!(
+            journal_failure_reason(&io::Error::other("другая ошибка")),
+            None
+        );
     }
 }
