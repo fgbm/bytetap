@@ -33,14 +33,14 @@ use std::time::Duration;
 
 use chrono::{Local, SecondsFormat};
 use serde_json::json;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::journal::{
     Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, Host, InfoEvent, Journal, Mode,
-    MonoClock, Open, Session as SessionHeader, SessionEnd, Stats, default_log_dir, io_message,
-    log_dir_warning, now_rfc3339, session_file_name,
+    MonoClock, Note, Open, Session as SessionHeader, SessionEnd, Stats, default_log_dir,
+    io_message, log_dir_warning, now_rfc3339, session_file_name,
 };
 use crate::responder::{
     Action, ControlIdSource, Hl7Mllp, NoResponder, Now, Responder, ResponderEvent,
@@ -235,6 +235,7 @@ impl Session {
         let feed = events.subscribe();
         let (stop_tx, stop_rx) = watch::channel(false);
         let (failure_tx, failure_rx) = watch::channel(None);
+        let (notes_tx, notes_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             responder: config.responder,
             journal,
@@ -251,6 +252,7 @@ impl Session {
             stop_rx,
             failure_rx,
             journal_failed,
+            notes_rx,
         ));
 
         let handle = SessionHandle {
@@ -260,6 +262,7 @@ impl Session {
             events: shared.events.clone(),
             failure: shared.failure.subscribe(),
             stop: stop_tx,
+            notes: notes_tx,
             task: Some(task),
         };
         Ok((handle, feed))
@@ -279,6 +282,7 @@ pub struct SessionHandle {
     events: broadcast::Sender<SessionEvent>,
     failure: watch::Receiver<Option<String>>,
     stop: watch::Sender<bool>,
+    notes: mpsc::UnboundedSender<String>,
     task: Option<tokio::task::JoinHandle<io::Result<Stats>>>,
 }
 
@@ -317,6 +321,24 @@ impl SessionHandle {
     #[must_use]
     pub fn journal_failure(&self) -> watch::Receiver<Option<String>> {
         self.failure.clone()
+    }
+
+    /// Комментарий инженера в идущую сессию: событие `note` в журнал и ленту (FR-23).
+    ///
+    /// Порядок строк журнала — порядок вызовов: комментарий стоит между событиями,
+    /// которые шли до и после него. Поле `mono_us` у такого комментария есть: сессия
+    /// ещё идёт.
+    ///
+    /// # Errors
+    ///
+    /// Сессия уже остановлена: класть событие некуда.
+    pub fn note(&self, text: impl Into<String>) -> io::Result<()> {
+        self.notes.send(text.into()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "сессия уже остановлена: комментарий не записан",
+            )
+        })
     }
 
     /// Останавливает сессию штатно и возвращает её статистику (FR-22).
@@ -643,6 +665,7 @@ async fn run(
     mut stop: watch::Receiver<bool>,
     mut failure: watch::Receiver<Option<String>>,
     mut journal_failed: watch::Receiver<Option<String>>,
+    mut notes: mpsc::UnboundedReceiver<String>,
 ) -> io::Result<Stats> {
     let mut tasks: JoinSet<()> = JoinSet::new();
     let mut accept_errors = AcceptErrors::default();
@@ -706,6 +729,14 @@ async fn run(
             },
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 let _ = joined;
+            },
+            Some(text) = notes.recv() => {
+                // Комментарий идёт в журнал и ленту как обычное событие сессии (FR-23).
+                shared.publish(Event::Note(Note {
+                    t: now_rfc3339(),
+                    mono_us: Some(shared.clock.now_us()),
+                    text,
+                }));
             },
             _ = wait_for_stop(&mut stop) => break,
             _ = wait_for_failure(&mut failure) => break,
@@ -1099,6 +1130,39 @@ mod tests {
             },
         )
         .expect("журнал после остановки не заблокирован");
+    }
+
+    #[tokio::test]
+    async fn a_note_of_a_running_session_goes_to_the_journal_and_the_feed() {
+        let dir = temp_dir();
+        let (handle, mut feed) = Session::start_with_feed(
+            SessionConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_responder(Autoresponder::None)
+                .with_log_dir(dir.path()),
+        )
+        .await
+        .expect("сессия");
+        let path = handle.journal_path().to_path_buf();
+
+        handle.note("прогнали три пробы").expect("комментарий");
+        let event = tokio::time::timeout(Duration::from_secs(1), feed.recv())
+            .await
+            .expect("событие в ленте")
+            .expect("лента не закрыта");
+        let Event::Note(note) = event.as_ref() else {
+            panic!("ожидался note, получено {}", event.kind());
+        };
+        assert_eq!(note.text, "прогнали три пробы");
+        assert!(
+            note.mono_us.is_some(),
+            "у комментария идущей сессии есть mono_us"
+        );
+
+        handle.stop().await.expect("остановка");
+        let outcome = read_all(&path).expect("чтение журнала");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        let kinds: Vec<&str> = outcome.lines.iter().map(|line| line.event.kind()).collect();
+        assert_eq!(kinds, ["session", "note", "session_end"]);
     }
 
     #[test]
