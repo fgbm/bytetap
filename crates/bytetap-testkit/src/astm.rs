@@ -7,7 +7,8 @@
 //!
 //! Поток режется на записи так же, как у HL7-эмулятора ([`Fragmentation`]): целиком,
 //! побайтно и случайными кусками по seed. Длинная запись режется на кадры-продолжения с
-//! `ETB`, как это делает прибор: `FN` растёт 0…7, последний кадр записи заканчивается `ETX`.
+//! `ETB`, как это делает прибор: первый кадр передачи — `'1'`, дальше `FN` идёт по кругу
+//! `'2'`…`'7'`, `'0'`, `'1'` ASCII-цифрами, последний кадр записи заканчивается `ETX`.
 //!
 //! Записи — только синтетические (`ANALYZER`, `LIS`, `PATIENT^TEST`) из `tests/fixtures/astm`.
 //! Эмулятор не разбирает записи: ему всё равно, `H`, `P`, `Q` или `R` в кадре — как и
@@ -49,6 +50,9 @@ pub const CR: u8 = 0x0D;
 
 /// `LF` — последний байт кадра.
 pub const LF: u8 = 0x0A;
+
+/// Номер первого кадра после `ENQ`: ASCII-цифра `'1'`.
+pub const FIRST_FRAME_NUMBER: u8 = b'1';
 
 /// Сколько байт записи эмулятор кладёт в один кадр по умолчанию.
 ///
@@ -187,8 +191,8 @@ impl AstmEmulator {
     pub async fn run(self) -> io::Result<AstmReport> {
         let mut report = AstmReport::default();
         let mut stream: Option<TcpStream> = None;
-        // Номер кадра идёт по кругу всю передачу: `EOT` (новое соединение) начинает с 0.
-        let mut number = 0u8;
+        // Номер кадра идёт по кругу всю передачу: `EOT` (новое соединение) начинает с `'1'`.
+        let mut number = FIRST_FRAME_NUMBER;
         for (index, record) in self.records.iter().enumerate() {
             let reconnect =
                 self.reconnect == Reconnect::BetweenMessages && index > 0 && stream.is_some();
@@ -200,7 +204,7 @@ impl AstmEmulator {
                 }
                 stream = Some(TcpStream::connect(self.addr).await?);
                 report.connections += 1;
-                number = 0;
+                number = FIRST_FRAME_NUMBER;
                 let stream = stream.as_mut().expect("соединение только что открыто");
                 stream.write_all(&[ENQ]).await?;
                 report
@@ -209,7 +213,9 @@ impl AstmEmulator {
             }
             let stream = stream.as_mut().expect("соединение только что открыто");
             let frames = record_frames(record, self.chunk, number, self.bad_checksum);
-            number = number.wrapping_add(frames.len() as u8) & 0x07;
+            for _ in &frames {
+                number = next_number(number);
+            }
             for frame in frames {
                 for (start, end) in fragment_bounds(frame.len(), self.fragmentation) {
                     stream.write_all(&frame[start..end]).await?;
@@ -266,7 +272,8 @@ impl AstmEmulator {
 /// Кадры одной записи так, как их отправит эмулятор.
 ///
 /// Запись режется на куски по `chunk` байт: все кадры, кроме последнего, заканчиваются
-/// `ETB`, последний — `ETX`. Номер кадра растёт от `start_number` по кругу 0…7.
+/// `ETB`, последний — `ETX`. `start_number` — ASCII-цифра номера первого кадра (`'1'` после
+/// `ENQ`); дальше номер идёт по кругу `'2'`…`'7'`, `'0'`, `'1'`.
 #[must_use]
 pub fn record_frames(
     record: &[u8],
@@ -276,7 +283,7 @@ pub fn record_frames(
 ) -> Vec<Vec<u8>> {
     let chunk = chunk.max(1);
     let mut frames = Vec::new();
-    let mut number = start_number & 0x07;
+    let mut number = start_number;
     let mut offset = 0;
     loop {
         let end = (offset + chunk).min(record.len());
@@ -288,7 +295,7 @@ pub fn record_frames(
             terminator,
             bad_checksum,
         ));
-        number = number.wrapping_add(1) & 0x07;
+        number = next_number(number);
         offset = end;
         if last {
             return frames;
@@ -296,8 +303,15 @@ pub fn record_frames(
     }
 }
 
+/// Следующий номер кадра: `'1'`…`'7'`, `'0'`, `'1'` — по кругу E1381.
+#[must_use]
+pub fn next_number(number: u8) -> u8 {
+    (number - b'0' + 1) % 8 + b'0'
+}
+
 /// Кадр ASTM: `STX`, номер, текст, терминатор, сумма, `CR LF`.
 ///
+/// `number` — ASCII-цифра номера кадра, как её передаёт прибор (`'0'`…`'7'`).
 /// `bad_checksum` добавляет к сумме единицу — так проверяется ошибка суммы на приёме.
 #[must_use]
 pub fn frame(number: u8, text: &[u8], terminator: u8, bad_checksum: bool) -> Vec<u8> {
@@ -373,13 +387,17 @@ mod tests {
 
     #[test]
     fn a_long_record_is_split_into_etb_frames() {
-        let frames = record_frames(RECORD, 8, 0, false);
+        let frames = record_frames(RECORD, 8, b'0', false);
         assert!(frames.len() > 1, "запись не влезла в один кадр");
         let mut text = Vec::new();
         for (index, frame) in frames.iter().enumerate() {
             let last = index == frames.len() - 1;
             assert_eq!(frame[0], STX, "кадр начинается с STX");
-            assert_eq!(frame[1], index as u8, "номер кадра растёт с 0");
+            assert_eq!(
+                frame[1],
+                b'0' + index as u8,
+                "номер кадра — ASCII-цифра, растёт с 0"
+            );
             assert_eq!(&frame[frame.len() - 2..], &[CR, LF], "кадр кончается CR LF");
             let terminator = frame[frame.len() - 5];
             assert_eq!(
@@ -403,8 +421,8 @@ mod tests {
 
     #[test]
     fn a_bad_checksum_frame_differs_by_one() {
-        let good = frame(0, b"P|1\r", ETX, false);
-        let bad = frame(0, b"P|1\r", ETX, true);
+        let good = frame(b'0', b"P|1\r", ETX, false);
+        let bad = frame(b'0', b"P|1\r", ETX, true);
         assert_eq!(good.len(), bad.len());
         assert_ne!(good, bad);
         let mut stream = vec![ENQ];
@@ -430,7 +448,7 @@ mod tests {
         assert_eq!(report.connections, 1);
         assert_eq!(
             report.frames,
-            record_frames(RECORD, DEFAULT_CHUNK, 0, false).len()
+            record_frames(RECORD, DEFAULT_CHUNK, b'1', false).len()
         );
         assert_eq!(report.acks(), report.frames + 1, "ACK на ENQ и на кадр");
         assert_eq!(report.naks(), 0);

@@ -4,7 +4,10 @@
 //! Сессия открывает первый как COM-порт, тест пишет во второй `ENQ` и кадр ASTM E1381
 //! и получает `ACK`; в журнале видны оба направления, `peer` — имя порта, `local` пуст.
 //!
-//! Без `socat` тест помечается пропущенным явным сообщением, а не молча зелёным.
+//! Тест помечен `#[ignore = "requires socat"]`: обычный прогон его не запускает, CI
+//! запускает отдельно (`cargo test -p bytetap-core --test serial -- --ignored`) с
+//! `BYTETAP_REQUIRE_SOCAT=1`. Если `socat` нужен, а его нет, тест падает; если его нет
+//! и требование не задано, тест печатает явный пропуск, а не молча зеленеет (M3-AC11).
 #![cfg(unix)]
 
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
@@ -23,8 +26,12 @@ struct Socat {
     second: String,
 }
 
+/// `socat` обязателен: CI ставит его и передаёт переменную, и молча зелёный тест там
+/// означал бы, что COM-режим не проверен вовсе.
+const REQUIRE_SOCAT: &str = "BYTETAP_REQUIRE_SOCAT";
+
 impl Socat {
-    /// Запускает `socat`; `None` — программы нет, тест пропускается.
+    /// Запускает `socat`; `None` — программы нет и её наличие не требуется.
     fn start() -> io::Result<Option<Self>> {
         let mut child = match Command::new("socat")
             .args(["-d", "-d", "pty,raw,echo=0", "pty,raw,echo=0"])
@@ -34,7 +41,18 @@ impl Socat {
             .spawn()
         {
             Ok(child) => child,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return if socat_required() {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "{REQUIRE_SOCAT}=1, но `socat` не найден: установите пакет `socat`"
+                        ),
+                    ))
+                } else {
+                    Ok(None)
+                };
+            }
             Err(err) => return Err(err),
         };
         let stderr = child
@@ -79,9 +97,16 @@ impl Drop for Socat {
     }
 }
 
+/// `socat` требуется этим прогоном: CI передаёт переменную, локальный прогон — нет.
+fn socat_required() -> bool {
+    std::env::var(REQUIRE_SOCAT).is_ok_and(|value| value == "1")
+}
+
 /// Кадр ASTM E1381 с верной контрольной суммой и содержанием, не требующим разбора.
+///
+/// Номер кадра — `'1'`: первый кадр после `ENQ` (FR-17).
 fn astm_frame() -> Vec<u8> {
-    let body = b"0H|\\^&||||||||||P|E1394-97|20261019101500\r";
+    let body = b"1H|\\^&||||||||||P|E1394-97|20261019101500\r";
     let checksum = body
         .iter()
         .chain(std::iter::once(&0x03u8))
@@ -152,11 +177,15 @@ async fn broken_port_settings_are_rejected_before_the_journal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires socat"]
 async fn an_astm_exchange_goes_through_a_pty_pair() {
     let socat = match Socat::start() {
         Ok(Some(socat)) => socat,
         Ok(None) => {
-            eprintln!("тест пропущен: socat не найден; для COM-теста установите socat (M3-AC11)");
+            eprintln!(
+                "тест пропущен: `socat` не найден; для COM-теста установите его (M3-AC11) \
+                 или запустите прогон с {REQUIRE_SOCAT}=1"
+            );
             return;
         }
         Err(err) => panic!("socat не запустился: {err}"),
@@ -239,4 +268,16 @@ async fn an_astm_exchange_goes_through_a_pty_pair() {
         "запросы записаны байт в байт"
     );
     assert_eq!(outgoing, [0x06, 0x06], "ответы записаны в журнал");
+
+    // Нумерация кадров верная: ни замечаний, ни ошибок в журнале нет (FR-17).
+    let notes: Vec<&str> = outcome
+        .lines
+        .iter()
+        .filter_map(|line| match &line.event {
+            Event::Info(info) => Some(info.message.as_str()),
+            Event::Error(error) => Some(error.message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(notes.is_empty(), "обмен без замечаний: {notes:?}");
 }

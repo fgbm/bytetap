@@ -64,6 +64,12 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --no-fail-fast
 
+      - name: COM-тест на pty (socat)
+        if: runner.os == 'Linux'
+        env:
+          BYTETAP_REQUIRE_SOCAT: "1"
+        run: cargo test -p bytetap-core --test serial -- --ignored
+
   frontend:
     name: frontend
     runs-on: ubuntu-latest

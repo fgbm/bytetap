@@ -135,7 +135,8 @@ struct CaptureArgs {
     /// Начальное состояние RTS: `on` или `off`
     #[arg(long, value_name = "on|off", requires = "serial", value_parser = parse_switch)]
     rts: Option<bool>,
-    /// Интервал переподключения к анализатору, секунды: 0…3600 (по умолчанию 5)
+    /// Интервал переподключения к анализатору, секунды: 0…3600 (по умолчанию 5);
+    /// пауза короче 100 мс всё равно выдерживается как 100 мс
     #[arg(
         long,
         value_name = "SEC",
@@ -158,6 +159,11 @@ struct CaptureArgs {
     /// Комментарий инженера для заголовка журнала
     #[arg(long, value_name = "TEXT")]
     note: Option<String>,
+}
+
+/// `--astm-nak` действует только там, где есть ASTM-автомат (FR-17).
+const fn astm_nak_applies(responder: Autoresponder) -> bool {
+    matches!(responder, Autoresponder::AstmE1381 | Autoresponder::Auto)
 }
 
 /// `on`/`off` для DTR и RTS.
@@ -201,6 +207,12 @@ fn capture(args: CaptureArgs) -> ExitCode {
         "hl7" => Autoresponder::Hl7Mllp,
         _ => Autoresponder::None,
     };
+    if args.astm_nak && !astm_nak_applies(responder) {
+        warn!(
+            "Предупреждение: --astm-nak действует только для профилей astm и auto; профиль {} его не использует.",
+            responder.as_str()
+        );
+    }
     let (mut config, target) = match (&args.listen, &args.connect, &args.serial) {
         (Some(listen), None, None) => (SessionConfig::new(*listen), format!("Слушаю {listen}")),
         (None, Some(connect), None) => {
@@ -221,7 +233,13 @@ fn capture(args: CaptureArgs) -> ExitCode {
                 format!("Порт {serial}"),
             )
         }
-        _ => unreachable!("clap требует ровно один источник соединений"),
+        // clap требует ровно один источник: сюда не попадает ни один набор аргументов.
+        (listen, connect, serial) => {
+            warn!(
+                "ошибка: нужен ровно один источник соединений — --listen, --connect или --serial (получено: listen={listen:?}, connect={connect:?}, serial={serial:?})"
+            );
+            return ExitCode::FAILURE;
+        }
     };
     config = config
         .with_responder(responder)
@@ -737,6 +755,17 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_astm_nak_switch_is_only_meaningful_for_astm_profiles() {
+        assert!(astm_nak_applies(Autoresponder::AstmE1381));
+        assert!(astm_nak_applies(Autoresponder::Auto));
+        assert!(
+            !astm_nak_applies(Autoresponder::Hl7Mllp),
+            "у HL7/MLLP нет контрольной суммы кадра"
+        );
+        assert!(!astm_nak_applies(Autoresponder::None));
     }
 
     #[test]

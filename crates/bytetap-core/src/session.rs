@@ -698,7 +698,7 @@ impl SourceErrors {
     fn failed(&mut self, message: String) -> SourceReport {
         match self.current.take() {
             Some((previous, repeats)) if previous == message => {
-                self.current = Some((previous, repeats + 1));
+                self.current = Some((previous, repeats.saturating_add(1)));
                 SourceReport::Repeated
             }
             Some((previous, repeats)) => {
@@ -1111,7 +1111,7 @@ async fn apply(
                         let (by, reason) = close_reason(&err);
                         shared.error_with_code(
                             Some(conn),
-                            Some("answer_write_failed"),
+                            Some("connection_write_failed"),
                             format!("answer write failed: {}", io_message(&err)),
                         );
                         return Some((by, reason));
@@ -1219,7 +1219,8 @@ fn close_reason(err: &io::Error) -> (ClosedBy, &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::{Note, append_note, read_all};
+    use crate::journal::read_all;
+    use crate::journal::writer::append_note_after_stop;
     use chrono::{DateTime, FixedOffset};
 
     fn temp_dir() -> tempfile::TempDir {
@@ -1302,15 +1303,10 @@ mod tests {
         .expect("сессия");
         let path = handle.journal_path().to_path_buf();
         handle.stop().await.expect("остановка");
-        append_note(
-            &path,
-            &Note {
-                t: now_rfc3339(),
-                mono_us: None,
-                text: "после остановки".to_owned(),
-            },
-        )
-        .expect("журнал после остановки не заблокирован");
+        // Дескриптор писателя закрывается вместе с задачей, а не с ответом на остановку,
+        // и `flock` снимается на доли миллисекунды позже. Ждём освобождения, как в тестах
+        // писателя: отказ «файл занят» при живой сессии по-прежнему виден сразу.
+        append_note_after_stop(&path, "после остановки");
     }
 
     #[tokio::test]

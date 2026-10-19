@@ -6,7 +6,7 @@
 
 use bytetap_core::responder::{Action, Astm, Auto, ControlIdSource, Responder, ResponderEvent};
 use bytetap_testkit::astm::{
-    ACK, AstmEmulator, DEFAULT_CHUNK, ENQ, EOT, ETB, ETX, NAK, STX, record_frames,
+    ACK, AstmEmulator, DEFAULT_CHUNK, ENQ, EOT, ETB, ETX, NAK, STX, next_number, record_frames,
 };
 use bytetap_testkit::emulator::Fragmentation;
 use bytetap_testkit::fixtures_dir;
@@ -24,7 +24,15 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
+/// Сообщение HL7 для профиля «Авто», выбравшего MLLP.
+fn hl7_fixture(name: &str) -> Vec<u8> {
+    let path = fixtures_dir().join("hl7").join(name);
+    std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
 /// Кадр с верной суммой: то, что должен принять автоответчик.
+///
+/// `number` — ASCII-цифра номера кадра: `'1'` — первый кадр после `ENQ`.
 fn framed(number: u8, text: &[u8], terminator: u8) -> Vec<u8> {
     let mut body = vec![number];
     body.extend_from_slice(text);
@@ -60,7 +68,7 @@ fn events(actions: &[Action]) -> Vec<&ResponderEvent> {
 fn a_patient_record_is_acknowledged_without_events() {
     let mut responder = Astm::new();
     let actions = responder.feed(
-        &framed(0, &fixture("analyzer_patient_result.astm"), ETX),
+        &framed(b'1', &fixture("analyzer_patient_result.astm"), ETX),
         now(),
     );
     assert_eq!(sends(&actions), vec![vec![ACK]]);
@@ -71,7 +79,7 @@ fn a_patient_record_is_acknowledged_without_events() {
 fn a_query_record_gets_a_single_ack_and_nothing_else() {
     // FR-18, M3-AC8: запрос подтверждается только на транспортном уровне.
     let mut responder = Astm::new();
-    let actions = responder.feed(&framed(0, &fixture("analyzer_query.astm"), ETX), now());
+    let actions = responder.feed(&framed(b'1', &fixture("analyzer_query.astm"), ETX), now());
     assert_eq!(sends(&actions), vec![vec![ACK]]);
     assert!(events(&actions).is_empty(), "{actions:?}");
 }
@@ -79,7 +87,7 @@ fn a_query_record_gets_a_single_ack_and_nothing_else() {
 #[test]
 fn a_long_record_arrives_as_etb_continuations() {
     let record = fixture("analyzer_long_result.astm");
-    let frames = record_frames(&record, DEFAULT_CHUNK, 0, false);
+    let frames = record_frames(&record, DEFAULT_CHUNK, b'1', false);
     assert!(frames.len() > 1, "запись не влезает в один кадр");
 
     let mut responder = Astm::new();
@@ -97,10 +105,13 @@ fn a_long_record_arrives_as_etb_continuations() {
 /// Поток эмулятора целиком: `ENQ`, кадры записей по кругу, `EOT`.
 fn expected_stream(records: &[Vec<u8>]) -> Vec<u8> {
     let mut stream = vec![ENQ];
-    let mut number = 0u8;
+    // Первый кадр после `ENQ` — `'1'`, дальше номер идёт по кругу ASCII-цифрами.
+    let mut number = b'1';
     for record in records {
         let frames = record_frames(record, DEFAULT_CHUNK, number, false);
-        number = number.wrapping_add(frames.len() as u8) & 0x07;
+        for _ in &frames {
+            number = next_number(number);
+        }
         for frame in frames {
             stream.extend_from_slice(&frame);
         }
@@ -195,7 +206,7 @@ async fn the_emulator_and_the_astm_answerer_exchange_the_same_bytes_in_any_fragm
         );
         let frames: usize = records
             .iter()
-            .map(|record| record_frames(record, DEFAULT_CHUNK, 0, false).len())
+            .map(|record| record_frames(record, DEFAULT_CHUNK, b'1', false).len())
             .sum();
         assert_eq!(
             report.frames, frames,
@@ -300,6 +311,46 @@ async fn the_auto_profile_keeps_the_bytes_of_an_unknown_protocol_without_answers
         Some("protocol_undetected"),
         "{events:?}"
     );
+}
+
+#[tokio::test]
+async fn the_auto_profile_skips_the_noise_before_enq() {
+    // M3-AC6: `EOT` перед `ENQ` — обычный шум приборов, решение принимает `ENQ`.
+    let (addr, server) = spawn(Auto::new(ControlIdSource::new())).await;
+    let mut stream = TcpStream::connect(addr).await.expect("подключение");
+    let mut request = vec![EOT, ENQ];
+    request.extend_from_slice(&framed(b'1', &fixture("analyzer_patient_result.astm"), ETX));
+    stream.write_all(&request).await.expect("запись");
+    let mut answers = [0u8; 2];
+    stream.read_exact(&mut answers).await.expect("ответы");
+    assert_eq!(answers, [ACK, ACK], "ACK на ENQ и на кадр");
+    stream.shutdown().await.expect("закрытие");
+
+    let exchange = server.await.expect("обслуживание");
+    assert_eq!(exchange.received, request, "шум записан как обычные данные");
+    assert!(exchange.events().is_empty(), "{:?}", exchange.events());
+}
+
+#[tokio::test]
+async fn the_auto_profile_skips_the_noise_before_the_mllp_frame() {
+    // M3-AC6: `NUL`, `CR`, `LF` и `XON` перед рамкой — шум линии, а не протокол.
+    let (addr, server) = spawn(Auto::new(ControlIdSource::new())).await;
+    let mut stream = TcpStream::connect(addr).await.expect("подключение");
+    let mut request = vec![0x00, b'\r', b'\n', 0x11, 0x0B];
+    request.extend_from_slice(&hl7_fixture("analyzer_oru_r01.hl7"));
+    request.extend_from_slice(&[0x1C, b'\r']);
+    stream.write_all(&request).await.expect("запись");
+    stream.shutdown().await.expect("закрытие");
+
+    let exchange = server.await.expect("обслуживание");
+    let answers = exchange.answers();
+    assert_eq!(answers.len(), 1, "один ACK: {answers:?}");
+    assert_eq!(answers[0].first(), Some(&0x0B), "ACK в рамке MLLP");
+    assert!(
+        answers[0].windows(6).any(|window| window == b"MSA|AA"),
+        "{answers:?}"
+    );
+    assert_eq!(exchange.received, request, "шум записан как обычные данные");
 }
 
 /// Байт потока ASTM: управляющие байты попадаются чаще случайных — на них живёт автомат.

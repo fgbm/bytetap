@@ -1,17 +1,22 @@
-//! «Авто»: профиль автоответчика по первому байту соединения (FR-15).
+//! «Авто»: профиль автоответчика по первому значимому байту соединения (FR-15).
 //!
-//! Обёртка над готовыми автоматами. Решение принимается один раз — по первому байту первого
-//! непустого фрагмента — и дальше не пересматривается: если на середине обмена пришёл байт
-//! другого протокола, он достанется выбранному автомату как есть.
+//! Обёртка над готовыми автоматами. Решение принимается один раз — по первому значимому
+//! байту — и дальше не пересматривается: если на середине обмена пришёл байт другого
+//! протокола, он достанется выбранному автомату как есть.
 //!
 //! - `0x0B` (`VT`) — начало рамки MLLP, профиль [`Hl7Mllp`];
 //! - `0x05` (`ENQ`) — ASTM E1381, профиль [`Astm`];
 //! - любой другой байт — [`NoResponder`] и [`ResponderEvent::Info`] с кодом
 //!   [`EventCode::ProtocolUndetected`]: запись идёт, ответов для этого соединения нет.
 //!
-//! Первый байт не теряется: выбранный автомат получает фрагмент целиком, в котором этот байт
-//! пришёл. Поэтому разбиение потока на фрагменты не меняет ни ответов, ни событий — кроме
-//! одного случая: если `feed` приходит пустым, решение откладывается до первых байтов.
+//! Незначимые ведущие байты — `0x00` (`NUL`), `0x04` (`EOT`), `0x0D` (`CR`), `0x0A` (`LF`),
+//! `0x11` (`XON`) и `0x13` (`XOFF`) — решение не принимают: приборы и переходники шлют их
+//! перед обменом. В журнал они попадают как обычные `data` (их пишет сессия), а автомату
+//! не передаются: выбранному профилю они не нужны.
+//!
+//! Значимый байт не теряется: выбранный автомат получает фрагмент с него. Поэтому разбиение
+//! потока на фрагменты не меняет ни ответов, ни событий — кроме одного случая: если `feed`
+//! приходит пустым или состоит из одних незначимых байтов, решение откладывается.
 //!
 //! Для COM-порта «соединение» — это открытие порта: там решение принимается на открытие,
 //! а [`Responder::reset`] забывает его к следующему.
@@ -23,6 +28,14 @@ use crate::responder::mllp::{self, Hl7Mllp};
 use crate::responder::{
     Action, ControlIdSource, EventCode, NoResponder, Now, Responder, ResponderEvent,
 };
+
+/// Ведущие байты, которые решение не принимают: `NUL`, `EOT`, `CR`, `LF`, `XON`, `XOFF`.
+const NOISE: [u8; 6] = [0x00, astm::EOT, 0x0D, 0x0A, 0x11, 0x13];
+
+/// Ведущий байт не участвует в решении о протоколе.
+fn is_noise(byte: u8) -> bool {
+    NOISE.contains(&byte)
+}
 
 /// Профиль «Авто» для одного соединения.
 pub struct Auto {
@@ -58,7 +71,7 @@ impl Auto {
         self.chosen.is_some()
     }
 
-    /// Выбирает автомат по первому байту соединения.
+    /// Выбирает автомат по первому значимому байту соединения.
     fn detect(&mut self, first: u8, actions: &mut Vec<Action>) {
         self.chosen = Some(match first {
             mllp::SB => Box::new(Hl7Mllp::new(self.ids.clone())),
@@ -69,7 +82,7 @@ impl Auto {
                 actions.push(
                     ResponderEvent::Info {
                         message: format!(
-                            "protocol is not detected: the first byte 0x{other:02X} is neither 0x0B (HL7/MLLP) nor 0x05 (ASTM E1381); no answers are sent for this connection"
+                            "protocol is not detected: the first significant byte 0x{other:02X} is neither 0x0B (HL7/MLLP) nor 0x05 (ASTM E1381); no answers are sent for this connection"
                         ),
                         code: Some(EventCode::ProtocolUndetected),
                     }
@@ -98,15 +111,17 @@ impl std::fmt::Debug for Auto {
 
 impl Responder for Auto {
     fn feed(&mut self, data: &[u8], now: Now) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let Some(&first) = data.first() else {
-            return actions;
-        };
-        if self.chosen.is_none() {
-            self.detect(first, &mut actions);
-        }
         if let Some(chosen) = self.chosen.as_mut() {
-            actions.extend(chosen.feed(data, now));
+            return chosen.feed(data, now);
+        }
+        // До решения ведущие незначимые байты не копятся: они уже в журнале как `data`.
+        let Some(start) = data.iter().position(|&byte| !is_noise(byte)) else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        self.detect(data[start], &mut actions);
+        if let Some(chosen) = self.chosen.as_mut() {
+            actions.extend(chosen.feed(&data[start..], now));
         }
         actions
     }
@@ -197,6 +212,50 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_eot_does_not_prevent_the_astm_decision() {
+        // Прибор шлёт `EOT` перед `ENQ`: решение принимает `ENQ`, а не шум перед ним.
+        let mut auto = Auto::new(ControlIdSource::new());
+        let actions = auto.feed(&[astm::EOT, astm::ENQ], now());
+        assert!(auto.is_detected());
+        assert_eq!(sends(&actions), vec![vec![astm::ACK]]);
+
+        let mut stream = vec![astm::STX];
+        stream.extend_from_slice(b"1P|1\r");
+        stream.push(astm::ETX);
+        stream.extend_from_slice(b"3E\r\n");
+        let actions = auto.feed(&stream, now());
+        assert_eq!(sends(&actions), vec![vec![astm::ACK]]);
+        assert!(events(&actions).is_empty(), "{actions:?}");
+    }
+
+    #[test]
+    fn leading_noise_before_a_vt_lane_chooses_mllp() {
+        // `NUL CR LF XON XOFF` перед рамкой — шум линии, а не протокол.
+        let mut auto = Auto::new(ControlIdSource::new());
+        let mut request = vec![0x00, b'\r', b'\n', 0x11, 0x13];
+        request.extend(framed(MESSAGE));
+        let actions = auto.feed(&request, now());
+        assert!(auto.is_detected());
+        assert_eq!(sends(&actions).len(), 1, "ACK на сообщение: {actions:?}");
+        assert_eq!(sends(&actions)[0].first(), Some(&mllp::SB));
+        assert!(events(&actions).is_empty(), "{actions:?}");
+    }
+
+    #[test]
+    fn a_fragment_of_noise_alone_does_not_decide() {
+        let mut auto = Auto::new(ControlIdSource::new());
+        assert!(
+            auto.feed(&[0x00, b'\r', b'\n', 0x11, 0x13, astm::EOT], now())
+                .is_empty()
+        );
+        assert!(!auto.is_detected(), "решение ещё не принято");
+        assert_eq!(
+            sends(&auto.feed(&[astm::ENQ], now())),
+            vec![vec![astm::ACK]]
+        );
+    }
+
+    #[test]
     fn any_other_first_byte_means_no_answers_with_a_code() {
         let mut auto = Auto::new(ControlIdSource::new());
         let actions = auto.feed(b"MSH|not framed\r", now());
@@ -264,9 +323,9 @@ mod tests {
     fn the_detected_astm_automaton_takes_the_nak_setting() {
         let mut auto = Auto::new(ControlIdSource::new()).with_nak_on_bad_checksum(true);
         let mut stream = vec![astm::ENQ, astm::STX];
-        stream.extend_from_slice(b"0x");
+        stream.extend_from_slice(b"1x");
         stream.extend_from_slice(&[astm::ETX]);
-        stream.extend_from_slice(b"AC\r\n");
+        stream.extend_from_slice(b"AD\r\n");
         let actions = auto.feed(&stream, now());
         assert_eq!(
             sends(&actions),

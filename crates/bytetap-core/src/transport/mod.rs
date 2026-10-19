@@ -27,6 +27,20 @@ use tokio::net::TcpStream;
 use self::serial::{SerialConnection, SerialSettings};
 use self::tcp::{TcpServer, TcpServerSource};
 
+/// Наименьшая пауза переподключения.
+///
+/// `--reconnect-sec 0` не должен превращать недоступный анализатор в цикл попыток без
+/// паузы: сто миллисекунд — уже не «сразу», но ещё и не заметно инженеру.
+const MIN_RECONNECT: Duration = Duration::from_millis(100);
+
+/// Сколько ждёт попытка TCP-подключения: `connect` без срока висит минутами.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Пауза переподключения с нижней границей [`MIN_RECONNECT`].
+fn reconnect_pause(pause: Duration) -> Duration {
+    pause.max(MIN_RECONNECT)
+}
+
 /// Байтовый поток одного соединения.
 ///
 /// Сессия работает только с этими трейтами: ей всё равно, сокет это или COM-порт.
@@ -216,13 +230,16 @@ impl ConnectionSource for TcpClientSource {
     }
 
     fn pause_between_connections(&self) -> Duration {
-        self.reconnect
+        reconnect_pause(self.reconnect)
     }
 
     fn next(&mut self) -> Pin<Box<dyn Future<Output = Next> + Send + '_>> {
         Box::pin(async move {
-            match TcpStream::connect(self.addr.as_str()).await {
-                Ok(stream) => {
+            let after = reconnect_pause(self.reconnect);
+            let connected =
+                tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(self.addr.as_str())).await;
+            match connected {
+                Ok(Ok(stream)) => {
                     // Подтверждение должно уйти одним пакетом, а не ждать Nagle (NFR-6).
                     let _ = stream.set_nodelay(true);
                     let peer = stream
@@ -237,9 +254,17 @@ impl ConnectionSource for TcpClientSource {
                         local,
                     })
                 }
-                Err(error) => Next::Retry {
-                    error,
-                    after: self.reconnect,
+                Ok(Err(error)) => Next::Retry { error, after },
+                Err(_elapsed) => Next::Retry {
+                    error: io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "connect to {} timed out after {} s",
+                            self.addr,
+                            CONNECT_TIMEOUT.as_secs()
+                        ),
+                    ),
+                    after,
                 },
             }
         })
@@ -274,7 +299,7 @@ impl ConnectionSource for SerialSource {
     }
 
     fn pause_between_connections(&self) -> Duration {
-        self.reconnect
+        reconnect_pause(self.reconnect)
     }
 
     fn next(&mut self) -> Pin<Box<dyn Future<Output = Next> + Send + '_>> {
@@ -286,7 +311,7 @@ impl ConnectionSource for SerialSource {
                 Ok(connection) => self.connected_connection(connection),
                 Err(error) => Next::Retry {
                     error,
-                    after: self.reconnect,
+                    after: reconnect_pause(self.reconnect),
                 },
             }
         })
@@ -319,12 +344,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_reconnect_pause_is_never_shorter_than_a_hundred_milliseconds() {
+        assert_eq!(reconnect_pause(Duration::ZERO), MIN_RECONNECT);
+        assert_eq!(
+            reconnect_pause(Duration::from_millis(50)),
+            MIN_RECONNECT,
+            "нулевой интервал не крутит попытки в цикле"
+        );
+        assert_eq!(
+            reconnect_pause(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
+
     #[tokio::test]
     async fn a_client_starts_without_an_analyzer_and_retries_with_the_configured_pause() {
-        // Порт заведомо свободен: подключение откажет, но старт источника — нет.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // Порт занят сокетом без `listen`: подключение откажет, но старт источника — нет.
+        // Сокет держится до конца проверки: иначе порт достался бы другому тесту (флак M4).
+        let socket = tokio::net::TcpSocket::new_v4().expect("сокет");
+        socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .expect("порт занят без прослушивания");
+        let addr = socket.local_addr().expect("адрес");
         let source = Source::TcpClient {
             addr: addr.to_string(),
             reconnect: Duration::from_secs(7),

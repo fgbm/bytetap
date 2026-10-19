@@ -677,6 +677,13 @@ async fn run(
         }
         pending.fetch_sub(events, Ordering::Relaxed);
 
+        if fatal || batch.stop {
+            // Файл отпускается до ответа ожидающим: `flock` снимается вместе с дескриптором,
+            // а не с завершением задачи, поэтому `shutdown` иначе возвращался бы раньше, чем
+            // журнал перестал быть занятым, и `append_note` сразу после остановки получал бы
+            // «файл занят».
+            drop(file.take());
+        }
         for waiter in batch.waiters {
             let _ = waiter.send(outcome.as_ref().map(|&()| ()).map_err(clone_error));
         }
@@ -718,6 +725,31 @@ fn remember(failure: &watch::Sender<Option<JournalFailureReason>>, err: &io::Err
 
 fn clone_error(err: &io::Error) -> io::Error {
     io::Error::new(err.kind(), err.to_string())
+}
+
+/// Дописывает `note` в журнал после остановки сессии, дожидаясь освобождения файла.
+///
+/// `shutdown` возвращается, когда писатель ответил, но дескриптор закрывается вместе с
+/// задачей, и `flock` снимается на доли миллисекунды позже; на Windows антивирус или
+/// индексатор могут задержать это сильнее. До пяти повторов по 100 мс проверку не
+/// ослабляют: отказ «файл занят» при живой сессии виден сразу, а ждём мы только
+/// освобождения файла после `shutdown`.
+#[cfg(test)]
+pub(crate) fn append_note_after_stop(path: &Path, text: &str) {
+    let note = Note {
+        t: crate::journal::now_rfc3339(),
+        mono_us: None,
+        text: text.to_owned(),
+    };
+    for attempt in 0..5 {
+        match append_note(path, &note) {
+            Ok(()) => return,
+            Err(err) if err.kind() == ErrorKind::WouldBlock && attempt < 4 => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(err) => panic!("note после остановки: {err}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -765,24 +797,6 @@ mod tests {
             false,
             format!("MSH|{index}").as_bytes(),
         ))
-    }
-
-    /// Дописывает `note` в журнал после остановки сессии.
-    ///
-    /// На Windows дескриптор журнала освобождается вместе с задачей-писателем, но антивирус
-    /// или индексатор могут задержать это на доли секунды. До пяти повторов по 100 мс
-    /// проверку не ослабляют: отказ «файл занят» по-прежнему виден сразу, а ждём
-    /// мы только освобождения файла после `shutdown`.
-    fn append_note_after_stop(path: &Path, text: &str) {
-        for attempt in 0..5 {
-            match append_note(path, &note(text)) {
-                Ok(()) => return,
-                Err(err) if err.kind() == ErrorKind::WouldBlock && attempt < 4 => {
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(err) => panic!("note после остановки: {err}"),
-            }
-        }
     }
 
     #[tokio::test]
@@ -1076,6 +1090,10 @@ mod tests {
         }
     }
 
+    /// Тесты, которым нужна текущая папка процесса, идут по очереди: она одна на процесс,
+    /// а тесты идут параллельно, и `set_current_dir` одного ломает абсолютный путь другого.
+    static CWD: Mutex<()> = Mutex::new(());
+
     /// Текущая папка возвращается на место, даже если проверка упала.
     struct CwdGuard(PathBuf);
 
@@ -1090,6 +1108,9 @@ mod tests {
         let base = temp_dir();
         let onedrive = base.path().join("OneDrive").join("bytetap");
         std::fs::create_dir_all(&onedrive).unwrap();
+        let _cwd = CWD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _guard = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(&onedrive).unwrap();
 
@@ -1102,6 +1123,9 @@ mod tests {
     fn a_windows_path_is_not_resolved_against_the_current_folder() {
         // На Unix `C:\…` и `\\server\…` выглядят относительными: их нельзя приклеивать
         // к текущей папке, иначе путь перестанет распознаваться по тексту.
+        let _cwd = CWD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for path in [r"\\fileserver\share\bytetap", r"C:\Users\user\Documents"] {
             assert_eq!(warning_path(Path::new(path)), PathBuf::from(path));
         }

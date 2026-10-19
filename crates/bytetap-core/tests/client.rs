@@ -157,10 +157,13 @@ async fn a_client_reconnects_after_the_analyzer_hangs_up() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_missing_analyzer_is_an_error_and_does_not_hold_the_stop() {
-    // Порт свободен: подключаться некуда, но сессия обязана стартовать.
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("свободный порт");
-    let addr = probe.local_addr().expect("адрес");
-    drop(probe);
+    // Порт занят сокетом без `listen`: подключаться некуда, но сессия обязана стартовать.
+    // Сокет держится до конца проверки: иначе порт достался бы другому тесту (флак M4).
+    let socket = tokio::net::TcpSocket::new_v4().expect("сокет");
+    socket
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("свободный порт");
+    let addr = socket.local_addr().expect("адрес");
 
     let dir = tempfile::tempdir().expect("временная папка");
     let (handle, mut feed) = Session::start_with_feed(
@@ -187,4 +190,5 @@ async fn a_missing_analyzer_is_an_error_and_does_not_hold_the_stop() {
         .expect("остановка не ждёт интервал переподключения")
         .expect("остановка штатная");
     assert_eq!(stats.connections, 0);
+    drop(socket);
 }

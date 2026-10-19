@@ -109,7 +109,7 @@
 | `connect_failed` | `error` | Не удалось подключиться к анализатору-серверу; повтор через интервал |
 | `serial_open_failed` | `error` | Не удалось открыть COM-порт; повтор через интервал |
 | `connection_read_failed` | `error` | Ошибка чтения соединения; соединение закрывается |
-| `answer_write_failed` | `error` | Ответ автоответчика не записался целиком |
+| `connection_write_failed` | `error` | Ответ автоответчика не записался целиком; соединение закрывается |
 | `answer_timeout` | `error` | Ответ не записался за отведённое время; соединение закрыто |
 | `journal_failure` | `error` | Писатель журнала отказал; событие только в ленте |
 | `protocol_undetected` | `info` | «Авто» не распознал протокол по первому байту; ответов нет (FR-15) |
@@ -121,7 +121,13 @@
 Замечание обработчика: `t`, `mono_us`, `message`, необязательные `conn` и `code`. Обмен не прерван, но событие стоит внимания инженера: мусор вне рамки MLLP, поле, выброшенное из ACK, входящее подтверждение, которое не подтверждается. Состав полей тот же, что у `error`.
 
 ```json
-{"type":"info","t":"2026-10-19T10:15:03.100000+03:00","mono_us":3100000,"conn":1,"code":"protocol_undetected","message":"protocol not detected: no answers for this connection"}
+{"type":"info","t":"2026-10-19T10:15:03.100000+03:00","mono_us":3100000,"conn":1,"code":"protocol_undetected","message":"protocol is not detected: the first significant byte 0x4D is neither 0x0B (HL7/MLLP) nor 0x05 (ASTM E1381); no answers are sent for this connection"}
+```
+
+Замечание без кода (интерфейс покажет `message` из журнала): недописанная запись ASTM после `ETB`-кадра.
+
+```json
+{"type":"info","t":"2026-10-19T10:16:44.512000+03:00","mono_us":74112000,"conn":2,"message":"incomplete ASTM record: EOT after an ETB frame"}
 ```
 
 ### `note`
