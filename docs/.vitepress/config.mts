@@ -67,6 +67,10 @@ export default defineConfig({
                   text: "M2 — интерфейс: настройки, старт/стоп, живая лента",
                   link: "/dev/stages/M2",
                 },
+                {
+                  text: "M3 — TCP-клиент, ASTM, «Авто», COM-порт",
+                  link: "/dev/stages/M3",
+                },
               ],
             },
             { text: "Архитектура", link: "/dev/architecture" },
