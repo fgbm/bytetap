@@ -17,8 +17,9 @@ use bytetap_core::journal::{
     Mode, MonoClock, Note, Session, now_rfc3339,
 };
 use bytetap_core::session::{Session as CaptureSession, SessionConfig, journal_failure_reason};
+use bytetap_core::transport::serial::{Flow, SerialFormat, SerialSettings};
 use chrono::DateTime;
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
@@ -63,24 +64,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Записать обмен: слушать порт, отвечать анализатору и писать журнал
-    Capture {
-        /// Адрес и порт прослушивания, например `0.0.0.0:5000`
-        #[arg(long, value_name = "ADDR")]
-        listen: SocketAddr,
-        /// Профиль автоответчика: `hl7` — HL7/MLLP, `none` — без ответов
-        #[arg(long, value_name = "PROFILE", value_parser = ["hl7", "none"])]
-        responder: String,
-        /// Папка журналов вместо папки по умолчанию
-        #[arg(long, value_name = "DIR")]
-        log_dir: Option<PathBuf>,
-        /// Модель анализатора для заголовка журнала
-        #[arg(long, value_name = "TEXT")]
-        analyzer: Option<String>,
-        /// Комментарий инженера для заголовка журнала
-        #[arg(long, value_name = "TEXT")]
-        note: Option<String>,
-    },
+    /// Записать обмен: ждать анализатор, подключиться к нему или открыть COM-порт
+    Capture(CaptureArgs),
+    /// Показать доступные COM-порты с понятным описанием (FR-12)
+    Ports,
     /// Проверить журнал сессии по схеме и напечатать статистику
     Verify {
         /// Файл журнала `*.jsonl`
@@ -105,16 +92,88 @@ enum Command {
     },
 }
 
+/// Параметры записи: ровно один источник — прослушивание, подключение или COM-порт.
+#[derive(Debug, clap::Args)]
+#[command(group(
+    ArgGroup::new("source")
+        .required(true)
+        .multiple(false)
+        .args(["listen", "connect", "serial"])
+))]
+struct CaptureArgs {
+    /// Адрес и порт прослушивания, например `0.0.0.0:5000`
+    #[arg(long, value_name = "ADDR", conflicts_with_all = ["connect", "serial"])]
+    listen: Option<SocketAddr>,
+    /// Адрес анализатора-сервера, к которому подключаться, например `192.168.1.50:5000`
+    #[arg(long, value_name = "HOST:PORT", conflicts_with_all = ["listen", "serial"])]
+    connect: Option<String>,
+    /// Имя COM-порта, например `COM5` или `/dev/ttyUSB0`
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with_all = ["listen", "connect"],
+        requires_all = ["baud", "format"]
+    )]
+    serial: Option<String>,
+    /// Скорость порта: 1…4 000 000, типовые 300–115200
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "serial",
+        value_parser = clap::value_parser!(u32).range(1..=4_000_000)
+    )]
+    baud: Option<u32>,
+    /// Формат порта: `<биты><чётность><стоп>`, например `8N1`, `7E2`, `8M1`
+    #[arg(long, value_name = "FORMAT", requires = "serial")]
+    format: Option<SerialFormat>,
+    /// Управление потоком: `none`, `rtscts`, `xonxoff`
+    #[arg(long, value_name = "FLOW", requires = "serial")]
+    flow: Option<Flow>,
+    /// Начальное состояние DTR: `on` или `off`
+    #[arg(long, value_name = "on|off", requires = "serial", value_parser = parse_switch)]
+    dtr: Option<bool>,
+    /// Начальное состояние RTS: `on` или `off`
+    #[arg(long, value_name = "on|off", requires = "serial", value_parser = parse_switch)]
+    rts: Option<bool>,
+    /// Интервал переподключения к анализатору, секунды: 0…3600 (по умолчанию 5)
+    #[arg(
+        long,
+        value_name = "SEC",
+        requires = "connect",
+        value_parser = clap::value_parser!(u64).range(0..=3600)
+    )]
+    reconnect_sec: Option<u64>,
+    /// Профиль автоответчика: `auto`, `hl7`, `astm` или `none`
+    #[arg(long, value_name = "PROFILE", value_parser = ["auto", "hl7", "astm", "none"])]
+    responder: String,
+    /// ASTM: отвечать `NAK` на неверную контрольную сумму вместо `ACK`
+    #[arg(long)]
+    astm_nak: bool,
+    /// Папка журналов вместо папки по умолчанию
+    #[arg(long, value_name = "DIR")]
+    log_dir: Option<PathBuf>,
+    /// Модель анализатора для заголовка журнала
+    #[arg(long, value_name = "TEXT")]
+    analyzer: Option<String>,
+    /// Комментарий инженера для заголовка журнала
+    #[arg(long, value_name = "TEXT")]
+    note: Option<String>,
+}
+
+/// `on`/`off` для DTR и RTS.
+fn parse_switch(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!("`{other}`: нужно `on` или `off`")),
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Capture {
-            listen,
-            responder,
-            log_dir,
-            analyzer,
-            note,
-        } => capture(listen, &responder, log_dir, analyzer, note),
+        Command::Capture(args) => capture(args),
+        Command::Ports => ports(),
         Command::Verify { file } => verify(&file),
         Command::Note { file, text } => note(&file, &text),
         Command::StressJournal { out, max_seconds } => stress_journal(&out, max_seconds),
@@ -133,15 +192,50 @@ const KINDS: [&str; 8] = [
     "session_end",
 ];
 
-/// `bytetap-cli capture`: слушает порт, отвечает анализатору, пишет журнал и печатает
-/// ленту до Ctrl+C (FR-1, FR-4, M1-AC15).
-fn capture(
-    listen: SocketAddr,
-    responder: &str,
-    log_dir: Option<PathBuf>,
-    analyzer: Option<String>,
-    note: Option<String>,
-) -> ExitCode {
+/// `bytetap-cli capture`: ждёт анализатор, подключается к нему или открывает COM-порт,
+/// отвечает анализатору, пишет журнал и печатает ленту до Ctrl+C (FR-1, FR-2, FR-9).
+fn capture(args: CaptureArgs) -> ExitCode {
+    let responder = match args.responder.as_str() {
+        "auto" => Autoresponder::Auto,
+        "astm" => Autoresponder::AstmE1381,
+        "hl7" => Autoresponder::Hl7Mllp,
+        _ => Autoresponder::None,
+    };
+    let (mut config, target) = match (&args.listen, &args.connect, &args.serial) {
+        (Some(listen), None, None) => (SessionConfig::new(*listen), format!("Слушаю {listen}")),
+        (None, Some(connect), None) => {
+            let reconnect = Duration::from_secs(args.reconnect_sec.unwrap_or(5));
+            (
+                SessionConfig::tcp_client(connect.clone(), reconnect),
+                format!("Подключаюсь к {connect}"),
+            )
+        }
+        (None, None, Some(serial)) => {
+            let format = args.format.unwrap_or(SerialFormat::EIGHT_N_ONE);
+            let baud = args.baud.unwrap_or(9600);
+            let settings = SerialSettings::new(serial.clone(), baud, format)
+                .with_flow(args.flow.unwrap_or(Flow::None))
+                .with_lines(args.dtr.unwrap_or(true), args.rts.unwrap_or(true));
+            (
+                SessionConfig::serial(settings, Duration::from_secs(5)),
+                format!("Порт {serial}"),
+            )
+        }
+        _ => unreachable!("clap требует ровно один источник соединений"),
+    };
+    config = config
+        .with_responder(responder)
+        .with_astm_nak(args.astm_nak);
+    if let Some(dir) = args.log_dir {
+        config = config.with_log_dir(dir);
+    }
+    if let Some(analyzer) = args.analyzer {
+        config = config.with_analyzer(analyzer);
+    }
+    if let Some(note) = args.note {
+        config = config.with_note(note);
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -154,20 +248,6 @@ fn capture(
     };
 
     let result = runtime.block_on(async move {
-        let mut config = SessionConfig::new(listen).with_responder(match responder {
-            "hl7" => Autoresponder::Hl7Mllp,
-            _ => Autoresponder::None,
-        });
-        if let Some(dir) = log_dir {
-            config = config.with_log_dir(dir);
-        }
-        if let Some(analyzer) = analyzer {
-            config = config.with_analyzer(analyzer);
-        }
-        if let Some(note) = note {
-            config = config.with_note(note);
-        }
-
         // Подписка создаётся до старта приёма: подключение анализатора сразу после
         // запуска не должно разойтись с лентой.
         let (handle, mut events) = CaptureSession::start_with_feed(config)
@@ -176,7 +256,7 @@ fn capture(
         let path = handle.journal_path().to_path_buf();
         let mut failure = handle.journal_failure();
         say!("Журнал: {}", path.display());
-        say!("Слушаю {} (Ctrl+C — остановка)", handle.local_addr());
+        say!("{target} (Ctrl+C — остановка)");
         if let Some(warning) = handle.log_dir_warning() {
             say!("Внимание: {warning}");
         }
@@ -397,6 +477,28 @@ fn shorten(text: &str) -> String {
     let mut short: String = text.chars().take(FEED_WIDTH).collect();
     short.push('…');
     short
+}
+
+/// `bytetap-cli ports`: доступные COM-порты с описанием (FR-12, M3-AC4).
+///
+/// Пустой список — не ошибка: на машине без портов команда так и говорит.
+fn ports() -> ExitCode {
+    match bytetap_core::transport::serial::list_ports() {
+        Ok(list) if list.is_empty() => {
+            say!("Портов не найдено.");
+            ExitCode::SUCCESS
+        }
+        Ok(list) => {
+            for port in list {
+                say!("{}", port.description);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            warn!("ошибка: не удалось перечислить порты: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `bytetap-cli verify`: проверка каждой строки по схеме и краткая статистика (M1-AC1, M1-AC15).
@@ -656,20 +758,52 @@ mod tests {
     }
 
     #[test]
-    fn capture_takes_a_listen_address_and_a_known_responder() {
-        let capture = Cli::try_parse_from([
+    fn capture_takes_exactly_one_source() {
+        for args in [
+            vec!["--listen", "127.0.0.1:0"],
+            vec!["--connect", "127.0.0.1:5000"],
+            vec!["--serial", "COM5", "--baud", "9600", "--format", "8N1"],
+        ] {
+            let parsed = Cli::try_parse_from(
+                ["bytetap-cli", "capture"]
+                    .into_iter()
+                    .chain(args)
+                    .chain(["--responder", "hl7"]),
+            );
+            assert!(parsed.is_ok(), "{:?}", parsed.err());
+        }
+
+        let none = Cli::try_parse_from(["bytetap-cli", "capture", "--responder", "hl7"]);
+        assert!(none.is_err(), "нужен ровно один источник");
+
+        let both = Cli::try_parse_from([
             "bytetap-cli",
             "capture",
             "--listen",
             "127.0.0.1:0",
+            "--connect",
+            "127.0.0.1:5000",
             "--responder",
             "hl7",
-            "--note",
-            "синтетическая сессия",
         ]);
-        assert!(capture.is_ok(), "{:?}", capture.err());
+        assert!(both.is_err(), "два источника одновременно");
 
-        for responder in ["hl7", "none"] {
+        let serial_without_baud = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--serial",
+            "COM5",
+            "--format",
+            "8N1",
+            "--responder",
+            "hl7",
+        ]);
+        assert!(serial_without_baud.is_err(), "--baud обязателен для порта");
+    }
+
+    #[test]
+    fn capture_takes_all_responder_profiles_and_the_astm_switch() {
+        for responder in ["auto", "hl7", "astm", "none"] {
             let parsed = Cli::try_parse_from([
                 "bytetap-cli",
                 "capture",
@@ -680,19 +814,73 @@ mod tests {
             ]);
             assert!(parsed.is_ok(), "{responder}: {:?}", parsed.err());
         }
-        let unsupported = Cli::try_parse_from([
+        let astm = Cli::try_parse_from([
             "bytetap-cli",
             "capture",
-            "--listen",
-            "127.0.0.1:0",
+            "--serial",
+            "/dev/ttyUSB0",
+            "--baud",
+            "115200",
+            "--format",
+            "7E2",
+            "--flow",
+            "rtscts",
+            "--dtr",
+            "off",
+            "--rts",
+            "off",
             "--responder",
             "astm",
-        ]);
-        assert!(unsupported.is_err(), "в M1 доступны только hl7 и none");
+            "--astm-nak",
+        ])
+        .expect("порт ASTM");
+        assert!(matches!(astm.command, Command::Capture(_)));
 
-        let without_responder =
-            Cli::try_parse_from(["bytetap-cli", "capture", "--listen", "127.0.0.1:0"]);
-        assert!(without_responder.is_err(), "--responder обязателен");
+        let bad_format = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--serial",
+            "COM5",
+            "--baud",
+            "9600",
+            "--format",
+            "9N1",
+            "--responder",
+            "hl7",
+        ]);
+        assert!(bad_format.is_err(), "формат порта проверяется clap");
+
+        let bad_baud = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--serial",
+            "COM5",
+            "--baud",
+            "4000001",
+            "--format",
+            "8N1",
+            "--responder",
+            "hl7",
+        ]);
+        assert!(bad_baud.is_err(), "скорость вне 1…4 000 000");
+
+        let reconnect = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--connect",
+            "127.0.0.1:5000",
+            "--reconnect-sec",
+            "3601",
+            "--responder",
+            "hl7",
+        ]);
+        assert!(reconnect.is_err(), "интервал 0…3600");
+    }
+
+    #[test]
+    fn a_ports_command_is_defined() {
+        let parsed = Cli::try_parse_from(["bytetap-cli", "ports"]);
+        assert!(parsed.is_ok(), "{:?}", parsed.err());
     }
 
     #[test]
