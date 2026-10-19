@@ -4,6 +4,8 @@
   },
   "header": {
     "openJournal": "Открыть журнал",
+    "openJournalBusy": "Во время записи журнал не открывается: сначала остановите сессию.",
+    "openJournalOpen": "Журнал уже открыт: закройте его, чтобы открыть другой.",
     "journalFolder": "Папка журналов",
     "themeSystem": "Тема: системная",
     "themeLight": "Тема: светлая",
@@ -106,8 +108,7 @@
     "autoscrollOn": "Автопрокрутка включена",
     "autoscrollOff": "Включить автопрокрутку и перейти вниз",
     "synthetic": "автоответ",
-    "viewingTitle": "Просмотр журнала — шаг 4",
-    "viewingText": "Журнал открыт: {path}. Чтение журнала в ленте появится на следующем шаге."
+    "hexUnavailable": "HEX доступен в ленте записи: строки журнала читаются постранично"
   },
   "trace": {
     "a2l": "анализатор→ЛИС",
@@ -118,7 +119,32 @@
   },
   "journal": {
     "readOnly": "только чтение",
-    "close": "Закрыть журнал"
+    "close": "Закрыть журнал",
+    "appendNote": "Дописать комментарий",
+    "personalData": "Журнал может содержать персональные данные пациентов. Не публикуйте и не пересылайте его без обезличивания.",
+    "metaAnalyzer": "Анализатор",
+    "metaMode": "Режим",
+    "metaStart": "Начало",
+    "metaDuration": "Длительность",
+    "metaNote": "Комментарий",
+    "notSpecified": "не указан",
+    "modeUnknown": "неизвестный режим",
+    "modeTcpServer": "TCP-сервер",
+    "modeTcpClient": "TCP-клиент",
+    "modeProxy": "Прокси",
+    "modeComServer": "Вместо ЛИС · COM",
+    "modeComMonitor": "Прослушка COM",
+    "modeComTcp": "COM → TCP",
+    "responderHl7": "HL7/MLLP",
+    "responderAstm": "ASTM",
+    "responderNone": "Без ответов",
+    "responderAuto": "Авто",
+    "emptyTitle": "В журнале нет событий ленты",
+    "emptyText": "В файле есть только заголовок сессии: обмена не было.",
+    "noteTitle": "Комментарий к журналу",
+    "noteLabel": "Что дописать в конец журнала",
+    "notePlaceholder": "например, «перезалили пробу, результат тот же»",
+    "noteAdd": "Дописать"
   },
   "banner": {
     "journalFailureTitle": "Запись в журнал прервана",

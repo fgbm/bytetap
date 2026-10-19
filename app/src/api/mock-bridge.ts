@@ -136,10 +136,99 @@ interface MockSession {
   failed: boolean;
 }
 
+/** Сколько событий в журнале заглушки и какова его длительность. */
+const MOCK_JOURNAL_EVENTS = 128;
+const MOCK_JOURNAL_DURATION_US = 2_538_000_000;
+
+/** Событие журнала заглушки по номеру: тот же обмен, что в живой ленте (FR-29). */
+function mockJournalEvent(index: number): FeedEvent {
+  const monoUs = Math.round((index / MOCK_JOURNAL_EVENTS) * MOCK_JOURNAL_DURATION_US);
+  const when = new Date(Date.UTC(2026, 9, 19, 7, 15, 0) + Math.round(monoUs / 1000));
+  const t = when.toISOString();
+  const conn = Math.floor(index / 9) + 1;
+  const messageId = `J${pad(index, 4)}`;
+  const bytes = (text: string): string => bytesToBase64(Array.from(new TextEncoder().encode(text)));
+
+  switch (index % 9) {
+    case 0:
+      return {
+        type: "open",
+        t,
+        monoUs,
+        conn,
+        peer: `192.168.1.${50 + conn}:49152`,
+        local: "0.0.0.0:5000",
+      };
+    case 1:
+      return {
+        type: "data",
+        t,
+        monoUs,
+        conn,
+        dir: "a2l",
+        synthetic: false,
+        b64: bytes(resultFrame(messageId, when, index)),
+      };
+    case 2:
+      return {
+        type: "data",
+        t,
+        monoUs,
+        conn,
+        dir: "a2l",
+        synthetic: false,
+        b64: bytesToBase64(cp1251Bytes(resultFrameCp1251(messageId, when, index))),
+      };
+    case 3:
+    case 6:
+      return {
+        type: "data",
+        t,
+        monoUs,
+        conn,
+        dir: "l2a",
+        synthetic: true,
+        b64: bytes(ackFrame(messageId, when)),
+      };
+    case 4:
+      return {
+        type: "data",
+        t,
+        monoUs,
+        conn,
+        dir: "a2l",
+        synthetic: false,
+        b64: bytes(resultFrame(`${messageId}B`, when, index + 1)),
+      };
+    case 5:
+      return {
+        type: "data",
+        t,
+        monoUs,
+        conn,
+        dir: "a2l",
+        synthetic: false,
+        b64: bytes(queryFrame(messageId, when)),
+      };
+    case 7:
+      return {
+        type: "info",
+        t,
+        monoUs,
+        conn,
+        message: "Автоответ: ACK отправлен",
+      };
+    default:
+      return { type: "close", t, monoUs, conn, by: "analyzer", reason: "eof" };
+  }
+}
+
 export function createMockBridge(scenario: MockScenario = scenarioFromLocation()): Bridge {
   let session: MockSession | null = null;
   let lastJournalPath: string | null = null;
   let journalDir = MOCK_LOG_DIR;
+  /** Комментарии, дописанные в журнал заглушки: их сразу видно в просмотре (FR-23). */
+  const journalNotes: FeedEvent[] = [];
 
   function emit(target: MockSession, events: FeedEvent[], dropped = 0): void {
     if (events.length === 0) return;
@@ -440,24 +529,36 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
       return {
         path,
         header: {
-          analyzer: "ANALYZER, зав. № 1234",
+          format: "bytetap-session/1",
+          app_version: "0.1.0",
+          started_at: "2026-10-19T10:15:00.000000+03:00",
           mode: "tcp_server",
-          responder: "hl7",
+          autoresponder: "hl7_mllp",
+          settings: { listen: "0.0.0.0:5000" },
+          analyzer: "ANALYZER, зав. № 1234",
           note: "3 пробы, 1 запрос",
+          host: { os: "Windows 11 23H2" },
         },
-        events: 128,
-        durationUs: 2_538_000_000,
-        stats: { connections: 3, bytesAnalyzerToLis: 10_240, bytesLisToAnalyzer: 512 },
+        events: MOCK_JOURNAL_EVENTS + journalNotes.length,
+        durationUs: MOCK_JOURNAL_DURATION_US,
+        stats: { connections: 15, bytesAnalyzerToLis: 10_240, bytesLisToAnalyzer: 512 },
         density: { a2l: density, l2a: density.map((value) => Math.round(value / 3)) },
       } satisfies JournalSummary;
     },
 
-    async readJournal() {
-      return [];
+    async readJournal(_path, from, count) {
+      const events: FeedEvent[] = [];
+      const total = MOCK_JOURNAL_EVENTS + journalNotes.length;
+      for (let index = from; index < Math.min(from + count, total); index += 1) {
+        const appended = journalNotes[index - MOCK_JOURNAL_EVENTS];
+        if (appended !== undefined) events.push(appended);
+        else if (index < MOCK_JOURNAL_EVENTS) events.push(mockJournalEvent(index));
+      }
+      return events;
     },
 
-    async appendNote() {
-      // В заглушке дописывать некуда: журнала на диске нет.
+    async appendNote(_path, text) {
+      journalNotes.push({ type: "note", t: new Date().toISOString(), text });
     },
 
     async pickJournal() {

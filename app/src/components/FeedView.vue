@@ -30,8 +30,8 @@ import {
 } from "../feed/bytes";
 import { connChips, filterIndices } from "../feed/filter";
 import { hexLine, hexLineCount, type HexByte } from "../feed/hex";
-import { FeedBuffer } from "../feed/ring";
 import { eventRow, type FeedRow, type RowIcon, type Translate } from "../feed/rows";
+import type { FeedSource } from "../feed/source";
 import {
   applyScroll,
   DEFAULT_VIEWPORT_HEIGHT,
@@ -44,7 +44,7 @@ import {
 import type { FeedViewMode } from "../settings/settings";
 
 const props = defineProps<{
-  feed: FeedBuffer<FeedEvent>;
+  feed: FeedSource<FeedEvent>;
   journal: JournalSummary | null;
   view: FeedViewMode;
   encoding: Encoding;
@@ -91,15 +91,36 @@ const viewportHeight = ref(DEFAULT_VIEWPORT_HEIGHT);
 const follow = ref(true);
 const connFilter = ref<number | null>(null);
 
-/** Индексы событий буфера: все или выбранного соединения. */
-const indices = computed<number[]>(() => {
+/** Просмотр журнала: строки читаются страницами, вид — только текст (FR-29). */
+const viewing = computed(() => props.journal !== null);
+const view = computed<FeedViewMode>(() => (viewing.value ? "text" : props.view));
+
+/**
+ * Индексы событий буфера: все или выбранного соединения.
+ *
+ * В журнале события читаются страницами, поэтому список всех индексов не строится:
+ * порядок строки совпадает с номером события, а фильтра соединений там нет.
+ */
+const indices = computed<number[] | null>(() => {
   void props.feed.version;
+  if (viewing.value) return null;
   return filterIndices(props.feed, connFilter.value);
 });
+
+/** Номер события по порядку строки: в журнале строка и есть событие. */
+function eventIndex(order: number): number {
+  const list = indices.value;
+  if (list === null) return order;
+  return list[order] ?? -1;
+}
+
+/** Сколько строк в ленте: в журнале — общее число событий из сводки. */
+const rowCount = computed(() => indices.value?.length ?? props.feed.length);
 
 /** Номера соединений для чипов фильтра. */
 const conns = computed<number[]>(() => {
   void props.feed.version;
+  if (viewing.value) return [];
   return connChips(props.feed);
 });
 
@@ -110,13 +131,11 @@ watch(conns, (list) => {
 
 /** Число строк дампа на событие — только для вида HEX. */
 const lineCounts = computed<number[]>(() => {
-  if (props.view !== "hex") return [];
+  if (view.value !== "hex") return [];
   const counts: number[] = [];
-  for (const index of indices.value) {
+  for (const index of indices.value ?? []) {
     const event = props.feed.at(index);
-    counts.push(
-      event.type === "data" ? hexLineCount(base64ByteLength(event.b64)) : 1,
-    );
+    counts.push(event !== undefined && event.type === "data" ? hexLineCount(base64ByteLength(event.b64)) : 1);
   }
   return counts;
 });
@@ -133,10 +152,10 @@ const linePrefix = computed<number[]>(() => {
 });
 
 const totalRows = computed(() =>
-  props.view === "hex" ? (linePrefix.value[linePrefix.value.length - 1] ?? 0) : indices.value.length,
+  view.value === "hex" ? (linePrefix.value[linePrefix.value.length - 1] ?? 0) : rowCount.value,
 );
 
-const rowHeight = computed(() => (props.view === "hex" ? HEX_ROW_HEIGHT : TEXT_ROW_HEIGHT));
+const rowHeight = computed(() => (view.value === "hex" ? HEX_ROW_HEIGHT : TEXT_ROW_HEIGHT));
 
 const range = computed(() =>
   visibleRange(
@@ -147,15 +166,25 @@ const range = computed(() =>
   ),
 );
 
+/** Просит у журнала страницы видимого окна; буферу записи это не нужно. */
+function requestPages(from: number, to: number): void {
+  props.feed.ensure?.(from, to);
+}
+
+watch(range, (value) => requestPages(value.start, value.end), { immediate: true });
+
 /** Строки текстового вида: только видимые, с текстом по кодировке. */
 const textRows = computed<FeedRow[]>(() => {
-  if (props.view !== "text") return [];
+  if (view.value !== "text") return [];
   const rows: FeedRow[] = [];
   const { start, end } = range.value;
   for (let order = start; order < end; order += 1) {
-    const index = indices.value[order];
-    if (index === undefined) break;
-    rows.push(eventRow(props.feed.at(index), order, translate, props.encoding));
+    const index = eventIndex(order);
+    if (index < 0) break;
+    const event = props.feed.at(index);
+    // Страница журнала ещё едет: строка появится, когда она придёт.
+    if (event === undefined) continue;
+    rows.push(eventRow(event, order, translate, props.encoding));
   }
   return rows;
 });
@@ -164,7 +193,7 @@ const textRows = computed<FeedRow[]>(() => {
 function eventAtLine(line: number): number {
   const prefix = linePrefix.value;
   let low = 0;
-  let high = indices.value.length - 1;
+  let high = (indices.value?.length ?? 0) - 1;
   while (low < high) {
     const middle = Math.ceil((low + high) / 2);
     if ((prefix[middle + 1] ?? 0) <= line) low = middle;
@@ -175,17 +204,19 @@ function eventAtLine(line: number): number {
 
 /** Строки дампа для видимого окна. */
 const hexRows = computed<HexRow[]>(() => {
-  if (props.view !== "hex") return [];
+  if (view.value !== "hex") return [];
   const rows: HexRow[] = [];
+  const list = indices.value ?? [];
   const { start, end } = range.value;
   if (end <= start) return rows;
   const prefix = linePrefix.value;
   let eventOrder = eventAtLine(start);
   let line = start;
 
-  while (line < end && eventOrder < indices.value.length) {
-    const index = indices.value[eventOrder];
+  while (line < end && eventOrder < list.length) {
+    const index = list[eventOrder];
     const event = props.feed.at(index);
+    if (event === undefined) break;
     const bytes = event.type === "data" ? base64ToBytes(event.b64) : new Uint8Array(0);
     const count = event.type === "data" ? hexLineCount(bytes.length) : 1;
     const row = eventRow(event, eventOrder, translate, props.encoding);
@@ -216,7 +247,7 @@ const listHeightPx = computed(() =>
 );
 
 const empty = computed(() => totalRows.value === 0);
-const viewingNotice = computed(() => props.journal !== null && empty.value);
+const journalEmpty = computed(() => props.journal !== null && empty.value);
 
 function rowStyle(order: number): Record<string, string> {
   return {
@@ -244,7 +275,10 @@ function onScroll(): void {
   if (element === null) return;
   scrollTop.value = element.scrollTop;
   viewportHeight.value = element.clientHeight || DEFAULT_VIEWPORT_HEIGHT;
-  follow.value = applyScroll(element.scrollTop, element.clientHeight, element.scrollHeight).follow;
+  // В просмотре журнала автопрокрутки нет: страница не должна уводить из середины.
+  follow.value =
+    !viewing.value &&
+    applyScroll(element.scrollTop, element.clientHeight, element.scrollHeight).follow;
   emitVisible();
 }
 
@@ -283,7 +317,11 @@ function seekFraction(fraction: number): void {
   const travel = Math.max(0, element.scrollHeight - element.clientHeight);
   element.scrollTop = clamped * travel;
   scrollTop.value = element.scrollTop;
-  follow.value = isAtBottom(element.scrollTop, element.clientHeight, element.scrollHeight);
+  follow.value =
+    !viewing.value &&
+    isAtBottom(element.scrollTop, element.clientHeight, element.scrollHeight);
+  const { start, end } = range.value;
+  requestPages(start, end);
   emitVisible();
 }
 
@@ -293,7 +331,7 @@ defineExpose({ seekFraction });
 watch(
   () => props.feed.version,
   () => {
-    if (!follow.value) return;
+    if (!follow.value || viewing.value) return;
     void scrollToBottom();
   },
 );
@@ -303,6 +341,20 @@ watch(
   () => {
     if (!follow.value) return;
     void scrollToBottom();
+  },
+);
+
+/** Открыли или закрыли журнал: лента начинается с начала, догон только у записи. */
+watch(
+  () => props.journal?.path ?? null,
+  async () => {
+    follow.value = !viewing.value;
+    await nextTick();
+    const element = scroller.value;
+    if (element !== null) element.scrollTop = 0;
+    scrollTop.value = 0;
+    measure();
+    emitVisible();
   },
 );
 
@@ -337,6 +389,8 @@ onBeforeUnmount(() => {
         <button
           type="button"
           :class="{ on: view === 'hex' }"
+          :disabled="viewing"
+          :title="viewing ? t('feed.hexUnavailable') : undefined"
           @click="emit('update:view', 'hex')"
         >
           {{ t("feed.viewHex") }}
@@ -354,7 +408,7 @@ onBeforeUnmount(() => {
         </button>
       </div>
       <span class="bt-spacer" />
-      <div class="bt-conns" role="group" :aria-label="t('feed.connFilter')">
+      <div v-if="!viewing" class="bt-conns" role="group" :aria-label="t('feed.connFilter')">
         <button
           type="button"
           :class="{ on: connFilter === null }"
@@ -373,6 +427,7 @@ onBeforeUnmount(() => {
         </button>
       </div>
       <button
+        v-if="!viewing"
         class="bt-btn ghost autoscroll"
         :class="{ on: !follow }"
         type="button"
@@ -384,9 +439,9 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <div v-if="viewingNotice" class="bt-empty">
-      <b>{{ t("feed.viewingTitle") }}</b>
-      <span>{{ t("feed.viewingText", { path: journal?.path ?? "" }) }}</span>
+    <div v-if="journalEmpty" class="bt-empty">
+      <b>{{ t("journal.emptyTitle") }}</b>
+      <span>{{ t("journal.emptyText") }}</span>
     </div>
     <div v-else-if="empty" class="bt-empty">
       <b>{{ t("feed.emptyTitle") }}</b>

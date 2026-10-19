@@ -159,7 +159,15 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
       if (state.status === "recording" || state.status === "starting" || state.status === "stopping") {
         return state;
       }
-      return { ...state, status: "viewing", journal: action.journal, journalFailure: null };
+      return {
+        ...state,
+        status: "viewing",
+        journal: action.journal,
+        journalFailure: null,
+        // Строка состояния показывает итоги открытого журнала, а не прошлой сессии.
+        stats: { ...action.journal.stats },
+        error: null,
+      };
 
     case "journal_closed":
       if (state.status !== "viewing") return state;

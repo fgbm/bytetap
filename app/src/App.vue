@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { FileText, X } from "@lucide/vue";
+import { FileText, PenLine, TriangleAlert, X } from "@lucide/vue";
 import { bridge } from "./api/bridge";
 import type { InterfaceInfo } from "./api/types";
 import ActionBar from "./components/ActionBar.vue";
@@ -14,6 +14,15 @@ import SessionChips from "./components/SessionChips.vue";
 import StatusBar from "./components/StatusBar.vue";
 import TextPrompt from "./components/TextPrompt.vue";
 import TraceView from "./components/TraceView.vue";
+import { formatDateTime } from "./format";
+import {
+  journalDuration,
+  journalFileName,
+  journalMeta,
+  journalNotes,
+  MODE_KEYS,
+  RESPONDER_KEYS,
+} from "./journal/meta";
 import { checkPort, PORT_PROBLEM_KEYS } from "./validation";
 import { nextTheme } from "./theme";
 import { useSettings } from "./settings/store";
@@ -25,11 +34,13 @@ const { t } = useI18n();
 const {
   state,
   feed,
+  journalFeed,
   elapsedMs,
   start,
   stop,
   addNote,
   openJournal,
+  appendJournalNote,
   closeJournal,
   dismissError,
   dismissFailure,
@@ -49,14 +60,19 @@ interface FeedViewHandle {
 }
 const feedView = ref<FeedViewHandle | null>(null);
 const visibleWindow = ref<{ start: number; end: number } | null>(null);
-const prompt = reactive<{ kind: "note" | "profile" | null; value: string }>({
+const prompt = reactive<{ kind: "note" | "profile" | "journalNote" | null; value: string }>({
   kind: null,
   value: "",
 });
 
 const recording = computed(() => state.value.status === "recording");
-const journalOpen = computed(
-  () => state.value.status === "viewing" || state.value.status === "starting",
+const journalOpen = computed(() => state.value.status === "viewing");
+/** Пока идёт запись или настройка стартует, открыть журнал нельзя: лента занята. */
+const journalBlocked = computed(
+  () =>
+    state.value.status === "starting" ||
+    state.value.status === "recording" ||
+    state.value.status === "stopping",
 );
 const nowUs = computed(() => Math.round(elapsedMs.value * 1000));
 const density = computed(() => state.value.journal?.density ?? null);
@@ -68,6 +84,42 @@ const canStart = computed(
     state.value.status !== "starting" &&
     state.value.status !== "stopping",
 );
+
+/** Строки ленты: при просмотре журнала — страницы, иначе кольцевой буфер записи. */
+const activeFeed = computed(() =>
+  journalOpen.value && journalFeed.value !== null ? journalFeed.value : feed,
+);
+
+const journal = computed(() => state.value.journal);
+const meta = computed(() =>
+  journal.value === null ? null : journalMeta(journal.value.header),
+);
+const journalName = computed(() =>
+  journal.value === null ? "" : journalFileName(journal.value.path),
+);
+const journalMode = computed(() => {
+  const current = meta.value;
+  if (current === null) return "";
+  const mode = t(MODE_KEYS[current.mode] ?? "journal.modeUnknown");
+  const responder =
+    current.responder === ""
+      ? ""
+      : `, ${t(RESPONDER_KEYS[current.responder] ?? "journal.modeUnknown")}`;
+  return `${mode}${current.port === "" ? "" : ` :${current.port}`}${responder}`;
+});
+const journalStarted = computed(() =>
+  meta.value === null ? "" : formatDateTime(meta.value.startedAt),
+);
+const journalDurationText = computed(() =>
+  journal.value === null ? "" : journalDuration(journal.value.durationUs),
+);
+/** Комментарий из заголовка и последние дописанные `note` (FR-23). */
+const journalNotesText = computed(() => {
+  const pages = journalFeed.value;
+  void pages?.version;
+  if (meta.value === null) return "";
+  return journalNotes(meta.value.note, pages?.notes(3) ?? []);
+});
 
 const portError = computed(() => {
   const error = state.value.error;
@@ -88,18 +140,26 @@ const journalPath = computed(
   () => state.value.startInfo?.journalPath ?? lastJournalPath.value,
 );
 
-const promptTitle = computed(() =>
-  prompt.kind === "note" ? t("actions.noteTitle") : t("actions.profileName"),
-);
-const promptLabel = computed(() =>
-  prompt.kind === "note" ? t("config.note") : t("actions.profileName"),
-);
-const promptPlaceholder = computed(() =>
-  prompt.kind === "note" ? t("actions.notePlaceholder") : t("actions.profileNamePlaceholder"),
-);
-const promptConfirm = computed(() =>
-  prompt.kind === "note" ? t("actions.noteAdd") : t("actions.save"),
-);
+const promptTitle = computed(() => {
+  if (prompt.kind === "note") return t("actions.noteTitle");
+  if (prompt.kind === "journalNote") return t("journal.noteTitle");
+  return t("actions.profileName");
+});
+const promptLabel = computed(() => {
+  if (prompt.kind === "note") return t("config.note");
+  if (prompt.kind === "journalNote") return t("journal.noteLabel");
+  return t("actions.profileName");
+});
+const promptPlaceholder = computed(() => {
+  if (prompt.kind === "note") return t("actions.notePlaceholder");
+  if (prompt.kind === "journalNote") return t("journal.notePlaceholder");
+  return t("actions.profileNamePlaceholder");
+});
+const promptConfirm = computed(() => {
+  if (prompt.kind === "note") return t("actions.noteAdd");
+  if (prompt.kind === "journalNote") return t("journal.noteAdd");
+  return t("actions.save");
+});
 
 async function refreshLogDirWarning(): Promise<void> {
   const dir = settings.config.logDir;
@@ -268,9 +328,17 @@ function openNote(): void {
   prompt.value = "";
 }
 
+/** «Дописать комментарий» в остановленный журнал (FR-23). */
+function openJournalNote(): void {
+  prompt.kind = "journalNote";
+  prompt.value = "";
+}
+
 function onPromptConfirm(text: string): void {
   if (prompt.kind === "note") {
     void addNote(text);
+  } else if (prompt.kind === "journalNote") {
+    void appendJournalNote(text);
   } else if (prompt.kind === "profile") {
     settingsStore.saveProfile(text);
     selectedProfile.value = text;
@@ -284,6 +352,7 @@ function onPromptConfirm(text: string): void {
     <AppHeader
       :theme="settings.theme"
       :journal-open="journalOpen"
+      :busy="journalBlocked"
       @open-journal="onOpenJournal"
       @open-folder="onOpenFolder"
       @cycle-theme="cycleTheme"
@@ -305,7 +374,49 @@ function onPromptConfirm(text: string): void {
       @open-recorded="onOpenRecorded"
     />
 
-    <div v-if="!recording" class="config-region">
+    <!-- Просмотр журнала: полоса файла, предупреждение о ПДн и метаданные заголовка (FR-29, FR-34). -->
+    <template v-if="journalOpen && journal !== null">
+      <div class="journal-bar">
+        <FileText :size="15" aria-hidden="true" />
+        <span class="bt-mono name" :title="journal.path">{{ journalName }}</span>
+        <span class="read-only">{{ t("journal.readOnly") }}</span>
+        <span class="bt-spacer" />
+        <button class="bt-btn" type="button" @click="openJournalNote">
+          <PenLine :size="15" aria-hidden="true" />
+          {{ t("journal.appendNote") }}
+        </button>
+        <button class="bt-btn ghost" type="button" :aria-label="t('journal.close')" @click="onCloseJournal">
+          <X :size="15" aria-hidden="true" />
+          {{ t("journal.close") }}
+        </button>
+      </div>
+
+      <div class="bt-ban pd" role="note">
+        <TriangleAlert :size="16" aria-hidden="true" />
+        <div>{{ t("journal.personalData") }}</div>
+      </div>
+
+      <div class="meta">
+        <span>
+          {{ t("journal.metaAnalyzer") }}
+          <b>{{ meta?.analyzer === "" ? t("journal.notSpecified") : meta?.analyzer }}</b>
+        </span>
+        <span>{{ t("journal.metaMode") }} <b>{{ journalMode }}</b></span>
+        <span>
+          {{ t("journal.metaStart") }}
+          <b class="bt-mono">{{ journalStarted }}</b>
+        </span>
+        <span>
+          {{ t("journal.metaDuration") }}
+          <b class="bt-mono">{{ journalDurationText }}</b>
+        </span>
+        <span v-if="journalNotesText !== ''" class="notes">
+          {{ t("journal.metaNote") }} <b>{{ journalNotesText }}</b>
+        </span>
+      </div>
+    </template>
+
+    <div v-if="!recording && !journalOpen" class="config-region">
       <ConfigForm
         :config="settings.config"
         :port-text="portText"
@@ -319,18 +430,8 @@ function onPromptConfirm(text: string): void {
       />
     </div>
 
-    <div v-if="state.status === 'viewing' && state.journal !== null" class="journal-bar">
-      <FileText :size="15" aria-hidden="true" />
-      <span class="bt-mono name">{{ state.journal.path }}</span>
-      <span class="read-only">{{ t("journal.readOnly") }}</span>
-      <span class="bt-spacer" />
-      <button class="bt-btn" type="button" @click="onCloseJournal">
-        <X :size="15" aria-hidden="true" />
-        {{ t("journal.close") }}
-      </button>
-    </div>
-
     <ActionBar
+      v-if="!journalOpen"
       :status="state.status"
       :elapsed-ms="elapsedMs"
       :profiles="settings.profiles"
@@ -355,7 +456,7 @@ function onPromptConfirm(text: string): void {
     />
     <FeedView
       ref="feedView"
-      :feed="feed"
+      :feed="activeFeed"
       :journal="state.journal"
       :view="settings.feed.view"
       :encoding="settings.feed.encoding"
@@ -377,7 +478,7 @@ function onPromptConfirm(text: string): void {
       :label="promptLabel"
       :placeholder="promptPlaceholder"
       :value="prompt.value"
-      :multiline="prompt.kind === 'note'"
+      :multiline="prompt.kind === 'note' || prompt.kind === 'journalNote'"
       :confirm-label="promptConfirm"
       @confirm="onPromptConfirm"
       @cancel="prompt.kind = null"
@@ -412,5 +513,35 @@ function onPromptConfirm(text: string): void {
   background: var(--bt-border-faint);
   color: var(--bt-text-muted);
   font-size: 10.5px;
+}
+
+/* Предупреждение о персональных данных (FR-34): всегда на экране журнала. */
+.bt-ban.pd {
+  background: var(--bt-warn-bg);
+  color: var(--bt-text);
+}
+
+.bt-ban.pd > svg {
+  color: var(--bt-warn);
+}
+
+/* Метаданные заголовка журнала: анализатор, режим, начало, длительность, комментарий. */
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px var(--bt-space-3);
+  padding: 8px var(--bt-space-3);
+  border-bottom: 1px solid var(--bt-border);
+  color: var(--bt-text-muted);
+  font-size: var(--bt-text-xs);
+}
+
+.meta b {
+  color: var(--bt-text);
+  font-weight: 500;
+}
+
+.meta .notes b {
+  white-space: pre-wrap;
 }
 </style>

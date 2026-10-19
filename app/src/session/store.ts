@@ -7,7 +7,7 @@
  * Редьюсер состояний живёт отдельно (`reducer.ts`) и проверяется vitest без Vue.
  */
 
-import { shallowReactive, ref } from "vue";
+import { shallowReactive, shallowRef, ref } from "vue";
 import { bridge } from "../api/bridge";
 import {
   BridgeError,
@@ -18,12 +18,19 @@ import {
   type SessionConfig,
 } from "../api/types";
 import { FEED_CAPACITY, FeedBuffer } from "../feed/ring";
+import { JournalFeed } from "../journal/feed";
 import { initialSessionState, reduceSession, type SessionAction, type SessionError, type SessionState } from "./reducer";
 
 const state = ref<SessionState>(initialSessionState());
 
 /** Кольцевой буфер ленты: 10 000 последних событий и номер версии для подписки. */
 const feed = shallowReactive(new FeedBuffer<FeedEvent>(FEED_CAPACITY));
+
+/**
+ * Открытый журнал: строки читаются страницами (FR-29). `shallowReactive` нужен, чтобы
+ * лента видела `version` при приходе страницы, а сами страницы остались обычными массивами.
+ */
+const journalFeed = shallowRef<JournalFeed | null>(null);
 
 const elapsedMs = ref(0);
 
@@ -73,12 +80,16 @@ function onBatch(batch: FeedBatch): void {
   if (stopped && stopped.type === "stopped") {
     stopTicker();
     dispatch({ type: "journal_failed", message: stopped.message ?? "" });
+    // Ядро уже остановило сессию; stop_session освобождает слот моста, иначе следующий
+    // старт получил бы «сессия уже идёт». Ошибка ожидаема: причина уже в баннере (NFR-5).
+    void bridge.stopSession().catch(() => undefined);
   }
 }
 
 async function start(cfg: SessionConfig): Promise<void> {
   if (state.value.status === "starting" || state.value.status === "recording") return;
   feed.clear();
+  journalFeed.value = null;
   elapsedMs.value = 0;
   dispatch({ type: "start_requested" });
   try {
@@ -115,7 +126,12 @@ async function addNote(text: string): Promise<void> {
 async function openJournal(path: string): Promise<JournalSummary | null> {
   try {
     const journal = await bridge.openJournal(path);
+    const pages = shallowReactive(
+      new JournalFeed(path, journal.events, (from, count) => bridge.readJournal(path, from, count)),
+    );    journalFeed.value = pages;
     dispatch({ type: "journal_opened", journal });
+    // Последняя страница нужна сразу: из неё берутся дописанные комментарии к журналу.
+    pages.ensure(Math.max(0, journal.events - 1), journal.events);
     return journal;
   } catch (error) {
     dispatch({ type: "command_failed", error: toSessionError(error) });
@@ -123,7 +139,28 @@ async function openJournal(path: string): Promise<JournalSummary | null> {
   }
 }
 
+/**
+ * Дописывает комментарий в остановленный журнал и обновляет сводку (FR-23).
+ *
+ * Начало файла не переписывается: событие `note` уходит в конец, поэтому в ленте
+ * становится на одно событие больше, а индекс журнала пересобирается по изменившемуся файлу.
+ */
+async function appendJournalNote(text: string): Promise<void> {
+  const journal = state.value.journal;
+  if (journal === null || journalFeed.value === null) return;
+  try {
+    await bridge.appendNote(journal.path, text);
+    const summary = await bridge.openJournal(journal.path);
+    journalFeed.value.extend(summary.events);
+    dispatch({ type: "journal_opened", journal: summary });
+  } catch (error) {
+    dispatch({ type: "command_failed", error: toSessionError(error) });
+  }
+}
+
 function closeJournal(): void {
+  journalFeed.value?.clear();
+  journalFeed.value = null;
   dispatch({ type: "journal_closed" });
 }
 
@@ -145,6 +182,7 @@ export function resetSession(): void {
   stopTicker();
   state.value = initialSessionState();
   feed.clear();
+  journalFeed.value = null;
   elapsedMs.value = 0;
 }
 
@@ -152,11 +190,13 @@ export function useSession() {
   return {
     state,
     feed,
+    journalFeed,
     elapsedMs,
     start,
     stop,
     addNote,
     openJournal,
+    appendJournalNote,
     closeJournal,
     dismissError,
     dismissFailure,

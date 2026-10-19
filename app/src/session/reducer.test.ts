@@ -134,12 +134,13 @@ describe("reduceSession", () => {
       header: {},
       events: 1,
       durationUs: 1,
-      stats: { connections: 1, bytesAnalyzerToLis: 1, bytesLisToAnalyzer: 1 },
+      stats: { connections: 4, bytesAnalyzerToLis: 300, bytesLisToAnalyzer: 40 },
       density: { a2l: [], l2a: [] },
     };
     const viewing = reduceSession(initialSessionState(), { type: "journal_opened", journal });
     expect(viewing.status).toBe("viewing");
     expect(viewing.journal?.path).toBe("a.jsonl");
+    expect(viewing.stats, "строка состояния показывает итоги журнала").toEqual(journal.stats);
 
     const closed = reduceSession(viewing, { type: "journal_closed" });
     expect(closed.status).toBe("idle");

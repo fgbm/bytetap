@@ -7,6 +7,8 @@ import type { ThemeMode } from "../settings/settings";
 const props = defineProps<{
   theme: ThemeMode;
   journalOpen: boolean;
+  /** Идёт запись или старт/стоп: журнал не открывается, лента занята. */
+  busy: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -16,6 +18,13 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+
+const journalDisabled = computed(() => props.journalOpen || props.busy);
+const journalHint = computed(() => {
+  if (props.busy) return t("header.openJournalBusy");
+  if (props.journalOpen) return t("header.openJournalOpen");
+  return undefined;
+});
 
 const themeLabel = computed(() => {
   if (props.theme === "light") return t("header.themeLight");
@@ -32,7 +41,8 @@ const themeLabel = computed(() => {
     <button
       class="bt-btn ghost"
       type="button"
-      :disabled="journalOpen"
+      :disabled="journalDisabled"
+      :title="journalHint"
       @click="emit('openJournal')"
     >
       <FileText :size="15" aria-hidden="true" />

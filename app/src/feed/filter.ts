@@ -1,14 +1,16 @@
 /** Выборка событий ленты: все или только выбранное соединение (AC8). */
 
 import type { FeedEvent } from "../api/types";
-import type { FeedBuffer } from "./ring";
+import type { FeedSource } from "./source";
 
-/** Номера соединений в буфере по возрастанию — для чипов фильтра. */
-export function connsOf(feed: FeedBuffer<FeedEvent>): number[] {
+/** Номера соединений в ленте по возрастанию — для чипов фильтра. */
+export function connsOf(feed: FeedSource<FeedEvent>): number[] {
   const seen = new Set<number>();
   for (let index = 0; index < feed.length; index += 1) {
     const event = feed.at(index);
-    if ("conn" in event && typeof event.conn === "number") seen.add(event.conn);
+    if (event !== undefined && "conn" in event && typeof event.conn === "number") {
+      seen.add(event.conn);
+    }
   }
   return [...seen].sort((left, right) => left - right);
 }
@@ -17,7 +19,7 @@ export function connsOf(feed: FeedBuffer<FeedEvent>): number[] {
 export const CONN_CHIPS = 8;
 
 /** Последние соединения ленты для панели фильтра. */
-export function connChips(feed: FeedBuffer<FeedEvent>): number[] {
+export function connChips(feed: FeedSource<FeedEvent>): number[] {
   return connsOf(feed).slice(-CONN_CHIPS);
 }
 
@@ -27,7 +29,7 @@ export function connChips(feed: FeedBuffer<FeedEvent>): number[] {
  * События без соединения (`note`, `stopped`) — контекст всей сессии, поэтому
  * остаются в ленте при любом фильтре.
  */
-export function filterIndices(feed: FeedBuffer<FeedEvent>, conn: number | null): number[] {
+export function filterIndices(feed: FeedSource<FeedEvent>, conn: number | null): number[] {
   const indices: number[] = [];
   for (let index = 0; index < feed.length; index += 1) {
     if (conn === null) {
@@ -35,7 +37,7 @@ export function filterIndices(feed: FeedBuffer<FeedEvent>, conn: number | null):
       continue;
     }
     const event = feed.at(index);
-    const eventConn = "conn" in event ? event.conn : undefined;
+    const eventConn = event !== undefined && "conn" in event ? event.conn : undefined;
     if (eventConn === undefined || eventConn === conn) indices.push(index);
   }
   return indices;
