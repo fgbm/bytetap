@@ -8,6 +8,9 @@
     "app",
     "docs"
   ],
+  "engines": {
+    "node": ">=22.18"
+  },
   "overrides": {
     "typescript": "^6.0.3"
   },
