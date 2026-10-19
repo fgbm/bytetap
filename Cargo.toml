@@ -16,4 +16,14 @@ license = "MIT"
 [workspace.dependencies]
 bytetap-core = { path = "crates/bytetap-core" }
 bytetap-testkit = { path = "crates/bytetap-testkit" }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.6", features = ["derive"] }
+dirs = "7"
+jsonschema = { version = "0.59", default-features = false }
+os_info = "3.15"
+proptest = "1.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

@@ -2,6 +2,9 @@
 //!
 //! Crate намеренно не зависит от Tauri, чтобы его можно было тестировать отдельно и собрать консольную версию (раздел 10 требований, M0-AC2).
 
+pub mod journal;
+pub mod text;
+
 /// Версия ядра из `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
