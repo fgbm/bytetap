@@ -38,9 +38,9 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::journal::{
-    Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, Host, InfoEvent, Journal, Mode,
-    MonoClock, Note, Open, Session as SessionHeader, SessionEnd, Stats, default_log_dir,
-    io_message, log_dir_warning, now_rfc3339, session_file_name,
+    Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, Host, InfoEvent, Journal,
+    JournalFailureReason, Mode, MonoClock, Note, Open, Session as SessionHeader, SessionEnd, Stats,
+    default_log_dir, io_message, log_dir_warning, now_rfc3339, session_file_name,
 };
 use crate::responder::{
     Action, ControlIdSource, Hl7Mllp, NoResponder, Now, Responder, ResponderEvent,
@@ -281,7 +281,7 @@ pub struct SessionHandle {
     path: PathBuf,
     warning: Option<String>,
     events: broadcast::Sender<SessionEvent>,
-    failure: watch::Receiver<Option<String>>,
+    failure: watch::Receiver<Option<JournalFailureReason>>,
     counters: SessionCounters,
     stop: watch::Sender<bool>,
     notes: mpsc::UnboundedSender<String>,
@@ -343,7 +343,7 @@ impl SessionHandle {
     /// По этой метке `capture` заканчивает ленту, не дожидаясь Ctrl+C: сессия уже
     /// остановлена, и [`SessionHandle::stop`] вернёт ошибку с той же причиной.
     #[must_use]
-    pub fn journal_failure(&self) -> watch::Receiver<Option<String>> {
+    pub fn journal_failure(&self) -> watch::Receiver<Option<JournalFailureReason>> {
         self.failure.clone()
     }
 
@@ -429,7 +429,7 @@ impl std::fmt::Debug for SessionHandle {
 /// Отказ журнала: сессия остановлена, потому что события больше не записываются.
 #[derive(Debug)]
 struct JournalFailure {
-    reason: String,
+    reason: JournalFailureReason,
 }
 
 impl std::fmt::Display for JournalFailure {
@@ -441,7 +441,7 @@ impl std::fmt::Display for JournalFailure {
 impl std::error::Error for JournalFailure {}
 
 /// Ошибка сессии с причиной отказа журнала.
-fn journal_failure_error(reason: String) -> io::Error {
+fn journal_failure_error(reason: JournalFailureReason) -> io::Error {
     io::Error::other(JournalFailure { reason })
 }
 
@@ -450,10 +450,10 @@ fn journal_failure_error(reason: String) -> io::Error {
 /// Нужна `bytetap-cli capture`, чтобы напечатать своё сообщение об остановке сессии,
 /// а не общую ошибку ввода-вывода.
 #[must_use]
-pub fn journal_failure_reason(err: &io::Error) -> Option<&str> {
+pub fn journal_failure_reason(err: &io::Error) -> Option<&JournalFailureReason> {
     err.get_ref()?
         .downcast_ref::<JournalFailure>()
-        .map(|failure| failure.reason.as_str())
+        .map(|failure| &failure.reason)
 }
 
 /// То, что нужно каждому соединению: журнал, часы, автоответчик, подписчики и счётчики.
@@ -465,7 +465,7 @@ struct Shared {
     ids: ControlIdSource,
     counters: Arc<Counters>,
     /// Причина отказа журнала: как только она появилась, сессия перестаёт отвечать.
-    failure: watch::Sender<Option<String>>,
+    failure: watch::Sender<Option<JournalFailureReason>>,
     /// Номера открытых соединений: `close` для них пишется даже после abort.
     open: Mutex<HashSet<u32>>,
 }
@@ -515,7 +515,7 @@ impl Shared {
         let reason = self
             .journal
             .failure()
-            .unwrap_or_else(|| "journal writer stopped".to_owned());
+            .unwrap_or_else(|| JournalFailureReason::from_message("journal writer stopped"));
         let first = self.failure.send_if_modified(|current| {
             if current.is_some() {
                 false
@@ -692,7 +692,7 @@ async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
 }
 
 /// Ждёт отказа журнала (или выгрузки дескриптора сессии).
-async fn wait_for_failure(failure: &mut watch::Receiver<Option<String>>) {
+async fn wait_for_failure(failure: &mut watch::Receiver<Option<JournalFailureReason>>) {
     if failure.borrow_and_update().is_some() {
         return;
     }
@@ -704,8 +704,8 @@ async fn run(
     server: TcpServer,
     shared: Arc<Shared>,
     mut stop: watch::Receiver<bool>,
-    mut failure: watch::Receiver<Option<String>>,
-    mut journal_failed: watch::Receiver<Option<String>>,
+    mut failure: watch::Receiver<Option<JournalFailureReason>>,
+    mut journal_failed: watch::Receiver<Option<JournalFailureReason>>,
     mut notes: mpsc::UnboundedReceiver<String>,
 ) -> io::Result<Stats> {
     let mut tasks: JoinSet<()> = JoinSet::new();
@@ -834,7 +834,10 @@ async fn run(
     }));
     if let Err(err) = shutdown_journal(&shared.journal).await {
         // Журнал отказал на последней пачке: `session_end` мог не записаться.
-        let reason = shared.journal.failure().unwrap_or_else(|| err.to_string());
+        let reason = shared
+            .journal
+            .failure()
+            .unwrap_or_else(|| JournalFailureReason::from_error(&err));
         return Err(journal_failure_error(reason));
     }
     Ok(stats)
@@ -864,9 +867,10 @@ async fn shutdown_journal(journal: &Journal) -> io::Result<()> {
     let pause = journal_shutdown_timeout();
     match timeout(pause, journal.shutdown()).await {
         Ok(result) => result,
-        Err(_elapsed) => Err(io::Error::other(format!(
-            "journal not flushed: the writer did not stop within {pause:?}"
-        ))),
+        Err(_elapsed) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("journal not flushed: the writer did not stop within {pause:?}"),
+        )),
     }
 }
 
@@ -876,7 +880,7 @@ async fn serve(
     conn: u32,
     shared: &Shared,
     stop: &mut watch::Receiver<bool>,
-    failure: &mut watch::Receiver<Option<String>>,
+    failure: &mut watch::Receiver<Option<JournalFailureReason>>,
 ) {
     let mut responder = make_responder(shared.responder, &shared.ids);
     let mut buffer = vec![0u8; READ_BUFFER];
@@ -957,7 +961,7 @@ async fn apply(
     connection: &mut TcpConnection,
     actions: Vec<Action>,
     stop: &mut watch::Receiver<bool>,
-    failure: &mut watch::Receiver<Option<String>>,
+    failure: &mut watch::Receiver<Option<JournalFailureReason>>,
 ) -> Option<(ClosedBy, &'static str)> {
     for action in actions {
         match action {
@@ -1392,8 +1396,11 @@ mod tests {
 
     #[test]
     fn journal_failure_error_keeps_its_reason() {
-        let err = journal_failure_error("диск недоступен".to_owned());
-        assert_eq!(journal_failure_reason(&err), Some("диск недоступен"));
+        let err = journal_failure_error(JournalFailureReason::from_message("диск недоступен"));
+        assert_eq!(
+            journal_failure_reason(&err).map(JournalFailureReason::message),
+            Some("диск недоступен")
+        );
         assert!(err.to_string().contains("запись в журнал прервана"));
         assert_eq!(
             journal_failure_reason(&io::Error::other("другая ошибка")),

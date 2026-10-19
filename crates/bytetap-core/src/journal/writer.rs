@@ -29,6 +29,7 @@ use chrono::{DateTime, Local};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::journal::JournalFailureReason;
 use crate::journal::event::{Event, Mode, Note, Session};
 
 /// Верхняя граница одной пачки.
@@ -106,7 +107,7 @@ fn test_hook_failure(_events: usize) -> Option<io::Error> {
 pub struct Journal {
     tx: mpsc::UnboundedSender<Command>,
     path: Arc<PathBuf>,
-    failure: watch::Sender<Option<String>>,
+    failure: watch::Sender<Option<JournalFailureReason>>,
     pending: Arc<AtomicUsize>,
     task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -200,7 +201,7 @@ impl Journal {
     /// `record` после отказа возвращает `false`, а сессия берёт причину отсюда и
     /// останавливается (ADR 0001, «Ошибка записи»).
     #[must_use]
-    pub fn failure(&self) -> Option<String> {
+    pub fn failure(&self) -> Option<JournalFailureReason> {
         self.failure.borrow().as_ref().cloned()
     }
 
@@ -211,7 +212,7 @@ impl Journal {
     /// и без этого сигнала сессия осталась бы висеть живой без журнала (ADR 0001,
     /// «Ошибка записи»).
     #[must_use]
-    pub fn failed(&self) -> watch::Receiver<Option<String>> {
+    pub fn failed(&self) -> watch::Receiver<Option<JournalFailureReason>> {
         self.failure.subscribe()
     }
 
@@ -246,7 +247,7 @@ impl Journal {
     fn stopped_error(&self) -> io::Error {
         let cause = self
             .failure()
-            .unwrap_or_else(|| "писатель журнала остановлен".to_owned());
+            .unwrap_or_else(|| JournalFailureReason::from_message("писатель журнала остановлен"));
         io::Error::other(cause)
     }
 }
@@ -622,7 +623,7 @@ impl Batch {
 async fn run(
     mut rx: mpsc::UnboundedReceiver<Command>,
     file: File,
-    failure: watch::Sender<Option<String>>,
+    failure: watch::Sender<Option<JournalFailureReason>>,
     pending: Arc<AtomicUsize>,
 ) {
     let mut file = Some(file);
@@ -704,12 +705,12 @@ async fn append(mut file: File, bytes: Vec<u8>) -> io::Result<File> {
 /// Запоминает причину отказа и будит подписчиков [`Journal::failed`].
 ///
 /// Первая причина остаётся: последующие отказы — следствие того же сбоя.
-fn remember(failure: &watch::Sender<Option<String>>, err: &io::Error) {
+fn remember(failure: &watch::Sender<Option<JournalFailureReason>>, err: &io::Error) {
     failure.send_if_modified(|current| {
         if current.is_some() {
             false
         } else {
-            *current = Some(crate::journal::io_message(err));
+            *current = Some(JournalFailureReason::from_error(err));
             true
         }
     });

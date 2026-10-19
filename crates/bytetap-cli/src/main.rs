@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use bytetap_core::journal::{
-    self, Autoresponder, Data, Dir, Event, Host, Journal, LineErrorKind, Mode, MonoClock, Note,
-    Session, now_rfc3339,
+    self, Autoresponder, Data, Dir, Event, Host, Journal, JournalFailureReason, LineErrorKind,
+    Mode, MonoClock, Note, Session, now_rfc3339,
 };
 use bytetap_core::session::{Session as CaptureSession, SessionConfig, journal_failure_reason};
 use chrono::DateTime;
@@ -205,7 +205,7 @@ fn capture(
             Ok(stats) => stats,
             Err(err) => {
                 return Err(match journal_failure_reason(&err) {
-                    Some(reason) => CaptureError::Journal(reason.to_owned()),
+                    Some(reason) => CaptureError::Journal(reason.message().to_owned()),
                     None => CaptureError::Stop(err),
                 });
             }
@@ -258,7 +258,7 @@ enum CaptureError {
 }
 
 /// Ждёт отказа журнала, о котором сессия сообщает до остановки.
-async fn wait_for_journal_failure(failure: &mut watch::Receiver<Option<String>>) {
+async fn wait_for_journal_failure(failure: &mut watch::Receiver<Option<JournalFailureReason>>) {
     if failure.borrow_and_update().is_some() {
         return;
     }

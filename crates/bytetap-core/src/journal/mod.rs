@@ -42,6 +42,112 @@ pub(crate) fn io_message(err: &io::Error) -> String {
     }
 }
 
+/// Семейство ОС: одинаковые сбои в Windows и Unix имеют разные номера.
+///
+/// 112 — «диск полон» в Windows и `EBADRQC` в Linux; 5 — «нет доступа» в Windows и `EIO`
+/// в Linux. Поэтому код ОС без семейства не говорит, что случилось.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsFamily {
+    /// Windows: коды `GetLastError`.
+    Windows,
+    /// Unix: номера `errno`.
+    Unix,
+}
+
+impl OsFamily {
+    /// Семейство, на котором работает программа.
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Unix
+        }
+    }
+}
+
+/// Причина отказа журнала: текст для журнала и подробностей, вид ошибки и код ОС.
+///
+/// Интерфейс переводит причину по коду ОС, а не по тексту: [`io_message`] — английский
+/// и живёт в журнале, тогда как вид отказа для баннера нужен структурой.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalFailureReason {
+    message: String,
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+    os: OsFamily,
+}
+
+impl JournalFailureReason {
+    /// Причина по системной ошибке: вид, код ОС и семейство сохраняются как есть.
+    #[must_use]
+    pub fn from_error(err: &io::Error) -> Self {
+        Self {
+            message: io_message(err),
+            kind: err.kind(),
+            raw_os_error: err.raw_os_error(),
+            os: OsFamily::current(),
+        }
+    }
+
+    /// Причина из текста без кода ОС: свои сообщения программы.
+    #[must_use]
+    pub fn from_message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: io::ErrorKind::Other,
+            raw_os_error: None,
+            os: OsFamily::current(),
+        }
+    }
+
+    /// Причина из вида ошибки и кода ОС: так же строятся сбои в тестах на любой ОС.
+    #[must_use]
+    pub fn from_code(kind: io::ErrorKind, raw_os_error: Option<i32>, os: OsFamily) -> Self {
+        Self {
+            message: match raw_os_error {
+                Some(code) => format!("{kind} (os error {code})"),
+                None => kind.to_string(),
+            },
+            kind,
+            raw_os_error,
+            os,
+        }
+    }
+
+    /// Текст причины для журнала и подробностей баннера.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Вид ошибки ввода-вывода.
+    #[must_use]
+    pub const fn kind(&self) -> io::ErrorKind {
+        self.kind
+    }
+
+    /// Числовой код ОС: по нему интерфейс отличает «нет места» от прочих сбоев.
+    #[must_use]
+    pub const fn raw_os_error(&self) -> Option<i32> {
+        self.raw_os_error
+    }
+
+    /// Семейство ОС, которому принадлежит [`Self::raw_os_error`].
+    #[must_use]
+    pub const fn os(&self) -> OsFamily {
+        self.os
+    }
+}
+
+impl std::fmt::Display for JournalFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for JournalFailureReason {}
+
 /// Монотонные часы сессии: `mono_us` — микросекунды от её начала (FR-22).
 #[derive(Debug, Clone)]
 pub struct MonoClock {

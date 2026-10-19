@@ -98,7 +98,11 @@ async fn a_journal_failure_stops_the_session_without_acks() {
         .await
         .expect_err("остановка после отказа журнала");
     let reason = journal_failure_reason(&err).expect("причина отказа журнала в ошибке");
-    assert!(reason.contains("test hook"), "{reason}");
+    assert!(
+        reason.message().contains("test hook"),
+        "{}",
+        reason.message()
+    );
     TEST_FAIL_AFTER_EVENTS.store(u64::MAX, Ordering::Relaxed);
 
     // `session_end` не пишется: журнал уже не принимает строк.
