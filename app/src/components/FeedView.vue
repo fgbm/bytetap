@@ -1,141 +1,487 @@
 <script setup lang="ts">
-import { computed } from "vue";
+/**
+ * Лента обмена: виртуализированный список фрагментов и служебных событий (FR-26,
+ * FR-28). В DOM живут только видимые строки; кольцевой буфер держит 10 000 событий.
+ *
+ * Вид «Текст» — время, направление, соединение, текст плашками; вид «HEX» —
+ * дамп по 16 байт, каждая строка дампа — отдельный элемент виртуализации.
+ */
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Component } from "vue";
 import { useI18n } from "vue-i18n";
 import {
+  ArrowDown,
   ArrowLeft,
   ArrowRight,
-  CircleAlert,
+  Bot,
   Info,
   PenLine,
   Plug,
   Square,
+  TriangleAlert,
   Unplug,
 } from "@lucide/vue";
 import type { FeedEvent, JournalSummary } from "../api/types";
-import type { SessionStatus } from "../session/reducer";
-import { eventText } from "../feed/preview";
-import { formatTime } from "../format";
+import {
+  base64ByteLength,
+  base64ToBytes,
+  ENCODINGS,
+  ENCODING_KEYS,
+  type Encoding,
+} from "../feed/bytes";
+import { connChips, filterIndices } from "../feed/filter";
+import { hexLine, hexLineCount, type HexByte } from "../feed/hex";
+import { FeedBuffer } from "../feed/ring";
+import { eventRow, type FeedRow, type RowIcon, type Translate } from "../feed/rows";
+import {
+  applyScroll,
+  DEFAULT_VIEWPORT_HEIGHT,
+  HEX_ROW_HEIGHT,
+  isAtBottom,
+  listHeight,
+  TEXT_ROW_HEIGHT,
+  visibleRange,
+} from "../feed/virtual";
+import type { FeedViewMode } from "../settings/settings";
 
 const props = defineProps<{
-  events: FeedEvent[];
-  status: SessionStatus;
+  feed: FeedBuffer<FeedEvent>;
   journal: JournalSummary | null;
+  view: FeedViewMode;
+  encoding: Encoding;
+}>();
+
+const emit = defineEmits<{
+  "update:view": [view: FeedViewMode];
+  "update:encoding": [encoding: Encoding];
+  /** Видимая область ленты в долях — рамка на карте сессии (AC9). */
+  "update:visible": [window: { start: number; end: number }];
 }>();
 
 const { t } = useI18n();
+const translate: Translate = (key, params) => t(key, params ?? {});
 
-type RowIcon = "a2l" | "l2a" | "open" | "close" | "error" | "info" | "note" | "stopped";
+/** Иконка строки по типу события. */
+const ICONS: Record<RowIcon, Component> = {
+  a2l: ArrowRight,
+  l2a: ArrowLeft,
+  open: Plug,
+  close: Unplug,
+  error: TriangleAlert,
+  info: Info,
+  note: PenLine,
+  stopped: Square,
+};
 
-interface Row {
-  key: number;
+interface HexRow {
+  key: string;
+  lineIndex: number;
   cls: string;
-  ts: string;
+  time: string;
+  icon: RowIcon | null;
   conn: string;
-  icon: RowIcon;
-  text: string;
+  offset: string;
+  bytes: HexByte[];
+  ascii: string;
 }
 
-/**
- * Простой список до шага 3: шаг 3 заменит его виртуализированной лентой
- * с HEX, кодировками, фильтром соединений и прокруткой.
- */
-const rows = computed<Row[]>(() =>
-  props.events.map((event, index) => {
-    const base: Row = { key: index, cls: "", ts: "", conn: "", icon: "info", text: "" };
-    switch (event.type) {
-      case "data":
-        return {
-          ...base,
-          cls: event.dir + (event.synthetic ? " syn" : ""),
-          ts: formatTime(event.t),
-          conn: `#${event.conn}`,
-          icon: event.dir,
-          text: eventText(event),
-        };
-      case "open":
-        return {
-          ...base,
-          cls: "ev",
-          ts: formatTime(event.t),
-          conn: `#${event.conn}`,
-          icon: "open",
-          text: t("feed.opened", { peer: event.peer, local: event.local }),
-        };
-      case "close":
-        return {
-          ...base,
-          cls: "ev",
-          ts: formatTime(event.t),
-          conn: `#${event.conn}`,
-          icon: "close",
-          text: event.reason === "" ? t("feed.closed") : event.reason,
-        };
-      case "error":
-        return {
-          ...base,
-          cls: "wn",
-          ts: formatTime(event.t),
-          conn: event.conn === undefined ? "" : `#${event.conn}`,
-          icon: "error",
-          text: event.message,
-        };
-      case "info":
-        return {
-          ...base,
-          cls: "ev",
-          ts: formatTime(event.t),
-          conn: event.conn === undefined ? "" : `#${event.conn}`,
-          icon: "info",
-          text: event.message,
-        };
-      case "note":
-        return {
-          ...base,
-          cls: "ev",
-          ts: formatTime(event.t),
-          icon: "note",
-          text: event.text,
-        };
-      case "stopped":
-        return {
-          ...base,
-          cls: "ev",
-          icon: "stopped",
-          text: t("feed.stopped"),
-        };
-      default:
-        return base;
-    }
-  }),
+const scroller = ref<HTMLElement | null>(null);
+const scrollTop = ref(0);
+const viewportHeight = ref(DEFAULT_VIEWPORT_HEIGHT);
+/** Догонять ли новые строки; ручная прокрутка вверх выключает (AC8). */
+const follow = ref(true);
+const connFilter = ref<number | null>(null);
+
+/** Индексы событий буфера: все или выбранного соединения. */
+const indices = computed<number[]>(() => {
+  void props.feed.version;
+  return filterIndices(props.feed, connFilter.value);
+});
+
+/** Номера соединений для чипов фильтра. */
+const conns = computed<number[]>(() => {
+  void props.feed.version;
+  return connChips(props.feed);
+});
+
+/** Выбранное соединение исчезло из буфера — фильтр снимается. */
+watch(conns, (list) => {
+  if (connFilter.value !== null && !list.includes(connFilter.value)) connFilter.value = null;
+});
+
+/** Число строк дампа на событие — только для вида HEX. */
+const lineCounts = computed<number[]>(() => {
+  if (props.view !== "hex") return [];
+  const counts: number[] = [];
+  for (const index of indices.value) {
+    const event = props.feed.at(index);
+    counts.push(
+      event.type === "data" ? hexLineCount(base64ByteLength(event.b64)) : 1,
+    );
+  }
+  return counts;
+});
+
+/** Префиксные суммы строк дампа: номер строки → событие. */
+const linePrefix = computed<number[]>(() => {
+  const prefix = [0];
+  let total = 0;
+  for (const count of lineCounts.value) {
+    total += count;
+    prefix.push(total);
+  }
+  return prefix;
+});
+
+const totalRows = computed(() =>
+  props.view === "hex" ? (linePrefix.value[linePrefix.value.length - 1] ?? 0) : indices.value.length,
 );
+
+const rowHeight = computed(() => (props.view === "hex" ? HEX_ROW_HEIGHT : TEXT_ROW_HEIGHT));
+
+const range = computed(() =>
+  visibleRange(
+    totalRows.value,
+    scrollTop.value,
+    viewportHeight.value,
+    rowHeight.value,
+  ),
+);
+
+/** Строки текстового вида: только видимые, с текстом по кодировке. */
+const textRows = computed<FeedRow[]>(() => {
+  if (props.view !== "text") return [];
+  const rows: FeedRow[] = [];
+  const { start, end } = range.value;
+  for (let order = start; order < end; order += 1) {
+    const index = indices.value[order];
+    if (index === undefined) break;
+    rows.push(eventRow(props.feed.at(index), order, translate, props.encoding));
+  }
+  return rows;
+});
+
+/** Ближайшее событие, начинающееся не позже строки `line`. */
+function eventAtLine(line: number): number {
+  const prefix = linePrefix.value;
+  let low = 0;
+  let high = indices.value.length - 1;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if ((prefix[middle + 1] ?? 0) <= line) low = middle;
+    else high = middle - 1;
+  }
+  return low;
+}
+
+/** Строки дампа для видимого окна. */
+const hexRows = computed<HexRow[]>(() => {
+  if (props.view !== "hex") return [];
+  const rows: HexRow[] = [];
+  const { start, end } = range.value;
+  if (end <= start) return rows;
+  const prefix = linePrefix.value;
+  let eventOrder = eventAtLine(start);
+  let line = start;
+
+  while (line < end && eventOrder < indices.value.length) {
+    const index = indices.value[eventOrder];
+    const event = props.feed.at(index);
+    const bytes = event.type === "data" ? base64ToBytes(event.b64) : new Uint8Array(0);
+    const count = event.type === "data" ? hexLineCount(bytes.length) : 1;
+    const row = eventRow(event, eventOrder, translate, props.encoding);
+    const firstLine = prefix[eventOrder] ?? 0;
+
+    for (let local = line - firstLine; local < count && line < end; local += 1) {
+      const dump = hexLine(bytes, local);
+      rows.push({
+        key: `${index}:${local}`,
+        lineIndex: line,
+        cls: row.kind === "data" ? row.cls : row.cls === "wn" ? "ev wn" : "ev",
+        time: local === 0 ? row.time : "",
+        icon: local === 0 ? row.icon : null,
+        conn: local === 0 ? row.conn : "",
+        offset: dump.offset,
+        bytes: dump.bytes,
+        ascii: dump.ascii,
+      });
+      line += 1;
+    }
+    eventOrder += 1;
+  }
+  return rows;
+});
+
+const listHeightPx = computed(() =>
+  listHeight(totalRows.value, rowHeight.value),
+);
+
+const empty = computed(() => totalRows.value === 0);
+const viewingNotice = computed(() => props.journal !== null && empty.value);
+
+function rowStyle(order: number): Record<string, string> {
+  return {
+    top: `${order * TEXT_ROW_HEIGHT}px`,
+    height: `${TEXT_ROW_HEIGHT}px`,
+  };
+}
+
+function hexStyle(line: number): Record<string, string> {
+  return {
+    top: `${line * HEX_ROW_HEIGHT}px`,
+    height: `${HEX_ROW_HEIGHT}px`,
+  };
+}
+
+function measure(): void {
+  const element = scroller.value;
+  if (element === null) return;
+  viewportHeight.value = element.clientHeight || DEFAULT_VIEWPORT_HEIGHT;
+  scrollTop.value = element.scrollTop;
+}
+
+function onScroll(): void {
+  const element = scroller.value;
+  if (element === null) return;
+  scrollTop.value = element.scrollTop;
+  viewportHeight.value = element.clientHeight || DEFAULT_VIEWPORT_HEIGHT;
+  follow.value = applyScroll(element.scrollTop, element.clientHeight, element.scrollHeight).follow;
+  emitVisible();
+}
+
+function emitVisible(): void {
+  const element = scroller.value;
+  if (element === null) return;
+  const total = element.scrollHeight;
+  if (total <= 0) {
+    emit("update:visible", { start: 0, end: 1 });
+    return;
+  }
+  const top = element.scrollTop / total;
+  const bottom = (element.scrollTop + element.clientHeight) / total;
+  emit("update:visible", { start: Math.min(1, Math.max(0, top)), end: Math.min(1, Math.max(0, bottom)) });
+}
+
+async function scrollToBottom(): Promise<void> {
+  await nextTick();
+  const element = scroller.value;
+  if (element === null) return;
+  element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+  scrollTop.value = element.scrollTop;
+}
+
+/** Кнопка «Автопрокрутка»: включает догон и прыгает вниз (AC8). */
+function enableFollow(): void {
+  follow.value = true;
+  void scrollToBottom();
+}
+
+/** Переход к доле списка — из трассы при просмотре журнала (AC9). */
+function seekFraction(fraction: number): void {
+  const element = scroller.value;
+  if (element === null) return;
+  const clamped = Math.min(1, Math.max(0, fraction));
+  const travel = Math.max(0, element.scrollHeight - element.clientHeight);
+  element.scrollTop = clamped * travel;
+  scrollTop.value = element.scrollTop;
+  follow.value = isAtBottom(element.scrollTop, element.clientHeight, element.scrollHeight);
+  emitVisible();
+}
+
+defineExpose({ seekFraction });
+
+/** Новая пачка в буфере: догоняем, если автопрокрутка включена. */
+watch(
+  () => props.feed.version,
+  () => {
+    if (!follow.value) return;
+    void scrollToBottom();
+  },
+);
+
+watch(
+  () => [props.view, props.encoding],
+  () => {
+    if (!follow.value) return;
+    void scrollToBottom();
+  },
+);
+
+let resize: ResizeObserver | null = null;
+
+onMounted(() => {
+  measure();
+  emitVisible();
+  if (typeof ResizeObserver !== "undefined" && scroller.value !== null) {
+    resize = new ResizeObserver(() => measure());
+    resize.observe(scroller.value);
+  }
+});
+
+onBeforeUnmount(() => {
+  resize?.disconnect();
+  resize = null;
+});
 </script>
 
 <template>
-  <div class="bt-feed">
-    <div v-if="journal !== null" class="bt-empty">
-      <b>{{ t("feed.viewingTitle") }}</b>
-      <span>{{ t("feed.viewingText", { path: journal.path }) }}</span>
+  <div class="bt-feed-view">
+    <div class="bt-feed-bar">
+      <div class="bt-seg" role="group" :aria-label="t('feed.viewGroup')">
+        <button
+          type="button"
+          :class="{ on: view === 'text' }"
+          @click="emit('update:view', 'text')"
+        >
+          {{ t("feed.viewText") }}
+        </button>
+        <button
+          type="button"
+          :class="{ on: view === 'hex' }"
+          @click="emit('update:view', 'hex')"
+        >
+          {{ t("feed.viewHex") }}
+        </button>
+      </div>
+      <div class="bt-seg" role="group" :aria-label="t('feed.encoding')">
+        <button
+          v-for="encodingName in ENCODINGS"
+          :key="encodingName"
+          type="button"
+          :class="{ on: encoding === encodingName }"
+          @click="emit('update:encoding', encodingName)"
+        >
+          {{ t(ENCODING_KEYS[encodingName]) }}
+        </button>
+      </div>
+      <span class="bt-spacer" />
+      <div class="bt-conns" role="group" :aria-label="t('feed.connFilter')">
+        <button
+          type="button"
+          :class="{ on: connFilter === null }"
+          @click="connFilter = null"
+        >
+          {{ t("feed.connAll") }}
+        </button>
+        <button
+          v-for="conn in conns"
+          :key="conn"
+          type="button"
+          :class="{ on: connFilter === conn }"
+          @click="connFilter = conn"
+        >
+          #{{ conn }}
+        </button>
+      </div>
+      <button
+        class="bt-btn ghost autoscroll"
+        :class="{ on: !follow }"
+        type="button"
+        :title="follow ? t('feed.autoscrollOn') : t('feed.autoscrollOff')"
+        @click="enableFollow"
+      >
+        <ArrowDown :size="15" aria-hidden="true" />
+        {{ t("feed.autoscroll") }}
+      </button>
     </div>
-    <div v-else-if="events.length === 0" class="bt-empty">
+
+    <div v-if="viewingNotice" class="bt-empty">
+      <b>{{ t("feed.viewingTitle") }}</b>
+      <span>{{ t("feed.viewingText", { path: journal?.path ?? "" }) }}</span>
+    </div>
+    <div v-else-if="empty" class="bt-empty">
       <b>{{ t("feed.emptyTitle") }}</b>
       <span>{{ t("feed.emptyText") }}</span>
     </div>
-    <template v-else>
-      <div v-for="row in rows" :key="row.key" class="bt-feed-row" :class="row.cls">
-        <span class="ts">{{ row.ts }}</span>
-        <span class="ar">
-          <ArrowRight v-if="row.icon === 'a2l'" :size="14" aria-hidden="true" />
-          <ArrowLeft v-else-if="row.icon === 'l2a'" :size="14" aria-hidden="true" />
-          <Plug v-else-if="row.icon === 'open'" :size="14" aria-hidden="true" />
-          <Unplug v-else-if="row.icon === 'close'" :size="14" aria-hidden="true" />
-          <CircleAlert v-else-if="row.icon === 'error'" :size="14" aria-hidden="true" />
-          <Square v-else-if="row.icon === 'stopped'" :size="14" aria-hidden="true" />
-          <PenLine v-else-if="row.icon === 'note'" :size="14" aria-hidden="true" />
-          <Info v-else :size="14" aria-hidden="true" />
-        </span>
-        <span class="cn">{{ row.conn }}</span>
-        <span class="pl">{{ row.text }}</span>
+    <div v-else ref="scroller" class="bt-feed" @scroll.passive="onScroll">
+      <div class="bt-feed-list" :style="{ height: `${listHeightPx}px` }">
+        <template v-if="view === 'text'">
+          <div
+            v-for="row in textRows"
+            :key="row.index"
+            class="bt-feed-row"
+            :class="row.cls"
+            :style="rowStyle(row.index)"
+          >
+            <span class="ts">{{ row.time }}</span>
+            <span class="ar">
+              <component :is="ICONS[row.icon]" :size="14" aria-hidden="true" />
+            </span>
+            <span class="cn">{{ row.conn }}</span>
+            <span class="pl">
+              <template v-if="row.kind === 'data'">
+                <template v-for="(segment, position) in row.segments" :key="position">
+                  <span v-if="segment.chip" class="bt-cc">{{ segment.value }}</span>
+                  <template v-else>{{ segment.value }}</template>
+                </template>
+              </template>
+              <template v-else>{{ row.text }}</template>
+              <span v-if="row.synthetic" class="bt-tag">
+                <Bot :size="11" aria-hidden="true" />
+                {{ t("feed.synthetic") }}
+              </span>
+            </span>
+          </div>
+        </template>
+        <template v-else>
+          <div
+            v-for="row in hexRows"
+            :key="row.key"
+            class="bt-feed-hex"
+            :class="row.cls"
+            :style="hexStyle(row.lineIndex)"
+          >
+            <span class="o">{{ row.time }}</span>
+            <span class="ar">
+              <component
+                :is="ICONS[row.icon ?? 'info']"
+                v-if="row.icon !== null"
+                :size="14"
+                aria-hidden="true"
+              />
+            </span>
+            <span class="o">{{ row.conn }}</span>
+            <span class="o">{{ row.offset }}</span>
+            <span class="b">
+              <template v-for="(byte, position) in row.bytes" :key="position">
+                <i v-if="byte.control">{{ byte.value }}</i>
+                <template v-else>{{ byte.value }} </template>
+              </template>
+            </span>
+            <span class="a">{{ row.ascii }}</span>
+          </div>
+        </template>
       </div>
-    </template>
+    </div>
   </div>
 </template>
+
+<style scoped>
+.bt-feed-view {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.bt-feed-list {
+  position: relative;
+}
+
+.autoscroll.on {
+  color: var(--bt-ctrl);
+  border-color: var(--bt-ctrl);
+}
+
+/* Размер строки задаётся inline из констант виртуализации, не из CSS. */
+.bt-feed-row {
+  position: absolute;
+  left: 0;
+  right: 0;
+}
+
+.bt-feed-hex {
+  position: absolute;
+  left: 0;
+  right: 0;
+}
+</style>

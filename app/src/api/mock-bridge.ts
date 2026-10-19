@@ -2,9 +2,11 @@
  * Заглушка моста для `npm run dev`, браузера и тестов.
  *
  * Отдаёт те же типы, что ядро, и синтетический HL7-обмен ANALYZER ↔ LIS ↔ PATIENT^TEST
- * по таймеру: подключение анализатора, ORU^R01, синтетический ACK автоответчика, QRY.
+ * по таймеру: два одновременных соединения анализатора, ORU^R01 в UTF-8 и в CP1251
+ * (кириллица в имени пациента), синтетические ACK автоответчика, QRY.
  * Ошибки воспроизводятся сценарием из адреса страницы: `?scenario=port_in_use`
- * или `?scenario=journal_failure`.
+ * или `?scenario=journal_failure`. `?burst=1` (или `?scenario=burst`) заливает
+ * ленту 12 000 фрагментов за 60 с — для проверки виртуализации и прокрутки.
  */
 
 import type { Bridge } from "./bridge";
@@ -28,12 +30,14 @@ const MOCK_LOG_DIR = "C:\\Users\\operator\\Documents\\bytetap";
 const TICK_MS = 500;
 const JOURNAL_FAILURE_AFTER_STEPS = 14;
 
-export type MockScenario = "default" | "port_in_use" | "journal_failure";
+export type MockScenario = "default" | "port_in_use" | "journal_failure" | "burst";
 
 function scenarioFromLocation(): MockScenario {
   if (typeof window === "undefined") return "default";
-  const value = new URLSearchParams(window.location.search).get("scenario");
-  return value === "port_in_use" || value === "journal_failure" ? value : "default";
+  const params = new URLSearchParams(window.location.search);
+  const value = params.get("scenario");
+  if (value === "port_in_use" || value === "journal_failure" || value === "burst") return value;
+  return params.get("burst") === "1" ? "burst" : "default";
 }
 
 function pad(value: number, width = 2): string {
@@ -56,8 +60,24 @@ function joinPath(dir: string, name: string): string {
   return dir.endsWith(separator) ? `${dir}${name}` : `${dir}${separator}${name}`;
 }
 
-function toBase64(text: string): string {
-  return btoa(String.fromCharCode(...new TextEncoder().encode(text)));
+/** Текст → байты CP1251: латиница как есть, кириллица 0xC0–0xFF, Ё и ё отдельно. */
+function cp1251Bytes(text: string): number[] {
+  const bytes: number[] = [];
+  for (const char of text) {
+    const code = char.codePointAt(0) ?? 0x3f;
+    if (code < 0x80) bytes.push(code);
+    else if (code >= 0x410 && code <= 0x44f) bytes.push(code - 0x410 + 0xc0);
+    else if (code === 0x401) bytes.push(0xa8);
+    else if (code === 0x451) bytes.push(0xb8);
+    else bytes.push(0x3f);
+  }
+  return bytes;
+}
+
+function bytesToBase64(bytes: readonly number[]): string {
+  let text = "";
+  for (const byte of bytes) text += String.fromCharCode(byte);
+  return btoa(text);
 }
 
 /** MLLP-кадр HL7: <VT> … <CR><FS><CR>. */
@@ -89,11 +109,23 @@ function resultFrame(messageId: string, at: Date, sample: number): string {
   );
 }
 
+/** Тот же результат, но имя пациента и показатель — кириллицей в CP1251 (FR-27). */
+function resultFrameCp1251(messageId: string, at: Date, sample: number): string {
+  return mllp(
+    `MSH|^~\\&|ANALYZER|LAB|LIS||${stamp(at)}||ORU^R01|${messageId}|P|2.3.1`,
+    `PID|1||${pad(sample, 6)}||ПАЦИЕНТ^ТЕСТ`,
+    "OBX|1|NM|GLU^Глюкоза||5.4|mmol/L|3.9-6.1|N|||F",
+  );
+}
+
 interface MockSession {
   cfg: SessionConfig;
   startInfo: StartInfo;
   startedAtMono: number;
+  /** Первое соединение цикла. */
   conn: number;
+  /** Второе соединение цикла: обмен идёт параллельно. */
+  second: number;
   step: number;
   sample: number;
   bytesA2l: number;
@@ -114,19 +146,38 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
     target.onBatch({ events, dropped });
   }
 
-  function dataEvent(target: MockSession, dir: Dir, text: string, synthetic: boolean): FeedEvent {
-    const bytes = new TextEncoder().encode(text).length;
-    if (dir === "a2l") target.bytesA2l += bytes;
-    else target.bytesL2a += bytes;
+  function dataEvent(
+    target: MockSession,
+    conn: number,
+    dir: Dir,
+    bytes: readonly number[],
+    synthetic: boolean,
+  ): FeedEvent {
+    if (dir === "a2l") target.bytesA2l += bytes.length;
+    else target.bytesL2a += bytes.length;
     return {
       type: "data",
       t: new Date().toISOString(),
       monoUs: Math.round((performance.now() - target.startedAtMono) * 1000),
-      conn: target.conn,
+      conn,
       dir,
       synthetic,
-      b64: toBase64(text),
+      b64: bytesToBase64(bytes),
     };
+  }
+
+  function textData(
+    target: MockSession,
+    conn: number,
+    dir: Dir,
+    text: string,
+    synthetic: boolean,
+  ): FeedEvent {
+    return dataEvent(target, conn, dir, Array.from(new TextEncoder().encode(text)), synthetic);
+  }
+
+  function cp1251Data(target: MockSession, conn: number, dir: Dir, text: string): FeedEvent {
+    return dataEvent(target, conn, dir, cp1251Bytes(text), false);
   }
 
   function at(target: MockSession): { t: string; monoUs: number } {
@@ -136,41 +187,62 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
     };
   }
 
+  function openEvent(target: MockSession, conn: number, peerHost: number): FeedEvent {
+    return {
+      type: "open",
+      ...at(target),
+      conn,
+      peer: `192.168.1.${peerHost}:${49152 + target.step}`,
+      local: target.startInfo.localAddr,
+    };
+  }
+
+  function closeEvent(target: MockSession, conn: number): FeedEvent {
+    return { type: "close", ...at(target), conn, by: "analyzer", reason: "eof" };
+  }
+
   /**
-   * Один шаг обмена: подключение анализатора, результаты, синтетический автоответ,
-   * запрос, отключение — затем всё по кругу с новым номером соединения.
+   * Один шаг обмена: два одновременных соединения анализатора, результаты в UTF-8
+   * и CP1251, синтетический автоответ, запрос, отключения — затем по кругу.
    */
   function nextEvents(target: MockSession): FeedEvent[] {
-    const phase = target.step % 6;
+    const phase = target.step % 9;
     const messageId = `MSG${pad(target.step + 1, 4)}`;
     const now = new Date();
 
     switch (phase) {
       case 0: {
         target.conn += 1;
-        target.connections += 1;
+        target.second = target.conn + 1;
+        target.connections += 2;
         return [
-          {
-            type: "open",
-            ...at(target),
-            conn: target.conn,
-            peer: `192.168.1.${50 + target.conn}:${49152 + target.step}`,
-            local: target.startInfo.localAddr,
-          },
+          openEvent(target, target.conn, 50 + target.conn),
+          openEvent(target, target.second, 51 + target.conn),
         ];
       }
       case 1: {
         target.sample += 1;
-        return [dataEvent(target, "a2l", resultFrame(messageId, now, target.sample), false)];
+        return [textData(target, target.conn, "a2l", resultFrame(messageId, now, target.sample), false)];
       }
-      case 2: {
+      case 2:
+        return [cp1251Data(target, target.conn, "a2l", resultFrameCp1251(messageId, now, target.sample))];
+      case 3: {
         if (target.cfg.responder !== "hl7") return [];
-        return [dataEvent(target, "l2a", ackFrame(messageId, now), true)];
+        return [textData(target, target.conn, "l2a", ackFrame(messageId, now), true)];
       }
-      case 3:
-        return [dataEvent(target, "a2l", queryFrame(messageId, now), false)];
       case 4: {
+        target.sample += 1;
+        return [
+          textData(target, target.second, "a2l", resultFrame(`${messageId}B`, now, target.sample), false),
+        ];
+      }
+      case 5:
+        return [textData(target, target.conn, "a2l", queryFrame(messageId, now), false)];
+      case 6: {
         if (target.cfg.responder !== "hl7") return [];
+        return [textData(target, target.second, "l2a", ackFrame(`${messageId}B`, now), true)];
+      }
+      case 7:
         return [
           {
             type: "info",
@@ -179,18 +251,69 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
             message: "Автоответ: ACK отправлен",
           },
         ];
-      }
       default:
-        return [
-          {
-            type: "close",
-            ...at(target),
-            conn: target.conn,
-            by: "analyzer",
-            reason: "соединение закрыто анализатором",
-          },
-        ];
+        return [closeEvent(target, target.conn), closeEvent(target, target.second)];
     }
+  }
+
+  /** Сколько фрагментов заливает сценарий `burst` и по сколько в пачке. */
+  const BURST_EVENTS = 12_000;
+  const BURST_BATCH = 500;
+  const BURST_CONNECTIONS = 4;
+
+  /** Пачка «длинной сессии»: 12 000 фрагментов за 60 с по четырём соединениям. */
+  function burstBatch(target: MockSession, from: number): FeedEvent[] {
+    const events: FeedEvent[] = [];
+    for (let index = from; index < Math.min(from + BURST_BATCH, BURST_EVENTS); index += 1) {
+      const monoUs = Math.round((index / BURST_EVENTS) * 60_000_000);
+      // Последний фрагмент — «сейчас», первый — минуту назад: время в ленте не идёт назад.
+      const when = new Date(Date.now() - (60_000_000 - monoUs) / 1000);
+      const conn = (index % BURST_CONNECTIONS) + 1;
+      const dir: Dir = index % 3 === 0 ? "l2a" : "a2l";
+      const messageId = `BURST${pad(index, 6)}`;
+      const cp1251 = index % 7 === 0;
+      const text = cp1251
+        ? resultFrameCp1251(messageId, when, index % 1000)
+        : dir === "l2a"
+          ? ackFrame(messageId, when)
+          : resultFrame(messageId, when, index % 1000);
+      const bytes = cp1251 ? cp1251Bytes(text) : Array.from(new TextEncoder().encode(text));
+      if (dir === "a2l") target.bytesA2l += bytes.length;
+      else target.bytesL2a += bytes.length;
+      events.push({
+        type: "data",
+        t: when.toISOString(),
+        monoUs,
+        conn,
+        dir,
+        synthetic: dir === "l2a",
+        b64: bytesToBase64(bytes),
+      });
+    }
+    return events;
+  }
+
+  /** Заливка ленты для проверки виртуализации: пачки по 500 событий в отдельных задачах. */
+  function startBurst(target: MockSession): void {
+    // Заполненная минута уже «прошла»: следующие события продолжают её по mono_us.
+    target.startedAtMono -= 60_000;
+    const opens: FeedEvent[] = [];
+    for (let conn = 1; conn <= BURST_CONNECTIONS; conn += 1) {
+      opens.push(openEvent(target, conn, 60 + conn));
+    }
+    target.conn = BURST_CONNECTIONS;
+    target.second = BURST_CONNECTIONS;
+    target.connections += BURST_CONNECTIONS;
+    emit(target, opens);
+
+    let produced = 0;
+    const push = (): void => {
+      if (target.failed || session !== target) return;
+      emit(target, burstBatch(target, produced));
+      produced += BURST_BATCH;
+      if (produced < BURST_EVENTS) setTimeout(push, 0);
+    };
+    setTimeout(push, 0);
   }
 
   function failJournal(target: MockSession): void {
@@ -255,6 +378,7 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
         },
         startedAtMono: performance.now(),
         conn: 0,
+        second: 0,
         step: -1,
         sample: 0,
         bytesA2l: 0,
@@ -273,6 +397,8 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
           failJournal(target);
         }
       }, TICK_MS);
+
+      if (scenario === "burst") startBurst(target);
 
       return target.startInfo;
     },

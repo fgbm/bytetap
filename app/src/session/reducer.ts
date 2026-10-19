@@ -13,6 +13,7 @@ import type {
   SessionSummary,
   StartInfo,
 } from "../api/types";
+import { base64ByteLength } from "../feed/bytes";
 
 export type SessionStatus =
   | "idle"
@@ -81,17 +82,12 @@ export function initialSessionState(): SessionState {
   };
 }
 
-/** Точная длина base64-фрагмента в байтах, без декодирования. */
-function byteLength(b64: string): number {
-  const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
-  return Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
-}
-
+/** Счётчики байтов и соединений по пачке событий. */
 function addStats(base: SessionStats, batch: FeedBatch): SessionStats {
   const next = { ...base };
   for (const event of batch.events) {
     if (event.type === "data") {
-      const bytes = byteLength(event.b64);
+      const bytes = base64ByteLength(event.b64);
       if (event.dir === "a2l") next.bytesAnalyzerToLis += bytes;
       else next.bytesLisToAnalyzer += bytes;
     }

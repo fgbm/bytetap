@@ -1,12 +1,13 @@
 /**
  * Состояние сессии приложения: старт, стоп, события ленты, таймер, просмотр журнала.
  *
- * Лента пока — простой массив с лимитом; шаг 3 заменит его кольцевым буфером на
- * 10 000 фрагментов и виртуализацией. Редьюсер состояний живёт отдельно
- * (`reducer.ts`) и проверяется vitest без Vue.
+ * Лента живёт в кольцевом буфере на 10 000 событий (FR-28): добавление пачки —
+ * O(1) на событие, без копирования массива. Буфер обёрнут в `shallowReactive`,
+ * поэтому реактивен только номер версии, а сами события остаются обычными объектами.
+ * Редьюсер состояний живёт отдельно (`reducer.ts`) и проверяется vitest без Vue.
  */
 
-import { ref } from "vue";
+import { shallowReactive, ref } from "vue";
 import { bridge } from "../api/bridge";
 import {
   BridgeError,
@@ -16,13 +17,14 @@ import {
   type JournalSummary,
   type SessionConfig,
 } from "../api/types";
+import { FEED_CAPACITY, FeedBuffer } from "../feed/ring";
 import { initialSessionState, reduceSession, type SessionAction, type SessionError, type SessionState } from "./reducer";
 
-/** Предел простого массива ленты до появления кольцевого буфера (шаг 3). */
-export const FEED_LIMIT = 2000;
-
 const state = ref<SessionState>(initialSessionState());
-const events = ref<FeedEvent[]>([]);
+
+/** Кольцевой буфер ленты: 10 000 последних событий и номер версии для подписки. */
+const feed = shallowReactive(new FeedBuffer<FeedEvent>(FEED_CAPACITY));
+
 const elapsedMs = ref(0);
 
 let ticker: ReturnType<typeof setInterval> | null = null;
@@ -43,9 +45,7 @@ function toSessionError(error: unknown): SessionError {
 }
 
 function appendEvents(incoming: FeedEvent[]): void {
-  const merged = events.value.concat(incoming);
-  events.value =
-    merged.length > FEED_LIMIT ? merged.slice(merged.length - FEED_LIMIT) : merged;
+  feed.pushMany(incoming);
 }
 
 function startTicker(startedAt: string): void {
@@ -78,7 +78,7 @@ function onBatch(batch: FeedBatch): void {
 
 async function start(cfg: SessionConfig): Promise<void> {
   if (state.value.status === "starting" || state.value.status === "recording") return;
-  events.value = [];
+  feed.clear();
   elapsedMs.value = 0;
   dispatch({ type: "start_requested" });
   try {
@@ -144,14 +144,14 @@ function reportError(code: BridgeErrorCode, message: string): void {
 export function resetSession(): void {
   stopTicker();
   state.value = initialSessionState();
-  events.value = [];
+  feed.clear();
   elapsedMs.value = 0;
 }
 
 export function useSession() {
   return {
     state,
-    events,
+    feed,
     elapsedMs,
     start,
     stop,

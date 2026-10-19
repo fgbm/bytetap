@@ -7,8 +7,18 @@
  */
 
 import type { Responder, SessionConfig } from "../api/types";
+import { parseEncoding, type Encoding } from "../feed/bytes";
 
 export type ThemeMode = "system" | "light" | "dark";
+
+/** Вид ленты: текст с плашками или HEX-дамп (FR-26). */
+export type FeedViewMode = "text" | "hex";
+
+/** Выбор вида и кодировки ленты — запоминается вместе с настройками (AC11). */
+export interface FeedSettings {
+  view: FeedViewMode;
+  encoding: Encoding;
+}
 
 /** Пустой адрес — слушать на всех интерфейсах; так его понимает ядро (`listen_host`). */
 export const ALL_INTERFACES = "";
@@ -23,6 +33,7 @@ export interface Settings {
   config: SessionConfig;
   theme: ThemeMode;
   profiles: Profile[];
+  feed: FeedSettings;
 }
 
 export function defaultConfig(logDir = ""): SessionConfig {
@@ -38,7 +49,12 @@ export function defaultConfig(logDir = ""): SessionConfig {
 }
 
 export function defaultSettings(logDir = ""): Settings {
-  return { config: defaultConfig(logDir), theme: "system", profiles: [] };
+  return {
+    config: defaultConfig(logDir),
+    theme: "system",
+    profiles: [],
+    feed: { view: "text", encoding: "cp1251" },
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -74,6 +90,16 @@ function normalizeProfile(raw: unknown, fallback: SessionConfig): Profile | null
   return { name, config: normalizeConfig(raw.config, fallback) };
 }
 
+/** Вид и кодировка ленты: неизвестные значения заменяются значениями по умолчанию. */
+export function normalizeFeed(raw: unknown): FeedSettings {
+  const base: FeedSettings = { view: "text", encoding: "cp1251" };
+  if (!isRecord(raw)) return base;
+  return {
+    view: raw.view === "hex" ? "hex" : "text",
+    encoding: parseEncoding(raw.encoding) ?? base.encoding,
+  };
+}
+
 export function normalizeSettings(raw: unknown, logDir = ""): Settings {
   const base = defaultSettings(logDir);
   if (!isRecord(raw)) return base;
@@ -84,7 +110,7 @@ export function normalizeSettings(raw: unknown, logDir = ""): Settings {
         .map((profile) => normalizeProfile(profile, config))
         .filter((profile): profile is Profile => profile !== null)
     : [];
-  return { config, theme, profiles };
+  return { config, theme, profiles, feed: normalizeFeed(raw.feed) };
 }
 
 /** Сохраняет профиль под именем: одноимённый заменяется, остальные остаются на месте. */

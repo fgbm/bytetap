@@ -24,7 +24,7 @@ const { t } = useI18n();
 
 const {
   state,
-  events,
+  feed,
   elapsedMs,
   start,
   stop,
@@ -43,6 +43,12 @@ const logDirWarning = ref<string | null>(null);
 const portText = ref(String(settings.config.listenPort));
 const selectedProfile = ref("");
 const lastJournalPath = ref<string | null>(null);
+/** Методы ленты для перехода из трассы при просмотре журнала (AC9). */
+interface FeedViewHandle {
+  seekFraction(fraction: number): void;
+}
+const feedView = ref<FeedViewHandle | null>(null);
+const visibleWindow = ref<{ start: number; end: number } | null>(null);
 const prompt = reactive<{ kind: "note" | "profile" | null; value: string }>({
   kind: null,
   value: "",
@@ -52,6 +58,8 @@ const recording = computed(() => state.value.status === "recording");
 const journalOpen = computed(
   () => state.value.status === "viewing" || state.value.status === "starting",
 );
+const nowUs = computed(() => Math.round(elapsedMs.value * 1000));
+const density = computed(() => state.value.journal?.density ?? null);
 const canStart = computed(
   () =>
     checkPort(portText.value).problem === null &&
@@ -153,12 +161,29 @@ async function onStart(): Promise<void> {
   if (port === null) return;
   settingsStore.updateConfig({ listenPort: port });
   lastJournalPath.value = null;
+  visibleWindow.value = null;
   await start({ ...settings.config, listenPort: port });
 }
 
 async function onStop(): Promise<void> {
   await stop();
   if (state.value.summary !== null) lastJournalPath.value = state.value.summary.journalPath;
+}
+
+/** Переход к доле списка из трассы (просмотр журнала). */
+function onSeek(fraction: number): void {
+  feedView.value?.seekFraction(fraction);
+}
+
+/** Лента сообщила видимую область — рамка на карте сессии. */
+function onVisible(window: { start: number; end: number }): void {
+  visibleWindow.value = window;
+}
+
+/** Закрытие журнала сбрасывает рамку видимой области. */
+function onCloseJournal(): void {
+  visibleWindow.value = null;
+  closeJournal();
 }
 
 function cycleTheme(): void {
@@ -299,7 +324,7 @@ function onPromptConfirm(text: string): void {
       <span class="bt-mono name">{{ state.journal.path }}</span>
       <span class="read-only">{{ t("journal.readOnly") }}</span>
       <span class="bt-spacer" />
-      <button class="bt-btn" type="button" @click="closeJournal">
+      <button class="bt-btn" type="button" @click="onCloseJournal">
         <X :size="15" aria-hidden="true" />
         {{ t("journal.close") }}
       </button>
@@ -320,8 +345,24 @@ function onPromptConfirm(text: string): void {
       @delete-profile="onDeleteProfile"
     />
 
-    <TraceView :status="state.status" />
-    <FeedView :events="events" :status="state.status" :journal="state.journal" />
+    <TraceView
+      :status="state.status"
+      :feed="feed"
+      :now-us="nowUs"
+      :density="density"
+      :window="visibleWindow"
+      @seek="onSeek"
+    />
+    <FeedView
+      ref="feedView"
+      :feed="feed"
+      :journal="state.journal"
+      :view="settings.feed.view"
+      :encoding="settings.feed.encoding"
+      @update:view="settingsStore.setFeedView"
+      @update:encoding="settingsStore.setFeedEncoding"
+      @update:visible="onVisible"
+    />
     <StatusBar
       :status="state.status"
       :stats="state.stats"

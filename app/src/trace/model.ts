@@ -1,0 +1,80 @@
+/**
+ * Расчёт трассы: импульсы бегущего окна и плотность всей сессии в координаты (AC9).
+ *
+ * Чистые функции без canvas: экран только умножает доли на ширину дорожки,
+ * поэтому раскладка проверяется vitest без браузера.
+ */
+
+/** Ширина бегущего окна во время записи: последние ~60 с. */
+export const TRACE_WINDOW_US = 60_000_000;
+
+/** Число корзин плотности в журнале (`JournalSummary.density`). */
+export const DENSITY_BINS = 600;
+
+/** Фрагмент для трассы: когда пришёл и сколько в нём байт. */
+export interface Point {
+  monoUs: number;
+  len: number;
+}
+
+/** Импульс в долях дорожки: `x` — положение, `height` — высота. */
+export interface Impulse {
+  x: number;
+  height: number;
+}
+
+/** Высота импульса по длине фрагмента: логарифм, чтобы 3 байта и 3 КБ различались. */
+export function impulseHeight(len: number): number {
+  const safe = Math.max(1, len);
+  return Math.min(1, Math.max(0.08, Math.log10(1 + safe) / Math.log10(1 + 4096)));
+}
+
+/** Окно «последние 60 с»: до заполнения окна — от нуля, дальше — скользит. */
+export function windowRange(nowUs: number, span = TRACE_WINDOW_US): { fromUs: number; toUs: number } {
+  const toUs = Math.max(span, nowUs);
+  return { fromUs: toUs - span, toUs };
+}
+
+/** Импульсы точек, попавших в окно `[fromUs, toUs]`, в долях ширины. */
+export function impulses(points: readonly Point[], fromUs: number, toUs: number): Impulse[] {
+  const span = toUs - fromUs;
+  if (span <= 0) return [];
+  const out: Impulse[] = [];
+  for (const point of points) {
+    if (point.monoUs < fromUs || point.monoUs > toUs) continue;
+    out.push({ x: (point.monoUs - fromUs) / span, height: impulseHeight(point.len) });
+  }
+  return out;
+}
+
+/** Плотность корзин → доли высоты дорожки; пустой журнал даёт нули. */
+export function densityBars(values: readonly number[], bins = DENSITY_BINS): number[] {
+  const out = new Array<number>(bins).fill(0);
+  const max = values.reduce((top, value) => Math.max(top, value), 0);
+  if (max <= 0) return out;
+  for (let index = 0; index < bins; index += 1) {
+    const value = values[index] ?? 0;
+    out[index] = Math.min(1, Math.max(0, value / max));
+  }
+  return out;
+}
+
+/** Доля ширины по координате указателя внутри области трассы. */
+export function fractionFromX(x: number, rect: { left: number; width: number }): number {
+  if (rect.width <= 0) return 0;
+  return Math.min(1, Math.max(0, (x - rect.left) / rect.width));
+}
+
+/** Рамка видимой области в долях ширины. */
+export interface BrushRect {
+  left: number;
+  width: number;
+}
+
+/** Рамка видимой области ленты; без окна — вся ширина. */
+export function frameRect(window: { start: number; end: number } | null): BrushRect {
+  if (window === null) return { left: 0, width: 1 };
+  const start = Math.min(1, Math.max(0, window.start));
+  const end = Math.min(1, Math.max(start, window.end));
+  return { left: start, width: end - start };
+}

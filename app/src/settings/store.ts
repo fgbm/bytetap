@@ -8,12 +8,14 @@
 import { reactive } from "vue";
 import { bridgeKind } from "../api/bridge";
 import type { SessionConfig } from "../api/types";
+import type { Encoding } from "../feed/bytes";
 import { applyTheme } from "../theme";
 import {
   defaultSettings,
   findProfile,
   normalizeSettings,
   removeProfile,
+  type FeedViewMode,
   type Profile,
   type Settings,
   type ThemeMode,
@@ -37,6 +39,7 @@ function snapshot(): Settings {
     config: { ...state.config },
     theme: state.theme,
     profiles: state.profiles.map((profile) => ({ ...profile, config: { ...profile.config } })),
+    feed: { ...state.feed },
   };
 }
 
@@ -63,6 +66,7 @@ export async function loadSettings(): Promise<void> {
   state.config = loaded.config;
   state.theme = loaded.theme;
   state.profiles = loaded.profiles;
+  state.feed = loaded.feed;
   state.loaded = true;
   applyTheme(state.theme);
 }
@@ -83,6 +87,18 @@ export function updateConfig(patch: Partial<SessionConfig>): void {
 export function setTheme(theme: ThemeMode): void {
   state.theme = theme;
   applyTheme(theme);
+  scheduleSave();
+}
+
+/** Вид ленты (текст или HEX) запоминается в настройках (FR-26, AC11). */
+export function setFeedView(view: FeedViewMode): void {
+  state.feed.view = view;
+  scheduleSave();
+}
+
+/** Кодировка отображения запоминается в настройках (FR-27, AC11). */
+export function setFeedEncoding(encoding: Encoding): void {
+  state.feed.encoding = encoding;
   scheduleSave();
 }
 
@@ -116,6 +132,8 @@ export function useSettings() {
     ensureLogDir,
     updateConfig,
     setTheme,
+    setFeedView,
+    setFeedEncoding,
     saveProfile,
     deleteProfile,
     applyProfile,

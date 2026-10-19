@@ -516,6 +516,150 @@ textarea {
   text-overflow: ellipsis;
 }
 
+/* Панель ленты: вид, кодировка, фильтр соединений, автопрокрутка */
+
+.bt-feed-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--bt-space-2);
+  flex-wrap: wrap;
+  padding: 7px var(--bt-space-3);
+  border-bottom: 1px solid var(--bt-border);
+}
+
+.bt-conns {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--bt-space-1);
+}
+
+.bt-conns button {
+  padding: 2px 7px;
+  border: 1px solid var(--bt-border);
+  border-radius: var(--bt-radius-record);
+  background: transparent;
+  color: var(--bt-text-muted);
+  font-family: var(--bt-font-mono);
+  font-size: var(--bt-text-2xs);
+  cursor: pointer;
+}
+
+.bt-conns button.on {
+  border-color: var(--bt-text);
+  background: var(--bt-text);
+  color: var(--bt-surface-0);
+}
+
+/* Плашки управляющих символов и метка автоответа (FR-22, FR-26) */
+
+.bt-cc {
+  display: inline-block;
+  margin: 0 1px;
+  padding: 0 4px;
+  border-radius: var(--bt-radius-chip);
+  background: var(--bt-ctrl-bg);
+  color: var(--bt-ctrl);
+  font-size: 10.5px;
+  line-height: 16px;
+  vertical-align: 1px;
+}
+
+.bt-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px dashed var(--bt-dir-l2a);
+  border-radius: var(--bt-radius-chip);
+  color: var(--bt-dir-l2a);
+  font-family: var(--bt-font-ui);
+  font-size: 10px;
+  line-height: 15px;
+  vertical-align: 1px;
+}
+
+/* HEX-дамп: смещение, байты с подсветкой управляющих, ASCII-колонка (AC5) */
+
+.bt-feed-hex {
+  display: grid;
+  grid-template-columns: 86px 18px 26px 44px 1fr 132px;
+  align-items: start;
+  gap: var(--bt-space-2);
+  padding: 3px var(--bt-space-3);
+  border-bottom: 1px solid var(--bt-border-faint);
+  font-size: var(--bt-text-xs);
+}
+
+.bt-feed-hex .o {
+  color: var(--bt-text-muted);
+}
+
+.bt-feed-hex .ar {
+  display: flex;
+  justify-content: center;
+  padding-top: 1px;
+}
+
+.bt-feed-hex .b {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  word-spacing: 2px;
+}
+
+.bt-feed-hex .b i {
+  font-style: normal;
+  color: var(--bt-ctrl);
+  font-weight: 500;
+}
+
+.bt-feed-hex .a {
+  color: var(--bt-text-muted);
+  white-space: pre;
+}
+
+.bt-feed-hex.a2l {
+  box-shadow: inset var(--bt-dir-width) 0 0 var(--bt-dir-a2l);
+}
+
+.bt-feed-hex.l2a {
+  box-shadow: inset var(--bt-dir-width) 0 0 var(--bt-dir-l2a);
+}
+
+.bt-feed-hex.a2l .ar {
+  color: var(--bt-dir-a2l);
+}
+
+.bt-feed-hex.l2a .ar {
+  color: var(--bt-dir-l2a);
+}
+
+.bt-feed-hex.syn {
+  background: repeating-linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--bt-dir-l2a) 9%, transparent) 0 6px,
+    transparent 6px 12px
+  );
+}
+
+.bt-feed-hex.ev .ar,
+.bt-feed-hex.ev .b,
+.bt-feed-hex.ev .a {
+  color: var(--bt-text-muted);
+}
+
+.bt-feed-hex.wn {
+  background: var(--bt-warn-bg);
+  box-shadow: inset var(--bt-dir-width) 0 0 var(--bt-warn);
+}
+
+.bt-feed-hex.wn .ar,
+.bt-feed-hex.wn .b,
+.bt-feed-hex.wn .a {
+  color: var(--bt-warn);
+}
+
 /* Трасса */
 
 .bt-trace {
