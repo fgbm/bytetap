@@ -9,6 +9,8 @@
 //!   идентификатор, `MSH-11` и `MSH-12` копируются из входящего (пустой `MSH-11` → `P`);
 //! - `MSH-9` ACK — `ACK` или `ACK<компонент><событие из MSH-9.2>`;
 //! - `MSA|AA|<MSH-10 входящего>` на разобранное сообщение, `MSA|AE|<MSH-10>` на неразбираемое;
+//! - неразбираемое сообщение, в котором найден `MSH` подтверждения, не подтверждается:
+//!   иначе ответ на ACK завёл бы петлю ACK↔ACK;
 //! - копируются только ASCII-поля: не-ASCII поле остаётся пустым и даёт [`ResponderEvent::Info`].
 
 use chrono::{DateTime, FixedOffset};
@@ -55,13 +57,21 @@ pub(crate) fn answer(message: &[u8], now: DateTime<FixedOffset>, ids: &ControlId
             events.push(ResponderEvent::Error {
                 message: problem.message,
             });
-            // Без MSH-10 подтверждать нечего: анализатор не сопоставит AE со своим сообщением.
-            Answer {
-                ack: problem
-                    .recovered
-                    .map(|recovered| build_ae(&recovered, now, ids, &mut events)),
-                events,
-            }
+            let ack = match problem.recovered {
+                // Найденный `MSH` сам оказался подтверждением: отвечать на него нельзя,
+                // иначе получилась бы петля ACK↔ACK (FR-16).
+                Some(recovered) if recovered.msh.is_acknowledgement() => {
+                    events.push(ResponderEvent::Info {
+                        message: "incoming ACK is not acknowledged".to_owned(),
+                    });
+                    None
+                }
+                // Без MSH-10 подтверждать нечего: анализатор не сопоставит AE со своим
+                // сообщением.
+                Some(recovered) => Some(build_ae(&recovered, now, ids, &mut events)),
+                None => None,
+            };
+            Answer { ack, events }
         }
     }
 }
@@ -322,6 +332,18 @@ fn build_ae(
     let receiving_facility = ae_field(msh.receiving_facility, "MSH-6", escape, events);
     let control_id = ae_field(msh.control_id, "MSH-10", escape, events);
     let version = ae_field(msh.version, "MSH-12", escape, events);
+    // `MSH-11` копируется, как в обычном ACK, если его можно перенести; иначе `P`:
+    // пустая процедура обработки выглядит как ошибка формата.
+    let processing_id = if !msh.processing_id.is_empty()
+        && msh
+            .processing_id
+            .iter()
+            .all(|byte| is_ascii_printable(*byte))
+    {
+        ae_field(msh.processing_id, "MSH-11", escape, events)
+    } else {
+        DEFAULT_PROCESSING_ID.to_vec()
+    };
 
     let mut out = Vec::with_capacity(128);
     out.extend_from_slice(b"MSH");
@@ -335,7 +357,7 @@ fn build_ae(
     push_field(&mut out, sep, b"");
     push_field(&mut out, sep, b"ACK");
     push_field(&mut out, sep, next_control_id(now, ids).as_bytes());
-    push_field(&mut out, sep, DEFAULT_PROCESSING_ID);
+    push_field(&mut out, sep, &processing_id);
     push_field(&mut out, sep, &version);
     out.extend_from_slice(b"\rMSA");
     push_field(&mut out, sep, b"AE");
@@ -624,6 +646,43 @@ mod tests {
         let answer = answer_of(b"PID|1||PATIENT^TEST\r");
         assert!(answer.ack.is_none());
         assert!(matches!(&answer.events[..], [ResponderEvent::Error { .. }]));
+    }
+
+    #[test]
+    fn an_unparsed_message_whose_msh_is_an_ack_is_not_answered() {
+        let answer = answer_of(
+            b"OBX|1\rMSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ACK^R01|ID1|P|2.3.1\r",
+        );
+        assert!(answer.ack.is_none(), "подтверждение не подтверждается");
+        assert!(
+            matches!(
+                &answer.events[..],
+                [
+                    ResponderEvent::Error { .. },
+                    ResponderEvent::Info { message }
+                ] if message.contains("incoming ACK")
+            ),
+            "{:?}",
+            answer.events
+        );
+    }
+
+    #[test]
+    fn ae_ack_copies_the_processing_id_of_the_recovered_msh() {
+        let (ack, _) = ack_of(
+            b"OBX|1\rMSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|MSG0011|T|2.3.1\r",
+        );
+        assert_eq!(
+            ack,
+            "MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK|BT261019101530000001|T|2.3.1\r\
+             MSA|AE|MSG0011\r"
+        );
+
+        // Не-ASCII `MSH-11` перенести нельзя: в ACK подставляется `P`, как и при пустом поле.
+        let (ack, _) = ack_of(
+            b"OBX|1\rMSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|MSG0012|\xe9|2.3.1\r",
+        );
+        assert!(ack.contains("|P|2.3.1\rMSA|AE|MSG0012\r"), "{ack:?}");
     }
 
     #[test]

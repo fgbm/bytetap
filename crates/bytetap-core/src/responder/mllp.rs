@@ -13,7 +13,7 @@
 //!   [`ResponderEvent::Error`]: бесконечно растущий буфер недопустим (NFR-5).
 //! - Подряд идущие `0x0B` с пустой рамкой — не ошибка: прибор мог начать сообщение заново.
 //! - При закрытии соединения [`Responder::finish`] сообщает о недособранной рамке и о хвосте
-//!   мусора вне неё: иначе они пропали бы из журнала молча.
+//!   мусора вне неё: иначе они пропали бы из журнала молча. Пустая рамка и здесь не ошибка.
 
 use crate::responder::hl7;
 use crate::responder::{Action, ControlIdSource, Now, Responder, ResponderEvent};
@@ -186,15 +186,19 @@ impl Responder for Hl7Mllp {
             }
         }
         if self.in_frame {
-            actions.push(
-                ResponderEvent::Error {
-                    message: format!(
-                        "incomplete MLLP frame at the end of the connection: {} bytes without 0x1C 0x0D",
-                        self.frame.len()
-                    ),
-                }
-                .into(),
-            );
+            // Пустая рамка (`0x0B` без единого байта данных) потерей не считается: как и
+            // подряд идущие `0x0B`, это прибор мог начать сообщение и передумать.
+            if !self.frame.is_empty() {
+                actions.push(
+                    ResponderEvent::Error {
+                        message: format!(
+                            "incomplete MLLP frame at the end of the connection: {} bytes without 0x1C 0x0D",
+                            self.frame.len()
+                        ),
+                    }
+                    .into(),
+                );
+            }
             self.frame.clear();
             self.in_frame = false;
         }
@@ -425,6 +429,16 @@ mod tests {
         let actions = responder.feed(&framed(MESSAGE), now());
         assert_eq!(sends(&actions).len(), 1);
         assert!(events(&actions).is_empty(), "{actions:?}");
+    }
+
+    #[test]
+    fn finish_after_a_lone_frame_start_is_not_an_error() {
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
+        assert!(responder.feed(b"\x0b", now()).is_empty());
+        assert!(
+            responder.finish(now()).is_empty(),
+            "пустая рамка — не потеря сообщения"
+        );
     }
 
     #[test]
