@@ -1,9 +1,11 @@
 //! Консольная версия bytetap.
 //!
-//! На M1 это работа с готовым журналом: `verify` проверяет журнал по схеме и печатает
-//! статистику, `note` дописывает комментарий инженера. `capture` появляется на шаге 3 этапа.
+//! `capture` записывает обмен: слушает порт, отвечает анализатору и пишет журнал.
+//! `verify` проверяет готовый журнал по схеме и печатает статистику, `note` дописывает
+//! комментарий инженера.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -12,8 +14,14 @@ use bytetap_core::journal::{
     self, Autoresponder, Data, Dir, Event, Host, Journal, LineErrorKind, Mode, MonoClock, Note,
     Session, now_rfc3339,
 };
+use bytetap_core::session::{Session as CaptureSession, SessionConfig};
+use chrono::DateTime;
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
+use tokio::sync::broadcast::error::RecvError;
+
+/// Сколько знаков поля `text` показывает лента `capture`.
+const FEED_WIDTH: usize = 120;
 
 /// JSON Schema формата, вшита в бинарь: проверка не зависит от файлов рядом и от сети (FR-24).
 const SCHEMA: &str = include_str!("../../../docs/public/schema/bytetap-session-1.schema.json");
@@ -28,6 +36,24 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Записать обмен: слушать порт, отвечать анализатору и писать журнал
+    Capture {
+        /// Адрес и порт прослушивания, например `0.0.0.0:5000`
+        #[arg(long, value_name = "ADDR")]
+        listen: SocketAddr,
+        /// Профиль автоответчика: `hl7` — HL7/MLLP, `none` — без ответов
+        #[arg(long, value_name = "PROFILE", value_parser = ["hl7", "none"])]
+        responder: String,
+        /// Папка журналов вместо папки по умолчанию
+        #[arg(long, value_name = "DIR")]
+        log_dir: Option<PathBuf>,
+        /// Модель анализатора для заголовка журнала
+        #[arg(long, value_name = "TEXT")]
+        analyzer: Option<String>,
+        /// Комментарий инженера для заголовка журнала
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
     /// Проверить журнал сессии по схеме и напечатать статистику
     Verify {
         /// Файл журнала `*.jsonl`
@@ -55,6 +81,13 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Command::Capture {
+            listen,
+            responder,
+            log_dir,
+            analyzer,
+            note,
+        } => capture(listen, &responder, log_dir, analyzer, note),
         Command::Verify { file } => verify(&file),
         Command::Note { file, text } => note(&file, &text),
         Command::StressJournal { out, max_seconds } => stress_journal(&out, max_seconds),
@@ -72,6 +105,154 @@ const KINDS: [&str; 8] = [
     "note",
     "session_end",
 ];
+
+/// `bytetap-cli capture`: слушает порт, отвечает анализатору, пишет журнал и печатает
+/// ленту до Ctrl+C (FR-1, FR-4, M1-AC15).
+fn capture(
+    listen: SocketAddr,
+    responder: &str,
+    log_dir: Option<PathBuf>,
+    analyzer: Option<String>,
+    note: Option<String>,
+) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("ошибка: не удалось запустить runtime: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let result = runtime.block_on(async move {
+        let mut config = SessionConfig::new(listen).with_responder(match responder {
+            "hl7" => Autoresponder::Hl7Mllp,
+            _ => Autoresponder::None,
+        });
+        if let Some(dir) = log_dir {
+            config = config.with_log_dir(dir);
+        }
+        if let Some(analyzer) = analyzer {
+            config = config.with_analyzer(analyzer);
+        }
+        if let Some(note) = note {
+            config = config.with_note(note);
+        }
+
+        let handle = CaptureSession::start(config).await?;
+        let path = handle.journal_path().to_path_buf();
+        println!("Журнал: {}", path.display());
+        println!("Слушаю {} (Ctrl+C — остановка)", handle.local_addr());
+        if let Some(warning) = handle.log_dir_warning() {
+            println!("Внимание: {warning}");
+        }
+        println!("Лента:");
+
+        let mut events = handle.subscribe();
+        let interrupt = tokio::signal::ctrl_c();
+        tokio::pin!(interrupt);
+        loop {
+            tokio::select! {
+                _ = &mut interrupt => {
+                    println!("\nОстановка…");
+                    break;
+                }
+                received = events.recv() => match received {
+                    Ok(event) => print_event(&event),
+                    Err(RecvError::Lagged(skipped)) => println!(
+                        "… лента отстала: пропущено событий {skipped}, в журнале они есть"
+                    ),
+                    Err(RecvError::Closed) => break,
+                },
+            }
+        }
+
+        let stats = handle.stop().await?;
+        // Сессия успела разослать последние события до остановки — показываем и их.
+        while let Ok(event) = events.try_recv() {
+            print_event(&event);
+        }
+        println!(
+            "Соединений: {}, байты: {} {}, {} {}",
+            stats.connections,
+            Dir::AnalyzerToLis.as_str(),
+            stats.bytes_analyzer_to_lis,
+            Dir::LisToAnalyzer.as_str(),
+            stats.bytes_lis_to_analyzer
+        );
+        println!("Журнал: {}", path.display());
+        Ok::<(), std::io::Error>(())
+    });
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("ошибка: запись прервана: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Строка ленты для события (M1-AC15, FR-26).
+fn print_event(event: &Event) {
+    match event {
+        Event::Open(open) => println!(
+            "{} ── #{} подключён {}",
+            feed_time(&open.t),
+            open.conn,
+            open.peer
+        ),
+        Event::Data(data) => {
+            let arrow = match data.dir {
+                Dir::AnalyzerToLis => "→",
+                Dir::LisToAnalyzer => "←",
+            };
+            let mark = if data.synthetic { " [авто]" } else { "" };
+            println!(
+                "{} {arrow} #{}{mark} {}",
+                feed_time(&data.t),
+                data.conn,
+                shorten(&data.text)
+            );
+        }
+        Event::Close(close) => println!(
+            "{} ── #{} закрыт: {} ({})",
+            feed_time(&close.t),
+            close.conn,
+            close.by,
+            close.reason
+        ),
+        Event::Error(error) => match error.conn {
+            Some(conn) => println!("{} !! #{} {}", feed_time(&error.t), conn, error.message),
+            None => println!("{} !! {}", feed_time(&error.t), error.message),
+        },
+        Event::Info(info) => match info.conn {
+            Some(conn) => println!("{} .. #{} {}", feed_time(&info.t), conn, info.message),
+            None => println!("{} .. {}", feed_time(&info.t), info.message),
+        },
+        Event::Session(_) | Event::Note(_) | Event::SessionEnd(_) => {}
+    }
+}
+
+/// Время события для ленты: `HH:MM:SS.mmm`.
+fn feed_time(t: &str) -> String {
+    DateTime::parse_from_rfc3339(t).map_or_else(
+        |_| t.to_owned(),
+        |moment| moment.format("%H:%M:%S%.3f").to_string(),
+    )
+}
+
+/// Обрезает `text` до ширины ленты.
+fn shorten(text: &str) -> String {
+    if text.chars().count() <= FEED_WIDTH {
+        return text.to_owned();
+    }
+    let mut short: String = text.chars().take(FEED_WIDTH).collect();
+    short.push('…');
+    short
+}
 
 /// `bytetap-cli verify`: проверка каждой строки по схеме и краткая статистика (M1-AC1, M1-AC15).
 fn verify(file: &Path) -> ExitCode {
@@ -326,5 +507,59 @@ mod tests {
     fn stress_command_is_hidden_from_help() {
         let help = Cli::command().render_help().to_string();
         assert!(!help.contains("_stress-journal"), "{help}");
+    }
+
+    #[test]
+    fn capture_takes_a_listen_address_and_a_known_responder() {
+        let capture = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--listen",
+            "127.0.0.1:0",
+            "--responder",
+            "hl7",
+            "--note",
+            "синтетическая сессия",
+        ]);
+        assert!(capture.is_ok(), "{:?}", capture.err());
+
+        for responder in ["hl7", "none"] {
+            let parsed = Cli::try_parse_from([
+                "bytetap-cli",
+                "capture",
+                "--listen",
+                "127.0.0.1:0",
+                "--responder",
+                responder,
+            ]);
+            assert!(parsed.is_ok(), "{responder}: {:?}", parsed.err());
+        }
+        let unsupported = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--listen",
+            "127.0.0.1:0",
+            "--responder",
+            "astm",
+        ]);
+        assert!(unsupported.is_err(), "в M1 доступны только hl7 и none");
+
+        let without_responder =
+            Cli::try_parse_from(["bytetap-cli", "capture", "--listen", "127.0.0.1:0"]);
+        assert!(without_responder.is_err(), "--responder обязателен");
+    }
+
+    #[test]
+    fn feed_shows_the_time_and_shortens_long_text() {
+        assert_eq!(
+            feed_time("2026-10-19T10:15:03.000512+03:00"),
+            "10:15:03.000"
+        );
+        assert_eq!(feed_time("не время"), "не время");
+        assert_eq!(shorten("abc"), "abc");
+        let long = "x".repeat(FEED_WIDTH + 10);
+        let short = shorten(&long);
+        assert_eq!(short.chars().count(), FEED_WIDTH + 1);
+        assert!(short.ends_with('…'));
     }
 }

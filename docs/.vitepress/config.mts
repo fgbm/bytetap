@@ -30,6 +30,7 @@ export default defineConfig({
             { text: "WebView2", link: "/guide/webview2" },
             { text: "Первый запуск", link: "/guide/first-run" },
             { text: "Режимы работы", link: "/guide/modes" },
+            { text: "Запуск из командной строки", link: "/guide/cli" },
             { text: "Брандмауэр", link: "/guide/firewall" },
             { text: "Персональные данные", link: "/guide/personal-data" },
             { text: "Проблемы", link: "/guide/troubleshooting" },

@@ -7,6 +7,7 @@
 - [WebView2](/guide/webview2)
 - [Первый запуск](/guide/first-run)
 - [Режимы работы](/guide/modes)
+- [Запуск из командной строки](/guide/cli)
 - [Брандмауэр](/guide/firewall)
 - [Персональные данные](/guide/personal-data)
 - [Проблемы](/guide/troubleshooting)
