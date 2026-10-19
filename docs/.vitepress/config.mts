@@ -70,6 +70,29 @@ export default defineConfig({
     },
     search: {
       provider: "local",
+      options: {
+        translations: {
+          button: {
+            buttonText: "Поиск",
+            buttonAriaLabel: "Поиск по документации",
+          },
+          modal: {
+            displayDetails: "Показать подробный список",
+            resetButtonTitle: "Сбросить поиск",
+            backButtonTitle: "Закрыть поиск",
+            noResultsText: "Ничего не найдено по запросу",
+            footer: {
+              selectText: "выбрать",
+              selectKeyAriaLabel: "Enter",
+              navigateText: "перейти",
+              navigateUpKeyAriaLabel: "Стрелка вверх",
+              navigateDownKeyAriaLabel: "Стрелка вниз",
+              closeText: "закрыть",
+              closeKeyAriaLabel: "Esc",
+            },
+          },
+        },
+      },
     },
     outline: {
       level: [2, 3],
@@ -82,9 +105,19 @@ export default defineConfig({
     lastUpdated: {
       text: "Обновлено",
     },
+    notFound: {
+      title: "Страница не найдена",
+      quote: "Такой страницы нет или она переехала. Проверьте адрес или вернитесь на главную.",
+      linkLabel: "перейти на главную",
+      linkText: "главная",
+    },
     returnToTopLabel: "Наверх",
+    skipToContentLabel: "Перейти к содержимому",
     sidebarMenuLabel: "Меню",
     darkModeSwitchLabel: "Тема",
+    lightModeSwitchTitle: "Включить светлую тему",
+    darkModeSwitchTitle: "Включить тёмную тему",
+    langMenuLabel: "Сменить язык",
     footer: {
       message: "Лицензия MIT",
       copyright: "bytetap",
