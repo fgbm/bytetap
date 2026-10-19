@@ -18,6 +18,10 @@ export default defineConfig({
     },
   },
   clearScreen: false,
+  build: {
+    // CSP `font-src 'self'` без `data:`: шрифты идут отдельными файлами, не data-URL.
+    assetsInlineLimit: (filePath: string) => (filePath.endsWith(".woff") || filePath.endsWith(".woff2") ? false : undefined),
+  },
   server: {
     port: 1420,
     strictPort: true,
