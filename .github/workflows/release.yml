@@ -6,60 +6,84 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  windows:
-    name: windows-x64
+  build:
+    name: build
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 22
-          cache: npm
+          package-manager-cache: false
 
       - name: Установить Rust из rust-toolchain.toml
-        run: rustup show
-
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-release-cargo-
+        run: |
+          rustup toolchain install
+          rustc -V
 
       - run: npm ci
+
+      - name: Сверить тег с версией
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "в корневом Cargo.toml не найден [workspace.package] version" }
+          $expected = "v" + $match.Matches[0].Groups[1].Value
+          if ($env:TAG -ne $expected) { throw "тег $env:TAG не совпадает с версией $expected" }
 
       - name: Сборка exe без установщика
         run: npm run tauri build -- --no-bundle
 
       - name: zip и SHA256SUMS
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $name = "bytetap-$tag-windows-x64"
+          $name = "bytetap-$env:TAG-windows-x64"
           New-Item -ItemType Directory -Path staging | Out-Null
           Copy-Item target/release/bytetap.exe staging/
           Copy-Item README.md, LICENSE staging/
-          Compress-Archive -Path staging/* -DestinationPath "$name.zip"
-          $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLower()
+          Compress-Archive -Path staging/* -DestinationPath "dist-$name.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist-$name.zip").Hash.ToLower()
           "$hash  $name.zip" | Out-File -FilePath SHA256SUMS -Encoding ascii
           Get-ChildItem staging | Select-Object Name, Length
 
-      - name: Черновик релиза
-        uses: softprops/action-gh-release@v3
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          draft: true
-          name: bytetap ${{ github.ref_name }}
-          generate_release_notes: true
-          files: |
-            bytetap-*-windows-x64.zip
+          name: bytetap-release
+          path: |
+            dist-*.zip
             SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: bytetap-release
+          path: dist
+
+      - name: Черновик релиза
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$TAG" --draft --verify-tag --generate-notes --title "bytetap $TAG" dist/dist-*.zip dist/SHA256SUMS
