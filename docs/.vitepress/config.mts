@@ -63,6 +63,10 @@ export default defineConfig({
                   text: "M1 — ядро: TCP-сервер, журнал, автоответчик HL7/MLLP",
                   link: "/dev/stages/M1",
                 },
+                {
+                  text: "M2 — интерфейс: настройки, старт/стоп, живая лента",
+                  link: "/dev/stages/M2",
+                },
               ],
             },
             { text: "Архитектура", link: "/dev/architecture" },

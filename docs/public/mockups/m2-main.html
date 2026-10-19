@@ -1,0 +1,157 @@
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>bytetap M2 — макеты главного экрана</title><style>
+:root{--radius:6px;--border:#d0d5db;--primary:#0f1418;--primary-foreground:#fff;--foreground:#0f1418;--muted-foreground:#5f6873}
+body{margin:24px auto;max-width:1100px;padding:0 16px;font-family:system-ui,sans-serif;color:var(--foreground)}
+*{box-sizing:border-box}
+.page{display:flex;flex-direction:column;gap:14px}
+.ctl{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.ctl button{font:inherit;font-size:13px;padding:6px 11px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--foreground);cursor:pointer}
+.ctl button.on{background:var(--primary);color:var(--primary-foreground);border-color:var(--primary)}
+.ctl .sep{flex:1}
+.cap{font-size:13px;color:var(--muted-foreground);margin:0}
+.cap b{color:var(--foreground);font-weight:600}
+.app[data-theme=light]{--s0:#ffffff;--s1:#f6f7f9;--tr:#f6f7f9;--ln:#e2e5e9;--lf:#eef0f2;--t:#0f1418;--mu:#5f6873;--a2l:#0a7d4f;--l2a:#b4530a;--cc:#2f3fbf;--ccb:#eceffd;--er:#c01f2f;--rec:#ef3b2d;--recb:#0f1418;--recf:#fff;--warn:#8a5a00;--warnb:#fff6e0}
+.app[data-theme=dark]{--s0:#0d1013;--s1:#13181d;--tr:#0a0d10;--ln:#252d36;--lf:#1a2027;--t:#dde4ea;--mu:#7d8995;--a2l:#3ee08f;--l2a:#ffb23e;--cc:#8fb4ff;--ccb:#1b2638;--er:#ff6464;--rec:#ff4d4d;--recb:#2a1416;--recf:#ffc2c2;--warn:#ffcf66;--warnb:#2a2210}
+.app{--ui:'IBM Plex Sans','Segoe UI',system-ui,sans-serif;--mono:'IBM Plex Mono','Cascadia Mono',Consolas,monospace;font-family:var(--ui);color:var(--t);background:var(--s0);border:1px solid var(--ln);border-radius:10px;overflow:hidden;font-size:13px}
+.ic{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.top{display:flex;align-items:center;gap:8px;padding:9px 12px;background:var(--s1);border-bottom:1px solid var(--ln);flex-wrap:wrap}
+.brand{font-family:var(--mono);font-weight:600;letter-spacing:-.02em;display:flex;align-items:center;gap:6px}
+.brand i{width:8px;height:8px;border-radius:2px;background:var(--a2l);box-shadow:5px 0 0 var(--l2a)}
+.brand span{margin-left:6px}
+.sp{flex:1}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:6px;border:1px solid var(--ln);background:var(--s0);color:var(--t);font:inherit;font-size:12.5px;white-space:nowrap}
+.btn.ghost{background:transparent;color:var(--mu)}
+.ib{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:6px;border:1px solid var(--ln);color:var(--mu);background:transparent;cursor:pointer}
+.rec{display:inline-flex;align-items:center;gap:8px;padding:7px 16px 7px 12px;border-radius:999px;background:var(--recb);color:var(--recf);border:0;font:inherit;font-weight:600}
+.rec.big{padding:10px 22px 10px 16px;font-size:14px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--rec)}
+.dot.live{animation:p 1.6s infinite}
+@keyframes p{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--rec) 60%,transparent)}70%{box-shadow:0 0 0 8px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:4px 8px;border-radius:6px;border:1px solid var(--ln);color:var(--mu);font-family:var(--mono);white-space:nowrap}
+.chip b{color:var(--t);font-weight:500}
+.seg{display:inline-flex;border:1px solid var(--ln);border-radius:6px;overflow:hidden;font-size:12px;flex-wrap:wrap}
+.seg span{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;color:var(--mu);border-right:1px solid var(--ln)}
+.seg span:last-child{border-right:0}
+.seg span.on{background:var(--lf);color:var(--t);font-weight:500}
+.seg span.off{opacity:.45}
+.seg small{font-size:10px;font-family:var(--mono)}
+.cfg{padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px 16px;border-bottom:1px solid var(--ln)}
+.f{display:flex;flex-direction:column;gap:5px}
+.f.w{grid-column:1/-1}
+.f label{font-size:11.5px;color:var(--mu);font-weight:500}
+.in{display:flex;align-items:center;gap:6px;border:1px solid var(--ln);border-radius:6px;padding:6px 9px;background:var(--s0);min-height:32px}
+.in.err{border-color:var(--er);box-shadow:0 0 0 3px color-mix(in srgb,var(--er) 15%,transparent)}
+.in .ph{color:var(--mu)}
+.in .cv{margin-left:auto;color:var(--mu);display:flex}
+.row2{display:flex;gap:8px}
+.row2 .in:first-child{flex:1}
+.hint{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-radius:8px;background:var(--s1);border:1px solid var(--ln);font-size:12.5px;line-height:1.6}
+.hint .ic{margin-top:3px;color:var(--cc)}
+.addr{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);background:var(--s0);border:1px solid var(--ln);border-radius:6px;padding:1px 6px;margin:2px 4px 2px 0;font-size:12px}
+.addr .ic{width:12px;height:12px;color:var(--mu);margin:0}
+.ferr{color:var(--er);font-size:12px;display:flex;gap:5px;align-items:flex-start}
+.ferr .ic{width:13px;height:13px;margin-top:2px}
+.actions{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--ln);flex-wrap:wrap}
+.muted{color:var(--mu);font-size:12px}
+.trace{padding:9px 12px 7px;border-bottom:1px solid var(--ln);background:var(--tr);position:relative}
+.lane{display:flex;align-items:center;gap:8px;height:18px}
+.lane label{display:flex;align-items:center;gap:4px;width:118px;font-size:11px;color:var(--mu);font-family:var(--mono);white-space:nowrap}
+.lane label .ic{width:12px;height:12px}
+.lane svg.w{flex:1;height:18px;overflow:visible}
+.trace .idle{position:absolute;right:14px;top:50%;transform:translateY(-50%);font-size:11px;color:var(--mu);font-family:var(--mono);background:var(--tr);padding:0 6px}
+.brush{position:absolute;top:4px;bottom:4px;border:1.5px solid var(--cc);border-radius:4px;background:color-mix(in srgb,var(--cc) 8%,transparent)}
+.fbar{display:flex;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid var(--ln);flex-wrap:wrap}
+.feed{font-family:var(--mono);font-size:12.5px;min-height:120px}
+.r{display:grid;grid-template-columns:86px 18px 26px 1fr;align-items:center;gap:8px;padding:0 12px;height:28px;border-bottom:1px solid var(--lf)}
+.r .ts{color:var(--mu)}
+.r .cn{color:var(--mu);font-size:11px}
+.r .ar{display:flex;justify-content:center}
+.r.a2l{box-shadow:inset 3px 0 0 var(--a2l)} .r.a2l .ar{color:var(--a2l)}
+.r.l2a{box-shadow:inset 3px 0 0 var(--l2a)} .r.l2a .ar{color:var(--l2a)}
+.r.syn{background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--l2a) 9%,transparent) 0 6px,transparent 6px 12px)}
+.r.ev .ar,.r.ev .pl{color:var(--mu)}
+.r.wn{background:var(--warnb);box-shadow:inset 3px 0 0 var(--warn)} .r.wn .ar,.r.wn .pl{color:var(--warn)}
+.pl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cc{display:inline-block;padding:0 4px;margin:0 1px;border-radius:4px;background:var(--ccb);color:var(--cc);font-size:10.5px;line-height:16px;vertical-align:1px}
+.tag{display:inline-flex;align-items:center;gap:3px;font-size:10px;padding:0 5px;border-radius:4px;border:1px dashed var(--l2a);color:var(--l2a);margin-left:6px;font-family:var(--ui);vertical-align:1px;line-height:15px}
+.tag .ic{width:11px;height:11px}
+.hex{font-family:var(--mono);font-size:12px}
+.hx{display:grid;grid-template-columns:86px 18px 26px 44px 1fr 132px;gap:8px;padding:3px 12px;border-bottom:1px solid var(--lf);align-items:start}
+.hx .o{color:var(--mu)}
+.hx .b{word-spacing:2px}
+.hx .b i{font-style:normal;color:var(--cc);font-weight:500}
+.hx .a{color:var(--mu);white-space:pre}
+.hx.a2l{box-shadow:inset 3px 0 0 var(--a2l)}.hx.a2l .ar{color:var(--a2l)}
+.hx.l2a{box-shadow:inset 3px 0 0 var(--l2a)}.hx.l2a .ar{color:var(--l2a)}
+.hx .ar{display:flex;justify-content:center;padding-top:1px}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;padding:28px 12px;color:var(--mu);text-align:center;font-family:var(--ui);font-size:12.5px}
+.empty b{color:var(--t);font-size:13.5px;font-weight:600}
+.status{display:flex;gap:14px;padding:7px 12px;font-size:11.5px;color:var(--mu);background:var(--s1);border-top:1px solid var(--ln);flex-wrap:wrap;font-family:var(--mono);align-items:center}
+.status span{display:inline-flex;align-items:center;gap:5px}.status b{color:var(--t);font-weight:500}
+.status .ic{width:13px;height:13px}
+.ban{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;font-size:12.5px;line-height:1.5;border-bottom:1px solid var(--ln)}
+.ban .ic{margin-top:2px}
+.ban.pd{background:var(--warnb);color:var(--t)} .ban.pd .ic{color:var(--warn)}
+.ban.err{background:color-mix(in srgb,var(--er) 10%,var(--s0))} .ban.err .ic{color:var(--er)}
+.ban.err b{color:var(--er)}
+.ban .acts{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+.file{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--ln);flex-wrap:wrap}
+.file .nm{font-family:var(--mono);font-weight:500}
+.ro{font-size:10.5px;padding:1px 6px;border-radius:4px;background:var(--lf);color:var(--mu)}
+.meta{display:flex;flex-wrap:wrap;gap:4px 16px;padding:8px 12px;border-bottom:1px solid var(--ln);font-size:12px;color:var(--mu)}
+.meta b{color:var(--t);font-weight:500}
+.cf{display:inline-flex;gap:4px;flex-wrap:wrap}
+.cf span{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:999px;border:1px solid var(--ln);color:var(--mu)}
+.cf span.on{background:var(--t);color:var(--s0);border-color:var(--t)}
+.mb{margin:14px;border:1px solid #c8c8c8;border-radius:8px;overflow:hidden;font-family:'Segoe UI',system-ui,sans-serif;background:#fff;color:#1b1b1b;max-width:460px;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+.mb .h{padding:8px 12px;font-size:12px;border-bottom:1px solid #e5e5e5}
+.mb .bd{padding:16px;display:flex;gap:12px;font-size:13px;line-height:1.5}
+.mb .bd .ic{width:28px;height:28px;color:#c42b1c}
+.mb .ft{background:#f3f3f3;padding:10px 12px;display:flex;justify-content:flex-end;gap:8px}
+.mb .ft span{padding:4px 16px;border:1px solid #c8c8c8;border-radius:4px;background:#fff;font-size:12px}
+.mb .ft span.p{background:#005fb8;color:#fff;border-color:#005fb8}
+.stack{display:flex;flex-direction:column;gap:14px;padding:14px;background:var(--s1)}
+.card{border:1px solid var(--ln);border-radius:10px;overflow:hidden;background:var(--s0)}
+.ct{font-size:11px;color:var(--mu);font-family:var(--mono);padding:6px 12px;border-bottom:1px solid var(--ln);background:var(--s1);text-transform:uppercase;letter-spacing:.04em}
+.notes{font-size:12.5px;line-height:1.55;margin:0;padding-left:18px;color:var(--muted-foreground)}
+.notes b{color:var(--foreground)}
+</style></head><body><div class="page">
+<div class="ctl" id="tabs"></div>
+<div class="ctl"><span class="cap" id="cap"></span><span class="sep"></span><button id="th">Тема</button></div>
+<div class="app" data-theme="light" id="app"></div>
+<ol class="notes" id="notes"></ol>
+</div>
+<script>
+(function(){
+var L={arrowRight:'<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',arrowLeft:'<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>',plug:'<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',alert:'<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>',tri:'<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',bot:'<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>',square:'<rect width="18" height="18" x="3" y="3" rx="2"/>',server:'<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',network:'<rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/>',usb:'<circle cx="10" cy="7" r="1"/><circle cx="4" cy="20" r="1"/><path d="M4.7 19.3 19 5"/><path d="m21 3-3 1 2 2Z"/><path d="M9.26 7.68 5 12l2 5"/><path d="m10 14 5 2 3.5-3.5"/><path d="m18 12 1-1 1 1-1 1Z"/>',folder:'<path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/>',file:'<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>',sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',moon:'<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',save:'<path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/>',copy:'<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',info:'<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',chev:'<path d="m6 9 6 6 6-6"/>',down:'<path d="M12 17V3"/><path d="m6 11 6 6 6-6"/><path d="M19 21H5"/>',pen:'<path d="M12 20h9"/><path d="M16.376 3.622a1 1 0 0 1 3.002 3.002L7.368 18.635a2 2 0 0 1-.855.506l-2.872.838a.5.5 0 0 1-.62-.62l.838-2.872a2 2 0 0 1 .506-.854z"/>',x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',refresh:'<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>'};
+function I(n){return '<svg class="ic" viewBox="0 0 24 24">'+L[n]+'</svg>';}
+function C(s){return s.replace(/<(STX|ETX|CR|LF|VT|FS|ENQ|ACK|EOT)>/g,'<span class="cc">$1</span>');}
+function topbar(extra){return '<div class="top"><span class="brand"><i></i><span>bytetap</span></span>'+(extra||'')+'<span class="sp"></span><span class="btn ghost">'+I('file')+'Открыть журнал</span><span class="btn ghost">'+I('folder')+'Папка журналов</span><span class="ib thm"></span></div>';}
+var sig1='M0 15 L60 15 L62 4 L66 4 L68 15 L180 15 L182 2 L190 2 L192 15 L196 15 L198 6 L201 6 L203 15 L380 15 L382 3 L394 3 L396 15 L560 15 L562 5 L570 5 L572 15 L600 15';
+var sig2='M0 15 L69 15 L70 9 L72 9 L73 15 L193 15 L194 9 L196 15 L204 15 L205 9 L207 15 L397 15 L398 9 L400 15 L573 15 L574 9 L576 15 L600 15';
+function trace(a,b,over){return '<div class="trace"><div class="lane"><label>'+I('arrowRight')+'анализатор→ЛИС</label><svg class="w" viewBox="0 0 600 18" preserveAspectRatio="none"><path d="'+a+'" fill="none" stroke="var(--a2l)" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg></div><div class="lane"><label>'+I('arrowLeft')+'ЛИС→анализатор</label><svg class="w" viewBox="0 0 600 18" preserveAspectRatio="none"><path d="'+b+'" fill="none" stroke="var(--l2a)" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg></div>'+(over||'')+'</div>';}
+function R(cls,ts,ic,cn,txt){return '<div class="r '+cls+'"><span class="ts">'+ts+'</span><span class="ar">'+I(ic)+'</span><span class="cn">'+cn+'</span><span class="pl">'+txt+'</span></div>';}
+var rows=[R('ev','10:15:00.981','plug','#1','подключился 192.168.1.50:49152 → :5000'),R('a2l','10:15:03.000','arrowRight','#1',C('<VT>MSH|^~\\&amp;|ANALYZER|LAB|LIS||20261019101503||ORU^R01|MSG0001|P|2.3.1<CR>PID|1||000123||PATIENT^TEST…')),R('a2l','10:15:03.002','arrowRight','#1',C('OBX|1|NM|GLU^Глюкоза||5.4|mmol/L|3.9-6.1|N|||F<CR><FS><CR>')),R('l2a syn','10:15:03.004','arrowLeft','#1',C('<VT>MSH|^~\\&amp;|LIS||ANALYZER|LAB|20261019101503||ACK^R01|BT2610191015030001|P|2.3.1<CR>MSA|AA|MSG0001<CR><FS><CR>')+'<span class="tag">'+I('bot')+'автоответ</span>'),R('a2l','10:15:11.120','arrowRight','#1',C('<VT>MSH|^~\\&amp;|ANALYZER|LAB|LIS||20261019101511||QRY^Q02|MSG0002|P|2.3.1<CR>QRD|…'))];
+function statusbar(extra){return '<div class="status"><span>'+I('plug')+'соединений <b>1</b></span><span>'+I('arrowRight')+'<b>10 240 Б</b></span><span>'+I('arrowLeft')+'<b>512 Б</b></span>'+(extra||'')+'<span class="sp"></span><span>'+I('folder')+'…\\Documents\\bytetap\\bytetap-20261019-101500-tcp_server.jsonl</span></div>';}
+function fbar(v){return '<div class="fbar"><div class="seg"><span class="'+(v==='t'?'on':'')+'">Текст</span><span class="'+(v==='h'?'on':'')+'">HEX</span></div><div class="seg"><span>ASCII</span><span class="on">CP1251</span><span>UTF-8</span><span>GBK</span><span>Latin-1</span></div><span class="sp"></span><span class="cf"><span class="on">все</span><span>#1</span></span><span class="btn ghost">'+I('down')+'Автопрокрутка</span></div>';}
+function modes(on){var m=[['srv','server','Вместо ЛИС · TCP-сервер'],['cli','network','TCP-клиент'],['com','usb','COM-порт']];return '<div class="f w"><label>Режим</label><div class="seg">'+m.map(function(x){return '<span class="'+(x[0]===on?'on':'')+'">'+I(x[1])+x[2]+'</span>';}).join('')+'<span class="off">Прокси <small>v0.2</small></span><span class="off">Прослушка COM <small>v0.3</small></span></div></div>';}
+var resp='<div class="f"><label>Автоответ</label><div class="seg"><span class="on">Авто</span><span>HL7/MLLP</span><span>ASTM</span><span>Без ответов</span></div></div>';
+function profile(name){return '<span class="sp"></span><div class="in" style="min-width:200px">Профиль: '+name+'<span class="cv">'+I('chev')+'</span></div><span class="btn">'+I('save')+'Сохранить профиль</span>';}
+var recbtn='<button class="rec" style="margin-left:10px"><span class="dot live"></span>'+I('square')+'Стоп <span class="mono">00:14:07</span></button>';
+function hx(cls,ts,ic,o,bytes,asc){return '<div class="hx '+cls+'"><span class="o">'+ts+'</span><span class="ar">'+(ic?I(ic):'')+'</span><span class="o">#1</span><span class="o">'+o+'</span><span class="b">'+bytes+'</span><span class="a">'+asc+'</span></div>';}
+var V={};
+V.idle={t:'1 · Готов к старту',cap:'<b>Готов к старту.</b> Подставлены последние настройки; подсказка с адресами ноутбука — что ввести в анализатор.',html:function(){return topbar()+'<div class="cfg">'+modes('srv')+'<div class="f"><label>Слушать на</label><div class="row2"><div class="in">Все интерфейсы<span class="cv">'+I('chev')+'</span></div><div class="in mono" style="width:76px">5000</div></div></div>'+resp+'<div class="f"><label>Анализатор</label><div class="in"><span class="ph">модель, серийный номер</span></div></div><div class="f"><label>Комментарий</label><div class="in"><span class="ph">что прогоняете</span></div></div><div class="f w"><div class="hint">'+I('info')+'<div>В настройках анализатора укажите адрес ЛИС — один из адресов этого ноутбука и порт 5000:<br><span class="addr">192.168.1.10'+I('copy')+'</span><span class="muted">Ethernet</span> &nbsp; <span class="addr">10.0.0.5'+I('copy')+'</span><span class="muted">Wi-Fi</span><br><span class="muted">При первом старте Windows спросит разрешение брандмауэра — разрешите для частных сетей.</span></div></div></div></div><div class="actions"><button class="rec big"><span class="dot"></span>Старт</button><span class="muted">Журнал → …\\Documents\\bytetap</span>'+profile('последние настройки')+'</div>'+trace('M0 15 L600 15','M0 15 L600 15','<span class="idle">тишина</span>')+'<div class="feed"><div class="empty"><b>Здесь появится обмен</b>Нажмите «Старт», затем запустите передачу на анализаторе.</div></div>';}};
+V.com={t:'1б · COM-порт',cap:'<b>Режим COM-порт.</b> Порты с понятными именами (FR-12); часто меняемое наверху, остальное — в свёрнутой строке.',html:function(){return topbar()+'<div class="cfg">'+modes('com')+'<div class="f"><label>Порт</label><div class="row2"><div class="in">USB-SERIAL CH340 (COM5)<span class="cv">'+I('chev')+'</span></div><span class="ib">'+I('refresh')+'</span></div></div><div class="f"><label>Скорость · формат</label><div class="row2"><div class="in mono">9600<span class="cv">'+I('chev')+'</span></div><div class="in mono" style="width:84px">8N1<span class="cv">'+I('chev')+'</span></div></div></div>'+resp+'<div class="f w"><span class="muted">Дополнительно: управление потоком <b class="mono">нет</b> · DTR <b class="mono">вкл</b> · RTS <b class="mono">вкл</b></span></div></div><div class="actions"><button class="rec big"><span class="dot"></span>Старт</button>'+profile('Анализатор X, COM5')+'</div>';}};
+V.rec={t:'2 · Запись',cap:'<b>Идёт запись.</b> Настройки сворачиваются в чипы; трасса — последние ~60 с, лента — последние 10 000 фрагментов.',html:function(){return topbar(recbtn+'<span class="chip">'+I('server')+'TCP-сервер <b>:5000</b></span><span class="chip">'+I('bot')+'<b>HL7/MLLP</b> (авто)</span>')+trace(sig1,sig2)+fbar('t')+'<div class="feed">'+rows.join('')+'</div>'+statusbar('<span class="btn ghost" style="padding:1px 6px">'+I('pen')+'Комментарий</span>');}};
+V.hex={t:'3 · HEX',cap:'<b>Вид HEX.</b> Фрагмент разворачивается в дамп по 16 байт; управляющие байты подсвечены тем же цветом, что плашки.',html:function(){return topbar(recbtn)+trace(sig1,sig2)+fbar('h')+'<div class="hex">'+hx('a2l','10:15:03.000','arrowRight','0000','<i>0B</i> 4D 53 48 7C 5E 7E 5C 26 7C 41 4E 41 4C 59 5A','.MSH|^~\\&amp;|ANALYZ')+hx('a2l','','','0010','45 52 7C 4C 41 42 7C 4C 49 53 7C 7C 32 30 32 36','ER|LAB|LIS||2026')+hx('a2l','','','…','… 46 <i>0D</i> <i>1C</i> <i>0D</i>','…F...')+hx('l2a','10:15:03.004','arrowLeft','0000','<i>0B</i> 4D 53 48 7C 5E 7E 5C 26 7C 4C 49 53 7C 7C 41','.MSH|^~\\&amp;|LIS||A')+'</div>'+statusbar();}};
+V.view={t:'4 · Просмотр журнала',cap:'<b>Открытый журнал (FR-29).</b> Трасса — карта всей сессии с рамкой видимой области, по ней можно переходить. Предупреждение о ПДн — всегда (FR-34).',html:function(){return topbar()+'<div class="file">'+I('file')+'<span class="nm">bytetap-20261019-101500-tcp_server.jsonl</span><span class="ro">только чтение</span><span class="sp"></span><span class="btn">'+I('pen')+'Дописать комментарий</span><span class="ib">'+I('x')+'</span></div><div class="ban pd">'+I('tri')+'<div>Журнал может содержать персональные данные пациентов. Не публикуйте и не пересылайте его без обезличивания.</div></div><div class="meta"><span>Анализатор <b>ANALYZER, зав. № 1234</b></span><span>Режим <b>TCP-сервер :5000, HL7/MLLP</b></span><span>Начало <b class="mono">19.10.2026 10:15:00</b></span><span>Длительность <b class="mono">00:42:18</b></span><span>Комментарий <b>3 пробы, 1 запрос</b></span></div>'+trace('M0 15 L20 15 L21 6 L23 6 L24 15 L90 15 L91 3 L95 3 L96 15 L170 15 L171 5 L174 5 L175 15 L260 15 L261 2 L268 2 L269 15 L330 15 L331 7 L333 7 L334 15 L420 15 L421 4 L425 4 L426 15 L510 15 L511 3 L516 3 L517 15 L600 15','M0 15 L25 15 L26 9 L27 15 L97 15 L98 9 L99 15 L176 15 L177 9 L178 15 L270 15 L271 9 L272 15 L335 15 L336 9 L337 15 L427 15 L428 9 L429 15 L518 15 L519 9 L520 15 L600 15','<div class="brush" style="left:calc(138px + (100% - 150px) * 0.42);width:calc((100% - 150px) * 0.1)"></div>')+fbar('t')+'<div class="feed">'+rows.slice(1).join('')+'</div>'+statusbar();}};
+V.err={t:'5 · Ошибки',cap:'<b>Состояния ошибок.</b> Каждая говорит, что случилось и что делать, без кодов и стектрейсов.',html:function(){return '<div class="stack"><div class="card"><div class="ct">сбой записи журнала — сессия остановлена</div><div class="ban err" style="border:0">'+I('alert')+'<div><b>Запись в журнал прервана: на диске нет места.</b><br>Сессия остановлена, анализатор не получил подтверждений после сбоя и повторит неотправленное. Записанное до сбоя сохранено.<div class="acts"><span class="btn">'+I('folder')+'Выбрать другую папку</span><span class="btn">'+I('file')+'Открыть записанное</span></div></div></div></div><div class="card"><div class="ct">порт занят — ошибка у поля</div><div class="cfg" style="border:0"><div class="f"><label>Слушать на</label><div class="row2"><div class="in">Все интерфейсы<span class="cv">'+I('chev')+'</span></div><div class="in mono err" style="width:76px">5000</div></div><span class="ferr">'+I('alert')+'Порт 5000 уже занят другой программой (возможно, ЛИС). Выберите другой.</span></div></div></div><div class="card"><div class="ct">«Авто» не узнал протокол (FR-15)</div><div class="feed" style="min-height:0">'+R('a2l','10:15:03.000','arrowRight','#1',C('*R0123,ANALYZER,…<CR><LF>'))+R('wn','10:15:03.000','tri','#1','Протокол не определён — ответы отключены для этого соединения. Запись идёт.')+'</div></div><div class="card"><div class="ct">нет WebView2 — системное окно (NFR-3)</div><div class="mb"><div class="h">bytetap</div><div class="bd">'+I('alert')+'<div>Для работы bytetap нужен компонент Microsoft Edge WebView2, а на этом компьютере его нет.<br><br>Установите WebView2 Runtime (автономный установщик можно принести на флешке) или используйте bytetap-cli.</div></div><div class="ft"><span>Инструкция</span><span class="p">Закрыть</span></div></div></div></div>';}};
+var N=['<b>Один экран</b>: настройки сверху, под ними трасса и лента. На старте настройки сворачиваются в чипы в шапке, лента получает всю высоту.','<b>Прокси и прослушка</b> видны, но неактивны с пометкой версии — или скрыть до их релиза?','<b>Адреса ноутбука</b> с кнопкой копирования — инженеру не нужен ipconfig.','<b>Трасса в просмотре журнала</b> — карта всей сессии с рамкой видимой области; во время записи — бегущее окно ~60 с.','<b>Автопрокрутка</b> выключается сама, когда инженер прокручивает ленту вверх, и включается кнопкой.'];
+var order=['idle','com','rec','hex','view','err'];var cur='idle',theme='light';
+function tog(){theme=theme==='light'?'dark':'light';draw();}
+function draw(){var v=V[cur];var a=document.getElementById('app');a.setAttribute('data-theme',theme);a.innerHTML=v.html();document.getElementById('cap').innerHTML=v.cap;var tb=document.getElementById('tabs');tb.innerHTML=order.map(function(k){return '<button data-k="'+k+'" class="'+(k===cur?'on':'')+'">'+V[k].t+'</button>';}).join('');Array.prototype.forEach.call(tb.querySelectorAll('button'),function(b){b.onclick=function(){cur=b.getAttribute('data-k');draw();};});document.getElementById('th').textContent=theme==='light'?'Тема: светлая':'Тема: тёмная';Array.prototype.forEach.call(a.querySelectorAll('.thm'),function(t){t.innerHTML=I(theme==='light'?'moon':'sun');t.onclick=tog;});}
+document.getElementById('th').onclick=tog;
+document.getElementById('notes').innerHTML=N.map(function(n){return '<li>'+n+'</li>';}).join('');
+draw();
+})();
+</script></body></html>
