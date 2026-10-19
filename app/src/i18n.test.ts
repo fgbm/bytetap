@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { ENCODING_KEYS } from "./feed/bytes";
+import { EVENT_KEYS } from "./feed/event-codes";
 import { ERROR_KEYS, FAILURE_KEYS } from "./session/errors";
 import { PORT_PROBLEM_KEYS } from "./validation";
 
@@ -56,6 +57,7 @@ describe("i18n", () => {
       ...Object.values(ERROR_KEYS),
       ...Object.values(FAILURE_KEYS),
       ...Object.values(PORT_PROBLEM_KEYS),
+      ...Object.values(EVENT_KEYS),
     ];
     expect(keys.filter((key) => !hasKey(key))).toEqual([]);
   });
@@ -79,6 +81,19 @@ describe("i18n", () => {
       "port_not_found",
       "port_settings",
       "serial",
+    ]);
+  });
+
+  it("покрывает все коды событий журнала", () => {
+    expect(Object.keys(EVENT_KEYS).sort()).toEqual([
+      "accept_failed",
+      "answer_timeout",
+      "connect_failed",
+      "connection_read_failed",
+      "connection_write_failed",
+      "journal_failure",
+      "protocol_undetected",
+      "serial_open_failed",
     ]);
   });
 

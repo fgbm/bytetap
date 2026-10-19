@@ -13,6 +13,7 @@ import type { FeedEvent } from "../api/types";
 import { formatTime } from "../format";
 import type { Segment } from "../../../shared/control-chips";
 import { eventSegments, type Encoding } from "./bytes";
+import { eventText } from "./event-codes";
 
 /** Иконка строки; Lucide-компонент выбирает по ней шаблон. */
 export type RowIcon = "a2l" | "l2a" | "open" | "close" | "error" | "info" | "note" | "stopped";
@@ -117,10 +118,15 @@ export function eventRow(
         cls: "err",
         conn: connLabel(event.conn),
         icon: "error",
-        text: event.message,
+        text: eventText(event.code, event.message, t),
       };
     case "info":
-      return { ...base, conn: connLabel(event.conn), icon: "info", text: event.message };
+      return {
+        ...base,
+        conn: connLabel(event.conn),
+        icon: "info",
+        text: eventText(event.code, event.message, t),
+      };
     case "note":
       return { ...base, icon: "note", text: event.text };
     case "stopped":
