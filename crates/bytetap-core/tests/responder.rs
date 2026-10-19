@@ -108,7 +108,7 @@ fn an_incoming_ack_is_not_acknowledged() {
     let events = events(&actions);
     assert_eq!(events.len(), 1, "{actions:?}");
     assert!(
-        matches!(events[0], ResponderEvent::Info { message } if message.contains("incoming ACK")),
+        matches!(events[0], ResponderEvent::Info { message, .. } if message.contains("incoming ACK")),
         "{events:?}"
     );
 }

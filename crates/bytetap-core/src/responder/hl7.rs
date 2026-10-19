@@ -46,6 +46,7 @@ pub(crate) fn answer(message: &[u8], now: DateTime<FixedOffset>, ids: &ControlId
         Ok(msh) if msh.is_acknowledgement() => {
             events.push(ResponderEvent::Info {
                 message: "incoming ACK is not acknowledged".to_owned(),
+                code: None,
             });
             Answer { ack: None, events }
         }
@@ -56,6 +57,7 @@ pub(crate) fn answer(message: &[u8], now: DateTime<FixedOffset>, ids: &ControlId
         Err(problem) => {
             events.push(ResponderEvent::Error {
                 message: problem.message,
+                code: None,
             });
             let ack = match problem.recovered {
                 // Найденный `MSH` сам оказался подтверждением: отвечать на него нельзя,
@@ -63,6 +65,7 @@ pub(crate) fn answer(message: &[u8], now: DateTime<FixedOffset>, ids: &ControlId
                 Some(recovered) if recovered.msh.is_acknowledgement() => {
                     events.push(ResponderEvent::Info {
                         message: "incoming ACK is not acknowledged".to_owned(),
+                        code: None,
                     });
                     None
                 }
@@ -272,6 +275,7 @@ fn build_ack(
     let control_id = if msh.control_id.is_empty() {
         events.push(ResponderEvent::Info {
             message: "MSH-10 is empty: MSA-2 is left empty in the ACK".to_owned(),
+            code: None,
         });
         &[][..]
     } else {
@@ -372,6 +376,7 @@ fn ae_field(value: &[u8], name: &str, escape: bool, events: &mut Vec<ResponderEv
     if !value.iter().all(|byte| is_ascii_printable(*byte)) {
         events.push(ResponderEvent::Info {
             message: format!("{name} is not ASCII: the field is left empty in the ACK"),
+            code: None,
         });
         return Vec::new();
     }
@@ -405,6 +410,7 @@ fn copyable<'a>(value: &'a [u8], name: &str, events: &mut Vec<ResponderEvent>) -
     } else {
         events.push(ResponderEvent::Info {
             message: format!("{name} is not ASCII: the field is left empty in the ACK"),
+            code: None,
         });
         b""
     }
@@ -423,6 +429,7 @@ fn message_type(
     if !event.iter().all(|byte| is_ascii_printable(*byte)) {
         events.push(ResponderEvent::Info {
             message: "MSH-9.2 is not ASCII: the ACK message type has no event".to_owned(),
+            code: None,
         });
         return message_type;
     }
@@ -539,7 +546,7 @@ mod tests {
             answer_of(b"MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101500||ACK^R01|MSG0005|P|2.3.1\r");
         assert!(answer.ack.is_none(), "подтверждение не подтверждается");
         assert!(
-            matches!(&answer.events[..], [ResponderEvent::Info { message }]
+            matches!(&answer.events[..], [ResponderEvent::Info { message, .. }]
                 if message.contains("incoming ACK")),
             "{:?}",
             answer.events
@@ -558,7 +565,7 @@ mod tests {
         assert!(ack.is_ascii(), "кодировка ACK — ASCII");
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(
-            matches!(&events[0], ResponderEvent::Info { message } if message.contains("MSH-3"))
+            matches!(&events[0], ResponderEvent::Info { message, .. } if message.contains("MSH-3"))
         );
     }
 
@@ -570,7 +577,7 @@ mod tests {
         assert!(ack.is_ascii());
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(
-            matches!(&events[0], ResponderEvent::Info { message } if message.contains("MSH-10"))
+            matches!(&events[0], ResponderEvent::Info { message, .. } if message.contains("MSH-10"))
         );
     }
 
@@ -580,7 +587,7 @@ mod tests {
             ack_of(b"MSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01||P|2.3.1\r");
         assert!(ack.ends_with("MSA|AA|\r"), "{ack:?}");
         assert!(
-            matches!(&events[..], [ResponderEvent::Info { message }]
+            matches!(&events[..], [ResponderEvent::Info { message, .. }]
                 if message.contains("MSH-10 is empty")),
             "{events:?}"
         );
@@ -608,7 +615,9 @@ mod tests {
             "MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK|BT261019101530000001|P|2.3.1\r\
              MSA|AE|MSG0008\r"
         );
-        assert!(matches!(&events[0], ResponderEvent::Error { message } if message.contains("MSH")));
+        assert!(
+            matches!(&events[0], ResponderEvent::Error { message, .. } if message.contains("MSH"))
+        );
     }
 
     #[test]
@@ -637,7 +646,7 @@ mod tests {
              MSA|AE|ID\\T\\1\r"
         );
         assert!(
-            matches!(&events[0], ResponderEvent::Error { message } if message.contains("MSH-2"))
+            matches!(&events[0], ResponderEvent::Error { message, .. } if message.contains("MSH-2"))
         );
     }
 
@@ -659,7 +668,7 @@ mod tests {
                 &answer.events[..],
                 [
                     ResponderEvent::Error { .. },
-                    ResponderEvent::Info { message }
+                    ResponderEvent::Info { message, .. }
                 ] if message.contains("incoming ACK")
             ),
             "{:?}",
@@ -695,7 +704,7 @@ mod tests {
              MSA|AE|MSG0009\r"
         );
         assert!(
-            matches!(&events[0], ResponderEvent::Error { message } if message.contains("MSH-2"))
+            matches!(&events[0], ResponderEvent::Error { message, .. } if message.contains("MSH-2"))
         );
     }
 
@@ -705,7 +714,7 @@ mod tests {
             answer_of(b"MSH\x01^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|X1|P|2.3.1\r");
         assert!(answer.ack.is_none());
         assert!(
-            matches!(&answer.events[0], ResponderEvent::Error { message } if message.contains("MSH-1"))
+            matches!(&answer.events[0], ResponderEvent::Error { message, .. } if message.contains("MSH-1"))
         );
     }
 
@@ -720,7 +729,7 @@ mod tests {
              MSA|AE|MSG0010\r"
         );
         assert!(
-            matches!(&events[0], ResponderEvent::Error { message } if message.contains("too short"))
+            matches!(&events[0], ResponderEvent::Error { message, .. } if message.contains("too short"))
         );
     }
 

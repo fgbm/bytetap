@@ -84,6 +84,7 @@ impl Hl7Mllp {
                         "incomplete MLLP frame dropped: {} bytes without 0x1C 0x0D",
                         self.frame.len()
                     ),
+                    code: None,
                 }
                 .into(),
             );
@@ -105,6 +106,7 @@ impl Hl7Mllp {
                         "MLLP frame exceeded {} bytes and was dropped; its bytes are treated as garbage until the next 0x0B",
                         self.frame_limit
                     ),
+                    code: None,
                 }
                 .into(),
             );
@@ -138,6 +140,7 @@ impl Hl7Mllp {
             actions.push(
                 ResponderEvent::Info {
                     message: format!("{} bytes outside the MLLP frame ignored", self.outside),
+                    code: None,
                 }
                 .into(),
             );
@@ -195,6 +198,7 @@ impl Responder for Hl7Mllp {
                             "incomplete MLLP frame at the end of the connection: {} bytes without 0x1C 0x0D",
                             self.frame.len()
                         ),
+                        code: None,
                     }
                     .into(),
                 );
@@ -314,7 +318,7 @@ mod tests {
         let events = events(&actions);
         assert_eq!(events.len(), 1, "{actions:?}");
         assert!(
-            matches!(events[0], ResponderEvent::Info { message } if message.contains("outside")),
+            matches!(events[0], ResponderEvent::Info { message, .. } if message.contains("outside")),
             "{events:?}"
         );
         assert_eq!(sends(&actions).len(), 1, "мусор не мешает ответу");
@@ -330,7 +334,7 @@ mod tests {
         let actions = responder.feed(&stream, now());
         let events = events(&actions);
         assert!(
-            matches!(events[0], ResponderEvent::Error { message } if message.contains("incomplete")),
+            matches!(events[0], ResponderEvent::Error { message, .. } if message.contains("incomplete")),
             "{events:?}"
         );
         assert_eq!(sends(&actions).len(), 1);
@@ -358,7 +362,7 @@ mod tests {
         let actions = responder.feed(&stream, now());
         assert_eq!(sends(&actions).len(), 1);
         assert!(
-            matches!(events(&actions)[0], ResponderEvent::Info { message } if message.contains("6 bytes")),
+            matches!(events(&actions)[0], ResponderEvent::Info { message, .. } if message.contains("6 bytes")),
             "0x1C 0x0D и junk вместе дают один блок мусора: {actions:?}"
         );
     }
@@ -457,7 +461,7 @@ mod tests {
         let actions = responder.finish(now());
         assert!(sends(&actions).is_empty());
         assert!(
-            matches!(&actions[..], [Action::Event(ResponderEvent::Error { message })]
+            matches!(&actions[..], [Action::Event(ResponderEvent::Error { message, .. })]
                 if message.contains(&format!("{body_len} bytes"))),
             "{actions:?}"
         );
@@ -468,7 +472,7 @@ mod tests {
         assert!(responder.feed(b"tail\x1c", now()).is_empty());
         let actions = responder.finish(now());
         assert!(
-            matches!(&actions[..], [Action::Event(ResponderEvent::Info { message })]
+            matches!(&actions[..], [Action::Event(ResponderEvent::Info { message, .. })]
                 if message.contains("5 bytes")),
             "{actions:?}"
         );
