@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ArrowLeft, ArrowRight, Bot } from "@lucide/vue";
+import { segments } from "../../../../shared/control-chips";
 
 /** Строка примера обмена: время, направление, признак автоответа и текст фрагмента. */
 export interface ExchangeRow {
@@ -10,22 +11,6 @@ export interface ExchangeRow {
 }
 
 defineProps<{ rows: ExchangeRow[] }>();
-
-/** Управляющие символы, записанные как `<STX>`, `<CR>`, `<x0B>` и т.п. (FR-22). */
-const CONTROL = /(<(?:STX|ETX|ETB|EOT|ENQ|ACK|NAK|VT|FS|CR|LF|x[0-9A-Fa-f]{2})>)/g;
-
-interface Segment {
-  chip: boolean;
-  value: string;
-}
-
-/** Режет текст на обычные куски и плашки управляющих символов; всё выводится интерполяцией. */
-function segments(text: string): Segment[] {
-  return text
-    .split(CONTROL)
-    .filter((value) => value !== "")
-    .map((value) => ({ chip: /^<[^<>]+>$/.test(value), value }));
-}
 </script>
 
 <template>
