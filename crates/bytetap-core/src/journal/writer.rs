@@ -16,6 +16,8 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, BufRead as _, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +35,34 @@ pub const MAX_BATCH_BYTES: usize = 256 * 1024;
 
 /// Сколько имён пробует [`Journal::create`], если файл с таким именем уже есть: `-2`…`-99`.
 const MAX_NAME_ATTEMPTS: u32 = 99;
+
+/// Тестовый хук: задержка перед `sync_data`, миллисекунды (M1-AC14).
+///
+/// Появляется только со сборкой feature `test-hooks` и существует ради одного теста:
+/// писатель журнала замедляется, а ответ анализатору всё равно уходит сразу. В обычной
+/// сборке поля нет, и писатель не может замедлиться из-за теста.
+#[cfg(feature = "test-hooks")]
+pub static TEST_SYNC_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Сколько раз хук [`TEST_SYNC_DELAY_MS`] уже задержал фиксацию.
+///
+/// Тест ждёт первое срабатывание, а не гадает по времени: так проверка не зависит от
+/// того, когда планировщик разбудил задачу-писателя.
+#[cfg(feature = "test-hooks")]
+pub static TEST_SYNC_DELAYS: AtomicU64 = AtomicU64::new(0);
+
+/// Задержка перед фиксацией пачки, если тест её запросил.
+#[cfg(feature = "test-hooks")]
+fn test_hook_delay() {
+    let millis = TEST_SYNC_DELAY_MS.load(Ordering::Relaxed);
+    if millis > 0 {
+        TEST_SYNC_DELAYS.fetch_add(1, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(millis));
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn test_hook_delay() {}
 
 /// Дескриптор писателя журнала.
 ///
@@ -435,10 +465,14 @@ async fn run(
 }
 
 /// Пишет пачку, делает один `flush` и один `sync_data` (FR-20).
+///
+/// С feature `test-hooks` перед фиксацией может спать [`TEST_SYNC_DELAY_MS`]: так
+/// проверяется, что пересылка ответа не ждёт журнал (M1-AC14).
 async fn append(mut file: File, bytes: Vec<u8>) -> io::Result<File> {
     tokio::task::spawn_blocking(move || {
         file.write_all(&bytes)?;
         file.flush()?;
+        test_hook_delay();
         file.sync_data()?;
         Ok::<File, io::Error>(file)
     })

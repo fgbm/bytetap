@@ -4,7 +4,9 @@
 
 pub mod journal;
 pub mod responder;
+pub mod session;
 pub mod text;
+pub mod transport;
 
 /// Версия ядра из `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -15,7 +15,13 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
+[features]
+# Тестовый хук писателя журнала: задержка перед `sync_data` (M1-AC14).
+# Включается только сборкой тестов этого crate, в обычной сборке его нет.
+test-hooks = []
+
 [dev-dependencies]
+bytetap-core = { path = ".", features = ["test-hooks"] }
 bytetap-testkit.workspace = true
 jsonschema.workspace = true
 proptest.workspace = true
