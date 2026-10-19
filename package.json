@@ -12,14 +12,15 @@
     "typescript": "^6.0.3"
   },
   "devDependencies": {
+    "esbuild": "^0.28.2",
     "typescript": "^6.0.3"
   },
   "scripts": {
     "dev": "npm run dev --workspace app",
     "build": "npm run build --workspace app",
-    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && npm run check --workspace app && npm run test --workspace app",
+    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && npm run check --workspace app && npm run test --workspace app && node scripts/check-docs-links.mjs",
     "docs:dev": "npm run dev --workspace docs",
-    "docs:build": "npm run build --workspace docs",
+    "docs:build": "node scripts/check-docs-links.mjs && npm run build --workspace docs",
     "tauri": "npm run tauri --workspace app --"
   }
 }

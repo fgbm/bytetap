@@ -12,11 +12,14 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/ibm-plex-sans": "^5.3.0",
     "@tauri-apps/api": "^2.12.4",
     "vue": "^3.5.44",
     "vue-i18n": "^11.4.16"
   },
   "devDependencies": {
+    "@intlify/unplugin-vue-i18n": "^11.2.7",
     "@tauri-apps/cli": "^2.12.3",
     "@vitejs/plugin-vue": "^6.0.10",
     "@vue/test-utils": "^2.5.1",
