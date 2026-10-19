@@ -84,12 +84,14 @@ export class JournalFeed {
     this.total = next;
     // Комментарий — служебная строка: своей длины для HEX у него нет.
     while (this.lengths.length < next) this.lengths.push(0);
-    // Новое событие всегда в последней странице; её и перечитываем.
+    // Новое событие всегда в последней странице; её и перечитываем, иначе дописанный
+    // комментарий не виден ни в метаданных (последние `note`), ни в ленте до прокрутки.
     const last = this.pageCount - 1;
     this.pages.delete(last);
     this.pending.delete(last);
     this.failed.delete(last);
     this.version += 1;
+    this.ensure(this.total - 1, this.total);
   }
 
   /** Последние комментарии журнала, новые первыми, — из уже загруженных страниц. */

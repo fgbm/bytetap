@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   densityBars,
+  eventAtFraction,
+  fractionAtEvent,
   fractionFromX,
   frameRect,
   impulseHeight,
@@ -78,5 +80,30 @@ describe("позиция указателя и рамка видимой обл�
     expect(frame.width).toBeCloseTo(0.2);
     expect(frameRect({ start: -1, end: 2 })).toEqual({ left: 0, width: 1 });
     expect(frameRect({ start: 0.8, end: 0.2 })).toEqual({ left: 0.8, width: 0 });
+  });
+});
+
+describe("связь трассы и ленты по времени (AC9)", () => {
+  /** Таблица журнала на 100 с с пачкой на 0–1 с и второй на 99–100 с: 601 точка. */
+  const total = 4;
+  const firstEvent = Array.from({ length: 601 }, (_, point) =>
+    point <= 5 ? 0 : point <= 599 ? 2 : total,
+  );
+
+  it("доля 0.99 попадает во вторую пачку, а не в конец первой", () => {
+    expect(eventAtFraction(firstEvent, total, 0)).toBe(0);
+    expect(eventAtFraction(firstEvent, total, 0.99)).toBe(2);
+    expect(eventAtFraction(firstEvent, total, 1)).toBe(total - 1);
+  });
+
+  it("номер события переводится обратно в долю времени", () => {
+    expect(fractionAtEvent(firstEvent, 0)).toBeCloseTo(5 / 600, 6);
+    expect(fractionAtEvent(firstEvent, 2)).toBeCloseTo(599 / 600, 6);
+    expect(fractionAtEvent(firstEvent, total)).toBe(1);
+  });
+
+  it("пустая таблица не ломает переходы", () => {
+    expect(eventAtFraction([], 0, 0.5)).toBe(0);
+    expect(fractionAtEvent([], 0)).toBe(0);
   });
 });

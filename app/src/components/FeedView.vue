@@ -35,12 +35,17 @@ import type { FeedSource } from "../feed/source";
 import {
   applyScroll,
   DEFAULT_VIEWPORT_HEIGHT,
+  firstVisibleRow,
   HEX_ROW_HEIGHT,
   isAtBottom,
+  isScaled,
   listHeight,
+  rangeFromRow,
+  scrollTopForRow,
   TEXT_ROW_HEIGHT,
-  visibleRange,
+  type ScrollAnchor,
 } from "../feed/virtual";
+import { fractionAtEvent } from "../trace/model";
 import type { FeedViewMode } from "../settings/settings";
 
 const props = defineProps<{
@@ -86,6 +91,11 @@ interface HexRow {
 
 const scroller = ref<HTMLElement | null>(null);
 const scrollTop = ref(0);
+/**
+ * Якорь точной прокрутки: со сжатой распоркой колесо двигает строки по одной,
+ * а далёкие прыжки считаются пропорцией по всей высоте (FR-28).
+ */
+const anchor = ref<ScrollAnchor | null>(null);
 const viewportHeight = ref(DEFAULT_VIEWPORT_HEIGHT);
 /** Догонять ли новые строки; ручная прокрутка вверх выключает (AC8). */
 const follow = ref(true);
@@ -178,10 +188,21 @@ const totalRows = computed(() =>
 
 const rowHeight = computed(() => (view.value === "hex" ? HEX_ROW_HEIGHT : TEXT_ROW_HEIGHT));
 
-const range = computed(() =>
-  visibleRange(
-    totalRows.value,
+/** Первая видимая строка: при сжатой распорке — смещением от якоря или пропорцией. */
+const firstRow = computed(() =>
+  firstVisibleRow(
     scrollTop.value,
+    totalRows.value,
+    viewportHeight.value,
+    rowHeight.value,
+    anchor.value,
+  ),
+);
+
+const range = computed(() =>
+  rangeFromRow(
+    totalRows.value,
+    firstRow.value,
     viewportHeight.value,
     rowHeight.value,
   ),
@@ -196,6 +217,9 @@ watch(range, (value) => requestPages(value.start, value.end), { immediate: true 
 
 /** Строки текстового вида: только видимые, с текстом по кодировке. */
 const textRows = computed<FeedRow[]>(() => {
+  // Пришедшая страница журнала меняет содержимое строк, а не их число: без этой
+  // зависимости лента не перерисовалась бы, пока не сдвинется прокрутка (AC5, AC10).
+  void props.feed.version;
   if (view.value !== "text") return [];
   const rows: FeedRow[] = [];
   const { start, end } = range.value;
@@ -225,6 +249,9 @@ function eventAtLine(line: number): number {
 
 /** Строки дампа для видимого окна. */
 const hexRows = computed<HexRow[]>(() => {
+  // Та же зависимость, что у текстовых строк: высоты HEX известны заранее, а байты
+  // приходят вместе со страницей журнала.
+  void props.feed.version;
   if (view.value !== "hex") return [];
   const rows: HexRow[] = [];
   const { start, end } = range.value;
@@ -271,16 +298,30 @@ const listHeightPx = computed(() =>
 const empty = computed(() => totalRows.value === 0);
 const journalEmpty = computed(() => props.journal !== null && empty.value);
 
+/**
+ * Верх строки в координатах содержимого списка.
+ *
+ * Без сжатия строка стоит на своём номере. Со сжатой распоркой браузер не держит
+ * содержимое выше предела, поэтому строки привязаны к окну: первая отрисованная
+ * строка встаёт на пиксель начала окна, остальные — через высоту строки.
+ */
+function rowTop(order: number, height: number): number {
+  if (!isScaled(totalRows.value, rowHeight.value)) return order * height;
+  const start = range.value.start;
+  const top = scrollTop.value - (firstRow.value - start) * height;
+  return Math.max(0, top) + (order - start) * height;
+}
+
 function rowStyle(order: number): Record<string, string> {
   return {
-    top: `${order * TEXT_ROW_HEIGHT}px`,
+    top: `${rowTop(order, TEXT_ROW_HEIGHT)}px`,
     height: `${TEXT_ROW_HEIGHT}px`,
   };
 }
 
 function hexStyle(line: number): Record<string, string> {
   return {
-    top: `${line * HEX_ROW_HEIGHT}px`,
+    top: `${rowTop(line, HEX_ROW_HEIGHT)}px`,
     height: `${HEX_ROW_HEIGHT}px`,
   };
 }
@@ -297,6 +338,8 @@ function onScroll(): void {
   if (element === null) return;
   scrollTop.value = element.scrollTop;
   viewportHeight.value = element.clientHeight || DEFAULT_VIEWPORT_HEIGHT;
+  // Точка отсчёта для колеса: от неё следующий шаг считается по одной строке.
+  anchor.value = { top: element.scrollTop, row: firstRow.value };
   // В просмотре журнала автопрокрутки нет: страница не должна уводить из середины.
   follow.value =
     !viewing.value &&
@@ -304,7 +347,26 @@ function onScroll(): void {
   emitVisible();
 }
 
+/**
+ * Видимая область в долях: при просмотре журнала — по времени (AC9).
+ *
+ * Плотность на трассе нарисована по `mono_us`, поэтому рамка берёт время первой и
+ * последней видимой строки из таблицы корзин журнала. Без таблицы (запись) доли
+ * считаются по прокрутке: лента идёт по времени и так.
+ */
 function emitVisible(): void {
+  const table = props.journal?.firstEvent ?? null;
+  const { start, end } = range.value;
+  if (table !== null && table.length > 0 && end > start) {
+    const first = view.value === "hex" ? eventAtLine(start) : eventIndex(start);
+    const last = view.value === "hex" ? eventAtLine(end - 1) : eventIndex(end - 1);
+    emit("update:visible", {
+      start: fractionAtEvent(table, Math.max(0, first)),
+      end: fractionAtEvent(table, Math.max(0, last) + 1),
+    });
+    return;
+  }
+
   const element = scroller.value;
   if (element === null) return;
   const total = element.scrollHeight;
@@ -323,6 +385,8 @@ async function scrollToBottom(): Promise<void> {
   if (element === null) return;
   element.scrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
   scrollTop.value = element.scrollTop;
+  // Догон — прыжок: якорь сбрасывается, нижний край считается пропорцией.
+  anchor.value = null;
 }
 
 /** Кнопка «Автопрокрутка»: включает догон и прыгает вниз (AC8). */
@@ -331,23 +395,33 @@ function enableFollow(): void {
   void scrollToBottom();
 }
 
-/** Переход к доле списка — из трассы при просмотре журнала (AC9). */
-function seekFraction(fraction: number): void {
+/**
+ * Переход к событию журнала — из трассы при просмотре (AC9).
+ *
+ * Трасса щёлкает по времени и переводит долю в номер события через таблицу корзин;
+ * строка события в журнале и есть событие. Со сжатой распоркой пиксель считается
+ * обратным отображением строки.
+ */
+function seekEvent(index: number): void {
+  const total = totalRows.value;
+  if (total <= 0) return;
+  const event = Math.min(rowCount.value - 1, Math.max(0, Math.trunc(index)));
+  const row = view.value === "hex" ? linePrefix.value[event] ?? 0 : event;
+  const top = scrollTopForRow(row, total, viewportHeight.value, rowHeight.value);
   const element = scroller.value;
-  if (element === null) return;
-  const clamped = Math.min(1, Math.max(0, fraction));
-  const travel = Math.max(0, element.scrollHeight - element.clientHeight);
-  element.scrollTop = clamped * travel;
-  scrollTop.value = element.scrollTop;
+  if (element !== null) element.scrollTop = top;
+  scrollTop.value = element === null ? top : element.scrollTop;
+  anchor.value = null;
   follow.value =
     !viewing.value &&
+    element !== null &&
     isAtBottom(element.scrollTop, element.clientHeight, element.scrollHeight);
   const { start, end } = range.value;
   requestPages(start, end);
   emitVisible();
 }
 
-defineExpose({ seekFraction });
+defineExpose({ seekEvent });
 
 /** Новая пачка в буфере: догоняем, если автопрокрутка включена. */
 watch(
@@ -375,6 +449,7 @@ watch(
     const element = scroller.value;
     if (element !== null) element.scrollTop = 0;
     scrollTop.value = 0;
+    anchor.value = null;
     measure();
     emitVisible();
   },

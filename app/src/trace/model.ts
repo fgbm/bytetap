@@ -65,6 +65,47 @@ export function fractionFromX(x: number, rect: { left: number; width: number }):
   return Math.min(1, Math.max(0, (x - rect.left) / rect.width));
 }
 
+/**
+ * Номер события для доли времени на трассе журнала (AC9).
+ *
+ * Плотность нарисована по времени, а лента считает строки событиями. Таблица
+ * `firstEvent` связывает их: `firstEvent[b]` — первое событие корзины `b`, поэтому
+ * доля 0.99 попадает в событие, а не в пропорцию номеров строк.
+ */
+export function eventAtFraction(
+  firstEvent: readonly number[],
+  total: number,
+  fraction: number,
+  bins = DENSITY_BINS,
+): number {
+  if (total <= 0 || firstEvent.length === 0) return 0;
+  const point = Math.min(bins, Math.round(Math.min(1, Math.max(0, fraction)) * bins));
+  // Правая граница сессии событий не содержит: переходим к последнему.
+  return Math.max(0, Math.min(total - 1, firstEvent[point] ?? total));
+}
+
+/**
+ * Доля времени для номера события: корзина, в которой оно первое (AC9).
+ *
+ * Обратное к [`eventAtFraction`]: рамка видимой области показывает время первой
+ * видимой строки, а не её место в списке строк.
+ */
+export function fractionAtEvent(
+  firstEvent: readonly number[],
+  index: number,
+  bins = DENSITY_BINS,
+): number {
+  if (firstEvent.length === 0) return 0;
+  let low = 0;
+  let high = bins;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if ((firstEvent[middle] ?? Number.POSITIVE_INFINITY) <= index) low = middle;
+    else high = middle - 1;
+  }
+  return low / bins;
+}
+
 /** Рамка видимой области в долях ширины. */
 export interface BrushRect {
   left: number;

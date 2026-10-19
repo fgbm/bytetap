@@ -24,6 +24,7 @@ import {
   RESPONDER_KEYS,
 } from "./journal/meta";
 import { checkPort, PORT_PROBLEM_KEYS } from "./validation";
+import { eventAtFraction } from "./trace/model";
 import { nextTheme } from "./theme";
 import { useSettings } from "./settings/store";
 import { useSession } from "./session/store";
@@ -58,7 +59,7 @@ const selectedProfile = ref("");
 const lastJournalPath = ref<string | null>(null);
 /** Методы ленты для перехода из трассы при просмотре журнала (AC9). */
 interface FeedViewHandle {
-  seekFraction(fraction: number): void;
+  seekEvent(index: number): void;
 }
 const feedView = ref<FeedViewHandle | null>(null);
 const visibleWindow = ref<{ start: number; end: number } | null>(null);
@@ -264,9 +265,14 @@ async function onStopFromBanner(): Promise<void> {
   if (state.value.summary !== null) lastJournalPath.value = state.value.summary.journalPath;
 }
 
-/** Переход к доле списка из трассы (просмотр журнала). */
+/**
+ * Переход к месту из трассы (просмотр журнала): доля времени переводится в событие
+ * через таблицу корзин сводки, поэтому плотность и лента говорят об одном времени.
+ */
 function onSeek(fraction: number): void {
-  feedView.value?.seekFraction(fraction);
+  const journal = state.value.journal;
+  if (journal === null) return;
+  feedView.value?.seekEvent(eventAtFraction(journal.firstEvent, journal.events, fraction));
 }
 
 /** Лента сообщила видимую область — рамка на карте сессии. */

@@ -1,10 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
+  ANCHOR_SPAN_PX,
   applyScroll,
+  DEFAULT_VIEWPORT_HEIGHT,
   enableAutoScroll,
+  firstVisibleRow,
   HEX_ROW_HEIGHT,
   isAtBottom,
   listHeight,
+  MAX_SCROLL_PX,
+  scrollTopForRow,
+  scrollTravel,
   TEXT_ROW_HEIGHT,
   visibleRange,
 } from "./virtual";
@@ -38,6 +44,72 @@ describe("высота списка", () => {
   it("умножает число строк на высоту", () => {
     expect(listHeight(10_000, TEXT_ROW_HEIGHT)).toBe(280_000);
     expect(listHeight(0, TEXT_ROW_HEIGHT)).toBe(0);
+  });
+
+  it("не поднимает распорку выше предела прокрутки", () => {
+    // 1 000 000 строк по 28 px — 28 млн пикселей, больше, чем держит браузер.
+    expect(listHeight(1_000_000, TEXT_ROW_HEIGHT)).toBe(MAX_SCROLL_PX);
+  });
+});
+
+describe("сжатая прокрутка длинного списка (AC7)", () => {
+  const total = 1_000_000;
+  const travel = scrollTravel(total, DEFAULT_VIEWPORT_HEIGHT, TEXT_ROW_HEIGHT);
+
+  it("конец списка достижим и заканчивается последней строкой", () => {
+    expect(travel).toBeGreaterThan(0);
+    const bottom = visibleRange(
+      total,
+      travel,
+      DEFAULT_VIEWPORT_HEIGHT,
+      TEXT_ROW_HEIGHT,
+    );
+    expect(bottom.end).toBe(total);
+    expect(bottom.start).toBeGreaterThan(0);
+    expect(bottom.start).toBeLessThan(total);
+  });
+
+  it("номер строки переводится в пиксель и обратно без потери конца", () => {
+    expect(scrollTopForRow(total - 1, total, DEFAULT_VIEWPORT_HEIGHT, TEXT_ROW_HEIGHT)).toBe(
+      travel,
+    );
+    expect(
+      firstVisibleRow(travel, total, DEFAULT_VIEWPORT_HEIGHT, TEXT_ROW_HEIGHT),
+    ).toBe(total - 1);
+  });
+
+  it("рядом с якорем колесо двигает строки по одной, а не пропорцией", () => {
+    // Одна строка сжатого списка «стоит» доли пикселя: пропорция увела бы на 2–3 строки.
+    const anchor = { top: 5_000_000, row: 500_000 };
+    expect(
+      firstVisibleRow(
+        anchor.top + TEXT_ROW_HEIGHT,
+        total,
+        DEFAULT_VIEWPORT_HEIGHT,
+        TEXT_ROW_HEIGHT,
+        anchor,
+      ),
+    ).toBe(500_001);
+    expect(
+      firstVisibleRow(
+        anchor.top + 3 * TEXT_ROW_HEIGHT,
+        total,
+        DEFAULT_VIEWPORT_HEIGHT,
+        TEXT_ROW_HEIGHT,
+        anchor,
+      ),
+    ).toBe(500_003);
+    // Дальше якоря — прыжок: строка считается пропорцией.
+    const jump = anchor.top + ANCHOR_SPAN_PX + TEXT_ROW_HEIGHT;
+    expect(
+      firstVisibleRow(jump, total, DEFAULT_VIEWPORT_HEIGHT, TEXT_ROW_HEIGHT, anchor),
+    ).not.toBe(anchor.row + Math.round((ANCHOR_SPAN_PX + TEXT_ROW_HEIGHT) / TEXT_ROW_HEIGHT));
+  });
+
+  it("автопрокрутка и «у нижнего края» работают со сжатой распоркой", () => {
+    expect(isAtBottom(travel, DEFAULT_VIEWPORT_HEIGHT, MAX_SCROLL_PX)).toBe(true);
+    expect(applyScroll(travel, DEFAULT_VIEWPORT_HEIGHT, MAX_SCROLL_PX).follow).toBe(true);
+    expect(applyScroll(travel / 2, DEFAULT_VIEWPORT_HEIGHT, MAX_SCROLL_PX).follow).toBe(false);
   });
 });
 

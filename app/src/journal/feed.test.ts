@@ -86,7 +86,13 @@ describe("JournalFeed", () => {
     feed.extend(4);
     expect(feed.length).toBe(4);
     expect(feed.at(3), "новое событие ещё не прочитано").toBeUndefined();
-    expect(calls.at(-1)).toEqual({ from: 0, count: 4 });
+    expect(calls.at(-1), "последняя страница перечитана сразу").toEqual({ from: 0, count: 4 });
+
+    // Без ручной прокрутки: страница пришла, и комментарий виден и в ленте, и в метаданных.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(feed.at(3)).toEqual(note(3));
+    expect(feed.notes(1)).toEqual(["событие 3"]);
   });
 
   it("отказ страницы не повторяется и не зацикливает прокрутку", async () => {
