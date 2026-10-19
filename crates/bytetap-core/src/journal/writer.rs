@@ -274,23 +274,40 @@ pub fn default_log_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join("Documents").join("bytetap"))
 }
 
-/// Предупреждение о папке журналов, если она уезжает за пределы машины.
+/// Причина предупреждения о папке журналов: код для интерфейса (FR-19).
 ///
-/// `None` — папка обычная. Иначе текст для инженера: журналы могут содержать данные
-/// пациентов и не должны синхронизироваться в OneDrive или лежать на сетевом диске.
+/// Интерфейс переводит код, а не текст: сообщение ядра английское и для журнала.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogDirWarningKind {
+    /// Папка внутри OneDrive.
+    Onedrive,
+    /// Сетевой путь: UNC или сетевой диск.
+    Network,
+}
+
+impl LogDirWarningKind {
+    /// Код из контракта моста: `onedrive` | `network`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Onedrive => "onedrive",
+            Self::Network => "network",
+        }
+    }
+}
+
+/// Причина предупреждения о папке журналов, если она уезжает за пределы машины.
+///
 /// Сетевой путь распознаётся по UNC-записи (`\\server\share`, `\\?\UNC\server\share`),
 /// на Windows ещё и по типу тома: буква диска, подключённого по сети (`GetDriveTypeW`
 /// == `DRIVE_REMOTE`). Расширенные записи `\\?\C:` и `\\.\` — локальные.
 /// OneDrive ищется по компонентам пути (`OneDrive`, `OneDrive - Contoso`).
 #[must_use]
-pub fn log_dir_warning(path: impl AsRef<Path>) -> Option<String> {
+pub fn log_dir_warning_kind(path: impl AsRef<Path>) -> Option<LogDirWarningKind> {
     let path = warning_path(path.as_ref());
     let path = path.as_path();
     if is_remote_path(path) {
-        return Some(format!(
-            "папка журналов {} — сетевой путь: журналы с данными пациентов останутся на другом компьютере",
-            path.display()
-        ));
+        return Some(LogDirWarningKind::Network);
     }
     // Путь проверяется по тексту: на любой ОС разделители `/` и `\\` разбираются одинаково,
     // а Windows-путь, записанный на Unix, остаётся одной компонентой.
@@ -298,12 +315,25 @@ pub fn log_dir_warning(path: impl AsRef<Path>) -> Option<String> {
         .to_string_lossy()
         .split(['/', '\\'])
         .any(|segment| segment.to_lowercase().starts_with("onedrive"));
-    in_onedrive.then(|| {
-        format!(
-            "папка журналов {} внутри OneDrive: синхронизация может отправить журналы с данными пациентов в облако",
-            path.display()
-        )
-    })
+    in_onedrive.then_some(LogDirWarningKind::Onedrive)
+}
+
+/// Предупреждение о папке журналов текстом для журнала и CLI.
+///
+/// `None` — папка обычная. Иначе текст для инженера: журналы могут содержать данные
+/// пациентов и не должны синхронизироваться в OneDrive или лежать на сетевом диске.
+#[must_use]
+pub fn log_dir_warning(path: impl AsRef<Path>) -> Option<String> {
+    let path = warning_path(path.as_ref());
+    let shown = path.display();
+    match log_dir_warning_kind(&path)? {
+        LogDirWarningKind::Network => Some(format!(
+            "папка журналов {shown} — сетевой путь: журналы с данными пациентов останутся на другом компьютере"
+        )),
+        LogDirWarningKind::Onedrive => Some(format!(
+            "папка журналов {shown} внутри OneDrive: синхронизация может отправить журналы с данными пациентов в облако"
+        )),
+    }
 }
 
 /// Путь, по которому проверяется предупреждение о папке журналов.
@@ -989,6 +1019,21 @@ mod tests {
         assert!(dir.starts_with(&home), "{}", dir.display());
         assert_eq!(dir.parent().unwrap().file_name().unwrap(), "Documents");
         assert_eq!(dir.file_name().unwrap(), "bytetap");
+    }
+
+    #[test]
+    fn log_dir_warning_kind_is_a_code_for_the_interface() {
+        assert_eq!(log_dir_warning_kind("/home/user/Documents/bytetap"), None);
+        assert_eq!(
+            log_dir_warning_kind(r"C:\Users\user\OneDrive\Documents\bytetap"),
+            Some(LogDirWarningKind::Onedrive)
+        );
+        assert_eq!(
+            log_dir_warning_kind(r"\\fileserver\share\bytetap"),
+            Some(LogDirWarningKind::Network)
+        );
+        assert_eq!(LogDirWarningKind::Onedrive.as_str(), "onedrive");
+        assert_eq!(LogDirWarningKind::Network.as_str(), "network");
     }
 
     #[test]

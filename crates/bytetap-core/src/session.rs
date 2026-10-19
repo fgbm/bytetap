@@ -261,6 +261,7 @@ impl Session {
             warning,
             events: shared.events.clone(),
             failure: shared.failure.subscribe(),
+            counters: SessionCounters(Arc::clone(&shared.counters)),
             stop: stop_tx,
             notes: notes_tx,
             task: Some(task),
@@ -281,9 +282,32 @@ pub struct SessionHandle {
     warning: Option<String>,
     events: broadcast::Sender<SessionEvent>,
     failure: watch::Receiver<Option<String>>,
+    counters: SessionCounters,
     stop: watch::Sender<bool>,
     notes: mpsc::UnboundedSender<String>,
     task: Option<tokio::task::JoinHandle<io::Result<Stats>>>,
+}
+
+/// Снимок счётчиков идущей сессии.
+///
+/// Живёт отдельно от [`SessionHandle`], потому что ленте нужен только он: мост кладёт
+/// счётчики в каждую пачку, и строка состояния не считает байты по событиям, которые
+/// могли быть отброшены (M2-AC16).
+#[derive(Debug, Clone)]
+pub struct SessionCounters(Arc<Counters>);
+
+impl SessionCounters {
+    /// Текущие соединения и байты по направлениям.
+    #[must_use]
+    pub fn snapshot(&self) -> Stats {
+        self.0.snapshot()
+    }
+
+    /// Пустые счётчики: тесты ленты и команды без запущенной сессии.
+    #[must_use]
+    pub fn detached() -> Self {
+        Self(Arc::new(Counters::default()))
+    }
 }
 
 impl SessionHandle {
@@ -321,6 +345,23 @@ impl SessionHandle {
     #[must_use]
     pub fn journal_failure(&self) -> watch::Receiver<Option<String>> {
         self.failure.clone()
+    }
+
+    /// Счётчики сессии: соединения и байты по направлениям (FR-25).
+    #[must_use]
+    pub fn counters(&self) -> SessionCounters {
+        self.counters.clone()
+    }
+
+    /// Задача сессии уже завершилась.
+    ///
+    /// `true` после отказа журнала и после [`SessionHandle::stop`]: мост по этой метке
+    /// освобождает слот, если сессия остановилась сама (NFR-5).
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
     }
 
     /// Комментарий инженера в идущую сессию: событие `note` в журнал и ленту (FR-23).
@@ -777,6 +818,15 @@ async fn run(
     if let Some(note) = accept_errors.stopped() {
         shared.info(None, note);
     }
+    // Комментарий, отправленный перед «Стоп», не теряется: очередь дочитывается
+    // до `session_end` (FR-23). Без этого `note` мог остаться в канале и пропасть.
+    while let Ok(text) = notes.try_recv() {
+        shared.publish(Event::Note(Note {
+            t: now_rfc3339(),
+            mono_us: Some(shared.clock.now_us()),
+            text,
+        }));
+    }
     shared.publish(Event::SessionEnd(SessionEnd {
         t: now_rfc3339(),
         mono_us: shared.clock.now_us(),
@@ -1163,6 +1213,71 @@ mod tests {
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         let kinds: Vec<&str> = outcome.lines.iter().map(|line| line.event.kind()).collect();
         assert_eq!(kinds, ["session", "note", "session_end"]);
+    }
+
+    /// Комментарий, поставленный в очередь прямо перед «Стоп», не теряется.
+    #[tokio::test]
+    async fn a_note_sent_right_before_the_stop_reaches_the_journal() {
+        let dir = temp_dir();
+        let handle = Session::start(
+            SessionConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_responder(Autoresponder::None)
+                .with_log_dir(dir.path()),
+        )
+        .await
+        .expect("сессия");
+        let path = handle.journal_path().to_path_buf();
+
+        handle.note("перед остановкой").expect("комментарий");
+        handle.stop().await.expect("остановка");
+
+        let outcome = read_all(&path).expect("чтение журнала");
+        let kinds: Vec<&str> = outcome.lines.iter().map(|line| line.event.kind()).collect();
+        assert_eq!(
+            kinds,
+            ["session", "note", "session_end"],
+            "очередь комментариев дочитана до session_end"
+        );
+        let Event::Note(note) = &outcome.lines[1].event else {
+            panic!("вторая строка — комментарий");
+        };
+        assert_eq!(note.text, "перед остановкой");
+    }
+
+    /// Счётчики доступны ленте, пока сессия идёт: строка состояния не считает по событиям.
+    #[tokio::test]
+    async fn counters_are_visible_to_the_feed() {
+        let dir = temp_dir();
+        let handle = Session::start(
+            SessionConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_responder(Autoresponder::None)
+                .with_log_dir(dir.path()),
+        )
+        .await
+        .expect("сессия");
+        let counters = handle.counters();
+        assert_eq!(counters.snapshot().connections, 0);
+
+        let mut client = tokio::net::TcpStream::connect(handle.local_addr())
+            .await
+            .expect("анализатор");
+        tokio::io::AsyncWriteExt::write_all(&mut client, b"MSH|^~\\&\r")
+            .await
+            .expect("фрагмент");
+        tokio::io::AsyncWriteExt::shutdown(&mut client)
+            .await
+            .expect("закрытие");
+
+        for _ in 0..100 {
+            if counters.snapshot().bytes_analyzer_to_lis > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stats = counters.snapshot();
+        handle.stop().await.expect("остановка");
+        assert_eq!(stats.connections, 1);
+        assert_eq!(stats.bytes_analyzer_to_lis, 9);
     }
 
     #[test]

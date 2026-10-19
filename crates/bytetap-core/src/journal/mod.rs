@@ -18,7 +18,10 @@ pub use event::{
     Note, Open, Session, SessionEnd, Stats,
 };
 pub use reader::{JournalLine, JournalReader, LineError, LineErrorKind, ReadOutcome, read_all};
-pub use writer::{Journal, append_note, default_log_dir, log_dir_warning, session_file_name};
+pub use writer::{
+    Journal, LogDirWarningKind, append_note, default_log_dir, log_dir_warning,
+    log_dir_warning_kind, session_file_name,
+};
 
 /// Текущее время по системным часам: RFC 3339 с микросекундами и смещением (FR-22).
 #[must_use]
