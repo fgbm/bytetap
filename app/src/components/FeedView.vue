@@ -35,6 +35,7 @@ import type { FeedSource } from "../feed/source";
 import {
   applyScroll,
   DEFAULT_VIEWPORT_HEIGHT,
+  exactFirstRow,
   firstVisibleRow,
   HEX_ROW_HEIGHT,
   isAtBottom,
@@ -45,7 +46,7 @@ import {
   TEXT_ROW_HEIGHT,
   type ScrollAnchor,
 } from "../feed/virtual";
-import { fractionAtEvent } from "../trace/model";
+import { DENSITY_BINS, fractionAtEvent } from "../trace/model";
 import type { FeedViewMode } from "../settings/settings";
 
 const props = defineProps<{
@@ -338,8 +339,18 @@ function onScroll(): void {
   if (element === null) return;
   scrollTop.value = element.scrollTop;
   viewportHeight.value = element.clientHeight || DEFAULT_VIEWPORT_HEIGHT;
-  // Точка отсчёта для колеса: от неё следующий шаг считается по одной строке.
-  anchor.value = { top: element.scrollTop, row: firstRow.value };
+  // Точка отсчёта для колеса: следующий шаг считается по одной строке. Строка в якоре
+  // дробная, чтобы шаги меньше высоты строки копились, а не терялись при пересадке.
+  anchor.value = {
+    top: element.scrollTop,
+    row: exactFirstRow(
+      element.scrollTop,
+      totalRows.value,
+      viewportHeight.value,
+      rowHeight.value,
+      anchor.value,
+    ),
+  };
   // В просмотре журнала автопрокрутки нет: страница не должна уводить из середины.
   follow.value =
     !viewing.value &&
@@ -356,13 +367,24 @@ function onScroll(): void {
  */
 function emitVisible(): void {
   const table = props.journal?.firstEvent ?? null;
-  const { start, end } = range.value;
-  if (table !== null && table.length > 0 && end > start) {
-    const first = view.value === "hex" ? eventAtLine(start) : eventIndex(start);
-    const last = view.value === "hex" ? eventAtLine(end - 1) : eventIndex(end - 1);
+  // Видимое окно без запаса: рамка показывает видимые строки, а не соседние из overscan.
+  const visible = rangeFromRow(
+    totalRows.value,
+    firstRow.value,
+    viewportHeight.value,
+    rowHeight.value,
+    0,
+  );
+  if (table !== null && table.length > 0 && visible.end > visible.start) {
+    const first =
+      view.value === "hex" ? eventAtLine(visible.start) : eventIndex(visible.start);
+    const last =
+      view.value === "hex" ? eventAtLine(visible.end - 1) : eventIndex(visible.end - 1);
+    // Плотность нарисована по корзинам: конец рамки округляется вверх до целой корзины,
+    // иначе окно внутри одной корзины дало бы рамку нулевой ширины.
     emit("update:visible", {
       start: fractionAtEvent(table, Math.max(0, first)),
-      end: fractionAtEvent(table, Math.max(0, last) + 1),
+      end: Math.min(1, fractionAtEvent(table, Math.max(0, last)) + 1 / DENSITY_BINS),
     });
     return;
   }

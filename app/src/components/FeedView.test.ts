@@ -44,13 +44,11 @@ async function settle(): Promise<void> {
   await flushPromises();
 }
 
-function mountJournal(view: "text" | "hex" = "text") {
+function mountJournal(view: "text" | "hex" = "text", journal: JournalSummary = summary) {
   const calls: number[] = [];
-  const feed = shallowReactive(
-    new JournalFeed(summary.path, summary.events, slowLoader(calls)),
-  );
+  const feed = shallowReactive(new JournalFeed(journal.path, journal.events, slowLoader(calls)));
   const wrapper = mount(FeedView, {
-    props: { feed, journal: summary, view, encoding: "cp1251" as const },
+    props: { feed, journal, view, encoding: "cp1251" as const },
     global: { plugins: [i18n] },
   });
   return { wrapper, feed, calls };
@@ -98,5 +96,22 @@ describe("FeedView — просмотр журнала (AC5, AC10)", () => {
     await settle();
 
     expect(wrapper.findAll(".bt-feed-hex").length).toBeGreaterThan(0);
+  });
+
+  it("рамка не схлопывается, когда всё окно лежит в одной корзине плотности", async () => {
+    // 1000 событий на корзину: видимые строки целиком внутри одной корзины, поэтому
+    // конец рамки округляется вверх до целой корзины, а не совпадает с началом.
+    const dense: JournalSummary = {
+      ...summary,
+      events: 600_000,
+      firstEvent: Array.from({ length: 601 }, (_, point) => point * 1000),
+    };
+    const { wrapper } = mountJournal("text", dense);
+    await settle();
+
+    const visible = wrapper.emitted("update:visible");
+    const last = visible?.at(-1)?.[0] as { start: number; end: number } | undefined;
+    expect(last).toBeDefined();
+    expect(last!.end).toBeGreaterThan(last!.start);
   });
 });

@@ -46,7 +46,12 @@ export interface RowRange {
   end: number;
 }
 
-/** Якорь точной прокрутки: строка, стоявшая первой видимой на пикселе `top`. */
+/**
+ * Якорь точной прокрутки: строка на пикселе `top`.
+ *
+ * Строка дробная — её округляет отрисовка, — иначе мелкие шаги прокрутки терялись бы
+ * при каждой пересадке якоря.
+ */
 export interface ScrollAnchor {
   top: number;
   row: number;
@@ -79,6 +84,52 @@ function clampRow(row: number, total: number): number {
   return Math.min(Math.max(0, total - 1), Math.max(0, row));
 }
 
+/** Сколько строк окна видно: частичная нижняя строка тоже видна. */
+export function visibleRows(viewportHeight: number, rowHeight: number): number {
+  return Math.max(1, Math.ceil(Math.max(0, viewportHeight) / rowStep(rowHeight)));
+}
+
+/**
+ * Первая строка у нижнего края: последняя строка стоит у нижнего края окна.
+ *
+ * Считать краем последнюю строку первой видимой нельзя: под ней до нижнего края
+ * окна осталась бы пустая полоса, а выше конца списка нечего рисовать.
+ */
+function lastFirstRow(total: number, viewportHeight: number, rowHeight: number): number {
+  return Math.max(0, total - visibleRows(viewportHeight, rowHeight));
+}
+
+/**
+ * Строка на пикселе прокрутки без округления.
+ *
+ * Дробная часть нужна якорю: шаг колеса или трекпада меньше строки копится от шага
+ * к шагу, а не теряется при каждой пересадке якоря. Округляет только
+ * [`firstVisibleRow`] — в момент отрисовки.
+ */
+export function exactFirstRow(
+  scrollTop: number,
+  total: number,
+  viewportHeight: number,
+  rowHeight: number,
+  anchor: ScrollAnchor | null = null,
+): number {
+  if (total <= 0) return 0;
+  const height = rowStep(rowHeight);
+  const at = Math.max(0, scrollTop);
+  // Верх списка — нулевая строка, даже если якорь остался от прошлой прокрутки.
+  if (at <= 0) return 0;
+  if (!isScaled(total, height)) return Math.floor(at / height);
+  const travel = scrollTravel(total, viewportHeight, height);
+  const last = lastFirstRow(total, viewportHeight, height);
+  // Нижний край — последняя строка у нижнего края окна.
+  if (travel > 0 && at >= travel) return last;
+  if (anchor !== null && Math.abs(at - anchor.top) <= ANCHOR_SPAN_PX) {
+    return Math.min(last, Math.max(0, anchor.row + (at - anchor.top) / height));
+  }
+  if (travel <= 0) return 0;
+  return (at / travel) * last;
+}
+
 /**
  * Первая видимая строка при данной прокрутке.
  *
@@ -93,16 +144,10 @@ export function firstVisibleRow(
   rowHeight: number,
   anchor: ScrollAnchor | null = null,
 ): number {
-  if (total <= 0) return 0;
-  const height = rowStep(rowHeight);
-  const at = Math.max(0, scrollTop);
-  if (!isScaled(total, height)) return clampRow(Math.floor(at / height), total);
-  if (anchor !== null && Math.abs(at - anchor.top) <= ANCHOR_SPAN_PX) {
-    return clampRow(Math.round(anchor.row + (at - anchor.top) / height), total);
-  }
-  const travel = scrollTravel(total, viewportHeight, height);
-  if (travel <= 0) return 0;
-  return clampRow(Math.round((Math.min(1, at / travel)) * (total - 1)), total);
+  return clampRow(
+    Math.round(exactFirstRow(scrollTop, total, viewportHeight, rowHeight, anchor)),
+    total,
+  );
 }
 
 /** Пиксель прокрутки, на котором строка стоит первой видимой: обратное к [`firstVisibleRow`]. */
@@ -116,7 +161,9 @@ export function scrollTopForRow(
   const height = rowStep(rowHeight);
   if (!isScaled(total, height)) return Math.max(0, row) * height;
   const travel = scrollTravel(total, viewportHeight, height);
-  return Math.min(travel, (Math.max(0, row) / Math.max(1, total - 1)) * travel);
+  const last = lastFirstRow(total, viewportHeight, height);
+  // У нижнего края стоит строка `last`, и всё, что ниже неё, прокручивается в конец.
+  return Math.min(travel, (Math.max(0, row) / Math.max(1, last)) * travel);
 }
 
 /** Диапазон строк `[start, end)` вокруг первой видимой строки. */

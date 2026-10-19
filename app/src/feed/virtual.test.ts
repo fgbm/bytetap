@@ -4,15 +4,19 @@ import {
   applyScroll,
   DEFAULT_VIEWPORT_HEIGHT,
   enableAutoScroll,
+  exactFirstRow,
   firstVisibleRow,
   HEX_ROW_HEIGHT,
   isAtBottom,
   listHeight,
   MAX_SCROLL_PX,
+  rangeFromRow,
   scrollTopForRow,
   scrollTravel,
   TEXT_ROW_HEIGHT,
   visibleRange,
+  visibleRows,
+  type ScrollAnchor,
 } from "./virtual";
 
 describe("visibleRange", () => {
@@ -75,7 +79,54 @@ describe("сжатая прокрутка длинного списка (AC7)", 
     );
     expect(
       firstVisibleRow(travel, total, DEFAULT_VIEWPORT_HEIGHT, TEXT_ROW_HEIGHT),
-    ).toBe(total - 1);
+    ).toBe(total - visibleRows(DEFAULT_VIEWPORT_HEIGHT, TEXT_ROW_HEIGHT));
+  });
+
+  it("верх и низ списка считаются от краёв окна", () => {
+    // Верх: нулевой пиксель — нулевая строка, даже если якорь остался от прошлой прокрутки.
+    expect(
+      firstVisibleRow(0, total, DEFAULT_VIEWPORT_HEIGHT, TEXT_ROW_HEIGHT, {
+        top: 10_000,
+        row: 1000,
+      }),
+    ).toBe(0);
+    // Низ: последняя строка стоит у нижнего края окна, пустой полосы под списком нет.
+    const visible = visibleRows(DEFAULT_VIEWPORT_HEIGHT, TEXT_ROW_HEIGHT);
+    const bottom = firstVisibleRow(travel, total, DEFAULT_VIEWPORT_HEIGHT, TEXT_ROW_HEIGHT, {
+      top: travel - 10,
+      row: total - visible - 50,
+    });
+    expect(bottom).toBe(total - visible);
+    expect(bottom + visible).toBe(total);
+  });
+
+  it("мелкие шаги прокрутки копятся в якоре, а не теряются", () => {
+    // Двадцать шагов по 5 px — это 100 px, то есть 3–4 строки: якорь пересаживается
+    // на каждом шаге и хранит дробную строку, поэтому доля шага не пропадает.
+    const geometry = [total, DEFAULT_VIEWPORT_HEIGHT, TEXT_ROW_HEIGHT] as const;
+    let top = 5_000_000;
+    let anchor: ScrollAnchor = {
+      top,
+      row: exactFirstRow(top, ...geometry),
+    };
+    const start = firstVisibleRow(top, ...geometry, anchor);
+    for (let step = 0; step < 20; step += 1) {
+      top += 5;
+      anchor = { top, row: exactFirstRow(top, ...geometry, anchor) };
+    }
+    const moved = firstVisibleRow(top, ...geometry, anchor) - start;
+    expect(moved).toBeGreaterThanOrEqual(3);
+    expect(moved).toBeLessThanOrEqual(4);
+  });
+
+  it("сжатый HEX у нижнего края показывает конец без пустой полосы", () => {
+    const rows = 2_000_000;
+    const hexTravel = scrollTravel(rows, DEFAULT_VIEWPORT_HEIGHT, HEX_ROW_HEIGHT);
+    expect(hexTravel).toBeGreaterThan(0);
+    const visible = visibleRows(DEFAULT_VIEWPORT_HEIGHT, HEX_ROW_HEIGHT);
+    const first = firstVisibleRow(hexTravel, rows, DEFAULT_VIEWPORT_HEIGHT, HEX_ROW_HEIGHT);
+    expect(first + visible).toBe(rows);
+    expect(rangeFromRow(rows, first, DEFAULT_VIEWPORT_HEIGHT, HEX_ROW_HEIGHT).end).toBe(rows);
   });
 
   it("рядом с якорем колесо двигает строки по одной, а не пропорцией", () => {
