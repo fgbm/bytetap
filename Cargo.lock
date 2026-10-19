@@ -349,6 +349,7 @@ dependencies = [
  "chrono",
  "clap",
  "jsonschema",
+ "libc",
  "serde_json",
  "tempfile",
  "tokio",

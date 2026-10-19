@@ -22,3 +22,8 @@ tokio.workspace = true
 [dev-dependencies]
 bytetap-testkit.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Раскладка сигналов процесса: SIGHUP, унаследованный проигнорированным, не должен
+# становиться сигналом остановки (NFR-5).
+libc.workspace = true
