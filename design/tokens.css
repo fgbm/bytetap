@@ -1,16 +1,14 @@
 /*
  * Дизайн-токены bytetap — единственный источник значений для приложения и сайта.
  *
- * Тема задаётся атрибутом `data-theme="light|dark"` на <html>; без атрибута действует
- * системная тема через `prefers-color-scheme`. VitePress ставит на <html> класс `dark`,
- * поэтому тёмные значения продублированы и для селектора `html.dark`.
+ * Тема задаётся атрибутом `data-theme="light|dark"` на <html>. Системная тема
+ * (`prefers-color-scheme`) живёт отдельно в `tokens-system.css`: только приложение
+ * следует за системой, сайт переключается классом `dark` от VitePress.
  *
  * Принципы и таблица значений — docs/dev/design.md.
  */
 
 :root {
-  color-scheme: light dark;
-
   /* Шрифты */
   --bt-font-ui: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
   --bt-font-mono: "IBM Plex Mono", "Cascadia Mono", Consolas, monospace;
@@ -47,9 +45,6 @@
   --bt-flash-duration: 1.4s;
   --bt-pulse-duration: 1.6s;
 
-  /* Штриховка автоответа: доля цвета текста в заливке */
-  --bt-hatch-opacity: 9%;
-
   /* Светлая тема «Белая» */
   --bt-surface-0: #ffffff;
   --bt-surface-1: #f6f7f9;
@@ -68,29 +63,6 @@
   --bt-rec-fg: #ffffff;
   --bt-accent: #2f3fbf;
   --bt-hatch: rgb(15 20 24 / 9%);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    /* Тёмная тема «Осциллограф» */
-    --bt-surface-0: #0d1013;
-    --bt-surface-1: #13181d;
-    --bt-trace-bg: #0a0d10;
-    --bt-border: #252d36;
-    --bt-border-faint: #1a2027;
-    --bt-text: #dde4ea;
-    --bt-text-muted: #7d8995;
-    --bt-dir-a2l: #3ee08f;
-    --bt-dir-l2a: #ffb23e;
-    --bt-ctrl: #8fb4ff;
-    --bt-ctrl-bg: #1b2638;
-    --bt-danger: #ff6464;
-    --bt-rec: #ff4d4d;
-    --bt-rec-bg: #2a1416;
-    --bt-rec-fg: #ffc2c2;
-    --bt-accent: #8fb4ff;
-    --bt-hatch: rgb(221 228 234 / 9%);
-  }
 }
 
 :root[data-theme="light"] {
