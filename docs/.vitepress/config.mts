@@ -58,6 +58,10 @@ export default defineConfig({
               items: [
                 { text: "Список этапов", link: "/dev/stages/" },
                 { text: "M0 — каркас", link: "/dev/stages/M0" },
+                {
+                  text: "M1 — ядро: TCP-сервер, журнал, автоответчик HL7/MLLP",
+                  link: "/dev/stages/M1",
+                },
               ],
             },
             { text: "Архитектура", link: "/dev/architecture" },
