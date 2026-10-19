@@ -18,6 +18,11 @@ mod tests {
     #[test]
     fn version_comes_from_manifest() {
         assert_eq!(version(), env!("CARGO_PKG_VERSION"));
-        assert_eq!(version().split('.').count(), 3);
+
+        let mut parts = version().split('.');
+        assert_eq!(parts.next(), Some(env!("CARGO_PKG_VERSION_MAJOR")));
+        assert_eq!(parts.next(), Some(env!("CARGO_PKG_VERSION_MINOR")));
+        assert_eq!(parts.next(), Some(env!("CARGO_PKG_VERSION_PATCH")));
+        assert_eq!(parts.next(), None);
     }
 }
