@@ -25,6 +25,9 @@ libc = "0.2"
 os_info = "3.15"
 proptest = "1.12"
 serde = { version = "1", features = ["derive"] }
+# COM-порт (FR-9, FR-11, FR-12): блокирующие чтение/запись с таймаутом и перечисление
+# портов с VID/PID. ADR 0002.
+serialport = { version = "4.10", default-features = false }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }

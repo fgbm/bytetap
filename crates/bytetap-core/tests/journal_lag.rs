@@ -31,7 +31,7 @@ async fn an_ack_does_not_wait_for_the_journal() {
     TEST_SYNC_DELAY_MS.store(JOURNAL_DELAY.as_millis() as u64, Ordering::Relaxed);
 
     let started = Instant::now();
-    let report = AnalyzerEmulator::new(handle.local_addr())
+    let report = AnalyzerEmulator::new(handle.local_addr().parse().expect("адрес сессии"))
         .with_messages([message.clone()])
         .run()
         .await

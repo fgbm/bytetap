@@ -67,7 +67,7 @@ pub enum Mode {
     /// Прокси TCP.
     Proxy,
     /// Вместо ЛИС через COM-порт.
-    ComServer,
+    Serial,
     /// Прослушка через два COM-порта.
     ComMonitor,
     /// COM-порт анализатора ↔ ЛИС по TCP.
@@ -76,13 +76,15 @@ pub enum Mode {
 
 impl Mode {
     /// Значение режима в поле `mode` и в имени файла.
+    ///
+    /// COM-порт «вместо ЛИС» пишется как `serial`: имя файла `…-serial.jsonl` (M3-AC16).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TcpServer => "tcp_server",
             Self::TcpClient => "tcp_client",
             Self::Proxy => "proxy",
-            Self::ComServer => "com_server",
+            Self::Serial => "serial",
             Self::ComMonitor => "com_monitor",
             Self::ComTcp => "com_tcp",
         }
@@ -365,6 +367,12 @@ pub struct ErrorEvent {
     /// Номер соединения; у ошибки уровня сессии его нет.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conn: Option<u32>,
+    /// Код ошибки для интерфейса: `connect_failed`, `serial_open_failed` и подобные.
+    ///
+    /// Список кодов — в `docs/reference/session-format.md`. Текст `message` остаётся
+    /// английским для журнала, а русскую строку интерфейс берёт по коду из i18n.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     /// Описание ошибки для инженера.
     pub message: String,
 }
@@ -382,6 +390,9 @@ pub struct InfoEvent {
     /// Номер соединения; у замечания уровня сессии его нет.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conn: Option<u32>,
+    /// Код замечания для интерфейса; список — в `docs/reference/session-format.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     /// Описание для инженера.
     pub message: String,
 }
@@ -565,11 +576,16 @@ mod tests {
             t: "2026-10-19T10:15:09.100000+03:00".to_owned(),
             mono_us: 9_100_000,
             conn: Some(1),
+            code: Some("checksum_mismatch".to_owned()),
             message: "ASTM checksum mismatch: got 3A, expected 3B".to_owned(),
         });
         assert_eq!(
             serde_json::to_value(&error).unwrap()["message"],
             "ASTM checksum mismatch: got 3A, expected 3B"
+        );
+        assert_eq!(
+            serde_json::to_value(&error).unwrap()["code"],
+            "checksum_mismatch"
         );
 
         let mut stats = Stats::default();
@@ -597,6 +613,7 @@ mod tests {
             t: "2026-10-19T10:15:09.100000+03:00".to_owned(),
             mono_us: 9_100_000,
             conn: None,
+            code: None,
             message: "4 bytes outside the MLLP frame ignored".to_owned(),
         });
         assert_eq!(
@@ -646,12 +663,14 @@ mod tests {
                 t: "t".to_owned(),
                 mono_us: 4,
                 conn: None,
+                code: None,
                 message: "boom".to_owned(),
             }),
             Event::Info(InfoEvent {
                 t: "t".to_owned(),
                 mono_us: 5,
                 conn: Some(1),
+                code: Some("protocol_undetected".to_owned()),
                 message: "incoming ACK is not acknowledged".to_owned(),
             }),
             Event::Note(Note {
@@ -680,6 +699,8 @@ mod tests {
     #[test]
     fn mode_and_dir_display_the_wire_values() {
         assert_eq!(Mode::TcpServer.to_string(), "tcp_server");
+        assert_eq!(Mode::TcpClient.to_string(), "tcp_client");
+        assert_eq!(Mode::Serial.to_string(), "serial");
         assert_eq!(Mode::ComTcp.to_string(), "com_tcp");
         assert_eq!(Dir::LisToAnalyzer.to_string(), "lis_to_analyzer");
         assert_eq!(Autoresponder::AstmE1381.to_string(), "astm_e1381");

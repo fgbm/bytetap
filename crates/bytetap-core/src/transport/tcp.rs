@@ -6,12 +6,34 @@
 //!
 //! `TCP_NODELAY` включён: подтверждение в один пакет не должно ждать, пока Nagle соберёт
 //! ещё данные, иначе таймаут протокола у анализатора может сработать раньше ответа (NFR-6).
+//!
+//! Ошибка `accept` не роняет источник: [`TcpServerSource`] отдаёт её сессии вместе
+//! с паузой до повтора, удваивая паузу до [`ACCEPT_BACKOFF_MAX`]. Занятый порт на старте —
+//! по-прежнему ошибка [`TcpServer::bind`].
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+
+use super::{Connection, ConnectionSource, Next};
+
+/// Первая пауза после ошибки `accept`.
+pub(crate) const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+
+/// Предел паузы после ошибки `accept`: порт, занятый чужой программой, не должен
+/// превращаться в поток событий `error` по тысяче в секунду (NFR-5).
+pub(crate) const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Следующая пауза после ошибки `accept`: удвоение до [`ACCEPT_BACKOFF_MAX`].
+pub(crate) fn next_backoff(previous: Duration) -> Duration {
+    (previous * 2).min(ACCEPT_BACKOFF_MAX)
+}
 
 /// Слушающий сокет TCP-сервера.
 #[derive(Debug)]
@@ -23,6 +45,10 @@ impl TcpServer {
     /// Занимает адрес и начинает слушать.
     ///
     /// Порт `0` означает «любой свободный»: фактический адрес даёт [`TcpServer::local_addr`].
+    ///
+    /// # Errors
+    ///
+    /// Адрес занят или недоступен.
     pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self { listener })
@@ -48,6 +74,50 @@ impl TcpServer {
     }
 }
 
+/// Источник соединений TCP-сервера.
+///
+/// Пауза `accept` живёт здесь, а не в сессии: источник решает, через сколько повторять,
+/// а сессия ждёт в `select!` вместе с остановкой и отказом журнала (NFR-5).
+pub struct TcpServerSource {
+    server: TcpServer,
+    backoff: Duration,
+}
+
+impl TcpServerSource {
+    /// Источник поверх занятого адреса.
+    #[must_use]
+    pub fn new(server: TcpServer) -> Self {
+        Self {
+            server,
+            backoff: ACCEPT_BACKOFF_MIN,
+        }
+    }
+}
+
+impl ConnectionSource for TcpServerSource {
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Next> + Send + '_>> {
+        Box::pin(async move {
+            match self.server.accept().await {
+                Ok(connection) => {
+                    self.backoff = ACCEPT_BACKOFF_MIN;
+                    let peer = connection.peer().to_string();
+                    let local = connection.local().to_string();
+                    Next::Connected(Connection {
+                        transport: Box::new(connection),
+                        peer,
+                        local,
+                    })
+                }
+                Err(error) => {
+                    let after = self.backoff;
+                    self.backoff = next_backoff(after);
+                    Next::Retry { error, after }
+                }
+            }
+        })
+    }
+}
+
 /// Принятое TCP-соединение.
 #[derive(Debug)]
 pub struct TcpConnection {
@@ -68,37 +138,39 @@ impl TcpConnection {
     pub const fn local(&self) -> SocketAddr {
         self.local
     }
+}
 
-    /// Читает очередной фрагмент. `Ok(0)` — собеседник закрыл соединение.
-    ///
-    /// Метод отменяемый, если прервать его до готовности данных: прочитанное не теряется.
-    pub async fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buffer).await
+impl AsyncRead for TcpConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TcpConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
-    /// Отправляет ответ целиком.
-    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.stream.write_all(bytes).await
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 
-    /// Отправляет часть ответа и возвращает число байт, принятых сокетом.
-    ///
-    /// Нужен, чтобы после обрыва посреди ответа в журнал попала именно отправленная
-    /// часть: [`AsyncWriteExt::write_all`] об этом не говорит.
-    pub async fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.stream.write(bytes).await
-    }
-
-    /// Закрывает соединение со своей стороны.
-    ///
-    /// Ошибка не возвращается: к моменту закрытия собеседник мог уже уйти.
-    pub async fn shutdown(&mut self) {
-        let _ = self.stream.shutdown().await;
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpStream;
 
     use super::*;
@@ -147,5 +219,19 @@ mod tests {
         drop(client);
         let mut buffer = [0u8; 8];
         assert_eq!(connection.read(&mut buffer).await.unwrap(), 0, "EOF");
+    }
+
+    #[test]
+    fn the_accept_backoff_grows_to_one_second() {
+        let mut pause = ACCEPT_BACKOFF_MIN;
+        assert_eq!(pause, Duration::from_millis(10), "первая пауза — 10 мс");
+        pause = next_backoff(pause);
+        assert_eq!(pause, Duration::from_millis(20));
+        pause = next_backoff(pause);
+        assert_eq!(pause, Duration::from_millis(40));
+        for _ in 0..10 {
+            pause = next_backoff(pause);
+        }
+        assert_eq!(pause, ACCEPT_BACKOFF_MAX, "предел паузы — 1 с");
     }
 }

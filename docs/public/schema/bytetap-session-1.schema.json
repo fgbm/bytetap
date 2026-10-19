@@ -33,6 +33,11 @@
       "description": "Направление фрагмента относительно анализатора и ЛИС",
       "enum": ["analyzer_to_lis", "lis_to_analyzer"]
     },
+    "code": {
+      "description": "Код события для интерфейса: connect_failed, serial_open_failed, protocol_undetected и другие из docs/reference/session-format.md",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
     "session": {
       "type": "object",
       "description": "Заголовок сессии, первая строка файла (FR-21)",
@@ -53,7 +58,7 @@
         "started_at": { "$ref": "#/$defs/time" },
         "mode": {
           "description": "Режим работы",
-          "enum": ["tcp_server", "tcp_client", "proxy", "com_server", "com_monitor", "com_tcp"]
+          "enum": ["tcp_server", "tcp_client", "proxy", "serial", "com_monitor", "com_tcp"]
         },
         "autoresponder": {
           "description": "Профиль автоответчика",
@@ -152,6 +157,7 @@
         "t": { "$ref": "#/$defs/time" },
         "mono_us": { "$ref": "#/$defs/mono_us" },
         "conn": { "$ref": "#/$defs/conn" },
+        "code": { "$ref": "#/$defs/code" },
         "message": { "type": "string" }
       },
       "additionalProperties": false
@@ -165,6 +171,7 @@
         "t": { "$ref": "#/$defs/time" },
         "mono_us": { "$ref": "#/$defs/mono_us" },
         "conn": { "$ref": "#/$defs/conn" },
+        "code": { "$ref": "#/$defs/code" },
         "message": { "type": "string" }
       },
       "additionalProperties": false

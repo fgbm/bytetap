@@ -365,6 +365,7 @@ mod tests {
             t: "t".to_owned(),
             mono_us: 12,
             conn: None,
+            code: None,
             message: "boom".to_owned(),
         });
         let value = serde_json::to_value(FeedEvent::from_session(&error).unwrap()).unwrap();
@@ -378,6 +379,7 @@ mod tests {
             t: "t".to_owned(),
             mono_us: 13,
             conn: Some(2),
+            code: None,
             message: "note for the engineer".to_owned(),
         });
         assert_eq!(

@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{Local, SecondsFormat};
-use serde_json::json;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -42,10 +42,8 @@ use crate::journal::{
     JournalFailureReason, Mode, MonoClock, Note, Open, Session as SessionHeader, SessionEnd, Stats,
     default_log_dir, io_message, log_dir_warning, now_rfc3339, session_file_name,
 };
-use crate::responder::{
-    Action, ControlIdSource, Hl7Mllp, NoResponder, Now, Responder, ResponderEvent,
-};
-use crate::transport::tcp::{TcpConnection, TcpServer};
+use crate::responder::{Action, ControlIdSource, Now, Responder, ResponderEvent, ResponderKind};
+use crate::transport::{Connection, ConnectionSource, Next, Source, Transport};
 
 /// Сколько событий держат каналы подписчиков.
 ///
@@ -84,20 +82,15 @@ const JOURNAL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "test-hooks")]
 pub static TEST_JOURNAL_SHUTDOWN_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Первая пауза после ошибки `accept`.
-const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
-
-/// Предел паузы после ошибки `accept`: порт, занятый чужой программой, не должен
-/// превращаться в поток событий `error` по тысяче в секунду (NFR-5).
-const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
-
-/// Настройки сессии: адрес, автоответчик, папка журналов, поля заголовка (FR-21).
+/// Настройки сессии: источник соединений, автоответчик, папка журналов, поля заголовка (FR-21).
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    /// Адрес и порт прослушивания; порт `0` — любой свободный.
-    pub listen: SocketAddr,
-    /// Профиль автоответчика: в M1 доступны `hl7_mllp` и `none`.
+    /// Откуда берутся соединения: TCP-сервер, TCP-клиент или COM-порт.
+    pub source: Source,
+    /// Профиль автоответчика (FR-14).
     pub responder: Autoresponder,
+    /// Отвечать `NAK` на неверную контрольную сумму ASTM (FR-17, M3-AC7).
+    pub astm_nak_on_bad_checksum: bool,
     /// Папка журналов; `None` — [`default_log_dir`].
     pub log_dir: Option<PathBuf>,
     /// Модель анализатора для заголовка журнала.
@@ -107,16 +100,62 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
-    /// Настройки сессии на адресе с автоответчиком HL7/MLLP.
+    /// Сессия TCP-сервера: ждать анализатор на адресе с автоответчиком HL7/MLLP.
+    ///
+    /// Порт `0` — любой свободный (FR-1).
     #[must_use]
     pub fn new(listen: SocketAddr) -> Self {
         Self {
-            listen,
+            source: Source::TcpServer { listen },
             responder: Autoresponder::Hl7Mllp,
+            astm_nak_on_bad_checksum: false,
             log_dir: None,
             analyzer: None,
             note: None,
         }
+    }
+
+    /// Сессия TCP-клиента: подключаться к анализатору-серверу (FR-2).
+    ///
+    /// `reconnect` — пауза между попытками; старт не требует доступного анализатора.
+    #[must_use]
+    pub fn tcp_client(addr: impl Into<String>, reconnect: Duration) -> Self {
+        Self {
+            source: Source::TcpClient {
+                addr: addr.into(),
+                reconnect,
+            },
+            responder: Autoresponder::Hl7Mllp,
+            astm_nak_on_bad_checksum: false,
+            log_dir: None,
+            analyzer: None,
+            note: None,
+        }
+    }
+
+    /// Сессия COM-порта «вместо ЛИС» (FR-9).
+    ///
+    /// `reconnect` — пауза между попытками открыть порт после разрыва.
+    #[must_use]
+    pub fn serial(settings: crate::transport::serial::SerialSettings, reconnect: Duration) -> Self {
+        Self {
+            source: Source::Serial {
+                settings,
+                reconnect,
+            },
+            responder: Autoresponder::Hl7Mllp,
+            astm_nak_on_bad_checksum: false,
+            log_dir: None,
+            analyzer: None,
+            note: None,
+        }
+    }
+
+    /// Источник соединений вместо адреса прослушивания.
+    #[must_use]
+    pub fn with_source(mut self, source: Source) -> Self {
+        self.source = source;
+        self
     }
 
     /// Профиль автоответчика (FR-14).
@@ -124,6 +163,25 @@ impl SessionConfig {
     pub fn with_responder(mut self, responder: Autoresponder) -> Self {
         self.responder = responder;
         self
+    }
+
+    /// Отвечать `NAK` на неверную контрольную сумму ASTM (FR-17).
+    #[must_use]
+    pub fn with_astm_nak(mut self, nak_on_bad_checksum: bool) -> Self {
+        self.astm_nak_on_bad_checksum = nak_on_bad_checksum;
+        self
+    }
+
+    /// Профиль автоответчика в виде, из которого строится автомат соединения (FR-14).
+    fn responder_kind(&self) -> ResponderKind {
+        match self.responder {
+            Autoresponder::Auto => ResponderKind::Auto,
+            Autoresponder::Hl7Mllp => ResponderKind::Hl7,
+            Autoresponder::AstmE1381 => ResponderKind::Astm {
+                nak_on_bad_checksum: self.astm_nak_on_bad_checksum,
+            },
+            Autoresponder::None => ResponderKind::None,
+        }
     }
 
     /// Папка журналов вместо папки по умолчанию (FR-19).
@@ -164,11 +222,12 @@ impl Session {
     /// Заголовок `session` пишется и фиксируется до возврата: путь к журналу уже существует,
     /// а ошибка открытия файла — ошибка старта. Вызывается внутри runtime `tokio`.
     ///
-    /// Профили, которых нет в M1 (`astm_e1381`, `auto`), отвергаются до создания файла.
+    /// Ошибка источника (занятый порт, настройки или открытие COM-порта) — ошибка старта
+    /// до создания файла. TCP-клиент стартует и без доступного анализатора (M3-AC1).
     ///
     /// # Errors
     ///
-    /// Порт занят, папка журналов недоступна, журнал не создан.
+    /// Порт занят, настройки порта неверны, папка журналов недоступна, журнал не создан.
     pub async fn start(config: SessionConfig) -> io::Result<SessionHandle> {
         Self::start_with_feed(config)
             .await
@@ -186,18 +245,6 @@ impl Session {
     pub async fn start_with_feed(
         config: SessionConfig,
     ) -> io::Result<(SessionHandle, broadcast::Receiver<SessionEvent>)> {
-        if !matches!(
-            config.responder,
-            Autoresponder::Hl7Mllp | Autoresponder::None
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "автоответчик `{}` появится в M3: в M1 доступны `hl7_mllp` и `none`",
-                    config.responder
-                ),
-            ));
-        }
         let log_dir = match config.log_dir.clone().or_else(default_log_dir) {
             Some(log_dir) => log_dir,
             None => {
@@ -209,23 +256,26 @@ impl Session {
         };
         let warning = log_dir_warning(&log_dir);
 
-        let server = TcpServer::bind(config.listen).await?;
-        let local_addr = server.local_addr()?;
+        // Источник готовится до журнала: его отказ не должен оставлять пустой файл.
+        let mode = config.source.mode();
+        let opened = config.source.open().await?;
+        let local = opened.local;
 
         let started = Local::now();
         let mut header = SessionHeader::at(
             started,
-            Mode::TcpServer,
+            mode,
             config.responder,
-            // `settings` — фактический адрес слушателя: при порте 0 он выбран системой,
-            // и записанное в журнал значение совпадает с тем, куда подключался анализатор.
-            json!({"listen": local_addr.to_string()}),
+            // `settings` — фактические настройки режима: у TCP-сервера это адрес, выбранный
+            // системой при порте 0, у клиента — адрес анализатора и интервал, у COM — порт
+            // и параметры (M3-AC16).
+            config.source.settings(&local),
             Host::current(),
         );
         header.analyzer = config.analyzer.clone();
         header.note = config.note.clone();
 
-        let path = log_dir.join(session_file_name(started, Mode::TcpServer));
+        let path = log_dir.join(session_file_name(started, mode));
         let journal = Journal::create(&path, header)?;
         // Подписка до запуска задачи: отказ, случившийся до неё, не должен потеряться.
         let journal_failed = journal.failed();
@@ -237,7 +287,7 @@ impl Session {
         let (failure_tx, failure_rx) = watch::channel(None);
         let (notes_tx, notes_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
-            responder: config.responder,
+            responder: config.responder_kind(),
             journal,
             clock: MonoClock::new(),
             events,
@@ -247,7 +297,8 @@ impl Session {
             open: Mutex::new(HashSet::new()),
         });
         let task = tokio::spawn(run(
-            server,
+            opened.source,
+            mode,
             Arc::clone(&shared),
             stop_rx,
             failure_rx,
@@ -256,7 +307,7 @@ impl Session {
         ));
 
         let handle = SessionHandle {
-            local_addr,
+            local,
             path,
             warning,
             events: shared.events.clone(),
@@ -277,7 +328,7 @@ impl Session {
 /// моменту уже остановлен, сигнал до неё не дойдёт, а `session_end` не запишется.
 /// Поэтому останавливать сессию нужно явно, пока runtime жив.
 pub struct SessionHandle {
-    local_addr: SocketAddr,
+    local: String,
     path: PathBuf,
     warning: Option<String>,
     events: broadcast::Sender<SessionEvent>,
@@ -311,10 +362,13 @@ impl SessionCounters {
 }
 
 impl SessionHandle {
-    /// Фактический адрес и порт слушателя (при порте `0` выбран системой).
+    /// Что показать в строке состояния.
+    ///
+    /// Для TCP-сервера — фактический адрес слушателя (при порте `0` выбран системой),
+    /// для TCP-клиента — адрес анализатора, для COM — имя порта (M3-AC16, контракт моста).
     #[must_use]
-    pub const fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+    pub fn local_addr(&self) -> &str {
+        &self.local
     }
 
     /// Путь к файлу журнала.
@@ -419,7 +473,7 @@ impl Drop for SessionHandle {
 impl std::fmt::Debug for SessionHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionHandle")
-            .field("local_addr", &self.local_addr)
+            .field("local_addr", &self.local)
             .field("path", &self.path)
             .field("stopped", &self.task.is_none())
             .finish()
@@ -458,7 +512,7 @@ pub fn journal_failure_reason(err: &io::Error) -> Option<&JournalFailureReason> 
 
 /// То, что нужно каждому соединению: журнал, часы, автоответчик, подписчики и счётчики.
 struct Shared {
-    responder: Autoresponder,
+    responder: ResponderKind,
     journal: Journal,
     clock: MonoClock,
     events: broadcast::Sender<SessionEvent>,
@@ -489,20 +543,27 @@ impl Shared {
     ///
     /// Сообщения в журнале — английские, независимо от источника: их читает и человек,
     /// и поиск по журналу (`docs/reference/session-format.md`). Русский — только интерфейс.
-    fn error(&self, conn: Option<u32>, message: impl Into<String>) {
+    /// Ошибка с кодом для интерфейса: `code` остаётся `None`, если перевода нет.
+    fn error_with_code(&self, conn: Option<u32>, code: Option<&str>, message: impl Into<String>) {
         self.publish(Event::Error(ErrorEvent {
             t: now_rfc3339(),
             mono_us: self.clock.now_us(),
             conn,
+            code: code.map(str::to_owned),
             message: message.into(),
         }));
     }
 
     fn info(&self, conn: Option<u32>, message: impl Into<String>) {
+        self.info_with_code(conn, None, message);
+    }
+
+    fn info_with_code(&self, conn: Option<u32>, code: Option<&str>, message: impl Into<String>) {
         self.publish(Event::Info(InfoEvent {
             t: now_rfc3339(),
             mono_us: self.clock.now_us(),
             conn,
+            code: code.map(str::to_owned),
             message: message.into(),
         }));
     }
@@ -531,6 +592,7 @@ impl Shared {
             t: now_rfc3339(),
             mono_us: self.clock.now_us(),
             conn: None,
+            code: Some("journal_failure".to_owned()),
             message: format!("journal write failed: {reason}; no ACKs are sent after the failure"),
         })));
     }
@@ -606,19 +668,19 @@ impl Counters {
     }
 }
 
-/// Подряд идущие ошибки `accept`.
+/// Подряд идущие ошибки источника: `accept`, подключения TCP-клиента, открытия порта.
 ///
 /// Одинаковые ошибки схлопываются: в журнал попадает одно событие `error`, а при
-/// восстановлении — одно `info` со счётчиком повторов. Иначе занятый порт давал бы
-/// две строки в секунду на весь журнал.
+/// восстановлении — одно `info` со счётчиком повторов. Иначе недоступный анализатор
+/// давал бы строку в журнал каждые несколько секунд на весь журнал (M3-AC1, M3-AC2).
 #[derive(Debug, Default)]
-struct AcceptErrors {
+struct SourceErrors {
     current: Option<(String, u32)>,
 }
 
-/// Что записать о новой ошибке `accept`.
+/// Что записать о новой ошибке источника.
 #[derive(Debug)]
-enum AcceptReport {
+enum SourceReport {
     /// Ошибка новая: нужен `error`.
     First(String),
     /// Ошибка сменилась: `info` о повторах прежней и `error` о новой.
@@ -631,17 +693,17 @@ enum AcceptReport {
     Repeated,
 }
 
-impl AcceptErrors {
+impl SourceErrors {
     /// Учитывает ошибку и говорит, что о ней писать.
-    fn failed(&mut self, message: String) -> AcceptReport {
+    fn failed(&mut self, message: String) -> SourceReport {
         match self.current.take() {
             Some((previous, repeats)) if previous == message => {
                 self.current = Some((previous, repeats + 1));
-                AcceptReport::Repeated
+                SourceReport::Repeated
             }
             Some((previous, repeats)) => {
                 self.current = Some((message.clone(), 0));
-                AcceptReport::Changed {
+                SourceReport::Changed {
                     previous,
                     repeats,
                     message,
@@ -649,37 +711,43 @@ impl AcceptErrors {
             }
             None => {
                 self.current = Some((message.clone(), 0));
-                AcceptReport::First(message)
+                SourceReport::First(message)
             }
         }
     }
 
     /// Приём восстановился: отчёт о схлопнутых повторах, если они были.
-    fn recovered(&mut self) -> Option<String> {
+    fn recovered(&mut self, prefix: &str) -> Option<String> {
         self.current.take().and_then(|(previous, repeats)| {
-            (repeats > 0)
-                .then(|| format!("accept recovered after {repeats} repeated failures: {previous}"))
+            (repeats > 0).then(|| {
+                format!("{prefix} recovered after {repeats} repeated failures: {previous}")
+            })
         })
     }
 
     /// Серия не закончилась к остановке: отчёт о повторах перед `session_end`.
     ///
-    /// Без него последняя серия ошибок `accept` выглядела бы в журнале одной ошибкой:
+    /// Без него последняя серия ошибок выглядела бы в журнале одной ошибкой:
     /// повторы схлопнуты, а восстановления, о котором сообщает `info`, уже не будет.
-    fn stopped(&mut self) -> Option<String> {
+    fn stopped(&mut self, prefix: &str) -> Option<String> {
         self.current.take().and_then(|(previous, repeats)| {
             (repeats > 0).then(|| {
                 format!(
-                    "accept still failing after {repeats} repeated failures at the stop: {previous}"
+                    "{prefix} still failing after {repeats} repeated failures at the stop: {previous}"
                 )
             })
         })
     }
 }
 
-/// Следующая пауза после ошибки `accept`: удвоение до [`ACCEPT_BACKOFF_MAX`].
-fn next_backoff(previous: Duration) -> Duration {
-    (previous * 2).min(ACCEPT_BACKOFF_MAX)
+/// Как назвать ошибку источника в журнале и какой код дать интерфейсу.
+fn source_failure(mode: Mode) -> (&'static str, &'static str) {
+    match mode {
+        Mode::TcpServer => ("accept failed", "accept_failed"),
+        Mode::TcpClient => ("connect failed", "connect_failed"),
+        Mode::Serial => ("serial port open failed", "serial_open_failed"),
+        Mode::Proxy | Mode::ComMonitor | Mode::ComTcp => ("source failed", "source_failed"),
+    }
 }
 
 /// Ждёт остановки сессии (или выгрузки её дескриптора).
@@ -691,6 +759,21 @@ async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
     let _ = stop.changed().await;
 }
 
+/// Срок автомата от текущего момента; `None` — автомат ждёт только данных.
+fn responder_deadline(responder: &mut (impl Responder + ?Sized)) -> Option<tokio::time::Instant> {
+    responder
+        .poll_timeout(timestamp().1)
+        .map(|after| tokio::time::Instant::now() + after)
+}
+
+/// Ждёт срок автомата; без срока не наступает никогда.
+async fn wait_for_deadline(deadline: &mut Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(*at).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Ждёт отказа журнала (или выгрузки дескриптора сессии).
 async fn wait_for_failure(failure: &mut watch::Receiver<Option<JournalFailureReason>>) {
     if failure.borrow_and_update().is_some() {
@@ -699,9 +782,10 @@ async fn wait_for_failure(failure: &mut watch::Receiver<Option<JournalFailureRea
     let _ = failure.changed().await;
 }
 
-/// Задача сессии: принимает соединения, пока не придёт остановка или отказ журнала.
+/// Задача сессии: берёт соединения из источника, пока не придёт остановка или отказ журнала.
 async fn run(
-    server: TcpServer,
+    mut source: Box<dyn ConnectionSource>,
+    mode: Mode,
     shared: Arc<Shared>,
     mut stop: watch::Receiver<bool>,
     mut failure: watch::Receiver<Option<JournalFailureReason>>,
@@ -709,16 +793,34 @@ async fn run(
     mut notes: mpsc::UnboundedReceiver<String>,
 ) -> io::Result<Stats> {
     let mut tasks: JoinSet<()> = JoinSet::new();
-    let mut accept_errors = AcceptErrors::default();
-    let mut backoff = ACCEPT_BACKOFF_MIN;
+    let mut source_errors = SourceErrors::default();
+    let sequential = source.sequential();
+    let (prefix, code) = source_failure(mode);
+    let mut wait_before_next = false;
     loop {
+        // TCP-клиент и COM-порт не открывают второе соединение, пока живо первое,
+        // и выдерживают интервал после разрыва (M3-AC1, M3-AC2).
+        if wait_before_next {
+            wait_before_next = false;
+            let pause = source.pause_between_connections();
+            if !pause.is_zero() {
+                tokio::select! {
+                    () = tokio::time::sleep(pause) => {}
+                    _ = wait_for_stop(&mut stop) => break,
+                    _ = wait_for_failure(&mut failure) => break,
+                    _ = wait_for_failure(&mut journal_failed) => {
+                        shared.fail_journal();
+                        break;
+                    }
+                }
+            }
+        }
         tokio::select! {
-            accepted = server.accept() => match accepted {
-                Ok(connection) => {
-                    if let Some(note) = accept_errors.recovered() {
+            next = source.next(), if !sequential || tasks.is_empty() => match next {
+                Next::Connected(connection) => {
+                    if let Some(note) = source_errors.recovered(prefix) {
                         shared.info(None, note);
                     }
-                    backoff = ACCEPT_BACKOFF_MIN;
                     let conn = shared.counters.next_conn();
                     if let Ok(mut open) = shared.open.lock() {
                         open.insert(conn);
@@ -726,38 +828,44 @@ async fn run(
                     // `open` пишется здесь, а не в задаче соединения: так порядок строк
                     // совпадает с порядком номеров, и открытие не может оказаться после
                     // первых фрагментов этого же соединения.
+                    let Connection { transport, peer, local } = connection;
                     shared.publish(Event::Open(Open {
                         t: now_rfc3339(),
                         mono_us: shared.clock.now_us(),
                         conn,
-                        peer: connection.peer().to_string(),
-                        local: connection.local().to_string(),
+                        peer,
+                        local,
                     }));
                     let shared = Arc::clone(&shared);
                     let mut conn_stop = stop.clone();
                     let mut conn_failure = failure.clone();
                     tasks.spawn(async move {
-                        serve(connection, conn, &shared, &mut conn_stop, &mut conn_failure).await;
+                        let mut transport = transport;
+                        serve(transport.as_mut(), conn, &shared, &mut conn_stop, &mut conn_failure)
+                            .await;
                     });
                 }
-                Err(err) => {
-                    // Ошибка приёма не роняет сессию (NFR-5): пишем её и слушаем дальше.
-                    let message = format!("accept failed: {}", io_message(&err));
-                    match accept_errors.failed(message) {
-                        AcceptReport::Repeated => {}
-                        AcceptReport::First(message) => shared.error(None, message),
-                        AcceptReport::Changed { previous, repeats, message } => {
+                Next::Retry { error, after } => {
+                    // Неудачное подключение не роняет сессию (NFR-5, M3-AC1, M3-AC2):
+                    // одно `error`, повторы схлопываются, ожидание прерывается «Стопом».
+                    let message = format!("{prefix}: {}", io_message(&error));
+                    match source_errors.failed(message) {
+                        SourceReport::Repeated => {}
+                        SourceReport::First(message) => {
+                            shared.error_with_code(None, Some(code), message);
+                        }
+                        SourceReport::Changed { previous, repeats, message } => {
                             shared.info(
                                 None,
                                 format!(
-                                    "accept error changed after {repeats} repeats of the previous one: {previous}"
+                                    "source error changed after {repeats} repeats of the previous one: {previous}"
                                 ),
                             );
-                            shared.error(None, message);
+                            shared.error_with_code(None, Some(code), message);
                         }
                     }
                     tokio::select! {
-                        () = tokio::time::sleep(backoff) => {}
+                        () = tokio::time::sleep(after) => {}
                         _ = wait_for_stop(&mut stop) => break,
                         _ = wait_for_failure(&mut failure) => break,
                         _ = wait_for_failure(&mut journal_failed) => {
@@ -765,11 +873,13 @@ async fn run(
                             break;
                         }
                     }
-                    backoff = next_backoff(backoff);
                 }
             },
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 let _ = joined;
+                if tasks.is_empty() && sequential {
+                    wait_before_next = true;
+                }
             },
             Some(text) = notes.recv() => {
                 // Комментарий идёт в журнал и ленту как обычное событие сессии (FR-23).
@@ -789,8 +899,8 @@ async fn run(
         }
     }
 
-    // Слушатель закрыт вместе с `server`; соединения видят остановку и пишут `close`.
-    drop(server);
+    // Источник закрыт: у TCP-сервера вместе с ним закрывается слушатель.
+    drop(source);
     let all_closed = timeout(CONNECTIONS_SHUTDOWN_TIMEOUT, async {
         while tasks.join_next().await.is_some() {}
     })
@@ -813,9 +923,9 @@ async fn run(
         return Err(journal_failure_error(reason));
     }
 
-    // Серия ошибок `accept`, не закончившаяся к остановке: повторы не должны пропасть
+    // Серия ошибок источника, не закончившаяся к остановке: повторы не должны пропасть
     // из журнала только потому, что восстановления не было (NFR-5).
-    if let Some(note) = accept_errors.stopped() {
+    if let Some(note) = source_errors.stopped(prefix) {
         shared.info(None, note);
     }
     // Комментарий, отправленный перед «Стоп», не теряется: очередь дочитывается
@@ -875,15 +985,20 @@ async fn shutdown_journal(journal: &Journal) -> io::Result<()> {
 }
 
 /// Обслуживает одно соединение до закрытия.
+///
+/// Функция не знает, TCP это или COM-порт: транспорт — `AsyncRead + AsyncWrite`
+/// (M3-AC12). Всё остальное — нумерация, журнал, автоответчик — общее для всех режимов.
 async fn serve(
-    mut connection: TcpConnection,
+    transport: &mut dyn Transport,
     conn: u32,
     shared: &Shared,
     stop: &mut watch::Receiver<bool>,
     failure: &mut watch::Receiver<Option<JournalFailureReason>>,
 ) {
-    let mut responder = make_responder(shared.responder, &shared.ids);
+    let mut responder = shared.responder.build(shared.ids.clone());
     let mut buffer = vec![0u8; READ_BUFFER];
+    // Срок автомата: ASTM сообщает по нему о недособранном кадре (FR-17).
+    let mut deadline = responder_deadline(responder.as_mut());
     let (by, reason) = loop {
         if failure.borrow().is_some() {
             break (ClosedBy::Bytetap, "stop");
@@ -892,7 +1007,7 @@ async fn serve(
             biased;
             _ = wait_for_stop(stop) => break (ClosedBy::Bytetap, "stop"),
             _ = wait_for_failure(failure) => break (ClosedBy::Bytetap, "stop"),
-            read = connection.read(&mut buffer) => match read {
+            read = transport.read(&mut buffer) => match read {
                 Ok(0) => break (ClosedBy::Analyzer, "eof"),
                 Ok(len) => {
                     let payload = &buffer[..len];
@@ -907,25 +1022,31 @@ async fn serve(
                         false,
                         payload,
                     )));
-                    if let Some((by, reason)) = apply(
-                        shared,
-                        conn,
-                        &mut connection,
-                        responder.feed(payload, now),
-                        stop,
-                        failure,
-                    )
-                    .await
+                    let actions = responder.feed(payload, now);
+                    deadline = responder_deadline(responder.as_mut());
+                    if let Some((by, reason)) =
+                        apply(shared, conn, transport, actions, stop, failure).await
                     {
                         break (by, reason);
                     }
                 }
                 Err(err) => {
                     let (by, reason) = close_reason(&err);
-                    shared.error(
+                    shared.error_with_code(
                         Some(conn),
+                        Some("connection_read_failed"),
                         format!("connection read failed: {}", io_message(&err)),
                     );
+                    break (by, reason);
+                }
+            },
+            // Срок автомата истёк: пустой фрагмент будит его, отчёт уходит в журнал.
+            _ = wait_for_deadline(&mut deadline) => {
+                let actions = responder.feed(&[], timestamp().1);
+                deadline = responder_deadline(responder.as_mut());
+                if let Some((by, reason)) =
+                    apply(shared, conn, transport, actions, stop, failure).await
+                {
                     break (by, reason);
                 }
             },
@@ -934,17 +1055,9 @@ async fn serve(
 
     // Автоответчик не теряет недособранное состояние молча: отчёт идёт до `close`.
     let actions = responder.finish(timestamp().1);
-    let _ = apply(shared, conn, &mut connection, actions, stop, failure).await;
+    let _ = apply(shared, conn, transport, actions, stop, failure).await;
     shared.close_conn(conn, by, reason);
-    connection.shutdown().await;
-}
-
-/// Автоответчик соединения по профилю. Профиль уже проверен при старте сессии.
-fn make_responder(kind: Autoresponder, ids: &ControlIdSource) -> Box<dyn Responder + Send> {
-    match kind {
-        Autoresponder::Hl7Mllp => Box::new(Hl7Mllp::new(ids.clone())),
-        _ => Box::new(NoResponder),
-    }
+    let _ = transport.shutdown().await;
 }
 
 /// Выполняет действия автоответчика по порядку: ответ — в сокет, затем в журнал.
@@ -958,7 +1071,7 @@ fn make_responder(kind: Autoresponder, ids: &ControlIdSource) -> Box<dyn Respond
 async fn apply(
     shared: &Shared,
     conn: u32,
-    connection: &mut TcpConnection,
+    transport: &mut dyn Transport,
     actions: Vec<Action>,
     stop: &mut watch::Receiver<bool>,
     failure: &mut watch::Receiver<Option<JournalFailureReason>>,
@@ -972,7 +1085,7 @@ async fn apply(
                     return Some((ClosedBy::Bytetap, "stop"));
                 }
                 let sent = AtomicUsize::new(0);
-                let write = write_counted(connection, &payload, &sent);
+                let write = write_counted(transport, &payload, &sent);
                 let outcome = tokio::select! {
                     biased;
                     _ = wait_for_stop(stop) => {
@@ -986,8 +1099,9 @@ async fn apply(
                 match outcome {
                     Err(_elapsed) => {
                         record_answer(shared, conn, &payload, sent.load(Ordering::Relaxed));
-                        shared.error(
+                        shared.error_with_code(
                             Some(conn),
+                            Some("answer_timeout"),
                             format!("answer write timed out after {} s", WRITE_TIMEOUT.as_secs()),
                         );
                         return Some((ClosedBy::Bytetap, "timeout"));
@@ -995,8 +1109,9 @@ async fn apply(
                     Ok(Err(err)) => {
                         record_answer(shared, conn, &payload, sent.load(Ordering::Relaxed));
                         let (by, reason) = close_reason(&err);
-                        shared.error(
+                        shared.error_with_code(
                             Some(conn),
+                            Some("answer_write_failed"),
                             format!("answer write failed: {}", io_message(&err)),
                         );
                         return Some((by, reason));
@@ -1011,16 +1126,18 @@ async fn apply(
                 let (t, _) = timestamp();
                 let mono_us = shared.clock.now_us();
                 let event = match event {
-                    ResponderEvent::Error { message } => Event::Error(ErrorEvent {
+                    ResponderEvent::Error { message, code } => Event::Error(ErrorEvent {
                         t,
                         mono_us,
                         conn: Some(conn),
+                        code: code.map(|code| code.as_str().to_owned()),
                         message,
                     }),
-                    ResponderEvent::Info { message } => Event::Info(InfoEvent {
+                    ResponderEvent::Info { message, code } => Event::Info(InfoEvent {
                         t,
                         mono_us,
                         conn: Some(conn),
+                        code: code.map(|code| code.as_str().to_owned()),
                         message,
                     }),
                 };
@@ -1037,7 +1154,7 @@ async fn apply(
 /// с вызывающим: если запись прервёт таймаут или остановка, отправленная часть
 /// останется в счётчике и попадёт в журнал — анализатор её получил.
 async fn write_counted(
-    connection: &mut TcpConnection,
+    transport: &mut dyn Transport,
     payload: &[u8],
     sent: &AtomicUsize,
 ) -> io::Result<()> {
@@ -1046,7 +1163,7 @@ async fn write_counted(
         if written >= payload.len() {
             return Ok(());
         }
-        let accepted = connection.write(&payload[written..]).await?;
+        let accepted = transport.write(&payload[written..]).await?;
         if accepted == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -1110,18 +1227,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unimplemented_responder_is_rejected_before_the_file() {
-        let dir = temp_dir();
-        let config = SessionConfig::new("127.0.0.1:0".parse().unwrap())
-            .with_responder(Autoresponder::Auto)
-            .with_log_dir(dir.path());
-        let err = Session::start(config).await.expect_err("профиль M3");
-        assert!(err.to_string().contains("M3"), "{err}");
-        assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            0,
-            "файл журнала не создан"
-        );
+    async fn every_responder_profile_starts_and_is_written_to_the_header() {
+        for responder in [
+            Autoresponder::Hl7Mllp,
+            Autoresponder::AstmE1381,
+            Autoresponder::Auto,
+            Autoresponder::None,
+        ] {
+            let dir = temp_dir();
+            let config = SessionConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_responder(responder)
+                .with_log_dir(dir.path());
+            let handle = Session::start(config)
+                .await
+                .unwrap_or_else(|err| panic!("{responder}: {err}"));
+            let path = handle.journal_path().to_path_buf();
+            handle.stop().await.expect("остановка");
+            let outcome = read_all(&path).expect("чтение журнала");
+            let Event::Session(header) = &outcome.lines[0].event else {
+                panic!("первая строка — заголовок");
+            };
+            assert_eq!(header.autoresponder, responder);
+        }
     }
 
     #[tokio::test]
@@ -1133,8 +1260,8 @@ mod tests {
             .with_analyzer("ANALYZER")
             .with_note("синтетическая сессия");
         let handle = Session::start(config).await.expect("сессия");
-        let addr = handle.local_addr();
-        assert_ne!(addr.port(), 0);
+        let addr = handle.local_addr().to_owned();
+        assert_ne!(addr.parse::<SocketAddr>().unwrap().port(), 0);
         assert!(handle.journal_path().exists(), "заголовок уже на диске");
         assert!(handle.log_dir_warning().is_none(), "{:?}", handle.warning);
         let path = handle.journal_path().to_path_buf();
@@ -1311,43 +1438,45 @@ mod tests {
     }
 
     #[test]
-    fn accept_backoff_grows_to_one_second() {
-        let mut pause = ACCEPT_BACKOFF_MIN;
-        assert_eq!(pause, Duration::from_millis(10), "первая пауза — 10 мс");
-        pause = next_backoff(pause);
-        assert_eq!(pause, Duration::from_millis(20));
-        pause = next_backoff(pause);
-        assert_eq!(pause, Duration::from_millis(40));
-        for _ in 0..10 {
-            pause = next_backoff(pause);
-        }
-        assert_eq!(pause, ACCEPT_BACKOFF_MAX, "предел паузы — 1 с");
+    fn accepts_and_connections_are_named_by_mode() {
+        assert_eq!(
+            source_failure(Mode::TcpServer),
+            ("accept failed", "accept_failed")
+        );
+        assert_eq!(
+            source_failure(Mode::TcpClient),
+            ("connect failed", "connect_failed")
+        );
+        assert_eq!(
+            source_failure(Mode::Serial),
+            ("serial port open failed", "serial_open_failed")
+        );
     }
 
     #[test]
-    fn identical_accept_errors_collapse_into_one_event_and_a_counter() {
-        let mut errors = AcceptErrors::default();
+    fn identical_source_errors_collapse_into_one_event_and_a_counter() {
+        let mut errors = SourceErrors::default();
         match errors.failed("accept failed: нет мест".to_owned()) {
-            AcceptReport::First(message) => assert!(message.contains("нет мест"), "{message}"),
+            SourceReport::First(message) => assert!(message.contains("нет мест"), "{message}"),
             other => panic!("первая ошибка должна попасть в журнал: {other:?}"),
         }
         assert!(
             matches!(
                 errors.failed("accept failed: нет мест".to_owned()),
-                AcceptReport::Repeated
+                SourceReport::Repeated
             ),
             "повтор не пишется"
         );
         assert!(matches!(
             errors.failed("accept failed: нет мест".to_owned()),
-            AcceptReport::Repeated
+            SourceReport::Repeated
         ));
         assert_eq!(
-            errors.recovered().as_deref(),
+            errors.recovered("accept").as_deref(),
             Some("accept recovered after 2 repeated failures: accept failed: нет мест")
         );
         assert_eq!(
-            errors.recovered(),
+            errors.recovered("accept"),
             None,
             "восстановление сообщается один раз"
         );
@@ -1355,32 +1484,32 @@ mod tests {
 
     #[test]
     fn a_series_unfinished_at_the_stop_is_reported_with_its_count() {
-        let mut errors = AcceptErrors::default();
+        let mut errors = SourceErrors::default();
         let _ = errors.failed("accept failed: port taken".to_owned());
         let _ = errors.failed("accept failed: port taken".to_owned());
 
         // Серия не восстановилась до остановки: счётчик повторов не теряется.
         assert_eq!(
-            errors.stopped().as_deref(),
+            errors.stopped("accept").as_deref(),
             Some(
                 "accept still failing after 1 repeated failures at the stop: accept failed: port taken"
             )
         );
-        assert_eq!(errors.stopped(), None, "серия сообщается один раз");
+        assert_eq!(errors.stopped("accept"), None, "серия сообщается один раз");
 
         // Одиночная ошибка уже в журнале: отчёт о нуле повторов не нужен.
-        let mut single = AcceptErrors::default();
+        let mut single = SourceErrors::default();
         let _ = single.failed("accept failed: port taken".to_owned());
-        assert_eq!(single.stopped(), None);
+        assert_eq!(single.stopped("accept"), None);
     }
 
     #[test]
-    fn a_different_accept_error_is_reported_with_the_previous_count() {
-        let mut errors = AcceptErrors::default();
+    fn a_different_source_error_is_reported_with_the_previous_count() {
+        let mut errors = SourceErrors::default();
         let _ = errors.failed("first".to_owned());
         let _ = errors.failed("first".to_owned());
         match errors.failed("second".to_owned()) {
-            AcceptReport::Changed {
+            SourceReport::Changed {
                 previous,
                 repeats,
                 message,
@@ -1391,7 +1520,11 @@ mod tests {
             }
             other => panic!("смена ошибки не сообщена: {other:?}"),
         }
-        assert_eq!(errors.recovered(), None, "у новой ошибки повторов не было");
+        assert_eq!(
+            errors.recovered("accept"),
+            None,
+            "у новой ошибки повторов не было"
+        );
     }
 
     #[test]

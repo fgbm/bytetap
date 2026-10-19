@@ -38,7 +38,7 @@ async fn a_hung_journal_fails_the_stop_instead_of_holding_it() {
         Ordering::Relaxed,
     );
 
-    let report = AnalyzerEmulator::new(handle.local_addr())
+    let report = AnalyzerEmulator::new(handle.local_addr().parse().expect("адрес сессии"))
         .with_messages([message])
         .run()
         .await

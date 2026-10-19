@@ -50,7 +50,7 @@ async fn capture(
     fragmentation: Fragmentation,
 ) -> (PathBuf, Stats, EmulatorReport, std::net::SocketAddr) {
     let handle = start(dir).await;
-    let addr = handle.local_addr();
+    let addr: std::net::SocketAddr = handle.local_addr().parse().expect("адрес сессии");
     let report = AnalyzerEmulator::new(addr)
         .with_messages(messages)
         .with_fragmentation(fragmentation)
@@ -267,7 +267,7 @@ async fn a_reconnecting_analyzer_gets_a_new_connection_number() {
         "analyzer_qry_q02.hl7",
         "analyzer_oru_r01.hl7",
     ]);
-    let report = AnalyzerEmulator::new(handle.local_addr())
+    let report = AnalyzerEmulator::new(handle.local_addr().parse().expect("адрес сессии"))
         .with_messages(messages.clone())
         .reconnect_between_messages()
         .run()
@@ -318,7 +318,7 @@ async fn a_reconnecting_analyzer_gets_a_new_connection_number() {
 async fn two_parallel_connections_are_numbered_apart() {
     let dir = tempfile::tempdir().expect("временная папка");
     let handle = start(dir.path()).await;
-    let addr = handle.local_addr();
+    let addr: std::net::SocketAddr = handle.local_addr().parse().expect("адрес сессии");
     let mut events = handle.subscribe();
 
     let first = fixtures(&["analyzer_oru_r01.hl7", "analyzer_qry_q02.hl7"]);

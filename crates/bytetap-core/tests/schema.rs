@@ -65,12 +65,14 @@ fn events() -> Vec<Event> {
             t: bytetap_core::journal::now_rfc3339(),
             mono_us: 9_100_000,
             conn: Some(1),
-            message: "неразбираемое сообщение".to_owned(),
+            code: Some("connect_failed".to_owned()),
+            message: "connect failed: connection refused".to_owned(),
         }),
         Event::Info(InfoEvent {
             t: bytetap_core::journal::now_rfc3339(),
             mono_us: 9_200_000,
             conn: Some(1),
+            code: None,
             message: "4 bytes outside the MLLP frame ignored".to_owned(),
         }),
         Event::Note(Note {
@@ -121,6 +123,35 @@ fn journal_written_by_the_core_validates_line_by_line() {
     for line in outcome.lines {
         if let Err(error) = validator.validate(&line.value) {
             panic!("строка {} не прошла схему: {error}", line.number);
+        }
+    }
+}
+
+#[test]
+fn tcp_client_and_serial_headers_validate_against_the_schema() {
+    let schema = schema();
+    let validator = jsonschema::validator_for(&schema).expect("схема проверяется движком");
+    for (mode, settings) in [
+        (
+            Mode::TcpClient,
+            json!({"connect": "192.168.1.50:5000", "reconnect_sec": 5}),
+        ),
+        (
+            Mode::Serial,
+            json!({
+                "port": "COM5",
+                "baud": 9600,
+                "format": "8N1",
+                "flow": "none",
+                "dtr": true,
+                "rts": true
+            }),
+        ),
+    ] {
+        let header = Session::new(mode, Autoresponder::Auto, settings, Host::current());
+        let value = serde_json::to_value(Event::Session(header)).expect("сериализация");
+        if let Err(error) = validator.validate(&value) {
+            panic!("заголовок {mode} не прошёл схему: {error}\n{value}");
         }
     }
 }

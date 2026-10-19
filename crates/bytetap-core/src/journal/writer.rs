@@ -990,6 +990,14 @@ mod tests {
             "bytetap-20261019-101500-tcp_server.jsonl"
         );
         assert_eq!(
+            session_file_name(started, Mode::TcpClient),
+            "bytetap-20261019-101500-tcp_client.jsonl"
+        );
+        assert_eq!(
+            session_file_name(started, Mode::Serial),
+            "bytetap-20261019-101500-serial.jsonl"
+        );
+        assert_eq!(
             session_file_name(started, Mode::ComMonitor),
             "bytetap-20261019-101500-com_monitor.jsonl"
         );

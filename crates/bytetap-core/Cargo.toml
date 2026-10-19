@@ -13,11 +13,21 @@ dirs.workspace = true
 os_info.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serialport.workspace = true
 tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Тип тома для предупреждения о сетевой папке журналов (FR-19): `GetDriveTypeW`.
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+# `GetCommState`/`SetCommState` — чётность mark/space, которой нет в `serialport` (FR-11).
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_Communication",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# Терминал порта: mark/space (`CMSPAR`, `TCGETS2`) и управляющие линии pty (FR-11, M3-AC11).
+libc.workspace = true
 
 [features]
 # Тестовый хук писателя журнала: задержка перед `sync_data` (M1-AC14).
