@@ -227,7 +227,7 @@ pub fn ack_msa(ack: &[u8]) -> Option<(String, String)> {
 }
 
 /// Читает один ответ в рамке MLLP.
-async fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+pub(crate) async fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {

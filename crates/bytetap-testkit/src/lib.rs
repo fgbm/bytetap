@@ -5,6 +5,7 @@
 
 pub mod astm;
 pub mod emulator;
+pub mod server;
 
 use std::path::{Path, PathBuf};
 
