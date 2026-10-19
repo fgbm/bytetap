@@ -1,8 +1,11 @@
 //! Читатель журнала: строки файла превращаются в события.
 //!
 //! Ошибка сообщается с номером строки. Последняя строка может быть обрезана аварийным
-//! завершением или отключением питания (FR-20): читатель отличает её от битой строки
-//! в середине файла, чтобы `bytetap-cli verify` считал её предупреждением.
+//! завершением или отключением питания (FR-20): читатель отличает её от битой строки,
+//! чтобы `bytetap-cli verify` считал её предупреждением. Признак обрыва строгий: строка без
+//! `\n`, на которой разбор JSON остановился из-за неожиданного конца ввода. Завершённая
+//! строка с синтаксической ошибкой и строка, где JSON цел, но не является событием формата,
+//! — ошибка разбора, где бы они ни стояли.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -79,14 +82,10 @@ impl<R: BufRead> JournalReader<R> {
         }
     }
 
-    fn error(&self, terminated: bool, message: impl Into<String>) -> LineError {
+    fn error(&self, kind: LineErrorKind, message: impl Into<String>) -> LineError {
         LineError {
             line: self.line,
-            kind: if terminated {
-                LineErrorKind::Parse
-            } else {
-                LineErrorKind::Truncated
-            },
+            kind,
             message: message.into(),
         }
     }
@@ -123,23 +122,31 @@ impl<R: BufRead> Iterator for JournalReader<R> {
             buffer.pop();
         }
         if buffer.is_empty() {
-            return Some(Err(self.error(terminated, "пустая строка")));
+            return Some(Err(self.error(LineErrorKind::Parse, "пустая строка")));
         }
         let text = match std::str::from_utf8(&buffer) {
             Ok(text) => text,
             Err(err) => {
                 return Some(Err(
-                    self.error(terminated, format!("строка не UTF-8: {err}"))
+                    self.error(LineErrorKind::Parse, format!("строка не UTF-8: {err}"))
                 ));
             }
         };
         let value: Value = match serde_json::from_str(text) {
             Ok(value) => value,
-            Err(err) => return Some(Err(self.error(terminated, err.to_string()))),
+            Err(err) => {
+                // Обрыв — только незавершённая строка, на которой кончился ввод.
+                let kind = if terminated || !err.is_eof() {
+                    LineErrorKind::Parse
+                } else {
+                    LineErrorKind::Truncated
+                };
+                return Some(Err(self.error(kind, err.to_string())));
+            }
         };
         let event = match Event::deserialize(&value) {
             Ok(event) => event,
-            Err(err) => return Some(Err(self.error(terminated, err.to_string()))),
+            Err(err) => return Some(Err(self.error(LineErrorKind::Parse, err.to_string()))),
         };
         Some(Ok(JournalLine {
             number: self.line,
@@ -238,6 +245,30 @@ mod tests {
     }
 
     #[test]
+    fn broken_json_without_newline_is_an_error_not_a_truncation() {
+        // Последняя строка без `\n`, но разбор упал не на конце ввода.
+        let text = format!("{SESSION}\n{{ мусор");
+        let error = reader(&text).last().unwrap().unwrap_err();
+        assert_eq!(error.line, 2);
+        assert_eq!(error.kind, LineErrorKind::Parse, "{error}");
+    }
+
+    #[test]
+    fn a_truncated_shape_with_newline_is_an_error() {
+        let text = format!("{SESSION}\n{{\"type\":\"note\",\"t\":\"2026\n");
+        let error = reader(&text).last().unwrap().unwrap_err();
+        assert_eq!(error.kind, LineErrorKind::Parse, "{error}");
+    }
+
+    #[test]
+    fn complete_json_that_is_not_an_event_is_a_parse_error() {
+        let text = "{\"type\":\"telemetry\"}";
+        let error = reader(text).next().unwrap().unwrap_err();
+        assert_eq!(error.kind, LineErrorKind::Parse, "{error}");
+        assert!(error.message.contains("telemetry"), "{}", error.message);
+    }
+
+    #[test]
     fn a_complete_last_line_without_newline_is_fine() {
         let text = format!("{SESSION}\n{NOTE}");
         let items: Vec<Result<JournalLine, LineError>> = reader(&text).collect();
@@ -260,7 +291,7 @@ mod tests {
 
     #[test]
     fn broken_middle_line_makes_outcome_erroneous_truncated_does_not() {
-        let text = format!("{SESSION}\n{{ обрезано");
+        let text = format!("{SESSION}\n{{\"type\":\"note\",\"t\":\"2026");
         let outcome = ReadOutcome {
             lines: reader(&text).filter_map(Result::ok).collect(),
             problems: reader(&text).filter_map(Result::err).collect(),

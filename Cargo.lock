@@ -343,6 +343,7 @@ dependencies = [
 name = "bytetap-cli"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "bytetap-core",
  "bytetap-testkit",
  "clap",

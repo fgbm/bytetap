@@ -130,6 +130,10 @@ fn schema_rejects_broken_events() {
         json!({"type":"data","t":"2026-10-19T10:15:03.000512+03:00","mono_us":1,"conn":1,"dir":"to_lis","synthetic":false,"len":1,"b64":"QQ==","text":"A"}),
         // время без микросекунд
         json!({"type":"note","t":"2026-10-19T10:15:03+03:00","text":"x"}),
+        // `text` не по каноническим правилам: `<xHH>` в нижнем регистре
+        json!({"type":"data","t":"2026-10-19T10:15:03.000512+03:00","mono_us":1,"conn":1,"dir":"analyzer_to_lis","synthetic":false,"len":1,"b64":"QQ==","text":"<x6a>"}),
+        // `text` с сырым `<`, который обязан быть `<x3C>`
+        json!({"type":"data","t":"2026-10-19T10:15:03.000512+03:00","mono_us":1,"conn":1,"dir":"analyzer_to_lis","synthetic":false,"len":1,"b64":"QQ==","text":"a<b"}),
         // лишнее поле
         json!({"type":"close","t":"2026-10-19T10:15:09.000000+03:00","mono_us":1,"conn":1,"by":"analyzer","reason":"eof","extra":1}),
         // неизвестный тип события

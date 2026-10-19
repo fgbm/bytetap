@@ -110,15 +110,26 @@ pub fn unescape(text: &str) -> Result<Vec<u8>, UnescapeError> {
 }
 
 /// Разбирает содержимое тега между `<` и `>`.
+///
+/// Допускается только то, что пишет [`escape`]: именованные управляющие — только именем,
+/// `<xHH>` — только в верхнем регистре и только для байтов, которые [`escape`] пишет как
+/// `<xHH>`. Запись вроде `<x0A>` (есть имя `<LF>`), `<x20>` (печатный байт) или `<x3c>`
+/// (нижний регистр) отвергается: у одного байта должна быть одна запись.
 fn decode_tag(tag: &str) -> Option<u8> {
-    if let Some(name) = named_byte(tag) {
-        return Some(name);
+    if let Some(byte) = named_byte(tag) {
+        return Some(byte);
     }
-    let hex = tag.strip_prefix('x').or_else(|| tag.strip_prefix('X'))?;
-    if hex.len() != 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    let hex = tag.strip_prefix('x')?;
+    if hex.len() != 2
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+    {
         return None;
     }
-    u8::from_str_radix(hex, 16).ok()
+    let byte = u8::from_str_radix(hex, 16).ok()?;
+    let hex_written = named(byte).is_none() && !((0x20..=0x7E).contains(&byte) && byte != b'<');
+    hex_written.then_some(byte)
 }
 
 /// Ошибка [`unescape`].
@@ -229,9 +240,17 @@ mod tests {
     }
 
     #[test]
-    fn lowercase_hex_is_accepted_on_input_but_never_produced() {
-        assert_eq!(unescape("<xc0>"), Ok(vec![0xC0]));
+    fn only_the_canonical_form_is_accepted() {
         assert_eq!(escape(&[0xC0]), "<xC0>");
+        // Нижний регистр, запись именованного байта через `<xHH>`, печатный байт.
+        for text in ["<xc0>", "<x0A>", "<x20>", "<X3C>", "<x3c>"] {
+            assert!(
+                unescape(text).is_err(),
+                "{text} не производится escape и должен отвергаться"
+            );
+        }
+        assert_eq!(unescape("<x3C>"), Ok(vec![b'<']));
+        assert_eq!(unescape("<LF>"), Ok(vec![0x0A]));
     }
 
     #[test]

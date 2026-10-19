@@ -4,7 +4,7 @@
 //! Тест гоняет настоящий бинарь под нагрузкой, ждёт накопления строк, убивает процесс
 //! и проверяет, что каждая строка, кроме, возможно, последней, — валидное событие формата.
 
-use std::io::BufRead;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -23,14 +23,12 @@ fn schema() -> Value {
     serde_json::from_str(&std::fs::read_to_string(&path).expect("схема формата")).expect("JSON")
 }
 
+/// Число строк в файле: строки считаются по `\n`, как их пишет и читает журнал.
 fn count_lines(path: &Path) -> usize {
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(bytes) = std::fs::read(path) else {
         return 0;
     };
-    std::io::BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .count()
+    bytes.iter().filter(|byte| **byte == b'\n').count()
 }
 
 /// Убивает процесс, даже если тест паникует раньше.
@@ -45,6 +43,18 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Останавливает тест с ошибкой, если дочерний процесс вышел раньше срока, и печатает его stderr.
+fn panic_on_early_exit(child: &mut Child, lines: usize) {
+    let Some(status) = child.try_wait().expect("try_wait") else {
+        return;
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    panic!("_stress-journal завершился раньше срока ({status}), в журнале {lines} строк: {stderr}");
+}
+
 #[test]
 fn journal_survives_a_killed_process() {
     let dir = tempfile::tempdir().expect("временная папка");
@@ -54,25 +64,32 @@ fn journal_survives_a_killed_process() {
         .arg("_stress-journal")
         .arg("--out")
         .arg(&path)
+        .arg("--max-seconds")
+        .arg("120")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("запуск bytetap-cli _stress-journal");
     let mut child = KillOnDrop(Some(child));
 
     let deadline = Instant::now() + TIMEOUT;
-    while count_lines(&path) < MIN_LINES {
+    loop {
+        let lines = count_lines(&path);
+        if lines >= MIN_LINES {
+            break;
+        }
+        let process = child.0.as_mut().expect("процесс ещё не забран");
+        panic_on_early_exit(process, lines);
         assert!(
             Instant::now() < deadline,
-            "журнал не наполнился за {TIMEOUT:?}: {} строк",
-            count_lines(&path)
+            "журнал не наполнился за {TIMEOUT:?}: {lines} строк"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let mut child = child.0.take().expect("процесс ещё жив");
-    child.kill().expect("SIGKILL / TerminateProcess");
-    let status = child.wait().expect("процесс завершился");
+    let mut process = child.0.take().expect("процесс ещё жив");
+    process.kill().expect("SIGKILL / TerminateProcess");
+    let status = process.wait().expect("процесс завершился");
     assert!(!status.success(), "процесс убит, а не завершился штатно");
 
     let outcome = read_all(&path).expect("чтение журнала");

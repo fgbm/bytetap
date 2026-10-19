@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use base64::Engine as _;
 use bytetap_core::journal::{
     self, Autoresponder, Data, Dir, Event, Host, Journal, LineErrorKind, Mode, MonoClock, Note,
     Session, now_rfc3339,
@@ -45,6 +46,9 @@ enum Command {
         /// Файл журнала
         #[arg(long)]
         out: PathBuf,
+        /// Сколько секунд писать, прежде чем завершиться штатно
+        #[arg(long, default_value_t = 30)]
+        max_seconds: u64,
     },
 }
 
@@ -53,7 +57,7 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Verify { file } => verify(&file),
         Command::Note { file, text } => note(&file, &text),
-        Command::StressJournal { out } => stress_journal(&out),
+        Command::StressJournal { out, max_seconds } => stress_journal(&out, max_seconds),
     }
 }
 
@@ -99,6 +103,8 @@ fn verify(file: &Path) -> ExitCode {
     let mut lines = 0usize;
     let mut errors = 0usize;
     let mut first_kind: Option<&'static str> = None;
+    let mut sessions = 0usize;
+    let mut ended = false;
 
     for item in reader {
         match item {
@@ -108,10 +114,26 @@ fn verify(file: &Path) -> ExitCode {
                     first_kind = Some(line.event.kind());
                 }
                 *counts.entry(line.event.kind()).or_default() += 1;
+                if matches!(line.event, Event::Session(_)) {
+                    sessions += 1;
+                }
+                // После итогов сессии файл может дополняться только комментариями.
+                if ended && !matches!(line.event, Event::Note(_)) {
+                    errors += 1;
+                    eprintln!(
+                        "ошибка: строка {}: после session_end допустим только note",
+                        line.number
+                    );
+                }
                 match &line.event {
                     Event::Data(data) => {
-                        *bytes.entry(data.dir.as_str()).or_default() += data.len;
+                        let counter = bytes.entry(data.dir.as_str()).or_default();
+                        *counter = counter.saturating_add(data.len);
                         connections.insert(data.conn);
+                        if let Err(message) = check_data(data) {
+                            errors += 1;
+                            eprintln!("ошибка: строка {}: {message}", line.number);
+                        }
                     }
                     Event::Open(open) => {
                         connections.insert(open.conn);
@@ -119,8 +141,8 @@ fn verify(file: &Path) -> ExitCode {
                     Event::Close(close) => {
                         connections.insert(close.conn);
                     }
-                    Event::Session(_) | Event::Error(_) | Event::Note(_) | Event::SessionEnd(_) => {
-                    }
+                    Event::SessionEnd(_) => ended = true,
+                    Event::Session(_) | Event::Error(_) | Event::Note(_) => {}
                 }
                 if let Err(error) = validator.validate(&line.value) {
                     errors += 1;
@@ -129,7 +151,7 @@ fn verify(file: &Path) -> ExitCode {
             }
             Err(error) if error.kind == LineErrorKind::Truncated => {
                 eprintln!(
-                    "предупреждение: строка {} обрезана — потеря при аварийном завершении (FR-20)",
+                    "предупреждение: строка {} обрезана — потеря при аварийном завершении",
                     error.line
                 );
             }
@@ -142,7 +164,13 @@ fn verify(file: &Path) -> ExitCode {
 
     if first_kind != Some("session") {
         errors += 1;
-        eprintln!("ошибка: первая строка файла должна быть заголовком `session` (FR-21)");
+        eprintln!("ошибка: первая строка файла должна быть заголовком `session`");
+    }
+    if sessions != 1 {
+        errors += 1;
+        eprintln!(
+            "ошибка: в журнале должен быть ровно один заголовок `session`, найдено {sessions}"
+        );
     }
 
     println!("Журнал: {}", file.display());
@@ -169,6 +197,27 @@ fn verify(file: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Проверяет то, чего не видно схеме: `len` и `text` должны выводиться из `b64`.
+fn check_data(data: &Data) -> Result<(), String> {
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(&data.b64)
+        .map_err(|err| format!("b64 не декодируется: {err}"))?;
+    let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    if len != data.len {
+        return Err(format!(
+            "len {} не совпадает с длиной декодированного b64 ({len})",
+            data.len
+        ));
+    }
+    let expected = bytetap_core::text::escape(&payload);
+    if expected != data.text {
+        return Err(format!(
+            "text не совпадает с экранированием b64: ожидалось {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// `bytetap-cli note`: дописывает событие `note` в конец файла, начало не переписывается (FR-23).
 fn note(file: &Path, text: &str) -> ExitCode {
     let note = Note {
@@ -191,7 +240,7 @@ fn note(file: &Path, text: &str) -> ExitCode {
 /// `_stress-journal`: пишет журнал под нагрузкой, пока процесс не убьют (T-4).
 ///
 /// Команда скрыта из справки: ею пользуется только интеграционный тест устойчивости.
-fn stress_journal(out: &Path) -> ExitCode {
+fn stress_journal(out: &Path, max_seconds: u64) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -212,11 +261,12 @@ fn stress_journal(out: &Path) -> ExitCode {
         );
         let journal = Journal::create(out, session)?;
         let clock = MonoClock::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_seconds);
         let mut index: u64 = 0;
         loop {
             index += 1;
             let message = format!(
-                "\u{b}MSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|{index}|P|2.3.1\rPID|1||PATIENT^TEST\rOBX|1|NM|GLU||5.4|mmol/L\r\u{c}\r"
+                "\u{b}MSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|{index}|P|2.3.1\rPID|1||PATIENT^TEST\rOBX|1|NM|GLU||5.4|mmol/L\r\u{1c}\r"
             );
             let event = Event::Data(Data::new(
                 now_rfc3339(),
@@ -231,6 +281,11 @@ fn stress_journal(out: &Path) -> ExitCode {
             }
             if index.is_multiple_of(64) {
                 tokio::task::yield_now().await;
+                if std::time::Instant::now() >= deadline {
+                    // Штатный выход, если тест не успел убить процесс.
+                    journal.shutdown().await?;
+                    return Ok(());
+                }
             }
         }
     });

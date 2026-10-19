@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://bytetap.app/schema/bytetap-session-1.schema.json",
+  "$id": "https://fgbm.github.io/bytetap/schema/bytetap-session-1.schema.json",
   "title": "Журнал сессии bytetap, формат bytetap-session/1",
   "description": "Одна строка файла — одно событие. Первая строка сессии — session, последняя при штатной остановке — session_end. Описание формата: docs/reference/session-format.md",
   "oneOf": [
@@ -68,7 +68,11 @@
           "type": "object",
           "required": ["os"],
           "properties": {
-            "os": { "type": "string" }
+            "os": {
+              "description": "Описание ОС в формате os_info: тип, версия, издание в скобках и разрядность в квадратных скобках, например Windows 11 Professional 10.0.22631 [64-bit]",
+              "type": "string",
+              "minLength": 1
+            }
           },
           "additionalProperties": false
         }
@@ -114,8 +118,9 @@
           "pattern": "^[A-Za-z0-9+/]*={0,2}$"
         },
         "text": {
-          "description": "Копия для чтения глазами: печатные ASCII как есть, кроме <, управляющие как <STX> и подобные, остальные байты как <xHH>",
-          "type": "string"
+          "description": "Копия для чтения глазами: печатные ASCII как есть, кроме <, управляющие как <STX> и подобные, остальные байты как <xHH> в верхнем регистре",
+          "type": "string",
+          "pattern": "^(?:[ -;=-~]|<(?:STX|ETX|EOT|ENQ|ACK|LF|VT|CR|NAK|ETB|FS|x[0-9A-F]{2})>)*$"
         }
       },
       "additionalProperties": false

@@ -7,6 +7,7 @@
 use std::fmt;
 
 use base64::Engine as _;
+use chrono::{DateTime, Local, SecondsFormat};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -184,7 +185,8 @@ impl fmt::Display for ClosedBy {
 /// Сведения о машине, на которой шла сессия.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Host {
-    /// Описание ОС, например `Windows 11 23H2` или `Ubuntu 24.04`.
+    /// Описание ОС в формате `os_info`, например `Windows 11 Professional 10.0.22631 [64-bit]`
+    /// или `Ubuntu 24.04.1 (noble) [64-bit]`.
     pub os: String,
 }
 
@@ -240,6 +242,23 @@ impl Session {
             note: None,
             host,
         }
+    }
+
+    /// Заголовок с началом сессии, заданным снаружи.
+    ///
+    /// Нужен, чтобы `started_at` заголовка и имя файла (`session_file_name`) считались от
+    /// одного момента: [`Self::new`] берёт текущее время сам, а здесь момент передают явно.
+    #[must_use]
+    pub fn at(
+        started: DateTime<Local>,
+        mode: Mode,
+        autoresponder: Autoresponder,
+        settings: Value,
+        host: Host,
+    ) -> Self {
+        let mut session = Self::new(mode, autoresponder, settings, host);
+        session.started_at = started.to_rfc3339_opts(SecondsFormat::Micros, false);
+        session
     }
 
     /// Заголовок с моделью анализатора.
@@ -411,12 +430,12 @@ mod tests {
             Autoresponder::Hl7Mllp,
             json!({"listen": "0.0.0.0:5000"}),
             Host {
-                os: "Windows 11 23H2".to_owned(),
+                os: "Windows 11 Professional 10.0.22631 [64-bit]".to_owned(),
             },
         );
         session.started_at = "2026-10-19T10:15:00.123456+03:00".to_owned();
         session
-            .with_analyzer("Technology Solution 190")
+            .with_analyzer("ANALYZER")
             .with_note("комментарий инженера")
     }
 
@@ -433,9 +452,9 @@ mod tests {
                 "mode": "tcp_server",
                 "autoresponder": "hl7_mllp",
                 "settings": {"listen": "0.0.0.0:5000"},
-                "analyzer": "Technology Solution 190",
+                "analyzer": "ANALYZER",
                 "note": "комментарий инженера",
-                "host": {"os": "Windows 11 23H2"}
+                "host": {"os": "Windows 11 Professional 10.0.22631 [64-bit]"}
             })
         );
     }
@@ -447,7 +466,7 @@ mod tests {
             Autoresponder::None,
             json!({}),
             Host {
-                os: "Ubuntu 24.04".to_owned(),
+                os: "Ubuntu 24.04.1 (noble) [64-bit]".to_owned(),
             },
         ));
         let value = serde_json::to_value(&event).unwrap();

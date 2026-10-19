@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use bytetap_testkit::fixtures_dir;
+use serde_json::{Value, json};
 
 fn verify(file: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_bytetap-cli"))
@@ -24,6 +25,26 @@ fn note(file: &Path, text: &str) -> Output {
 
 fn fixture() -> PathBuf {
     fixtures_dir().join("journal/minimal.jsonl")
+}
+
+fn fixture_lines() -> Vec<Value> {
+    std::fs::read_to_string(fixture())
+        .expect("фикстура")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("строка фикстуры — JSON"))
+        .collect()
+}
+
+/// Записывает строки журнала в новый файл и возвращает путь к нему.
+fn write_lines(dir: &Path, lines: &[Value]) -> PathBuf {
+    let path = dir.join("case.jsonl");
+    let text: String = lines
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<Vec<_>>()
+        .join("");
+    std::fs::write(&path, text).expect("журнал записан");
+    path
 }
 
 fn copy_fixture(dir: &Path) -> PathBuf {
@@ -96,6 +117,90 @@ fn verify_fails_when_the_first_line_is_not_a_session() {
     let output = verify(&path);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("session"), "{}", stderr(&output));
+}
+
+#[test]
+fn verify_checks_that_len_matches_the_decoded_b64() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut lines = fixture_lines();
+    let actual = lines[2]["len"].as_u64().unwrap();
+    lines[2]["len"] = json!(actual + 1);
+    let path = write_lines(dir.path(), &lines);
+
+    let output = verify(&path);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("len"), "{}", stderr(&output));
+}
+
+#[test]
+fn verify_checks_that_text_is_the_escaped_b64() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut lines = fixture_lines();
+    lines[2]["text"] = json!("<VT>MSH");
+    let path = write_lines(dir.path(), &lines);
+
+    let output = verify(&path);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("text"), "{}", stderr(&output));
+}
+
+#[test]
+fn verify_rejects_an_undecodable_b64() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut lines = fixture_lines();
+    lines[2]["b64"] = json!("не base64");
+    let path = write_lines(dir.path(), &lines);
+
+    let output = verify(&path);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("b64"), "{}", stderr(&output));
+}
+
+#[test]
+fn verify_rejects_two_session_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut lines = fixture_lines();
+    let header = lines[0].clone();
+    lines.push(header);
+    let path = write_lines(dir.path(), &lines);
+
+    let output = verify(&path);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("ровно один"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn verify_rejects_events_after_session_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut lines = fixture_lines();
+    let data = lines[2].clone();
+    lines.push(data);
+    let path = write_lines(dir.path(), &lines);
+
+    let output = verify(&path);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("после session_end"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn verify_accepts_a_note_after_session_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut lines = fixture_lines();
+    lines.push(
+        json!({"type":"note","t":"2026-10-19T10:30:00.000000+03:00","text":"прогнали три пробы"}),
+    );
+    let path = write_lines(dir.path(), &lines);
+
+    let output = verify(&path);
+    assert!(output.status.success(), "{}", stderr(&output));
 }
 
 #[test]
