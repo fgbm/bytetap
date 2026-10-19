@@ -9,6 +9,7 @@
     { "$ref": "#/$defs/data" },
     { "$ref": "#/$defs/close" },
     { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/info" },
     { "$ref": "#/$defs/note" },
     { "$ref": "#/$defs/session_end" }
   ],
@@ -144,10 +145,23 @@
     },
     "error": {
       "type": "object",
-      "description": "Ошибка обработки соединения: соединение закрывается, сессия продолжается (NFR-5)",
+      "description": "Ошибка обработки: соединение при этом не обязательно закрывается, сессия продолжается (NFR-5)",
       "required": ["type", "t", "mono_us", "message"],
       "properties": {
         "type": { "const": "error" },
+        "t": { "$ref": "#/$defs/time" },
+        "mono_us": { "$ref": "#/$defs/mono_us" },
+        "conn": { "$ref": "#/$defs/conn" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "info": {
+      "type": "object",
+      "description": "Замечание обработчика: обмен не прерван, но событие стоит записать (мусор вне рамки, поле, выброшенное из ACK)",
+      "required": ["type", "t", "mono_us", "message"],
+      "properties": {
+        "type": { "const": "info" },
         "t": { "$ref": "#/$defs/time" },
         "mono_us": { "$ref": "#/$defs/mono_us" },
         "conn": { "$ref": "#/$defs/conn" },

@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use bytetap_core::journal::{
-    Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, Host, Mode, Note, Session,
-    SessionEnd, Stats, read_all,
+    Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, Host, InfoEvent, Mode, Note,
+    Session, SessionEnd, Stats, read_all,
 };
 use serde_json::{Value, json};
 
@@ -66,6 +66,12 @@ fn events() -> Vec<Event> {
             mono_us: 9_100_000,
             conn: Some(1),
             message: "неразбираемое сообщение".to_owned(),
+        }),
+        Event::Info(InfoEvent {
+            t: bytetap_core::journal::now_rfc3339(),
+            mono_us: 9_200_000,
+            conn: Some(1),
+            message: "4 bytes outside the MLLP frame ignored".to_owned(),
         }),
         Event::Note(Note {
             t: bytetap_core::journal::now_rfc3339(),
@@ -136,6 +142,8 @@ fn schema_rejects_broken_events() {
         json!({"type":"data","t":"2026-10-19T10:15:03.000512+03:00","mono_us":1,"conn":1,"dir":"analyzer_to_lis","synthetic":false,"len":1,"b64":"QQ==","text":"a<b"}),
         // лишнее поле
         json!({"type":"close","t":"2026-10-19T10:15:09.000000+03:00","mono_us":1,"conn":1,"by":"analyzer","reason":"eof","extra":1}),
+        // у `info` нет обязательного `message`
+        json!({"type":"info","t":"2026-10-19T10:15:03.000512+03:00","mono_us":1}),
         // неизвестный тип события
         json!({"type":"telemetry","t":"2026-10-19T10:15:03.000512+03:00"}),
     ];

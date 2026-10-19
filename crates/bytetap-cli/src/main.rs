@@ -62,12 +62,13 @@ fn main() -> ExitCode {
 }
 
 /// События в порядке, в котором их печатает статистика.
-const KINDS: [&str; 7] = [
+const KINDS: [&str; 8] = [
     "session",
     "open",
     "data",
     "close",
     "error",
+    "info",
     "note",
     "session_end",
 ];
@@ -142,7 +143,7 @@ fn verify(file: &Path) -> ExitCode {
                         connections.insert(close.conn);
                     }
                     Event::SessionEnd(_) => ended = true,
-                    Event::Session(_) | Event::Error(_) | Event::Note(_) => {}
+                    Event::Session(_) | Event::Error(_) | Event::Info(_) | Event::Note(_) => {}
                 }
                 if let Err(error) = validator.validate(&line.value) {
                     errors += 1;

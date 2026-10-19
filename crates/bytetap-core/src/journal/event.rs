@@ -29,8 +29,10 @@ pub enum Event {
     Data(Data),
     /// Закрытие соединения.
     Close(Close),
-    /// Ошибка обработки соединения; сессия продолжается.
+    /// Ошибка обработки соединения. Соединение не обязательно закрывается, сессия продолжается.
     Error(ErrorEvent),
+    /// Замечание обработчика: обмен не прерван, но кое-что стоит записать.
+    Info(InfoEvent),
     /// Комментарий инженера, дописанный в конец файла (FR-23).
     Note(Note),
     /// Итоги сессии, последняя строка при штатной остановке.
@@ -47,6 +49,7 @@ impl Event {
             Self::Data(_) => "data",
             Self::Close(_) => "close",
             Self::Error(_) => "error",
+            Self::Info(_) => "info",
             Self::Note(_) => "note",
             Self::SessionEnd(_) => "session_end",
         }
@@ -351,7 +354,8 @@ pub struct Close {
     pub reason: String,
 }
 
-/// Ошибка обработки соединения.
+/// Ошибка обработки соединения. Соединение не обязательно закрывается: ошибка может быть
+/// и уровнем ниже, когда обмен продолжается.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorEvent {
     /// Время по системным часам.
@@ -362,6 +366,23 @@ pub struct ErrorEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conn: Option<u32>,
     /// Описание ошибки для инженера.
+    pub message: String,
+}
+
+/// Замечание обработчика, которое не мешает обмену.
+///
+/// Например: мусор вне рамки MLLP, поле, выброшенное из ACK, входящее подтверждение,
+/// которое не подтверждается. Поля те же, что у `error`, но обмен продолжается.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InfoEvent {
+    /// Время по системным часам.
+    pub t: String,
+    /// Микросекунды от начала сессии по монотонным часам.
+    pub mono_us: u64,
+    /// Номер соединения; у замечания уровня сессии его нет.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn: Option<u32>,
+    /// Описание для инженера.
     pub message: String,
 }
 
@@ -571,6 +592,25 @@ mod tests {
     }
 
     #[test]
+    fn info_event_has_the_error_fields_and_no_connection_when_absent() {
+        let info = Event::Info(InfoEvent {
+            t: "2026-10-19T10:15:09.100000+03:00".to_owned(),
+            mono_us: 9_100_000,
+            conn: None,
+            message: "4 bytes outside the MLLP frame ignored".to_owned(),
+        });
+        assert_eq!(
+            serde_json::to_value(&info).unwrap(),
+            json!({
+                "type": "info",
+                "t": "2026-10-19T10:15:09.100000+03:00",
+                "mono_us": 9_100_000,
+                "message": "4 bytes outside the MLLP frame ignored"
+            })
+        );
+    }
+
+    #[test]
     fn note_without_monotonic_time_omits_the_field() {
         let note = Event::Note(Note {
             t: "2026-10-19T10:20:00.000000+03:00".to_owned(),
@@ -607,6 +647,12 @@ mod tests {
                 mono_us: 4,
                 conn: None,
                 message: "boom".to_owned(),
+            }),
+            Event::Info(InfoEvent {
+                t: "t".to_owned(),
+                mono_us: 5,
+                conn: Some(1),
+                message: "incoming ACK is not acknowledged".to_owned(),
             }),
             Event::Note(Note {
                 t: "t".to_owned(),

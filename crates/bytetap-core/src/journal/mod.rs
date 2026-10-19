@@ -13,8 +13,8 @@ use std::time::Instant;
 use chrono::{Local, SecondsFormat};
 
 pub use event::{
-    Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, FORMAT, Host, Mode, Note, Open,
-    Session, SessionEnd, Stats,
+    Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, FORMAT, Host, InfoEvent, Mode,
+    Note, Open, Session, SessionEnd, Stats,
 };
 pub use reader::{JournalLine, JournalReader, LineError, LineErrorKind, ReadOutcome, read_all};
 pub use writer::{Journal, append_note, default_log_dir, log_dir_warning, session_file_name};
