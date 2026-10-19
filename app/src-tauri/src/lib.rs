@@ -47,6 +47,8 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::list_interfaces,
+            commands::list_serial_ports,
+            commands::list_recent_journals,
             commands::default_log_dir,
             commands::log_dir_warning,
             commands::session_status,

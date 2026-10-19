@@ -6,23 +6,117 @@
 use serde::{Deserialize, Serialize};
 
 /// Настройки старта из формы интерфейса (FR-25).
+///
+/// Поля чужого режима необязательны: интерфейс отправляет только поля выбранного
+/// режима, а лишние мост отвергает до создания журнала (контракт M3).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionConfig {
-    /// Режим работы; в M2 доступен только `tcp_server`.
+    /// Режим работы: `tcp_server`, `tcp_client` или `serial`.
     pub mode: String,
     /// IPv4-адрес прослушивания; пустая строка — все интерфейсы.
-    pub listen_host: String,
-    /// Порт прослушивания.
-    pub listen_port: u16,
-    /// Профиль автоответчика: `hl7` (HL7/MLLP) или `none`.
+    #[serde(default)]
+    pub listen_host: Option<String>,
+    /// Порт прослушивания; `0` — любой свободный.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
+    /// Адрес анализатора-сервера: имя узла или IP (FR-2).
+    #[serde(default)]
+    pub connect_host: Option<String>,
+    /// Порт анализатора-сервера.
+    #[serde(default)]
+    pub connect_port: Option<u16>,
+    /// Пауза между попытками подключения, секунды (FR-2).
+    #[serde(default)]
+    pub reconnect_sec: Option<u64>,
+    /// Параметры COM-порта (FR-11).
+    #[serde(default)]
+    pub serial: Option<SerialConfig>,
+    /// Профиль автоответчика: `auto`, `hl7`, `astm` или `none` (FR-14).
     pub responder: String,
+    /// Отвечать `NAK` на неверную контрольную сумму ASTM (FR-17).
+    #[serde(default)]
+    pub astm_nak_on_bad_checksum: bool,
     /// Модель анализатора для заголовка журнала; пусто — не указывать.
     pub analyzer: String,
     /// Комментарий инженера для заголовка журнала; пусто — не указывать.
     pub note: String,
     /// Папка журналов (FR-19).
     pub log_dir: String,
+}
+
+/// Настройки COM-порта из формы (FR-11).
+///
+/// Все поля имеют значения по умолчанию: форма показывает их сразу, поэтому
+/// не заполненное поле — не ошибка разбора, а ошибка поля с понятным текстом.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SerialConfig {
+    /// Имя порта: `COM5` или `/dev/ttyUSB0`.
+    #[serde(default)]
+    pub port: String,
+    /// Скорость: 1…4 000 000.
+    #[serde(default)]
+    pub baud: u32,
+    /// Биты данных: 7 или 8.
+    #[serde(default = "eight_bits")]
+    pub data_bits: u8,
+    /// Чётность: `none`, `even`, `odd`, `mark`, `space`.
+    #[serde(default = "none_word")]
+    pub parity: String,
+    /// Стоп-биты: 1 или 2.
+    #[serde(default = "one_stop_bit")]
+    pub stop_bits: u8,
+    /// Управление потоком: `none`, `rtscts`, `xonxoff`.
+    #[serde(default = "none_word")]
+    pub flow: String,
+    /// Начальное состояние DTR.
+    #[serde(default = "line_up")]
+    pub dtr: bool,
+    /// Начальное состояние RTS.
+    #[serde(default = "line_up")]
+    pub rts: bool,
+}
+
+fn eight_bits() -> u8 {
+    8
+}
+
+fn one_stop_bit() -> u8 {
+    1
+}
+
+fn none_word() -> String {
+    "none".to_owned()
+}
+
+fn line_up() -> bool {
+    true
+}
+
+/// Порт из `list_serial_ports`: имя для открытия и понятное описание (FR-12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SerialPort {
+    /// Имя порта: `COM5`, `/dev/ttyUSB0`.
+    pub name: String,
+    /// Описание для человека: `USB-SERIAL CH340 (COM5)` или имя порта.
+    pub description: String,
+}
+
+/// Журнал в папке: заголовок и итоги, без чтения всего файла (M3, стартовый экран).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentJournal {
+    /// Абсолютный путь к файлу.
+    pub path: String,
+    /// Начало сессии из заголовка, RFC 3339.
+    pub started_at: String,
+    /// Модель анализатора; пусто — не указана.
+    pub analyzer: String,
+    /// Длительность по `session_end`, микросекунды; `0` — журнал не закрыт.
+    pub duration_us: u64,
+    /// Режим из заголовка: `tcp_server`, `tcp_client` или `serial`.
+    pub mode: String,
 }
 
 /// Адрес ноутбука для подсказки анализатору (FR-25, M2-AC2).

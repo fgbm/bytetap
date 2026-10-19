@@ -18,8 +18,18 @@ pub enum ErrorCode {
     PortInUse,
     /// Адрес нельзя занять: его нет на этой машине.
     AddressUnavailable,
+    /// Адрес анализатора не разбирается: пустой узел или порт вне 1–65535.
+    AddressInvalid,
     /// Нет прав: защищённый порт, чужая папка.
     PermissionDenied,
+    /// COM-порта нет: имя не существует или адаптер выдернут (FR-12).
+    PortNotFound,
+    /// COM-порт занят другой программой или открыт этим же приложением.
+    PortBusy,
+    /// Настройки COM-порта неверны: скорость, биты, чётность, стоп-биты (FR-11).
+    PortSettings,
+    /// Прочая ошибка COM-порта: отказ ОС, сбой устройства.
+    Serial,
     /// Папка журналов недоступна.
     LogDir,
     /// Запись уже идёт.
@@ -129,7 +139,12 @@ mod tests {
         let codes = [
             (ErrorCode::PortInUse, "port_in_use"),
             (ErrorCode::AddressUnavailable, "address_unavailable"),
+            (ErrorCode::AddressInvalid, "address_invalid"),
             (ErrorCode::PermissionDenied, "permission_denied"),
+            (ErrorCode::PortNotFound, "port_not_found"),
+            (ErrorCode::PortBusy, "port_busy"),
+            (ErrorCode::PortSettings, "port_settings"),
+            (ErrorCode::Serial, "serial"),
             (ErrorCode::LogDir, "log_dir"),
             (ErrorCode::AlreadyRunning, "already_running"),
             (ErrorCode::JournalOpen, "journal_open"),

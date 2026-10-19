@@ -191,6 +191,9 @@ pub enum FeedEvent {
         /// Номер соединения; у ошибки уровня сессии его нет.
         #[serde(skip_serializing_if = "Option::is_none")]
         conn: Option<u32>,
+        /// Код ошибки для интерфейса: по нему берётся русская строка из i18n (M3).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
         /// Описание ошибки.
         message: String,
     },
@@ -203,6 +206,9 @@ pub enum FeedEvent {
         /// Номер соединения; у замечания уровня сессии его нет.
         #[serde(skip_serializing_if = "Option::is_none")]
         conn: Option<u32>,
+        /// Код замечания для интерфейса: по нему берётся русская строка из i18n (M3).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
         /// Описание для инженера.
         message: String,
     },
@@ -259,12 +265,14 @@ impl FeedEvent {
                 t: error.t.clone(),
                 mono_us: error.mono_us,
                 conn: error.conn,
+                code: error.code.clone(),
                 message: error.message.clone(),
             }),
             Event::Info(info) => Some(Self::Info {
                 t: info.t.clone(),
                 mono_us: info.mono_us,
                 conn: info.conn,
+                code: info.code.clone(),
                 message: info.message.clone(),
             }),
             Event::Note(note) => Some(Self::Note {
@@ -365,11 +373,15 @@ mod tests {
             t: "t".to_owned(),
             mono_us: 12,
             conn: None,
-            code: None,
+            code: Some("connect_failed".to_owned()),
             message: "boom".to_owned(),
         });
         let value = serde_json::to_value(FeedEvent::from_session(&error).unwrap()).unwrap();
         assert_eq!(value["type"], "error");
+        assert_eq!(
+            value["code"], "connect_failed",
+            "код ошибки доходит до интерфейса"
+        );
         assert!(
             value.get("conn").is_none(),
             "у ошибки уровня сессии нет conn"
@@ -382,9 +394,11 @@ mod tests {
             code: None,
             message: "note for the engineer".to_owned(),
         });
-        assert_eq!(
-            serde_json::to_value(FeedEvent::from_session(&info).unwrap()).unwrap()["conn"],
-            2
+        let value = serde_json::to_value(FeedEvent::from_session(&info).unwrap()).unwrap();
+        assert_eq!(value["conn"], 2);
+        assert!(
+            value.get("code").is_none(),
+            "без кода поле не пишется: интерфейс берёт message"
         );
 
         let note = Event::Note(Note {

@@ -15,8 +15,8 @@ use tauri_plugin_opener::OpenerExt as _;
 
 use crate::AppState;
 use crate::api::{
-    Interface, JournalSummary, LogDirWarning, SessionConfig, SessionStatus, SessionSummary,
-    StartInfo,
+    Interface, JournalSummary, LogDirWarning, RecentJournal, SerialPort, SessionConfig,
+    SessionStatus, SessionSummary, StartInfo,
 };
 use crate::error::{CommandError, ErrorCode};
 use crate::feed::{FeedBatch, FeedEvent};
@@ -111,6 +111,59 @@ pub async fn stop_session(
 #[tauri::command]
 pub fn add_session_note(text: String, state: State<'_, AppState>) -> Result<(), CommandError> {
     state.sessions.note(text)
+}
+
+/// Список COM-портов для формы COM (FR-12, M3-AC4).
+///
+/// Перечисление портов блокирующее, поэтому идёт в [`tokio::task::spawn_blocking`]:
+/// окно не замерзает на время опроса адаптеров. Пустой список — не ошибка: на машине
+/// без портов форма показывает, что портов нет.
+///
+/// # Errors
+///
+/// `serial`: система не смогла перечислить порты.
+#[tauri::command]
+pub async fn list_serial_ports() -> Result<Vec<SerialPort>, CommandError> {
+    serial_ports().await
+}
+
+/// Перечисление портов без границы Tauri: проверяется тестами без окна.
+async fn serial_ports() -> Result<Vec<SerialPort>, CommandError> {
+    let ports = tokio::task::spawn_blocking(bytetap_core::transport::serial::list_ports)
+        .await
+        .map_err(|err| {
+            CommandError::new(
+                ErrorCode::Serial,
+                format!("перечисление портов упало: {err}"),
+            )
+        })?
+        .map_err(|err| CommandError::from_io_with(ErrorCode::Serial, &err))?;
+    Ok(ports
+        .into_iter()
+        .map(|port| SerialPort {
+            name: port.name,
+            description: port.description,
+        })
+        .collect())
+}
+
+/// Журналы в папке для стартового экрана: новые сверху, не больше 20 (M3).
+///
+/// Читаются заголовок и `session_end` каждого файла, а не журнал целиком: папка может
+/// содержать сотни мегабайт (см. [`journal::recent`]).
+///
+/// # Errors
+///
+/// `log_dir`: путь относительный, папки нет или это не папка.
+#[tauri::command]
+pub async fn list_recent_journals(
+    dir: String,
+    limit: usize,
+) -> Result<Vec<RecentJournal>, CommandError> {
+    let path = log_dir_to_open(&dir)?;
+    tokio::task::spawn_blocking(move || journal::recent(&path, limit))
+        .await
+        .map_err(|err| CommandError::new(ErrorCode::LogDir, format!("чтение папки упало: {err}")))?
 }
 
 /// Сводка открытого журнала: заголовок, итоги и плотность всей сессии (FR-29).
@@ -415,6 +468,52 @@ mod tests {
                 .expect_err("не журнал")
                 .code,
             ErrorCode::Journal
+        );
+    }
+
+    /// Список портов — не ошибка на машине без портов (M3-AC4).
+    #[tokio::test]
+    async fn the_serial_port_list_is_never_an_error_without_ports() {
+        let ports = serial_ports().await.expect("перечисление портов");
+        for port in &ports {
+            assert!(!port.name.is_empty(), "у порта есть имя: {port:?}");
+            assert!(
+                !port.description.is_empty(),
+                "у порта есть описание: {port:?}"
+            );
+        }
+    }
+
+    /// Список журналов идёт только по существующей абсолютной папке, как `open_log_dir` (M3).
+    #[tokio::test]
+    async fn recent_journals_need_an_existing_absolute_directory() {
+        let dir = tempfile::tempdir().expect("временная папка");
+        assert!(
+            list_recent_journals(dir.path().to_string_lossy().into_owned(), 10)
+                .await
+                .expect("пустая папка")
+                .is_empty(),
+            "пустая папка — пустой список, а не ошибка"
+        );
+        assert_eq!(
+            list_recent_journals("logs".to_owned(), 10)
+                .await
+                .expect_err("относительный путь")
+                .code,
+            ErrorCode::LogDir
+        );
+        assert_eq!(
+            list_recent_journals(
+                dir.path()
+                    .join("no-such-dir")
+                    .to_string_lossy()
+                    .into_owned(),
+                10
+            )
+            .await
+            .expect_err("папки нет")
+            .code,
+            ErrorCode::LogDir
         );
     }
 }
