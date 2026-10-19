@@ -36,4 +36,5 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+bytetap-testkit.workspace = true
 tempfile.workspace = true

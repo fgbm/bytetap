@@ -386,11 +386,14 @@ mod tests {
     use std::io::Write as _;
 
     use bytetap_core::journal::{Event, read_all};
+    use bytetap_testkit::emulator::AnalyzerEmulator;
+    use bytetap_testkit::fixtures_dir;
     use tokio::io::AsyncWriteExt as _;
 
     use super::*;
     use crate::batch::test_sink::TestSink;
-    use crate::feed::{FeedEvent, StopReason};
+    use crate::feed::{FeedDir, FeedEvent, StopReason};
+    use crate::journal::{JournalCache, open, read_page};
 
     fn config(dir: &Path, port: u16) -> SessionConfig {
         SessionConfig {
@@ -610,6 +613,107 @@ mod tests {
             "журнал закрыт штатно, а не оборван"
         );
         sessions.stop_if_running().await; // без сессии ничего не делает
+    }
+
+    /// Сквозная проверка M2: запись через мост, затем чтение того же журнала командами.
+    ///
+    /// Эмулятор анализатора шлёт синтетические HL7/MLLP-сообщения, лента получает `open`,
+    /// `data` обоих направлений (ответ автоответчика — `synthetic`), `close` и `stopped`,
+    /// а `open_journal` с `read_journal` возвращают те же события из файла.
+    #[tokio::test]
+    async fn a_recorded_session_is_read_back_through_the_journal_commands() {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let sink = Arc::new(TestSink::default());
+        let sessions = Sessions::default();
+
+        let mut cfg = config(dir.path(), 0);
+        cfg.responder = "hl7".to_owned();
+        cfg.analyzer = "ANALYZER".to_owned();
+        cfg.note = "три пробы".to_owned();
+
+        let info = sessions.start(cfg, sink.clone()).await.expect("старт");
+        let addr: SocketAddr = info.local_addr.parse().expect("адрес слушателя");
+        let messages: Vec<Vec<u8>> = ["analyzer_oru_r01.hl7", "analyzer_qry_q02.hl7"]
+            .iter()
+            .map(|name| {
+                let path = fixtures_dir().join("hl7").join(name);
+                std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            })
+            .collect();
+        let report = AnalyzerEmulator::new(addr)
+            .with_messages(messages)
+            .run()
+            .await
+            .expect("обмен с анализатором");
+        assert_eq!(
+            report.acks.len(),
+            2,
+            "автоответчик подтвердил оба сообщения"
+        );
+
+        let summary = sessions.stop().await.expect("остановка");
+        assert_eq!(summary.stats.connections, 1);
+        assert!(summary.stats.bytes_analyzer_to_lis > 0);
+        assert!(summary.stats.bytes_lis_to_analyzer > 0);
+
+        let events = sink.events();
+        let count = |predicate: fn(&FeedEvent) -> bool| {
+            events.iter().filter(|event| predicate(event)).count()
+        };
+        assert_eq!(count(|event| matches!(event, FeedEvent::Open { .. })), 1);
+        assert!(
+            count(|event| matches!(
+                event,
+                FeedEvent::Data {
+                    dir: FeedDir::A2l,
+                    synthetic: false,
+                    ..
+                }
+            )) >= 2
+        );
+        assert!(
+            count(|event| matches!(
+                event,
+                FeedEvent::Data {
+                    dir: FeedDir::L2a,
+                    synthetic: true,
+                    ..
+                }
+            )) >= 2
+        );
+        assert_eq!(count(|event| matches!(event, FeedEvent::Close { .. })), 1);
+        assert_eq!(
+            events.last(),
+            Some(&FeedEvent::Stopped {
+                reason: StopReason::User,
+                message: None,
+            })
+        );
+
+        let path = Path::new(&summary.journal_path);
+        let cache = JournalCache::default();
+        let journal = open(path, &cache).await.expect("сводка журнала");
+        assert_eq!(journal.header["analyzer"].as_str(), Some("ANALYZER"));
+        assert_eq!(journal.header["note"].as_str(), Some("три пробы"));
+        assert_eq!(
+            journal.stats, summary.stats,
+            "итоги журнала и сессии совпали"
+        );
+        assert_eq!(journal.density.a2l.len(), crate::journal::DENSITY_BUCKETS);
+
+        let page = read_page(path, 0, 10_000, &cache)
+            .await
+            .expect("страница журнала");
+        assert_eq!(page.len(), journal.events, "журнал читается целиком");
+        assert_eq!(
+            page.iter()
+                .filter(|event| matches!(event, FeedEvent::Data { .. }))
+                .count(),
+            count(|event| matches!(event, FeedEvent::Data { .. })),
+            "лента и журнал содержат одни и те же фрагменты"
+        );
+        assert!(matches!(page.first(), Some(FeedEvent::Open { .. })));
+        assert!(matches!(page.last(), Some(FeedEvent::Close { .. })));
     }
 
     #[test]
