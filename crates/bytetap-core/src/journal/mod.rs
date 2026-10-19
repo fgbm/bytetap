@@ -8,6 +8,7 @@ mod event;
 pub mod reader;
 pub mod writer;
 
+use std::io;
 use std::time::Instant;
 
 use chrono::{Local, SecondsFormat};
@@ -23,6 +24,19 @@ pub use writer::{Journal, append_note, default_log_dir, log_dir_warning, session
 #[must_use]
 pub fn now_rfc3339() -> String {
     Local::now().to_rfc3339_opts(SecondsFormat::Micros, false)
+}
+
+/// Текст ошибки ввода-вывода для журнала: английский, из вида ошибки и кода ОС.
+///
+/// `Display` у системной ошибки зависит от языка системы: на русской Windows тот же сбой
+/// описан по-русски. Вид ошибки Rust печатает по-английски всегда, а [`io::Error::raw_os_error`]
+/// даёт числовой код для поиска: `connection reset (os error 10054)`. Ошибки без кода ОС
+/// (свои сообщения программы) остаются как есть: у них `Display` и есть текст.
+pub(crate) fn io_message(err: &io::Error) -> String {
+    match err.raw_os_error() {
+        Some(code) => format!("{} (os error {code})", err.kind()),
+        None => err.to_string(),
+    }
 }
 
 /// Монотонные часы сессии: `mono_us` — микросекунды от её начала (FR-22).
@@ -82,5 +96,30 @@ mod tests {
     #[test]
     fn format_constant_is_the_expected_version() {
         assert_eq!(FORMAT, "bytetap-session/1");
+    }
+
+    #[test]
+    fn a_system_error_is_described_in_english_with_its_code() {
+        let text = io_message(&io::Error::from_raw_os_error(2));
+        assert_eq!(text, format!("{} (os error 2)", io::ErrorKind::NotFound));
+        assert!(
+            text.is_ascii(),
+            "журнал не должен зависеть от языка системы: {text}"
+        );
+    }
+
+    #[test]
+    fn an_error_without_an_os_code_keeps_its_own_text() {
+        assert_eq!(
+            io_message(&io::Error::from(io::ErrorKind::ConnectionReset)),
+            "connection reset",
+            "вид ошибки без кода ОС"
+        );
+        assert_eq!(
+            io_message(&io::Error::other(
+                "test hook: the journal device refused the write"
+            )),
+            "test hook: the journal device refused the write"
+        );
     }
 }

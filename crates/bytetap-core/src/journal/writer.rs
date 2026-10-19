@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Local};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::journal::event::{Event, Mode, Note, Session};
 
@@ -106,7 +106,7 @@ fn test_hook_failure(_events: usize) -> Option<io::Error> {
 pub struct Journal {
     tx: mpsc::UnboundedSender<Command>,
     path: Arc<PathBuf>,
-    failure: Arc<Mutex<Option<String>>>,
+    failure: watch::Sender<Option<String>>,
     pending: Arc<AtomicUsize>,
     task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -149,13 +149,13 @@ impl Journal {
         }
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let failure = Arc::new(Mutex::new(None));
+        let (failure, _) = watch::channel(None);
         let pending = Arc::new(AtomicUsize::new(0));
         let task = Arc::new(Mutex::new(None));
         let journal = Self {
             tx,
             path: Arc::new(path),
-            failure: Arc::clone(&failure),
+            failure: failure.clone(),
             pending: Arc::clone(&pending),
             task: Arc::clone(&task),
         };
@@ -201,7 +201,18 @@ impl Journal {
     /// останавливается (ADR 0001, «Ошибка записи»).
     #[must_use]
     pub fn failure(&self) -> Option<String> {
-        self.failure.lock().ok().and_then(|failure| failure.clone())
+        self.failure.borrow().as_ref().cloned()
+    }
+
+    /// Подписка на отказ писателя: `Some(причина)`, как только запись стала невозможна.
+    ///
+    /// Нужна сессии, чтобы остановиться сразу, а не ждать следующего события: если
+    /// анализатор замолчал ровно в момент отказа, `record` больше никто не вызовет,
+    /// и без этого сигнала сессия осталась бы висеть живой без журнала (ADR 0001,
+    /// «Ошибка записи»).
+    #[must_use]
+    pub fn failed(&self) -> watch::Receiver<Option<String>> {
+        self.failure.subscribe()
     }
 
     /// Дожидается, пока всё отправленное окажется на диске.
@@ -234,10 +245,7 @@ impl Journal {
 
     fn stopped_error(&self) -> io::Error {
         let cause = self
-            .failure
-            .lock()
-            .ok()
-            .and_then(|failure| failure.clone())
+            .failure()
             .unwrap_or_else(|| "писатель журнала остановлен".to_owned());
         io::Error::other(cause)
     }
@@ -584,7 +592,7 @@ impl Batch {
 async fn run(
     mut rx: mpsc::UnboundedReceiver<Command>,
     file: File,
-    failure: Arc<Mutex<Option<String>>>,
+    failure: watch::Sender<Option<String>>,
     pending: Arc<AtomicUsize>,
 ) {
     let mut file = Some(file);
@@ -663,12 +671,18 @@ async fn append(mut file: File, bytes: Vec<u8>) -> io::Result<File> {
     .map_err(|err| io::Error::other(format!("задача записи журнала упала: {err}")))?
 }
 
-fn remember(failure: &Mutex<Option<String>>, err: &io::Error) {
-    if let Ok(mut failure) = failure.lock()
-        && failure.is_none()
-    {
-        *failure = Some(err.to_string());
-    }
+/// Запоминает причину отказа и будит подписчиков [`Journal::failed`].
+///
+/// Первая причина остаётся: последующие отказы — следствие того же сбоя.
+fn remember(failure: &watch::Sender<Option<String>>, err: &io::Error) {
+    failure.send_if_modified(|current| {
+        if current.is_some() {
+            false
+        } else {
+            *current = Some(crate::journal::io_message(err));
+            true
+        }
+    });
 }
 
 fn clone_error(err: &io::Error) -> io::Error {
