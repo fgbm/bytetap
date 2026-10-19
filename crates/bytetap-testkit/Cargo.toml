@@ -8,3 +8,4 @@ description = "Тестовые помощники для crates bytetap"
 publish = false
 
 [dependencies]
+tokio.workspace = true
