@@ -87,7 +87,7 @@ pub fn run() {
 ///
 /// Закрытие откладывается, пока сессия пишет `session_end` и фиксирует журнал; затем окно
 /// закрывается повторно, и вторая попытка проходит уже без активной сессии. Если остановка
-/// не уложилась в [`bridge::STOP_WAIT`], окно всё равно закрывается, но пользователь видит,
+/// не уложилась в [`bridge::STOP_WAIT`], приложение всё равно выходит, но пользователь видит,
 /// почему журнал мог остаться неполным.
 fn close_after_stopping(window: &tauri::Window, api: &tauri::CloseRequestApi) {
     if !window.state::<AppState>().sessions.is_running() {
@@ -100,8 +100,10 @@ fn close_after_stopping(window: &tauri::Window, api: &tauri::CloseRequestApi) {
         if let Err(err) = stopped {
             warn_journal_incomplete(window.app_handle(), &err.message);
             // Остановка не уложилась в предел: `close` снова упёрся бы в этот же
-            // обработчик, и окно осталось бы висеть. `destroy` не спрашивает разрешения.
-            let _ = window.destroy();
+            // обработчик, а `destroy` вызвал бы `ExitRequested` без кода — второе
+            // ожидание остановки и второй диалог. `exit` идёт с кодом, и `ExitRequested`
+            // его не перехватывает.
+            window.app_handle().exit(0);
             return;
         }
         let _ = window.close();
