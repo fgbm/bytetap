@@ -62,6 +62,8 @@
   --bt-rec-bg: #0f1418;
   --bt-rec-fg: #ffffff;
   --bt-accent: #2f3fbf;
+  --bt-warn: #8a5a00;
+  --bt-warn-bg: #fff6e0;
   --bt-hatch: rgb(15 20 24 / 9%);
 }
 
@@ -85,6 +87,8 @@
   --bt-rec-bg: #0f1418;
   --bt-rec-fg: #ffffff;
   --bt-accent: #2f3fbf;
+  --bt-warn: #8a5a00;
+  --bt-warn-bg: #fff6e0;
   --bt-hatch: rgb(15 20 24 / 9%);
 }
 
@@ -112,6 +116,8 @@ html.dark {
   --bt-rec-bg: #2a1416;
   --bt-rec-fg: #ffc2c2;
   --bt-accent: #8fb4ff;
+  --bt-warn: #ffcf66;
+  --bt-warn-bg: #2a2210;
   --bt-hatch: rgb(221 228 234 / 9%);
 }
 
