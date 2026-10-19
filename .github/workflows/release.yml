@@ -56,8 +56,8 @@ jobs:
           New-Item -ItemType Directory -Path staging | Out-Null
           Copy-Item target/release/bytetap.exe staging/
           Copy-Item README.md, LICENSE staging/
-          Compress-Archive -Path staging/* -DestinationPath "dist-$name.zip"
-          $hash = (Get-FileHash -Algorithm SHA256 "dist-$name.zip").Hash.ToLower()
+          Compress-Archive -Path staging/* -DestinationPath "$name.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLower()
           "$hash  $name.zip" | Out-File -FilePath SHA256SUMS -Encoding ascii
           Get-ChildItem staging | Select-Object Name, Length
 
@@ -65,7 +65,7 @@ jobs:
         with:
           name: bytetap-release
           path: |
-            dist-*.zip
+            bytetap-*.zip
             SHA256SUMS
           if-no-files-found: error
 
@@ -81,9 +81,12 @@ jobs:
           name: bytetap-release
           path: dist
 
+      - name: Сверить контрольную сумму
+        run: cd dist && sha256sum -c SHA256SUMS
+
       - name: Черновик релиза
         env:
           TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$TAG" --draft --verify-tag --generate-notes --title "bytetap $TAG" dist/dist-*.zip dist/SHA256SUMS
+        run: gh release create "$TAG" --draft --verify-tag --generate-notes --title "bytetap $TAG" dist/bytetap-*.zip dist/SHA256SUMS
