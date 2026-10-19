@@ -13,36 +13,49 @@ const { t } = useI18n();
   </main>
 </template>
 
+<style>
+body {
+  margin: 0;
+  background: var(--bt-surface-0);
+  color: var(--bt-text);
+  font-family: var(--bt-font-ui);
+  font-size: var(--bt-text-md);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+</style>
+
 <style scoped>
 .app {
   margin: 0 auto;
   max-width: 42rem;
-  padding: 3rem 1.5rem;
-  font-family: system-ui, sans-serif;
-  line-height: 1.5;
+  padding: var(--bt-space-6) var(--bt-space-5);
 }
 
 .title {
-  margin: 0 0 0.5rem;
-  font-size: 2rem;
+  margin: 0 0 var(--bt-space-2);
+  font-size: var(--bt-text-xl);
+  font-weight: 600;
   letter-spacing: -0.02em;
 }
 
 .tagline {
-  margin: 0 0 1.5rem;
-  font-size: 1.125rem;
+  margin: 0 0 var(--bt-space-5);
+  font-size: var(--bt-text-md);
+  color: var(--bt-text-muted);
 }
 
 .status {
-  margin: 0 0 1rem;
-  opacity: 0.75;
+  margin: 0 0 var(--bt-space-4);
+  color: var(--bt-text-muted);
 }
 
 .warning {
   margin: 0;
-  padding: 0.75rem 1rem;
-  border-left: 3px solid currentColor;
-  background: rgba(127, 127, 127, 0.12);
-  font-size: 0.875rem;
+  padding: var(--bt-space-3) var(--bt-space-4);
+  border-left: var(--bt-dir-width) solid var(--bt-danger);
+  border-radius: 0 var(--bt-radius-control) var(--bt-radius-control) 0;
+  background: var(--bt-surface-1);
+  font-size: var(--bt-text-sm);
 }
 </style>
