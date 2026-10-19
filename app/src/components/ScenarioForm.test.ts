@@ -50,7 +50,9 @@ describe("ScenarioForm — сценарий «Анализатор подклю�
     expect(wrapper.text()).toContain(i18n.global.t("form.copy"));
     expect(wrapper.text()).toContain("другая сеть: 10.0.0.5 (Wi-Fi)");
     expect(wrapper.text()).toContain(i18n.global.t("form.firewall"));
-    expect(wrapper.text()).toContain(i18n.global.t("form.firewallMore"));
+    // Подсказка — иконка с title: текст ссылки «подробнее» из интерфейса убран.
+    const hint = wrapper.get(".bt-hintline .bt-info");
+    expect(hint.attributes("title")).toBe(i18n.global.t("form.firewallHint"));
 
     const options = wrapper.findAll("#bt-responder option").map((option) => option.text());
     expect(options).toEqual([
@@ -192,6 +194,20 @@ describe("ScenarioForm — тишина интерфейса (UI v2)", () => {
     expect(wrapper.text()).not.toContain("Прокси");
     expect(wrapper.text()).not.toContain("Прослушка");
     expect(wrapper.findAll(".bt-seg")).toHaveLength(0);
+  });
+
+  it("рисует свою стрелку у каждого списка: системную в WebView2 не показываем", async () => {
+    const wrapper = mountForm("serial");
+    await expand(wrapper);
+
+    const selects = wrapper.findAll("select");
+    expect(selects.length).toBeGreaterThan(0);
+    for (const select of selects) {
+      const box = select.element.parentElement as HTMLElement;
+      expect(box.classList.contains("bt-select")).toBe(true);
+      expect(box.querySelector("svg")).not.toBeNull();
+    }
+    expect(wrapper.findAll(".bt-select")).toHaveLength(selects.length);
   });
 
   it("показывает ошибку старта текстом у поля, без баннера", () => {

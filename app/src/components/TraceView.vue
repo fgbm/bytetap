@@ -115,13 +115,14 @@ function drawWindow(
 
   context.strokeStyle = color;
   // Импульс — столбик 2px: тоньше не видно на дорожке 22px, толще — уже плашка.
+  // Ниже 6px столбик сливается с базовой линией, поэтому высота не опускается ниже.
   context.globalAlpha = 0.9;
   context.lineWidth = 2;
   context.beginPath();
   for (const impulse of impulses(pointsFor(dir, fromUs, toUs), fromUs, toUs)) {
     const x = Math.round(impulse.x * width) + 0.5;
     context.moveTo(x, bottom);
-    context.lineTo(x, bottom - Math.max(1, impulse.height * (height - 2)));
+    context.lineTo(x, bottom - Math.max(6, impulse.height * (height - 2)));
   }
   context.stroke();
   context.globalAlpha = 1;

@@ -23,10 +23,21 @@ export interface Impulse {
   height: number;
 }
 
-/** Высота импульса по длине фрагмента: логарифм, чтобы 3 байта и 3 КБ различались. */
+/** Нижняя граница высоты импульса: столбик короче 30% дорожки не читается. */
+const IMPULSE_MIN = 0.3;
+
+/** Длина фрагмента, на которой импульс занимает всю дорожку. */
+const IMPULSE_FULL_LEN = 4096;
+
+/**
+ * Высота импульса по длине фрагмента — от 30% до 100% высоты дорожки.
+ *
+ * Логарифм различает 3 байта и 3 КБ, а нижняя граница держит короткие служебные
+ * кадры (ENQ, ACK) видимыми: иначе ритм обмена пропадает в плоской полосе.
+ */
 export function impulseHeight(len: number): number {
-  const safe = Math.max(1, len);
-  return Math.min(1, Math.max(0.08, Math.log10(1 + safe) / Math.log10(1 + 4096)));
+  const share = Math.min(1, Math.log10(Math.max(1, len)) / Math.log10(IMPULSE_FULL_LEN));
+  return IMPULSE_MIN + (1 - IMPULSE_MIN) * share;
 }
 
 /** Окно «последние 60 с»: до заполнения окна — от нуля, дальше — скользит. */

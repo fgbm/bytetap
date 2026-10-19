@@ -23,11 +23,16 @@ describe("окно трассы", () => {
 });
 
 describe("импульсы", () => {
-  it("высота растёт с длиной фрагмента и остаётся в долях", () => {
-    expect(impulseHeight(0)).toBeLessThan(impulseHeight(512));
-    expect(impulseHeight(512)).toBeLessThan(impulseHeight(4096));
-    expect(impulseHeight(4096)).toBeLessThanOrEqual(1);
-    expect(impulseHeight(10_000_000)).toBeLessThanOrEqual(1);
+  it("высота идёт по логарифму от 30% до 100% высоты дорожки", () => {
+    // Короткий фрагмент (1 байт) — нижняя граница, 4 КБ и длиннее — вся дорожка.
+    expect(impulseHeight(1)).toBeCloseTo(0.3, 6);
+    expect(impulseHeight(0)).toBeCloseTo(0.3, 6);
+    expect(impulseHeight(4096)).toBeCloseTo(1, 6);
+    expect(impulseHeight(10_000_000)).toBeCloseTo(1, 6);
+    // Ритм виден: ENQ, ACK и кадр результата различаются по высоте.
+    expect(impulseHeight(3)).toBeGreaterThan(0.3);
+    expect(impulseHeight(3)).toBeLessThan(impulseHeight(150));
+    expect(impulseHeight(150)).toBeLessThan(impulseHeight(4096));
   });
 
   it("раскладывает точки окна в доли ширины и выбрасывает чужие", () => {

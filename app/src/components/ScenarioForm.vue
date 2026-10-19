@@ -9,7 +9,7 @@
  */
 import { computed, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowLeft, ChevronDown, ChevronRight, Copy, RefreshCw } from "@lucide/vue";
+import { ArrowLeft, ChevronDown, ChevronRight, Copy, Info, RefreshCw } from "@lucide/vue";
 import type {
   InterfaceInfo,
   LogDirWarning,
@@ -318,11 +318,14 @@ function onProfile(event: Event): void {
           </div>
           <div class="bt-field wide">
             <label for="bt-responder">{{ t("form.responder") }}</label>
-            <select id="bt-responder" class="bt-input" :value="config.responder" @change="onResponder">
-              <option v-for="item in RESPONDERS" :key="item.value" :value="item.value">
-                {{ t(item.key) }}
-              </option>
-            </select>
+            <span class="bt-select">
+              <select id="bt-responder" class="bt-input" :value="config.responder" @change="onResponder">
+                <option v-for="item in RESPONDERS" :key="item.value" :value="item.value">
+                  {{ t(item.key) }}
+                </option>
+              </select>
+              <ChevronDown :size="14" aria-hidden="true" />
+            </span>
           </div>
 
           <div class="bt-field wide">
@@ -339,7 +342,13 @@ function onProfile(event: Event): void {
             <span v-else-if="interfaces.length === 0" class="bt-hintline">{{ t("form.noInterfaces") }}</span>
             <span class="bt-hintline">
               {{ t("form.firewall") }}
-              <span class="bt-link" :title="t('form.firewallHint')">{{ t("form.firewallMore") }}</span>
+              <Info
+                class="bt-info"
+                :size="13"
+                role="img"
+                :title="t('form.firewallHint')"
+                :aria-label="t('form.firewallHint')"
+              />
             </span>
           </div>
         </template>
@@ -376,16 +385,19 @@ function onProfile(event: Event): void {
           </div>
           <div class="bt-field wide">
             <label for="bt-responder-client">{{ t("form.responder") }}</label>
-            <select
-              id="bt-responder-client"
-              class="bt-input"
-              :value="config.responder"
-              @change="onResponder"
-            >
-              <option v-for="item in RESPONDERS" :key="item.value" :value="item.value">
-                {{ t(item.key) }}
-              </option>
-            </select>
+            <span class="bt-select">
+              <select
+                id="bt-responder-client"
+                class="bt-input"
+                :value="config.responder"
+                @change="onResponder"
+              >
+                <option v-for="item in RESPONDERS" :key="item.value" :value="item.value">
+                  {{ t(item.key) }}
+                </option>
+              </select>
+              <ChevronDown :size="14" aria-hidden="true" />
+            </span>
           </div>
         </template>
 
@@ -394,19 +406,22 @@ function onProfile(event: Event): void {
           <div class="bt-field wide">
             <label for="bt-serial">{{ t("form.serialPort") }}</label>
             <div class="bt-row">
-              <select
-                id="bt-serial"
-                class="bt-input"
-                :class="{ err: fieldError('serial') !== null }"
-                :value="config.serial.port"
-                :aria-invalid="fieldError('serial') !== null"
-                @change="touched.serial = true; emit('update-serial', { port: ($event.target as HTMLSelectElement).value })"
-              >
-                <option value="">{{ t("form.serialChoose") }}</option>
-                <option v-for="port in serialOptions" :key="port.name" :value="port.name">
-                  {{ port.description }} ({{ port.name }})
-                </option>
-              </select>
+              <span class="bt-select">
+                <select
+                  id="bt-serial"
+                  class="bt-input"
+                  :class="{ err: fieldError('serial') !== null }"
+                  :value="config.serial.port"
+                  :aria-invalid="fieldError('serial') !== null"
+                  @change="touched.serial = true; emit('update-serial', { port: ($event.target as HTMLSelectElement).value })"
+                >
+                  <option value="">{{ t("form.serialChoose") }}</option>
+                  <option v-for="port in serialOptions" :key="port.name" :value="port.name">
+                    {{ port.description }} ({{ port.name }})
+                  </option>
+                </select>
+                <ChevronDown :size="14" aria-hidden="true" />
+              </span>
               <button
                 class="bt-icon"
                 type="button"
@@ -421,16 +436,13 @@ function onProfile(event: Event): void {
           </div>
           <div class="bt-field">
             <label for="bt-baud">{{ t("form.baud") }}</label>
-            <select
-              v-if="!baudOther"
-              id="bt-baud"
-              class="bt-input bt-mono"
-              :value="String(config.serial.baud)"
-              @change="onBaud"
-            >
-              <option v-for="rate in BAUD_RATES" :key="rate" :value="String(rate)">{{ rate }}</option>
-              <option value="other">{{ t("form.baudOther") }}</option>
-            </select>
+            <span v-if="!baudOther" class="bt-select">
+              <select id="bt-baud" class="bt-input bt-mono" :value="String(config.serial.baud)" @change="onBaud">
+                <option v-for="rate in BAUD_RATES" :key="rate" :value="String(rate)">{{ rate }}</option>
+                <option value="other">{{ t("form.baudOther") }}</option>
+              </select>
+              <ChevronDown :size="14" aria-hidden="true" />
+            </span>
             <input
               v-else
               id="bt-baud"
@@ -443,22 +455,28 @@ function onProfile(event: Event): void {
           </div>
           <div class="bt-field">
             <label for="bt-format">{{ t("form.format") }}</label>
-            <select id="bt-format" class="bt-input bt-mono" :value="format" @change="onFormat">
-              <option v-for="value in FORMATS" :key="value" :value="value">{{ value }}</option>
-            </select>
+            <span class="bt-select">
+              <select id="bt-format" class="bt-input bt-mono" :value="format" @change="onFormat">
+                <option v-for="value in FORMATS" :key="value" :value="value">{{ value }}</option>
+              </select>
+              <ChevronDown :size="14" aria-hidden="true" />
+            </span>
           </div>
           <div class="bt-field wide">
             <label for="bt-responder-serial">{{ t("form.responder") }}</label>
-            <select
-              id="bt-responder-serial"
-              class="bt-input"
-              :value="config.responder"
-              @change="onResponder"
-            >
-              <option v-for="item in RESPONDERS" :key="item.value" :value="item.value">
-                {{ t(item.key) }}
-              </option>
-            </select>
+            <span class="bt-select">
+              <select
+                id="bt-responder-serial"
+                class="bt-input"
+                :value="config.responder"
+                @change="onResponder"
+              >
+                <option v-for="item in RESPONDERS" :key="item.value" :value="item.value">
+                  {{ t(item.key) }}
+                </option>
+              </select>
+              <ChevronDown :size="14" aria-hidden="true" />
+            </span>
           </div>
         </template>
       </div>
@@ -474,17 +492,20 @@ function onProfile(event: Event): void {
           <template v-if="mode === 'tcp_server'">
             <div class="bt-field wide">
               <label for="bt-iface">{{ t("form.listenOn") }}</label>
-              <select
-                id="bt-iface"
-                class="bt-input"
-                :value="config.listenHost"
-                @change="emit('update', { listenHost: ($event.target as HTMLSelectElement).value })"
-              >
-                <option :value="ALL_INTERFACES">{{ t("form.allInterfaces") }}</option>
-                <option v-for="iface in interfaces" :key="iface.addr" :value="iface.addr">
-                  {{ iface.addr }} — {{ iface.name }}
-                </option>
-              </select>
+              <span class="bt-select">
+                <select
+                  id="bt-iface"
+                  class="bt-input"
+                  :value="config.listenHost"
+                  @change="emit('update', { listenHost: ($event.target as HTMLSelectElement).value })"
+                >
+                  <option :value="ALL_INTERFACES">{{ t("form.allInterfaces") }}</option>
+                  <option v-for="iface in interfaces" :key="iface.addr" :value="iface.addr">
+                    {{ iface.addr }} — {{ iface.name }}
+                  </option>
+                </select>
+                <ChevronDown :size="14" aria-hidden="true" />
+              </span>
             </div>
           </template>
 
@@ -504,16 +525,19 @@ function onProfile(event: Event): void {
           <template v-if="mode === 'serial'">
             <div class="bt-field">
               <label for="bt-flow">{{ t("form.flow") }}</label>
-              <select
-                id="bt-flow"
-                class="bt-input"
-                :value="config.serial.flow"
-                @change="emit('update-serial', { flow: ($event.target as HTMLSelectElement).value as AppConfig['serial']['flow'] })"
-              >
-                <option value="none">{{ t("form.flowNone") }}</option>
-                <option value="rtscts">{{ t("form.flowRtscts") }}</option>
-                <option value="xonxoff">{{ t("form.flowXonxoff") }}</option>
-              </select>
+              <span class="bt-select">
+                <select
+                  id="bt-flow"
+                  class="bt-input"
+                  :value="config.serial.flow"
+                  @change="emit('update-serial', { flow: ($event.target as HTMLSelectElement).value as AppConfig['serial']['flow'] })"
+                >
+                  <option value="none">{{ t("form.flowNone") }}</option>
+                  <option value="rtscts">{{ t("form.flowRtscts") }}</option>
+                  <option value="xonxoff">{{ t("form.flowXonxoff") }}</option>
+                </select>
+                <ChevronDown :size="14" aria-hidden="true" />
+              </span>
             </div>
             <div class="bt-field">
               <label class="bt-check">
@@ -591,12 +615,15 @@ function onProfile(event: Event): void {
           <div class="bt-field wide">
             <label for="bt-profile">{{ t("form.profile") }}</label>
             <div class="bt-row">
-              <select id="bt-profile" class="bt-input" :value="selectedProfile" @change="onProfile">
-                <option value="">{{ t("form.profileLast") }}</option>
-                <option v-for="profile in profiles" :key="profile.name" :value="profile.name">
-                  {{ profile.name }}
-                </option>
-              </select>
+              <span class="bt-select">
+                <select id="bt-profile" class="bt-input" :value="selectedProfile" @change="onProfile">
+                  <option value="">{{ t("form.profileLast") }}</option>
+                  <option v-for="profile in profiles" :key="profile.name" :value="profile.name">
+                    {{ profile.name }}
+                  </option>
+                </select>
+                <ChevronDown :size="14" aria-hidden="true" />
+              </span>
               <button class="bt-chip-btn" type="button" @click="emit('save-profile')">
                 {{ t("form.profileSave") }}
               </button>

@@ -144,14 +144,15 @@ function resultFrameCp1251(messageId: string, at: Date, sample: number): string 
 }
 
 /**
- * Кадр ASTM E1381: `STX FN текст ETX|ETB C1 C2 CR LF`.
+ * Кадр ASTM E1381: `STX FN текст CR ETX|ETB C1 C2 CR LF`.
  *
- * Сумма — по модулю 256 от `FN` до `ETX`/`ETB` включительно, на отправку две hex-цифры
- * верхнего регистра (FR-17).
+ * `FN` — ASCII-цифра `0`…`7`, а не байт номера: 0x01 в ленте читается как служебный
+ * `SOH`, а не как номер кадра. Сумма — по модулю 256 от `FN` до `ETX`/`ETB`
+ * включительно, на отправку две hex-цифры верхнего регистра (FR-17).
  */
 function astmFrame(fn: number, records: readonly string[], final = true): number[] {
-  const text = asciiBytes(records.join("\r"));
-  const body = [fn, ...text, final ? 0x03 : 0x17];
+  const text = asciiBytes(records.map((record) => `${record}\r`).join(""));
+  const body = [0x30 + (fn % 8), ...text, final ? 0x03 : 0x17];
   const sum = body.reduce((total, byte) => total + byte, 0) & 0xff;
   return [0x02, ...body, ...asciiBytes(sum.toString(16).toUpperCase().padStart(2, "0")), 0x0d, 0x0a];
 }
@@ -189,7 +190,7 @@ interface MockSession {
   failed: boolean;
   /** Кто отвечает: `auto` в заглушке выбирает HL7, как по первому байту VT. */
   responder: "hl7" | "astm" | "none";
-  /** Номер кадра ASTM 0–7 циклически. */
+  /** Номер следующего кадра ASTM: первый в сессии — 1, дальше 2…7 и 0. */
   fn: number;
 }
 
@@ -477,32 +478,52 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
             message: "Автоответ: ACK отправлен",
           },
         ];
+      case 8: {
+        // У клиента и COM соединение одно: `second` совпадает с `conn`, и без
+        // проверки лента показала бы два одинаковых «отключился» подряд.
+        const closed = second === target.conn ? [target.conn] : [target.conn, second];
+        return closed.map((conn) => closeEvent(target, conn));
+      }
       default:
-        return [closeEvent(target, target.conn), closeEvent(target, second)];
+        // Шаг между циклами: закрывать уже нечего.
+        return [];
     }
+  }
+
+  /** Номер кадра ASTM на отправку: берёт текущий и сдвигает счётчик 1…7, 0. */
+  function nextFn(target: MockSession): number {
+    const value = target.fn;
+    target.fn = (target.fn + 1) % 8;
+    return value;
   }
 
   /** Обмен ASTM E1381: ENQ → ACK, кадры с ETX и ETB → ACK, EOT. */
   function astmEvents(target: MockSession): FeedEvent[] {
     const phase = target.step % 10;
     const conn = target.conn;
-    const frames: Record<number, number[]> = {
-      3: astmFrame(target.fn, astmRecords(target.sample + 1)),
-      5: astmFrame((target.fn + 1) % 8, astmRecords(target.sample + 1), false),
-      7: astmFrame((target.fn + 2) % 8, astmRecords(target.sample + 1)),
-    };
 
     switch (phase) {
       case 1:
         target.sample += 1;
         return [dataEvent(target, conn, "a2l", [ENQ], false)];
       case 3:
+        return [
+          dataEvent(target, conn, "a2l", astmFrame(nextFn(target), astmRecords(target.sample + 1)), false),
+        ];
       case 5:
-      case 7: {
-        const frame = frames[phase] ?? [];
-        target.fn = (target.fn + 1) % 8;
-        return [dataEvent(target, conn, "a2l", frame, false)];
-      }
+        return [
+          dataEvent(
+            target,
+            conn,
+            "a2l",
+            astmFrame(nextFn(target), astmRecords(target.sample + 1), false),
+            false,
+          ),
+        ];
+      case 7:
+        return [
+          dataEvent(target, conn, "a2l", astmFrame(nextFn(target), astmRecords(target.sample + 1)), false),
+        ];
       case 2:
       case 4:
       case 6:
@@ -520,7 +541,7 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
           },
         ];
       default:
-        return [closeEvent(target, conn)];
+        return [];
     }
   }
 
@@ -679,7 +700,7 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
         {
           path: joinPath(target, journalName(day(1, 18, 2), "tcp_client")),
           startedAt: day(1, 18, 2).toISOString(),
-          analyzer: "Sysmex XN-1000",
+          analyzer: "ANALYZER-2",
           durationUs: 1_260_000_000,
           mode: "tcp_client",
         },
@@ -746,7 +767,7 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
         onBatch,
         failed: false,
         responder,
-        fn: 0,
+        fn: 1,
       };
       lastGeneration += 1;
       target.startInfo.generation = lastGeneration;

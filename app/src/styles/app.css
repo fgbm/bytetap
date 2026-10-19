@@ -424,12 +424,41 @@ textarea {
   font-size: var(--bt-text-sm);
 }
 
-select.bt-input {
-  padding-right: 4px;
-}
-
 .bt-input::placeholder {
   color: var(--bt-text-faint);
+}
+
+/* Списки: своя стрелка вместо системной — в WebView2 системная выглядит инородно */
+
+.bt-select {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+
+.bt-select > select {
+  appearance: none;
+  padding-right: 26px;
+  cursor: pointer;
+}
+
+/* Стрелка — элемент, а не data-URL в фоне: CSP `img-src` не пропускает data: */
+.bt-select > svg {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  transform: translateY(-50%);
+  color: var(--bt-text-muted);
+  pointer-events: none;
+}
+
+.bt-row > .bt-select {
+  flex: 1;
+}
+
+.bt-input:focus-visible {
+  outline: 1px solid var(--bt-ctrl);
+  outline-offset: 0;
 }
 
 .bt-input.err {
@@ -466,11 +495,12 @@ select.bt-input {
   font-size: var(--bt-text-xs);
 }
 
-.bt-hintline .bt-link {
-  padding: 0;
-  font-size: inherit;
-  text-decoration: underline;
-  text-underline-offset: 2px;
+/* Подсказка — иконка с title вместо ссылки: нажимать в ней нечего */
+.bt-hintline .bt-info {
+  margin-left: 2px;
+  color: var(--bt-text-faint);
+  vertical-align: -2px;
+  cursor: help;
 }
 
 /* «Дополнительно» */
@@ -886,17 +916,13 @@ select.bt-input {
   font-size: var(--bt-text-xs);
 }
 
-/* Просмотр журнала: карта сессии в тонкой рамке */
+/* Просмотр журнала: карта сессии и лента как при записи, без общей рамки */
 
 .bt-journal-map {
   display: flex;
   flex: 1;
   flex-direction: column;
   min-height: 0;
-  margin: var(--bt-space-3);
-  border: 1px solid var(--bt-border);
-  border-radius: var(--bt-radius-panel);
-  overflow: hidden;
 }
 
 .bt-journal-map .bt-trace {
