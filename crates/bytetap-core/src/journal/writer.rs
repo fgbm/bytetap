@@ -7,13 +7,17 @@
 //! - задача-писатель забирает всё накопленное (`recv` + `try_recv` в цикле), пишет строки,
 //!   делает один `flush` и один `sync_data` на пачку (FR-20);
 //! - пачка ограничена сверху [`MAX_BATCH_BYTES`], чтобы журнал не отставал на большую очередь;
-//! - файл открыт в режиме дописывания и удерживается под эксклюзивной блокировкой до конца
-//!   сессии: пока сессия пишет, `note` в тот же файл не дописывается;
+//! - файл открыт в режиме дописывания и защищён от второй записи до конца сессии: на Unix —
+//!   рекомендательной `flock`, на Windows — режимом совместного использования без
+//!   `FILE_SHARE_WRITE`. Читать журнал при этом можно и во время сессии (`verify`, FR-29),
+//!   а `note` в тот же файл не дописывается;
 //! - заголовок `session` пишется синхронно до запуска задачи: файл без заголовка не появляется;
 //! - после аварийного завершения в худшем случае теряется последняя неполная строка:
 //!   записанные пачки уже прошли `sync_data`.
 
-use std::fs::{File, OpenOptions, TryLockError};
+#[cfg(unix)]
+use std::fs::TryLockError;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead as _, ErrorKind, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "test-hooks")]
@@ -105,8 +109,13 @@ impl Journal {
             std::fs::create_dir_all(parent)?;
         }
         let (path, file) = open_new(&path)?;
-        lock_exclusive(&file)?;
-        write_header(&file, &session)?;
+        if let Err(err) = lock_exclusive(&file).and_then(|()| write_header(&file, &session)) {
+            // Созданный пустой файл без заголовка не остаётся: иначе он выглядел бы
+            // журналом сессии, а `verify` отказывал бы на первой же строке (ADR 0001, п. 9).
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(err);
+        }
 
         let (tx, rx) = mpsc::unbounded_channel();
         let failure = Arc::new(Mutex::new(None));
@@ -221,12 +230,14 @@ pub fn default_log_dir() -> Option<PathBuf> {
 ///
 /// `None` — папка обычная. Иначе текст для инженера: журналы могут содержать данные
 /// пациентов и не должны синхронизироваться в OneDrive или лежать на сетевом диске.
-/// Путь проверяется по компонентам (`OneDrive`, `OneDrive - Contoso`) и по UNC-записи `\\…`.
+/// Сетевой путь распознаётся по UNC-записи (`\\server\share`, `\\?\UNC\server\share`),
+/// на Windows ещё и по типу тома: буква диска, подключённого по сети (`GetDriveTypeW`
+/// == `DRIVE_REMOTE`). Расширенные записи `\\?\C:` и `\\.\` — локальные.
+/// OneDrive ищется по компонентам пути (`OneDrive`, `OneDrive - Contoso`).
 #[must_use]
 pub fn log_dir_warning(path: impl AsRef<Path>) -> Option<String> {
     let path = path.as_ref();
-    let text = path.to_string_lossy();
-    if text.starts_with(r"\\") || text.starts_with("//") {
+    if is_remote_path(path) {
         return Some(format!(
             "папка журналов {} — сетевой путь: журналы с данными пациентов останутся на другом компьютере",
             path.display()
@@ -234,7 +245,8 @@ pub fn log_dir_warning(path: impl AsRef<Path>) -> Option<String> {
     }
     // Путь проверяется по тексту: на любой ОС разделители `/` и `\\` разбираются одинаково,
     // а Windows-путь, записанный на Unix, остаётся одной компонентой.
-    let in_onedrive = text
+    let in_onedrive = path
+        .to_string_lossy()
         .split(['/', '\\'])
         .any(|segment| segment.to_lowercase().starts_with("onedrive"));
     in_onedrive.then(|| {
@@ -245,24 +257,65 @@ pub fn log_dir_warning(path: impl AsRef<Path>) -> Option<String> {
     })
 }
 
+/// `true`, если папка лежит на другом компьютере.
+///
+/// `\\?\` и `\\.\` — локальные записи (`\\?\C:`, устройство); `\\?\UNC\` и `\\server\`
+/// — сетевые. Проверка на тип тома нужна для буквы диска: `Z:` может быть сетевой.
+fn is_remote_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let lower = text.to_lowercase();
+    if lower.starts_with(r"\\?\unc\") || lower.starts_with("//?/unc/") {
+        return true;
+    }
+    if text.starts_with(r"\\?\")
+        || text.starts_with("//?/")
+        || text.starts_with(r"\\.\")
+        || text.starts_with("//./")
+    {
+        return false;
+    }
+    if text.starts_with(r"\\") || text.starts_with("//") {
+        return true;
+    }
+    drive_is_remote(path)
+}
+
+/// `DRIVE_REMOTE` из `GetDriveTypeW`: том подключён по сети.
+#[cfg(windows)]
+const DRIVE_REMOTE: u32 = 4;
+
+/// Буква диска в пути принадлежит сетевому тому (`GetDriveTypeW`).
+#[cfg(windows)]
+fn drive_is_remote(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    // `GetDriveTypeW` хочет корень тома (`C:\`), а не полный путь.
+    let Some(std::path::Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    if !matches!(prefix.kind(), std::path::Prefix::Disk(_)) {
+        return false;
+    }
+    let mut root: Vec<u16> = prefix.as_os_str().encode_wide().collect();
+    root.extend([u16::from(b'\\'), 0]);
+    // SAFETY: строка с завершающим NUL живёт до конца вызова, других требований у функции нет.
+    let kind = unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) };
+    kind == DRIVE_REMOTE
+}
+
+#[cfg(not(windows))]
+fn drive_is_remote(_path: &Path) -> bool {
+    false
+}
+
 /// Дописывает событие `note` в конец готового журнала, не переписывая начало файла (FR-23).
 ///
-/// Файл должен существовать и не должен быть занят идущей сессией: писатель держит
-/// эксклюзивную блокировку до остановки. Обрезанный хвост (последняя строка без `\n`, обычно
+/// Файл должен существовать и не должен быть занят идущей сессией: писатель не отдаёт
+/// файл на запись до остановки. Обрезанный хвост (последняя строка без `\n`, обычно
 /// после аварийного завершения) — отказ: комментарий не дописывается и файл не меняется,
 /// иначе неполная строка слилась бы с комментарием и журнал перестал читаться.
 pub fn append_note(path: impl AsRef<Path>, note: &Note) -> io::Result<()> {
-    let mut file = OpenOptions::new().append(true).read(true).open(path)?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            return Err(io::Error::new(
-                ErrorKind::WouldBlock,
-                "журнал ещё пишется, дождитесь остановки сессии",
-            ));
-        }
-        Err(TryLockError::Error(err)) => return Err(err),
-    }
+    let mut file = open_for_note(path.as_ref())?;
 
     let mut first = String::new();
     {
@@ -296,6 +349,45 @@ pub fn append_note(path: impl AsRef<Path>, note: &Note) -> io::Result<()> {
     line.push(b'\n');
     file.write_all(&line)?;
     file.sync_data()
+}
+
+/// Открывает журнал на дописывание и убеждается, что его не пишет идущая сессия.
+///
+/// Unix: сессия держит `flock`, и `try_lock` отвечает `WouldBlock`. Windows: сессия открыла
+/// файл без `FILE_SHARE_WRITE`, поэтому открыть его на запись нельзя, и система отвечает
+/// `ERROR_SHARING_VIOLATION` — по правилам Windows это и значит «файл занят на запись».
+fn open_for_note(path: &Path) -> io::Result<File> {
+    let file = match OpenOptions::new().append(true).read(true).open(path) {
+        Ok(file) => file,
+        Err(err) if is_sharing_violation(&err) => return Err(journal_busy_error()),
+        Err(err) => return Err(err),
+    };
+    #[cfg(unix)]
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Err(journal_busy_error()),
+        Err(TryLockError::Error(err)) => return Err(err),
+    }
+    Ok(file)
+}
+
+/// Ошибка «журнал занят идущей сессией»: `WouldBlock` — на обеих ОС.
+fn journal_busy_error() -> io::Error {
+    io::Error::new(
+        ErrorKind::WouldBlock,
+        "журнал ещё пишется, дождитесь остановки сессии",
+    )
+}
+
+/// `ERROR_SHARING_VIOLATION` (32): файл открыт другой программой без `FILE_SHARE_WRITE`.
+#[cfg(windows)]
+fn is_sharing_violation(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(32)
+}
+
+#[cfg(not(windows))]
+fn is_sharing_violation(_err: &io::Error) -> bool {
+    false
 }
 
 /// Создаёт новый файл по пути, подбирая свободное имя.
@@ -335,16 +427,28 @@ fn suffixed(path: &Path, suffix: u32) -> PathBuf {
 }
 
 fn create_new(path: &Path) -> io::Result<File> {
-    // `read(true)` нужен ради блокировки: LockFileEx на Windows требует GENERIC_READ или
-    // GENERIC_WRITE, а режим дописывания сам по себе даёт только FILE_APPEND_DATA.
-    OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .append(true)
-        .open(path)
+    let mut options = OpenOptions::new();
+    options.create_new(true).append(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+        // Другие процессы читают журнал на ходу — `verify`, Блокнот, будущий FR-29.
+        // `FILE_SHARE_WRITE` не запрашивается, поэтому открыть файл на запись больше
+        // нельзя, и это заменяет `LockFileEx`: тот на Windows запрещал бы и чтение,
+        // то есть журнал не прочитать при живой сессии (ADR 0001, п. 7).
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+    }
+    options.open(path)
 }
 
-/// Эксклюзивная блокировка файла на всё время сессии.
+/// Запрещает вторую запись в файл журнала на всё время сессии.
+///
+/// Unix: рекомендательная `flock` — чтению она не мешает, а `append_note` получает
+/// `WouldBlock`. Windows: блокировки нет, её роль играет [`create_new`] с `share_mode`
+/// без `FILE_SHARE_WRITE` (ADR 0001, п. 7).
+#[cfg(unix)]
 fn lock_exclusive(file: &File) -> io::Result<()> {
     match file.try_lock() {
         Ok(()) => Ok(()),
@@ -354,6 +458,11 @@ fn lock_exclusive(file: &File) -> io::Result<()> {
         )),
         Err(TryLockError::Error(err)) => Err(err),
     }
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(_file: &File) -> io::Result<()> {
+    Ok(())
 }
 
 /// Пишет и фиксирует заголовок сессии до запуска задачи-писателя.
@@ -426,9 +535,10 @@ async fn run(
 
         if batch.stop {
             // Остановка: новые события не принимаются, а всё отправленное до неё дочитывается
-            // в эту же пачку.
+            // в эту же пачку. `recv` после `close` доходит до конца очереди: `try_recv` здесь
+            // не годится, он может остановиться раньше, чем очередь опустеет.
             rx.close();
-            while let Ok(command) = rx.try_recv() {
+            while let Some(command) = rx.recv().await {
                 batch.push(command);
             }
         }
@@ -537,6 +647,24 @@ mod tests {
             false,
             format!("MSH|{index}").as_bytes(),
         ))
+    }
+
+    /// Дописывает `note` в журнал после остановки сессии.
+    ///
+    /// На Windows дескриптор журнала освобождается вместе с задачей-писателем, но антивирус
+    /// или индексатор могут задержать это на доли секунды. До пяти повторов по 100 мс
+    /// проверку не ослабляют: отказ «журнал ещё пишется» по-прежнему виден сразу, а ждём
+    /// мы только освобождения файла после `shutdown`.
+    fn append_note_after_stop(path: &Path, text: &str) {
+        for attempt in 0..5 {
+            match append_note(path, &note(text)) {
+                Ok(()) => return,
+                Err(err) if err.kind() == ErrorKind::WouldBlock && attempt < 4 => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(err) => panic!("note после остановки: {err}"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -655,13 +783,18 @@ mod tests {
         let path = dir.path().join("session.jsonl");
         let journal = Journal::create(&path, session()).unwrap();
         journal.record(data(1));
+        journal.flush().await.unwrap();
 
         let err = append_note(&path, &note("во время сессии")).unwrap_err();
         assert!(err.to_string().contains("ещё пишется"), "{err}");
 
-        journal.flush().await.unwrap();
+        // Читать журнал идущей сессии можно: на этом стоят `verify`, Блокнот и будущий FR-29.
+        let outcome = read_all(&path).expect("журнал читается на ходу");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        assert_eq!(outcome.lines.len(), 2, "заголовок и записанное событие");
+
         journal.shutdown().await.unwrap();
-        append_note(&path, &note("после остановки")).unwrap();
+        append_note_after_stop(&path, "после остановки");
 
         let outcome = read_all(&path).unwrap();
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
@@ -784,6 +917,22 @@ mod tests {
         );
         let network = log_dir_warning(r"\\fileserver\share\bytetap").unwrap();
         assert!(network.contains("сетевой"), "{network}");
+    }
+
+    #[test]
+    fn log_dir_warning_tells_extended_paths_from_unc() {
+        // `\\?\` и `\\.\` — расширенные записи этого же компьютера, а не сеть.
+        assert!(log_dir_warning(r"\\?\C:\Users\user\Documents\bytetap").is_none());
+        assert!(log_dir_warning(r"\\.\C:\Users\user\Documents\bytetap").is_none());
+        // `\\?\UNC\` и `\\server\` — сетевые, в обеих записях разделителей.
+        for path in [
+            r"\\?\UNC\fileserver\share\bytetap",
+            r"\\fileserver\share\bytetap",
+            "//fileserver/share/bytetap",
+        ] {
+            let warning = log_dir_warning(path).unwrap_or_else(|| panic!("{path} — сетевой путь"));
+            assert!(warning.contains("сетевой"), "{path}: {warning}");
+        }
     }
 
     #[tokio::test]

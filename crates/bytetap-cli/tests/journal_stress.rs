@@ -3,6 +3,10 @@
 //!
 //! Тест гоняет настоящий бинарь под нагрузкой, ждёт накопления строк, убивает процесс
 //! и проверяет, что каждая строка, кроме, возможно, последней, — валидное событие формата.
+//!
+//! Журнал читается, пока процесс ещё пишет, и на Windows: писатель открывает файл без
+//! `FILE_SHARE_WRITE`, но с `FILE_SHARE_READ` (ADR 0001, п. 7), поэтому чтение из другого
+//! процесса проходит, а запись — нет.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -16,13 +20,6 @@ use serde_json::Value;
 const MIN_LINES: usize = 2_000;
 /// Сколько ждём наполнения журнала — с запасом на медленную CI-машину.
 const TIMEOUT: Duration = Duration::from_secs(60);
-/// Сколько ждём, если файл не читается из-за блокировки идущей сессии (Windows).
-///
-/// Идущая сессия удерживает файл под эксклюзивной блокировкой, а `LockFileEx` на Windows
-/// запрещает и чтение из другого процесса (`ERROR_LOCK_VIOLATION`). Наблюдать строки
-/// на ходу там нельзя, зато писатель под нагрузкой фиксирует пачки постоянно: к концу
-/// этой паузы данные уже на диске, и их найдёт `read_all` после убийства.
-const LOCKED_GRACE: Duration = Duration::from_secs(3);
 
 fn schema() -> Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -80,7 +77,6 @@ fn journal_survives_a_killed_process() {
     let mut child = KillOnDrop(Some(child));
 
     let deadline = Instant::now() + TIMEOUT;
-    let started = Instant::now();
     loop {
         let lines = count_lines(&path);
         if lines >= MIN_LINES {
@@ -88,10 +84,6 @@ fn journal_survives_a_killed_process() {
         }
         let process = child.0.as_mut().expect("процесс ещё не забран");
         panic_on_early_exit(process, lines);
-        if lines == 0 && started.elapsed() >= LOCKED_GRACE {
-            // Файл не читается из-за блокировки сессии (Windows): ждём по времени.
-            break;
-        }
         assert!(
             Instant::now() < deadline,
             "журнал не наполнился за {TIMEOUT:?}: {lines} строк"
