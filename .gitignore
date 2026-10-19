@@ -1,0 +1,9 @@
+/target/
+**/target/
+node_modules/
+dist/
+*.jsonl
+!tests/fixtures/**/*.jsonl
+.DS_Store
+.vscode/
+.idea/
