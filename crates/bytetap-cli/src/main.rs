@@ -14,11 +14,12 @@ use bytetap_core::journal::{
     self, Autoresponder, Data, Dir, Event, Host, Journal, LineErrorKind, Mode, MonoClock, Note,
     Session, now_rfc3339,
 };
-use bytetap_core::session::{Session as CaptureSession, SessionConfig};
+use bytetap_core::session::{Session as CaptureSession, SessionConfig, journal_failure_reason};
 use chrono::DateTime;
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::watch;
 
 /// Сколько знаков поля `text` показывает лента `capture`.
 const FEED_WIDTH: usize = 120;
@@ -141,8 +142,13 @@ fn capture(
             config = config.with_note(note);
         }
 
-        let handle = CaptureSession::start(config).await?;
+        // Подписка создаётся до старта приёма: подключение анализатора сразу после
+        // запуска не должно разойтись с лентой.
+        let (handle, mut events) = CaptureSession::start_with_feed(config)
+            .await
+            .map_err(CaptureError::Start)?;
         let path = handle.journal_path().to_path_buf();
+        let mut failure = handle.journal_failure();
         println!("Журнал: {}", path.display());
         println!("Слушаю {} (Ctrl+C — остановка)", handle.local_addr());
         if let Some(warning) = handle.log_dir_warning() {
@@ -150,8 +156,7 @@ fn capture(
         }
         println!("Лента:");
 
-        let mut events = handle.subscribe();
-        let interrupt = tokio::signal::ctrl_c();
+        let interrupt = shutdown_signal();
         tokio::pin!(interrupt);
         loop {
             tokio::select! {
@@ -159,6 +164,7 @@ fn capture(
                     println!("\nОстановка…");
                     break;
                 }
+                _ = wait_for_journal_failure(&mut failure) => break,
                 received = events.recv() => match received {
                     Ok(event) => print_event(&event),
                     Err(RecvError::Lagged(skipped)) => println!(
@@ -169,7 +175,15 @@ fn capture(
             }
         }
 
-        let stats = handle.stop().await?;
+        let stats = match handle.stop().await {
+            Ok(stats) => stats,
+            Err(err) => {
+                return Err(match journal_failure_reason(&err) {
+                    Some(reason) => CaptureError::Journal(reason.to_owned()),
+                    None => CaptureError::Stop(err),
+                });
+            }
+        };
         // Сессия успела разослать последние события до остановки — показываем и их.
         while let Ok(event) = events.try_recv() {
             print_event(&event);
@@ -183,16 +197,84 @@ fn capture(
             stats.bytes_lis_to_analyzer
         );
         println!("Журнал: {}", path.display());
-        Ok::<(), std::io::Error>(())
+        Ok(())
     });
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
+        Err(CaptureError::Journal(reason)) => {
+            eprintln!(
+                "Запись в журнал прервана: {reason}. Сессия остановлена, анализатор не получил подтверждений после сбоя."
+            );
+            ExitCode::FAILURE
+        }
+        Err(CaptureError::Start(err)) => {
+            eprintln!("Не удалось начать сессию: {err}");
+            ExitCode::FAILURE
+        }
+        Err(CaptureError::Stop(err)) => {
             eprintln!("ошибка: запись прервана: {err}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Чем закончился `capture`.
+enum CaptureError {
+    /// Сессия не началась: занят порт, недоступна папка журналов.
+    Start(std::io::Error),
+    /// Журнал отказал: сессия остановлена, подтверждений больше не будет.
+    Journal(String),
+    /// Другая ошибка остановки.
+    Stop(std::io::Error),
+}
+
+/// Ждёт отказа журнала, о котором сессия сообщает до остановки.
+async fn wait_for_journal_failure(failure: &mut watch::Receiver<Option<String>>) {
+    if failure.borrow_and_update().is_some() {
+        return;
+    }
+    // Ошибка `changed` значит, что сессия выгружена: ждать больше нечего.
+    let _ = failure.changed().await;
+}
+
+/// Ждёт сигнала штатной остановки.
+///
+/// Кроме `Ctrl+C` это SIGTERM и SIGHUP на Unix (служба, закрытая консоль) и
+/// `ctrl_close`/`ctrl_break` на Windows: консольное окно закрывается так же штатно,
+/// и журнал должен получить `session_end`.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        if let (Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+                _ = hangup.recv() => {}
+            }
+            return;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+
+        if let (Ok(mut close), Ok(mut interrupt)) = (windows::ctrl_close(), windows::ctrl_break()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = close.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+            return;
+        }
+    }
+    // Обработчики дополнительных сигналов не поставились: остаётся `Ctrl+C`.
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Строка ленты для события (M1-AC15, FR-26).
