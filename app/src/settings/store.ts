@@ -21,15 +21,30 @@ import {
   type ThemeMode,
   upsertProfile,
 } from "./settings";
-import { createSettingsStorage, type SettingsStorage } from "./storage";
+import {
+  CorruptSettingsError,
+  createSettingsStorage,
+  preserveCorruptSettings,
+  type SettingsStorage,
+} from "./storage";
 
 const SAVE_DELAY_MS = 400;
 
 const storage: SettingsStorage = createSettingsStorage(bridgeKind());
 
-const state = reactive<Settings & { loaded: boolean }>({
+/** Почему настройки не прочитались: интерфейс работает на значениях по умолчанию. */
+export interface SettingsWarning {
+  code: "reset" | "corrupt";
+  /** Куда положена копия испорченного файла. */
+  path: string;
+}
+
+const state = reactive<
+  Settings & { loaded: boolean; warning: SettingsWarning | null }
+>({
   ...defaultSettings(),
   loaded: false,
+  warning: null,
 });
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -60,8 +75,21 @@ export async function flushSettings(): Promise<void> {
   await storage.save(snapshot());
 }
 
+/**
+ * Читает сохранённые настройки и никогда не бросает: ошибка чтения — баннер и значения
+ * по умолчанию, а не оборванная загрузка окружения (AC11). Испорченный файл перед
+ * перезаписью копируется рядом: `settings.corrupt-<дата>.json`.
+ */
 export async function loadSettings(): Promise<void> {
-  const raw = await storage.load();
+  let raw: unknown = null;
+  try {
+    raw = await storage.load();
+    state.warning = null;
+  } catch (error) {
+    const corrupt = error instanceof CorruptSettingsError;
+    const path = corrupt ? ((await preserveCorruptSettings(bridgeKind())) ?? "") : "";
+    state.warning = corrupt ? { code: "corrupt", path } : { code: "reset", path: "" };
+  }
   const loaded = normalizeSettings(raw, state.config.logDir);
   state.config = loaded.config;
   state.theme = loaded.theme;
@@ -69,6 +97,12 @@ export async function loadSettings(): Promise<void> {
   state.feed = loaded.feed;
   state.loaded = true;
   applyTheme(state.theme);
+  if (state.warning !== null) void flushSettings();
+}
+
+/** Закрыть баннер о настройках. */
+export function dismissSettingsWarning(): void {
+  state.warning = null;
 }
 
 /** Стартовая логика: папка журналов по умолчанию, если своих настроек ещё нет. */
@@ -117,12 +151,14 @@ export function applyProfile(name: string): boolean {
   if (profile === null) return false;
   state.config = { ...profile.config };
   scheduleSave();
+  // Смена профиля — заметное решение: пишем сразу, а не через отложенный таймер (AC11).
+  void flushSettings();
   return true;
 }
 
 /** Только для тестов: вернуть настройки к значениям по умолчанию. */
 export function resetSettings(): void {
-  Object.assign(state, defaultSettings(), { loaded: false });
+  Object.assign(state, defaultSettings(), { loaded: false, warning: null });
 }
 
 export function useSettings() {
@@ -138,5 +174,6 @@ export function useSettings() {
     deleteProfile,
     applyProfile,
     flushSettings,
+    dismissSettingsWarning,
   };
 }

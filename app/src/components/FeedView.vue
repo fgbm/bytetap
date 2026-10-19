@@ -91,15 +91,16 @@ const viewportHeight = ref(DEFAULT_VIEWPORT_HEIGHT);
 const follow = ref(true);
 const connFilter = ref<number | null>(null);
 
-/** Просмотр журнала: строки читаются страницами, вид — только текст (FR-29). */
+/** Просмотр журнала: строки читаются страницами, высоты HEX берутся из индекса (FR-29). */
 const viewing = computed(() => props.journal !== null);
-const view = computed<FeedViewMode>(() => (viewing.value ? "text" : props.view));
+const view = computed<FeedViewMode>(() => props.view);
 
 /**
  * Индексы событий буфера: все или выбранного соединения.
  *
  * В журнале события читаются страницами, поэтому список всех индексов не строится:
  * порядок строки совпадает с номером события, а фильтра соединений там нет.
+ * Высоты HEX-строк приходят из индекса журнала, а не из прочитанных страниц.
  */
 const indices = computed<number[] | null>(() => {
   void props.feed.version;
@@ -117,6 +118,14 @@ function eventIndex(order: number): number {
 /** Сколько строк в ленте: в журнале — общее число событий из сводки. */
 const rowCount = computed(() => indices.value?.length ?? props.feed.length);
 
+/** Длина события в байтах: из индекса журнала, иначе из загруженного события. */
+function byteLengthAt(index: number, event: FeedEvent | undefined): number | null {
+  const known = props.feed.byteLength?.(index);
+  if (known !== undefined && known !== null) return known;
+  if (event === undefined) return null;
+  return event.type === "data" ? base64ByteLength(event.b64) : 0;
+}
+
 /** Номера соединений для чипов фильтра. */
 const conns = computed<number[]>(() => {
   void props.feed.version;
@@ -133,9 +142,21 @@ watch(conns, (list) => {
 const lineCounts = computed<number[]>(() => {
   if (view.value !== "hex") return [];
   const counts: number[] = [];
-  for (const index of indices.value ?? []) {
+  const list = indices.value;
+  if (list === null) {
+    // Журнал: высоты известны из индекса, страницы не читаются.
+    for (let index = 0; index < props.feed.length; index += 1) {
+      counts.push(hexLineCount(props.feed.byteLength?.(index) ?? 0));
+    }
+    return counts;
+  }
+  for (const index of list) {
     const event = props.feed.at(index);
-    counts.push(event !== undefined && event.type === "data" ? hexLineCount(base64ByteLength(event.b64)) : 1);
+    counts.push(
+      event !== undefined && event.type === "data"
+        ? hexLineCount(base64ByteLength(event.b64))
+        : 1,
+    );
   }
   return counts;
 });
@@ -193,7 +214,7 @@ const textRows = computed<FeedRow[]>(() => {
 function eventAtLine(line: number): number {
   const prefix = linePrefix.value;
   let low = 0;
-  let high = (indices.value?.length ?? 0) - 1;
+  let high = rowCount.value - 1;
   while (low < high) {
     const middle = Math.ceil((low + high) / 2);
     if ((prefix[middle + 1] ?? 0) <= line) low = middle;
@@ -206,19 +227,20 @@ function eventAtLine(line: number): number {
 const hexRows = computed<HexRow[]>(() => {
   if (view.value !== "hex") return [];
   const rows: HexRow[] = [];
-  const list = indices.value ?? [];
   const { start, end } = range.value;
   if (end <= start) return rows;
   const prefix = linePrefix.value;
   let eventOrder = eventAtLine(start);
   let line = start;
 
-  while (line < end && eventOrder < list.length) {
-    const index = list[eventOrder];
+  while (line < end && eventOrder < rowCount.value) {
+    const index = eventIndex(eventOrder);
+    if (index < 0) break;
     const event = props.feed.at(index);
     if (event === undefined) break;
     const bytes = event.type === "data" ? base64ToBytes(event.b64) : new Uint8Array(0);
-    const count = event.type === "data" ? hexLineCount(bytes.length) : 1;
+    const length = byteLengthAt(index, event) ?? bytes.length;
+    const count = hexLineCount(length);
     const row = eventRow(event, eventOrder, translate, props.encoding);
     const firstLine = prefix[eventOrder] ?? 0;
 
@@ -389,8 +411,6 @@ onBeforeUnmount(() => {
         <button
           type="button"
           :class="{ on: view === 'hex' }"
-          :disabled="viewing"
-          :title="viewing ? t('feed.hexUnavailable') : undefined"
           @click="emit('update:view', 'hex')"
         >
           {{ t("feed.viewHex") }}

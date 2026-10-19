@@ -11,7 +11,9 @@ import type {
   FeedEvent,
   InterfaceInfo,
   JournalSummary,
+  LogDirWarning,
   SessionConfig,
+  SessionStatus,
   SessionSummary,
   StartInfo,
 } from "./types";
@@ -24,7 +26,9 @@ export interface Bridge {
   /** Папка журналов по умолчанию. */
   defaultLogDir(): Promise<string>;
   /** Предупреждение о OneDrive или сетевом пути; `null` — папка в порядке. */
-  logDirWarning(dir: string): Promise<string | null>;
+  logDirWarning(dir: string): Promise<LogDirWarning | null>;
+  /** Идёт ли запись и что вернул её старт: для перезагруженной страницы (AC1). */
+  sessionStatus(): Promise<SessionStatus>;
   /**
    * Запускает сессию. События приходят пачками в `onBatch`; отписка не нужна —
    * поток закрывается вместе с командой `stopSession`.
@@ -34,6 +38,8 @@ export interface Bridge {
   addSessionNote(text: string): Promise<void>;
   openJournal(path: string): Promise<JournalSummary>;
   readJournal(path: string, from: number, count: number): Promise<FeedEvent[]>;
+  /** Длины событий журнала: по ним лента считает высоты HEX-строк (AC5). */
+  journalLengths(path: string): Promise<number[]>;
   appendNote(path: string, text: string): Promise<void>;
   pickJournal(): Promise<string | null>;
   pickLogDir(): Promise<string | null>;

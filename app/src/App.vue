@@ -3,7 +3,7 @@ import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { FileText, PenLine, TriangleAlert, X } from "@lucide/vue";
 import { bridge } from "./api/bridge";
-import type { InterfaceInfo } from "./api/types";
+import type { InterfaceInfo, LogDirWarning } from "./api/types";
 import ActionBar from "./components/ActionBar.vue";
 import AppHeader from "./components/AppHeader.vue";
 import ConfigForm from "./components/ConfigForm.vue";
@@ -38,6 +38,8 @@ const {
   elapsedMs,
   start,
   stop,
+  stopAny,
+  adopt,
   addNote,
   openJournal,
   appendJournalNote,
@@ -50,7 +52,7 @@ const settingsStore = useSettings();
 const settings = settingsStore.state;
 
 const interfaces = ref<InterfaceInfo[]>([]);
-const logDirWarning = ref<string | null>(null);
+const logDirWarning = ref<LogDirWarning | null>(null);
 const portText = ref(String(settings.config.listenPort));
 const selectedProfile = ref("");
 const lastJournalPath = ref<string | null>(null);
@@ -140,6 +142,21 @@ const journalPath = computed(
   () => state.value.startInfo?.journalPath ?? lastJournalPath.value,
 );
 
+/** Запись идёт, а настроек старта у страницы нет: сессия пережила перезагрузку (AC1). */
+const orphanSession = computed(
+  () => state.value.status === "recording" && state.value.startedConfig === null,
+);
+
+/** Баннер о настройках: сброс или испорченный файл с копией (AC11). */
+const settingsWarning = computed(() => {
+  const warning = settingsStore.state.warning;
+  if (warning === null) return "";
+  if (warning.code === "corrupt") {
+    return t("settings.warningCorrupt", { path: warning.path });
+  }
+  return t("settings.warningReset");
+});
+
 const promptTitle = computed(() => {
   if (prompt.kind === "note") return t("actions.noteTitle");
   if (prompt.kind === "journalNote") return t("journal.noteTitle");
@@ -175,6 +192,8 @@ async function refreshLogDirWarning(): Promise<void> {
 }
 
 async function loadEnvironment(): Promise<void> {
+  // Ошибка настроек не обрывает окружение: интерфейс работает на значениях по умолчанию,
+  // а баннер settings.warning* объясняет, что случилось (AC11).
   await settingsStore.loadSettings();
   portText.value = String(settings.config.listenPort);
   try {
@@ -191,8 +210,17 @@ async function loadEnvironment(): Promise<void> {
   await refreshLogDirWarning();
 }
 
+/** Перезагрузка страницы не должна оставить сессию сиротой (AC1). */
+async function restoreSession(): Promise<void> {
+  try {
+    await adopt(await bridge.sessionStatus());
+  } catch {
+    // Состояние не узнать — интерфейс просто начнёт с «Готов к старту».
+  }
+}
+
 onMounted(() => {
-  void loadEnvironment();
+  void loadEnvironment().finally(() => void restoreSession());
 });
 
 watch(
@@ -227,6 +255,12 @@ async function onStart(): Promise<void> {
 
 async function onStop(): Promise<void> {
   await stop();
+  if (state.value.summary !== null) lastJournalPath.value = state.value.summary.journalPath;
+}
+
+/** «Остановить» из баннера «сессия уже идёт»: лента могла остаться от прошлой страницы. */
+async function onStopFromBanner(): Promise<void> {
+  await stopAny();
   if (state.value.summary !== null) lastJournalPath.value = state.value.summary.journalPath;
 }
 
@@ -357,7 +391,7 @@ function onPromptConfirm(text: string): void {
       @open-folder="onOpenFolder"
       @cycle-theme="cycleTheme"
     >
-      <SessionChips v-if="state.startInfo !== null" :config="settings.config" />
+      <SessionChips v-if="state.startedConfig !== null" :config="state.startedConfig" />
     </AppHeader>
 
     <ErrorBanner
@@ -365,10 +399,23 @@ function onPromptConfirm(text: string): void {
       :error="state.error"
       :config="settings.config"
       @dismiss="dismissError"
+      @stop="onStopFromBanner"
     />
+
+    <div v-if="settingsStore.state.warning !== null" class="bt-ban warn" role="note">
+      <TriangleAlert :size="16" aria-hidden="true" />
+      <div>{{ settingsWarning }}</div>
+    </div>
+
+    <!-- Сессия пережила перезагрузку страницы: ленты нет, но «Стоп» завершит запись (AC1). -->
+    <div v-if="orphanSession" class="bt-ban warn" role="note">
+      <TriangleAlert :size="16" aria-hidden="true" />
+      <div>{{ t("status.stopOrphan") }}</div>
+    </div>
 
     <JournalFailureBanner
       v-if="state.journalFailure !== null"
+      :code="state.journalFailure.code"
       :message="state.journalFailure.message"
       @choose-dir="onChooseDirFromFailure"
       @open-recorded="onOpenRecorded"

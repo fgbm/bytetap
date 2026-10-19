@@ -2,7 +2,7 @@ import { mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
 import ConfigForm from "./ConfigForm.vue";
 import { i18n } from "../i18n";
-import type { InterfaceInfo, SessionConfig } from "../api/types";
+import type { InterfaceInfo, LogDirWarning, SessionConfig } from "../api/types";
 import { defaultConfig } from "../settings/settings";
 import { MOCK_INTERFACES } from "../api/mock-bridge";
 
@@ -12,7 +12,7 @@ interface FormProps {
   interfaces: InterfaceInfo[];
   portError: string | null;
   logDirError: string | null;
-  logDirWarning: string | null;
+  logDirWarning: LogDirWarning | null;
 }
 
 function mountForm(overrides: Partial<FormProps> = {}) {
@@ -95,6 +95,14 @@ describe("ConfigForm", () => {
     const pick = wrapper.findAll("button").find((button) => button.text().includes(i18n.global.t("config.logDirChoose")));
     await pick?.trigger("click");
     expect(wrapper.emitted("pick-log-dir")).toHaveLength(1);
+  });
+
+  it("переводит предупреждение о папке журналов по коду моста (FR-19)", () => {
+    const wrapper = mountForm({
+      logDirWarning: { code: "onedrive", params: { dir: "C:\\Users\\op\\OneDrive\\bytetap" } },
+    });
+    expect(wrapper.text()).toContain(i18n.global.t("config.logDirWarningOnedrive"));
+    expect(wrapper.text()).not.toContain("onedrive");
   });
 
   it("показывает подсказку с адресами ноутбука и брандмауэр (AC2)", () => {

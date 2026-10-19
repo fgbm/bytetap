@@ -25,10 +25,12 @@ const emit = defineEmits<{
   deleteProfile: [];
 }>();
 
-const { t } = useI18n();
+const { t, n } = useI18n();
 
 const recording = computed(() => props.status === "recording");
 const busy = computed(() => props.status === "starting" || props.status === "stopping");
+/** Пока идёт запись, профили не меняют: они меняют конфигурацию сессии (AC3). */
+const locked = computed(() => recording.value || busy.value);
 const duration = computed(() => formatDuration(props.elapsedMs));
 const startLabel = computed(() => {
   if (props.status === "starting") return t("actions.starting");
@@ -39,7 +41,7 @@ const startLabel = computed(() => {
 const summaryText = computed(() => {
   if (props.summary === null) return null;
   return t("status.summary", {
-    connections: props.summary.stats.connections,
+    connections: n(props.summary.stats.connections, "integer"),
     a2l: formatBytes(props.summary.stats.bytesAnalyzerToLis),
     l2a: formatBytes(props.summary.stats.bytesLisToAnalyzer),
   });
@@ -71,6 +73,7 @@ function onProfileChange(event: Event): void {
       id="bt-profile"
       class="bt-input profile"
       :value="selectedProfile"
+      :disabled="locked"
       :aria-label="t('actions.profileChoose')"
       @change="onProfileChange"
     >
@@ -79,14 +82,14 @@ function onProfileChange(event: Event): void {
         {{ profile.name }}
       </option>
     </select>
-    <button class="bt-btn" type="button" @click="emit('saveProfile')">
+    <button class="bt-btn" type="button" :disabled="locked" @click="emit('saveProfile')">
       <Save :size="15" aria-hidden="true" />
       {{ t("actions.profileSave") }}
     </button>
     <button
       class="bt-btn ghost"
       type="button"
-      :disabled="selectedProfile === ''"
+      :disabled="locked || selectedProfile === ''"
       :aria-label="t('actions.profileDelete')"
       @click="emit('deleteProfile')"
     >

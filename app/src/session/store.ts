@@ -14,8 +14,10 @@ import {
   type BridgeErrorCode,
   type FeedBatch,
   type FeedEvent,
+  type JournalFailureCode,
   type JournalSummary,
   type SessionConfig,
+  type SessionStatus,
 } from "../api/types";
 import { FEED_CAPACITY, FeedBuffer } from "../feed/ring";
 import { JournalFeed } from "../journal/feed";
@@ -70,6 +72,19 @@ function stopTicker(): void {
   ticker = null;
 }
 
+/** Код отказа журнала из ошибки команды: мост кладёт его в `params.failure`. */
+function failureCodeOf(error: unknown): JournalFailureCode {
+  const raw = error instanceof BridgeError ? error.params.failure : undefined;
+  const known: JournalFailureCode[] = [
+    "disk_full",
+    "permission_denied",
+    "not_found",
+    "timeout",
+    "io",
+  ];
+  return known.find((code) => code === raw) ?? "io";
+}
+
 function onBatch(batch: FeedBatch): void {
   dispatch({ type: "batch", batch });
   appendEvents(batch.events);
@@ -79,9 +94,13 @@ function onBatch(batch: FeedBatch): void {
   );
   if (stopped && stopped.type === "stopped") {
     stopTicker();
-    dispatch({ type: "journal_failed", message: stopped.message ?? "" });
-    // Ядро уже остановило сессию; stop_session освобождает слот моста, иначе следующий
-    // старт получил бы «сессия уже идёт». Ошибка ожидаема: причина уже в баннере (NFR-5).
+    dispatch({
+      type: "journal_failed",
+      code: stopped.code ?? "io",
+      message: stopped.message ?? "",
+    });
+    // Ядро уже остановило сессию, а мост сам освобождает слот; вызов остаётся
+    // безвредным и на случай старого моста. Ошибка ожидаема: причина в баннере (NFR-5).
     void bridge.stopSession().catch(() => undefined);
   }
 }
@@ -94,7 +113,7 @@ async function start(cfg: SessionConfig): Promise<void> {
   dispatch({ type: "start_requested" });
   try {
     const info = await bridge.startSession(cfg, onBatch);
-    dispatch({ type: "started", info });
+    dispatch({ type: "started", info, config: cfg });
     startTicker(info.startedAt);
   } catch (error) {
     dispatch({ type: "start_failed", error: toSessionError(error) });
@@ -108,10 +127,47 @@ async function stop(): Promise<void> {
     const summary = await bridge.stopSession();
     dispatch({ type: "stopped", summary });
   } catch (error) {
-    dispatch({ type: "stop_failed", error: toSessionError(error) });
+    // Отказ журнала на финальной фиксации: это тот же баннер AC15, а не ошибка команды.
+    if (error instanceof BridgeError && error.code === "journal") {
+      dispatch({
+        type: "journal_failed",
+        code: failureCodeOf(error),
+        message: error.message,
+      });
+    } else {
+      dispatch({ type: "stop_failed", error: toSessionError(error) });
+    }
   } finally {
     stopTicker();
   }
+}
+
+/**
+ * Останавливает запись без записи ленты: кнопка «Остановить» в баннере «сессия уже идёт»
+ * и сессия, пережившая перезагрузку страницы (AC1).
+ */
+async function stopAny(): Promise<void> {
+  try {
+    const summary = await bridge.stopSession();
+    dispatch({ type: "stopped", summary });
+  } catch (error) {
+    dispatch({ type: "command_failed", error: toSessionError(error) });
+  }
+  stopTicker();
+}
+
+/**
+ * Подхватывает идущую сессию после перезагрузки страницы (AC1).
+ *
+ * Лента перезагрузки не переживает: канал событий принадлежал старой странице. Зато
+ * «Стоп» работает, и сессия не остаётся сиротой в ядре.
+ */
+async function adopt(status: SessionStatus): Promise<boolean> {
+  if (!status.running || status.startInfo === null) return false;
+  if (state.value.status !== "idle" && state.value.status !== "viewing") return false;
+  dispatch({ type: "resumed", info: status.startInfo });
+  startTicker(status.startInfo.startedAt);
+  return true;
 }
 
 async function addNote(text: string): Promise<void> {
@@ -126,9 +182,16 @@ async function addNote(text: string): Promise<void> {
 async function openJournal(path: string): Promise<JournalSummary | null> {
   try {
     const journal = await bridge.openJournal(path);
+    const lengths = await bridge.journalLengths(path).catch(() => []);
     const pages = shallowReactive(
-      new JournalFeed(path, journal.events, (from, count) => bridge.readJournal(path, from, count)),
-    );    journalFeed.value = pages;
+      new JournalFeed(
+        path,
+        journal.events,
+        (from, count) => bridge.readJournal(path, from, count),
+        lengths,
+      ),
+    );
+    journalFeed.value = pages;
     dispatch({ type: "journal_opened", journal });
     // Последняя страница нужна сразу: из неё берутся дописанные комментарии к журналу.
     pages.ensure(Math.max(0, journal.events - 1), journal.events);
@@ -194,6 +257,8 @@ export function useSession() {
     elapsedMs,
     start,
     stop,
+    stopAny,
+    adopt,
     addNote,
     openJournal,
     appendJournalNote,

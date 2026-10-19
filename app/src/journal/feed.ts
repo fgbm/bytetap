@@ -33,11 +33,20 @@ export class JournalFeed {
   private readonly pages = new Map<number, Page>();
   private readonly pending = new Set<number>();
   private readonly failed = new Set<number>();
+  /** Длины событий из индекса журнала: нужны для высот HEX-строк (AC5). */
+  private lengths: number[];
 
-  constructor(path: string, total: number, load: PageLoader) {
+  constructor(path: string, total: number, load: PageLoader, lengths: number[] = []) {
     this.path = path;
     this.total = Math.max(0, Math.floor(total));
     this.load = load;
+    this.lengths = lengths.slice();
+  }
+
+  /** Длина события в байтах из индекса; `null` — индекс не дал её. */
+  byteLength(index: number): number | null {
+    const length = this.lengths[index];
+    return length === undefined ? null : length;
   }
 
   get length(): number {
@@ -73,6 +82,8 @@ export class JournalFeed {
     const next = Math.max(0, Math.floor(total));
     if (next <= this.total) return;
     this.total = next;
+    // Комментарий — служебная строка: своей длины для HEX у него нет.
+    while (this.lengths.length < next) this.lengths.push(0);
     // Новое событие всегда в последней странице; её и перечитываем.
     const last = this.pageCount - 1;
     this.pages.delete(last);

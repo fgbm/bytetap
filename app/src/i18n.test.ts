@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { ENCODING_KEYS } from "./feed/bytes";
-import { ERROR_KEYS } from "./session/errors";
+import { ERROR_KEYS, FAILURE_KEYS } from "./session/errors";
 import { PORT_PROBLEM_KEYS } from "./validation";
 
 /** Корень исходников: vitest запускается из каталога `app`. */
@@ -51,8 +51,12 @@ describe("i18n", () => {
     expect(missing).toEqual([]);
   });
 
-  it("ключи ошибок по коду и по порту заведены в локали", () => {
-    const keys = [...Object.values(ERROR_KEYS), ...Object.values(PORT_PROBLEM_KEYS)];
+  it("ключи ошибок и причин отказа журнала заведены в локали", () => {
+    const keys = [
+      ...Object.values(ERROR_KEYS),
+      ...Object.values(FAILURE_KEYS),
+      ...Object.values(PORT_PROBLEM_KEYS),
+    ];
     expect(keys.filter((key) => !hasKey(key))).toEqual([]);
   });
 
@@ -66,6 +70,7 @@ describe("i18n", () => {
       "already_running",
       "io",
       "journal",
+      "journal_open",
       "log_dir",
       "permission_denied",
       "port_in_use",

@@ -44,8 +44,8 @@ describe("formatTime", () => {
 });
 
 describe("formatDateTime", () => {
-  it("выводит дату и время журнала", () => {
+  it("выводит дату и время журнала через локаль", () => {
     const iso = new Date(2026, 9, 19, 10, 15, 0).toISOString();
-    expect(formatDateTime(iso)).toBe("19.10.2026 10:15:00");
+    expect(formatDateTime(iso), "дата и время по правилам локали").toBe("19.10.2026, 10:15:00");
   });
 });

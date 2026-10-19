@@ -15,16 +15,19 @@ const props = defineProps<{
 
 const emit = defineEmits<{ note: [] }>();
 
-const { t } = useI18n();
+const { t, n } = useI18n();
 
 const recording = computed(() => props.status === "recording");
+/** Числа — по правилам локали: разряды и запятая не собираются вручную. */
+const connections = computed(() => n(props.stats.connections, "integer"));
+const droppedText = computed(() => n(props.dropped, "integer"));
 </script>
 
 <template>
   <footer class="bt-status">
     <span>
       <Plug :size="13" aria-hidden="true" />
-      {{ t("status.connections") }} <b>{{ stats.connections }}</b>
+      {{ t("status.connections") }} <b>{{ connections }}</b>
     </span>
     <span :title="t('status.bytesA2l')">
       <ArrowRight :size="13" aria-hidden="true" />
@@ -34,7 +37,7 @@ const recording = computed(() => props.status === "recording");
       <ArrowLeft :size="13" aria-hidden="true" />
       <b>{{ formatBytes(stats.bytesLisToAnalyzer) }}</b>
     </span>
-    <span v-if="dropped > 0">{{ t("status.dropped", { count: dropped }) }}</span>
+    <span v-if="dropped > 0">{{ t("status.dropped", { count: droppedText }) }}</span>
     <button v-if="recording" class="bt-btn ghost" type="button" @click="emit('note')">
       <PenLine :size="13" aria-hidden="true" />
       {{ t("actions.note") }}

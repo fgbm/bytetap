@@ -11,11 +11,13 @@ const props = defineProps<{
   config: SessionConfig;
 }>();
 
-const emit = defineEmits<{ dismiss: [] }>();
+const emit = defineEmits<{ dismiss: []; stop: [] }>();
 
 const { t } = useI18n();
 
 const text = computed(() => t(ERROR_KEYS[props.error.code], errorParams(props.error, props.config)));
+/** «Сессия уже идёт» — единственная ошибка, которую можно исправить прямо здесь. */
+const canStop = computed(() => props.error.code === "already_running");
 </script>
 
 <template>
@@ -23,6 +25,9 @@ const text = computed(() => t(ERROR_KEYS[props.error.code], errorParams(props.er
     <CircleAlert :size="16" aria-hidden="true" />
     <div class="body">
       <div>{{ text }}</div>
+      <button v-if="canStop" class="bt-btn" type="button" @click="emit('stop')">
+        {{ t("actions.stop") }}
+      </button>
     </div>
     <button class="bt-icon-btn" type="button" :aria-label="t('banner.dismiss')" @click="emit('dismiss')">
       <X :size="14" aria-hidden="true" />

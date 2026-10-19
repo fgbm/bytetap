@@ -10,7 +10,7 @@ import {
   Server,
   Usb,
 } from "@lucide/vue";
-import type { InterfaceInfo, Responder, SessionConfig } from "../api/types";
+import type { InterfaceInfo, LogDirWarning, Responder, SessionConfig } from "../api/types";
 import { ALL_INTERFACES } from "../settings/settings";
 
 const props = defineProps<{
@@ -19,7 +19,7 @@ const props = defineProps<{
   interfaces: InterfaceInfo[];
   portError: string | null;
   logDirError: string | null;
-  logDirWarning: string | null;
+  logDirWarning: LogDirWarning | null;
 }>();
 
 const emit = defineEmits<{
@@ -60,11 +60,15 @@ async function copyAddress(addr: string): Promise<void> {
   }
 }
 
+/** Предупреждение переводится по коду из моста, а путь подставляется параметром (FR-19). */
 const logDirWarningText = computed(() => {
-  if (props.logDirWarning === null || props.logDirWarning === "") return null;
-  if (props.logDirWarning === "onedrive") return t("config.logDirWarningOnedrive");
-  if (props.logDirWarning === "network") return t("config.logDirWarningNetwork");
-  return props.logDirWarning;
+  const warning = props.logDirWarning;
+  if (warning === null) return null;
+  const keys = {
+    onedrive: "config.logDirWarningOnedrive",
+    network: "config.logDirWarningNetwork",
+  } as const;
+  return t(keys[warning.code], warning.params);
 });
 </script>
 

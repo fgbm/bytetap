@@ -17,9 +17,11 @@ import {
   type FeedEvent,
   type InterfaceInfo,
   type JournalSummary,
+  type LogDirWarning,
   type SessionConfig,
   type StartInfo,
 } from "./types";
+import { base64ByteLength } from "../feed/bytes";
 
 export const MOCK_INTERFACES: InterfaceInfo[] = [
   { name: "Ethernet", addr: "192.168.1.10" },
@@ -232,7 +234,16 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
 
   function emit(target: MockSession, events: FeedEvent[], dropped = 0): void {
     if (events.length === 0) return;
-    target.onBatch({ events, dropped });
+    // Счётчики — как у моста: строка состояния берёт их, а не считает по ленте.
+    target.onBatch({
+      events,
+      dropped,
+      stats: {
+        connections: target.connections,
+        bytesAnalyzerToLis: target.bytesA2l,
+        bytesLisToAnalyzer: target.bytesL2a,
+      },
+    });
   }
 
   function dataEvent(
@@ -420,7 +431,8 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
       {
         type: "stopped",
         reason: "journal_failure",
-        message: "на диске нет места",
+        code: "disk_full",
+        message: "storage full (os error 112)",
       },
     ]);
   }
@@ -436,9 +448,20 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
 
     async logDirWarning(dir) {
       const lower = dir.toLowerCase();
-      if (lower.includes("onedrive")) return "onedrive";
-      if (dir.startsWith("\\\\") || dir.startsWith("//")) return "network";
+      const warning = (code: LogDirWarning["code"]): LogDirWarning => ({
+        code,
+        params: { dir },
+      });
+      if (lower.includes("onedrive")) return warning("onedrive");
+      if (dir.startsWith("\\\\") || dir.startsWith("//")) return warning("network");
       return null;
+    },
+
+    async sessionStatus() {
+      return {
+        running: session !== null && !session.failed,
+        startInfo: session?.startInfo ?? null,
+      };
     },
 
     async startSession(cfg, onBatch) {
@@ -555,6 +578,16 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
         else if (index < MOCK_JOURNAL_EVENTS) events.push(mockJournalEvent(index));
       }
       return events;
+    },
+
+    async journalLengths(path) {
+      void path;
+      const total = MOCK_JOURNAL_EVENTS + journalNotes.length;
+      return Array.from({ length: total }, (_, index) => {
+        if (index >= MOCK_JOURNAL_EVENTS) return 0;
+        const event = mockJournalEvent(index);
+        return event.type === "data" ? base64ByteLength(event.b64) : 0;
+      });
     },
 
     async appendNote(_path, text) {

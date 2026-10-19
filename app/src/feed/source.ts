@@ -15,4 +15,6 @@ export interface FeedSource<T> {
   at(index: number): T | undefined;
   /** Просьба загрузить строки `[start, end)`; буферу записи не нужна. */
   ensure?(start: number, end: number): void;
+  /** Длина события в байтах, если источник знает её без чтения файла (журнал). */
+  byteLength?(index: number): number | null;
 }

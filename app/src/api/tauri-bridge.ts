@@ -16,7 +16,9 @@ import {
   type FeedEvent,
   type InterfaceInfo,
   type JournalSummary,
+  type LogDirWarning,
   type SessionConfig,
+  type SessionStatus,
   type SessionSummary,
   type StartInfo,
 } from "./types";
@@ -28,6 +30,7 @@ const CODES: BridgeErrorCode[] = [
   "log_dir",
   "already_running",
   "journal",
+  "journal_open",
   "io",
 ];
 
@@ -63,7 +66,8 @@ export function createTauriBridge(): Bridge {
   return {
     listInterfaces: () => call<InterfaceInfo[]>("list_interfaces"),
     defaultLogDir: () => call<string>("default_log_dir"),
-    logDirWarning: (dir) => call<string | null>("log_dir_warning", { dir }),
+    logDirWarning: (dir) => call<LogDirWarning | null>("log_dir_warning", { dir }),
+    sessionStatus: () => call<SessionStatus>("session_status"),
 
     async startSession(cfg: SessionConfig, onBatch: (batch: FeedBatch) => void) {
       const channel = new Channel<FeedBatch>();
@@ -76,6 +80,7 @@ export function createTauriBridge(): Bridge {
 
     openJournal: (path) => call<JournalSummary>("open_journal", { path }),
     readJournal: (path, from, count) => call<FeedEvent[]>("read_journal", { path, from, count }),
+    journalLengths: (path) => call<number[]>("journal_lengths", { path }),
     appendNote: (path, text) => call<void>("append_note", { path, text }),
 
     async pickJournal() {

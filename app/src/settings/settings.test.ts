@@ -9,7 +9,13 @@ import {
   upsertProfile,
   type Profile,
 } from "./settings";
-import { localSettingsStorage, SETTINGS_KEY } from "./storage";
+import {
+  CorruptSettingsError,
+  CORRUPT_KEY,
+  localSettingsStorage,
+  preserveCorruptSettings,
+  SETTINGS_KEY,
+} from "./storage";
 
 const config = defaultConfig("C:\\journals");
 
@@ -97,9 +103,17 @@ describe("localSettingsStorage", () => {
     expect(await storage.load()).toEqual(settings);
   });
 
-  it("на испорченной записи возвращает null", async () => {
+  it("на испорченной записи сообщает об испорченном файле, а не об отсутствии", async () => {
     localStorage.setItem(SETTINGS_KEY, "{не json");
-    expect(await localSettingsStorage().load()).toBeNull();
+    await expect(localSettingsStorage().load()).rejects.toBeInstanceOf(CorruptSettingsError);
+  });
+
+  it("сохраняет копию испорченной записи перед перезаписью", async () => {
+    localStorage.setItem(SETTINGS_KEY, "{не json");
+    const copy = await preserveCorruptSettings("mock");
+    expect(copy).not.toBeNull();
+    expect(localStorage.getItem(copy ?? ""), "копия рядом").toBe("{не json");
+    expect((copy ?? "").startsWith(CORRUPT_KEY)).toBe(true);
   });
 
   it("без сохранения возвращает null", async () => {

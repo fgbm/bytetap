@@ -1,15 +1,15 @@
 import { describe, expect, it } from "vitest";
-import type { FeedBatch, SessionSummary } from "../api/types";
+import type { FeedBatch, SessionConfig, SessionSummary } from "../api/types";
+import { defaultConfig } from "../settings/settings";
 import { initialSessionState, reduceSession, type SessionState } from "./reducer";
 
 const startedAt = new Date(2026, 9, 19, 10, 15, 0).toISOString();
+const startedInfo = { journalPath: "C:\\journals\\a.jsonl", localAddr: "0.0.0.0:5000", startedAt };
+const config: SessionConfig = defaultConfig("C:\\journals");
 
 function recording(): SessionState {
   let state = reduceSession(initialSessionState(), { type: "start_requested" });
-  state = reduceSession(state, {
-    type: "started",
-    info: { journalPath: "C:\\journals\\a.jsonl", localAddr: "0.0.0.0:5000", startedAt },
-  });
+  state = reduceSession(state, { type: "started", info: startedInfo, config });
   return state;
 }
 
@@ -26,9 +26,11 @@ describe("reduceSession", () => {
     const recordingState = reduceSession(starting, {
       type: "started",
       info: { journalPath: "j", localAddr: "0.0.0.0:5000", startedAt },
+      config,
     });
     expect(recordingState.status).toBe("recording");
     expect(recordingState.startInfo?.journalPath).toBe("j");
+    expect(recordingState.startedConfig, "чипы берутся из снимка настроек").toEqual(config);
 
     const stopping = reduceSession(recordingState, { type: "stop_requested" });
     expect(stopping.status).toBe("stopping");
@@ -88,22 +90,29 @@ describe("reduceSession", () => {
     expect(state.startInfo).toBeNull();
   });
 
-  it("отказ журнала переводит в failed и сохраняет сообщение (AC15)", () => {
+  it("отказ журнала переводит в failed и сохраняет причину по коду (AC15)", () => {
     const state = reduceSession(recording(), {
       type: "journal_failed",
-      message: "на диске нет места",
+      code: "disk_full",
+      message: "storage full (os error 112)",
     });
     expect(state.status).toBe("failed");
-    expect(state.journalFailure?.message).toBe("на диске нет места");
+    expect(state.journalFailure?.code).toBe("disk_full");
+    expect(state.journalFailure?.message).toBe("storage full (os error 112)");
     expect(state.startInfo).toBeNull();
+    expect(state.startedConfig).toBeNull();
 
     const dismissed = reduceSession(state, { type: "failure_dismissed" });
     expect(dismissed.status).toBe("idle");
     expect(dismissed.journalFailure).toBeNull();
   });
 
-  it("после отказа журнала события продолжают считаться, стоп подводит итог", () => {
-    const failed: SessionState = { ...recording(), status: "failed", journalFailure: { message: "x" } };
+  it("после отказа журнала события продолжают считаться, итогов стоп не будет", () => {
+    const failed: SessionState = {
+      ...recording(),
+      status: "failed",
+      journalFailure: { code: "io", message: "x" },
+    };
     const withBatch = reduceSession(failed, {
       type: "batch",
       batch: {
@@ -123,9 +132,39 @@ describe("reduceSession", () => {
     });
     expect(withBatch.stats.bytesAnalyzerToLis).toBe(3);
 
-    const idle = reduceSession(withBatch, { type: "stopped", summary });
-    expect(idle.status).toBe("idle");
-    expect(idle.journalFailure).toBeNull();
+    // Мост остановил сессию сам: `stopped` после отказа не приходит, итогов нет.
+    expect(reduceSession(withBatch, { type: "stopped", summary })).toBe(withBatch);
+
+    const dismissed = reduceSession(withBatch, { type: "failure_dismissed" });
+    expect(dismissed.status).toBe("idle");
+    expect(dismissed.journalFailure).toBeNull();
+  });
+
+  it("берёт счётчики ядра из пачки, а не считает по ленте (AC16)", () => {
+    const batch: FeedBatch = {
+      events: [],
+      dropped: 5,
+      stats: { connections: 3, bytesAnalyzerToLis: 100, bytesLisToAnalyzer: 40 },
+    };
+    const state = reduceSession(recording(), { type: "batch", batch });
+    expect(state.stats, "потерянные лентой события учтены ядром").toEqual(batch.stats);
+    expect(state.dropped).toBe(5);
+  });
+
+  it("подхватывает сессию, пережившую перезагрузку страницы (AC1)", () => {
+    const resumed = reduceSession(initialSessionState(), { type: "resumed", info: startedInfo });
+    expect(resumed.status).toBe("recording");
+    expect(resumed.startInfo?.journalPath).toBe(startedInfo.journalPath);
+    expect(resumed.startedConfig, "настроек старой страницы уже нет").toBeNull();
+
+    const stopping = reduceSession(resumed, { type: "stop_requested" });
+    expect(stopping.status).toBe("stopping");
+  });
+
+  it("«Стоп» из баннера уже идущей сессии возвращает в idle", () => {
+    const stopped = reduceSession(initialSessionState(), { type: "stopped", summary });
+    expect(stopped.status).toBe("idle");
+    expect(stopped.summary, "итоги остановленной сессии сохраняются").toEqual(summary);
   });
 
   it("просмотр журнала — отдельное состояние, во время записи не открывается", () => {

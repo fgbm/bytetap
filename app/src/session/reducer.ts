@@ -1,6 +1,7 @@
 /**
  * Чистый редьюсер состояний сессии: `idle → starting → recording → stopping → idle`,
- * плюс `failed` (отказ журнала) и `viewing` (просмотр журнала, шаг 4).
+ * плюс `failed` (отказ журнала), `viewing` (просмотр журнала) и `resumed`
+ * (страница перезагрузилась, а сессия в ядре ещё идёт).
  *
  * Ни DOM, ни таймеров, ни моста — только состояние и действия, поэтому проверяется vitest.
  */
@@ -8,7 +9,9 @@
 import type {
   BridgeErrorCode,
   FeedBatch,
+  JournalFailureCode,
   JournalSummary,
+  SessionConfig,
   SessionStats,
   SessionSummary,
   StartInfo,
@@ -34,6 +37,8 @@ export interface SessionState {
   status: SessionStatus;
   /** Запущенная сессия: путь к журналу, адрес прослушивания, время старта. */
   startInfo: StartInfo | null;
+  /** Настройки, с которыми стартовала сессия: чипы не меняются на ходу (AC3). */
+  startedConfig: SessionConfig | null;
   /** Накопленная статистика; после стопа заменяется итогами `stop_session`. */
   stats: SessionStats;
   /** Сколько событий ленты отброшено переполненной очередью интерфейса (AC16). */
@@ -41,7 +46,7 @@ export interface SessionState {
   /** Ошибка старта или остановки; показывается у поля и в баннере. */
   error: SessionError | null;
   /** Отказ журнала: сессия остановлена, записанное сохранено (AC15). */
-  journalFailure: { message: string } | null;
+  journalFailure: { code: JournalFailureCode; message: string } | null;
   /** Итоги последней остановленной сессии. */
   summary: SessionSummary | null;
   /** Открытый журнал в режиме просмотра. */
@@ -50,12 +55,13 @@ export interface SessionState {
 
 export type SessionAction =
   | { type: "start_requested" }
-  | { type: "started"; info: StartInfo }
+  | { type: "started"; info: StartInfo; config: SessionConfig }
   | { type: "start_failed"; error: SessionError }
+  | { type: "resumed"; info: StartInfo }
   | { type: "stop_requested" }
   | { type: "stopped"; summary: SessionSummary | null }
   | { type: "stop_failed"; error: SessionError }
-  | { type: "journal_failed"; message: string }
+  | { type: "journal_failed"; code: JournalFailureCode; message: string }
   | { type: "failure_dismissed" }
   | { type: "batch"; batch: FeedBatch }
   | { type: "journal_opened"; journal: JournalSummary }
@@ -73,6 +79,7 @@ export function initialSessionState(): SessionState {
   return {
     status: "idle",
     startInfo: null,
+    startedConfig: null,
     stats: { ...EMPTY_STATS },
     dropped: 0,
     error: null,
@@ -82,8 +89,12 @@ export function initialSessionState(): SessionState {
   };
 }
 
-/** Счётчики байтов и соединений по пачке событий. */
-function addStats(base: SessionStats, batch: FeedBatch): SessionStats {
+/**
+ * Счётчики по пачке: счётчики ядра из `stats`, а если их нет (старый мост или тест) —
+ * подсчёт по событиям ленты. Лента теряет события при переполнении, поэтому ядру верим.
+ */
+function batchStats(base: SessionStats, batch: FeedBatch): SessionStats {
+  if (batch.stats !== undefined) return { ...batch.stats };
   const next = { ...base };
   for (const event of batch.events) {
     if (event.type === "data") {
@@ -110,7 +121,22 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
 
     case "started":
       if (state.status !== "starting") return state;
-      return { ...state, status: "recording", startInfo: action.info, error: null };
+      return {
+        ...state,
+        status: "recording",
+        startInfo: action.info,
+        startedConfig: { ...action.config },
+        error: null,
+      };
+
+    case "resumed":
+      if (state.status !== "idle" && state.status !== "viewing") return state;
+      // Перезагрузка страницы: лента пуста, но ядро пишет; «Стоп» освободит сессию.
+      return {
+        ...initialSessionState(),
+        status: "recording",
+        startInfo: action.info,
+      };
 
     case "start_failed":
       if (state.status !== "starting" && state.status !== "recording") return state;
@@ -121,11 +147,13 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
       return { ...state, status: "stopping" };
 
     case "stopped":
-      if (state.status !== "stopping" && state.status !== "failed") return state;
+      // `idle` — «Стоп» из баннера «сессия уже идёт»: ленты нет, но запись остановлена.
+      if (state.status !== "stopping" && state.status !== "idle") return state;
       return {
         ...state,
         status: "idle",
         startInfo: null,
+        startedConfig: null,
         summary: action.summary,
         error: null,
         journalFailure: null,
@@ -140,7 +168,8 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         ...state,
         status: "failed",
         startInfo: null,
-        journalFailure: { message: action.message },
+        startedConfig: null,
+        journalFailure: { code: action.code, message: action.message },
       };
 
     case "failure_dismissed":
@@ -151,7 +180,7 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
       if (state.status !== "recording" && state.status !== "failed") return state;
       return {
         ...state,
-        stats: addStats(state.stats, action.batch),
+        stats: batchStats(state.stats, action.batch),
         dropped: state.dropped + action.batch.dropped,
       };
 

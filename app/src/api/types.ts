@@ -100,6 +100,8 @@ export interface NoteEvent {
 export interface StoppedEvent {
   type: "stopped";
   reason: "user" | "journal_failure";
+  /** Вид отказа журнала: интерфейс переводит его, а `message` оставляет в подробностях. */
+  code?: JournalFailureCode;
   message?: string;
 }
 
@@ -116,6 +118,8 @@ export type FeedEvent =
 export interface FeedBatch {
   events: FeedEvent[];
   dropped: number;
+  /** Счётчики ядра на момент пачки: строка состояния берёт их, а не считает по ленте. */
+  stats?: SessionStats;
 }
 
 /** Коды ошибок команд; текст `message` — для журнала и отладки, не для экрана. */
@@ -126,6 +130,7 @@ export type BridgeErrorCode =
   | "log_dir"
   | "already_running"
   | "journal"
+  | "journal_open"
   | "io";
 
 export interface BridgeErrorPayload {
@@ -155,4 +160,25 @@ export interface JournalSummary {
   stats: SessionStats;
   /** Плотность байтов на 600 корзин — из неё рисуется трасса всей сессии. */
   density: { a2l: number[]; l2a: number[] };
+}
+
+/** Причина отказа журнала: код из моста, интерфейс переводит её через `ru.json`. */
+export type JournalFailureCode =
+  | "disk_full"
+  | "permission_denied"
+  | "not_found"
+  | "timeout"
+  | "io";
+
+/** Предупреждение о папке журналов: код и подстановки текста (FR-19). */
+export interface LogDirWarning {
+  code: "onedrive" | "network";
+  params: Record<string, string>;
+}
+
+/** Состояние записи для перезагруженной страницы (M2-AC1). */
+export interface SessionStatus {
+  running: boolean;
+  /** Параметры идущей сессии; `null`, если мост занят запуском или остановкой. */
+  startInfo: StartInfo | null;
 }
