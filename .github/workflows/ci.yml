@@ -164,5 +164,5 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Проверить workflow на уязвимости
-        run: pipx run zizmor==1.31.1 --min-severity medium .github/workflows
+      - name: Проверить workflow и dependabot на уязвимости
+        run: pipx run zizmor==1.31.1 --min-severity medium .github
