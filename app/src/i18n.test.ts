@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { ENCODING_KEYS } from "./feed/bytes";
 import { ERROR_KEYS } from "./session/errors";
 import { PORT_PROBLEM_KEYS } from "./validation";
 
@@ -53,6 +54,10 @@ describe("i18n", () => {
   it("ключи ошибок по коду и по порту заведены в локали", () => {
     const keys = [...Object.values(ERROR_KEYS), ...Object.values(PORT_PROBLEM_KEYS)];
     expect(keys.filter((key) => !hasKey(key))).toEqual([]);
+  });
+
+  it("подписи кодировок ленты заведены в локали", () => {
+    expect(Object.values(ENCODING_KEYS).filter((key) => !hasKey(key))).toEqual([]);
   });
 
   it("покрывает все коды ошибок контракта", () => {

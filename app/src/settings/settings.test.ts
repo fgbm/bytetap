@@ -42,6 +42,18 @@ describe("normalizeSettings", () => {
     expect(raw.responder).toBe("hl7");
     expect(raw.listenHost).toBe("192.168.1.10");
   });
+
+  it("запоминает вид и кодировку ленты, отвергая неизвестные значения", () => {
+    expect(normalizeSettings({ feed: { view: "hex", encoding: "utf8" } }).feed).toEqual({
+      view: "hex",
+      encoding: "utf8",
+    });
+    expect(normalizeSettings({ feed: { view: "dump", encoding: "koi8-r" } }).feed).toEqual({
+      view: "text",
+      encoding: "cp1251",
+    });
+    expect(normalizeSettings({}).feed).toEqual({ view: "text", encoding: "cp1251" });
+  });
 });
 
 describe("профили", () => {
