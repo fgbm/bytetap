@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: windows-x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Установить Rust из rust-toolchain.toml
+        run: rustup show
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+
+      - run: npm ci
+
+      - name: Сборка exe без установщика
+        run: npm run tauri build -- --no-bundle
+
+      - name: zip и SHA256SUMS
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $name = "bytetap-$tag-windows-x64"
+          New-Item -ItemType Directory -Path staging | Out-Null
+          Copy-Item target/release/bytetap.exe staging/
+          Copy-Item README.md, LICENSE staging/
+          Compress-Archive -Path staging/* -DestinationPath "$name.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLower()
+          "$hash  $name.zip" | Out-File -FilePath SHA256SUMS -Encoding ascii
+          Get-ChildItem staging | Select-Object Name, Length
+
+      - name: Черновик релиза
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          name: bytetap ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            bytetap-*-windows-x64.zip
+            SHA256SUMS
