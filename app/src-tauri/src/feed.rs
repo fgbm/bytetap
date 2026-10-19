@@ -37,6 +37,62 @@ pub enum StopReason {
     JournalFailure,
 }
 
+/// Код причины отказа журнала: интерфейс переводит его, а `message` оставляет в подробностях.
+///
+/// Ядро отдаёт причину текстом (`io_message`: вид ошибки и код ОС), поэтому вид ошибки
+/// восстанавливается здесь по этому тексту, один раз на весь мост.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalFailureCode {
+    /// На диске нет места.
+    DiskFull,
+    /// Нет прав на файл или папку.
+    PermissionDenied,
+    /// Файл или папка исчезли.
+    NotFound,
+    /// Фиксация не завершилась за отведённое время.
+    Timeout,
+    /// Всё остальное: сбой устройства, сброс, ошибка записи.
+    Io,
+}
+
+impl JournalFailureCode {
+    /// Код из контракта моста: `disk_full` | `permission_denied` | `not_found` | `timeout` | `io`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DiskFull => "disk_full",
+            Self::PermissionDenied => "permission_denied",
+            Self::NotFound => "not_found",
+            Self::Timeout => "timeout",
+            Self::Io => "io",
+        }
+    }
+
+    /// Вид отказа по причине от ядра.
+    #[must_use]
+    pub fn from_reason(reason: &str) -> Self {
+        let reason = reason.to_lowercase();
+        let has = |needle: &str| reason.contains(needle);
+        if has("storage full")
+            || has("no space")
+            || has("os error 112")
+            || has("os error 28")
+            || has("disk full")
+        {
+            Self::DiskFull
+        } else if has("permission denied") || has("os error 5") || has("access is denied") {
+            Self::PermissionDenied
+        } else if has("not found") || has("os error 2") || has("os error 3") {
+            Self::NotFound
+        } else if has("not flushed") || has("timed out") || has("timeout") {
+            Self::Timeout
+        } else {
+            Self::Io
+        }
+    }
+}
+
 /// Событие ленты — дискриминированный union по `type`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
@@ -121,7 +177,10 @@ pub enum FeedEvent {
     Stopped {
         /// Почему остановлена.
         reason: StopReason,
-        /// Подробности отказа журнала.
+        /// Вид отказа журнала для перевода в интерфейсе.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<JournalFailureCode>,
+        /// Подробности отказа журнала: для журнала и отладки.
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
@@ -184,6 +243,8 @@ pub struct FeedBatch {
     pub events: Vec<FeedEvent>,
     /// Сколько событий ленты отброшено из-за переполнения буфера или отставания подписчика.
     pub dropped: u64,
+    /// Счётчики сессии на момент пачки: строка состояния берёт их, а не считает по ленте.
+    pub stats: crate::api::SessionStats,
 }
 
 #[cfg(test)]
@@ -318,6 +379,7 @@ mod tests {
     fn stopped_has_reason_and_optional_message() {
         let user = FeedEvent::Stopped {
             reason: StopReason::User,
+            code: None,
             message: None,
         };
         assert_eq!(
@@ -326,15 +388,57 @@ mod tests {
         );
         let failure = FeedEvent::Stopped {
             reason: StopReason::JournalFailure,
-            message: Some("disk full".to_owned()),
+            code: Some(JournalFailureCode::DiskFull),
+            message: Some("storage full (os error 112)".to_owned()),
         };
         assert_eq!(
             serde_json::to_value(&failure).unwrap(),
             serde_json::json!({
                 "type": "stopped",
                 "reason": "journal_failure",
-                "message": "disk full"
+                "code": "disk_full",
+                "message": "storage full (os error 112)"
             })
         );
+    }
+
+    #[test]
+    fn a_journal_failure_reason_becomes_a_code_for_the_interface() {
+        assert_eq!(
+            JournalFailureCode::from_reason("storage full (os error 112)"),
+            JournalFailureCode::DiskFull
+        );
+        assert_eq!(
+            JournalFailureCode::from_reason("no space left on device (os error 28)"),
+            JournalFailureCode::DiskFull
+        );
+        assert_eq!(
+            JournalFailureCode::from_reason("permission denied (os error 5)"),
+            JournalFailureCode::PermissionDenied
+        );
+        assert_eq!(
+            JournalFailureCode::from_reason("entity not found (os error 3)"),
+            JournalFailureCode::NotFound
+        );
+        assert_eq!(
+            JournalFailureCode::from_reason(
+                "journal not flushed: the writer did not stop within 10s"
+            ),
+            JournalFailureCode::Timeout
+        );
+        assert_eq!(
+            JournalFailureCode::from_reason("test hook: the journal device refused the write"),
+            JournalFailureCode::Io
+        );
+        for (code, name) in [
+            (JournalFailureCode::DiskFull, "disk_full"),
+            (JournalFailureCode::PermissionDenied, "permission_denied"),
+            (JournalFailureCode::NotFound, "not_found"),
+            (JournalFailureCode::Timeout, "timeout"),
+            (JournalFailureCode::Io, "io"),
+        ] {
+            assert_eq!(code.as_str(), name);
+            assert_eq!(serde_json::to_value(code).unwrap(), name);
+        }
     }
 }

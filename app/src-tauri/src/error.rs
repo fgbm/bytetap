@@ -24,7 +24,9 @@ pub enum ErrorCode {
     LogDir,
     /// Запись уже идёт.
     AlreadyRunning,
-    /// Журнал не открылся, не читается или отказал.
+    /// Журнал не открылся или не читается.
+    JournalOpen,
+    /// Запись в журнал отказала.
     Journal,
     /// Всё остальное.
     Io,
@@ -130,6 +132,7 @@ mod tests {
             (ErrorCode::PermissionDenied, "permission_denied"),
             (ErrorCode::LogDir, "log_dir"),
             (ErrorCode::AlreadyRunning, "already_running"),
+            (ErrorCode::JournalOpen, "journal_open"),
             (ErrorCode::Journal, "journal"),
             (ErrorCode::Io, "io"),
         ];

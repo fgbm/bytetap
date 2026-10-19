@@ -4,16 +4,20 @@
 //! [`crate::bridge`], [`crate::journal`] и [`crate::net`], которую можно проверить без окна
 //! (M2-AC17), и превращают ошибки в [`CommandError`] с кодом из контракта.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::ipc::Channel;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager as _, State};
 use tauri_plugin_dialog::DialogExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 
 use crate::AppState;
-use crate::api::{Interface, JournalSummary, SessionConfig, SessionSummary, StartInfo};
+use crate::api::{
+    Interface, JournalSummary, LogDirWarning, SessionConfig, SessionStatus, SessionSummary,
+    StartInfo,
+};
 use crate::error::{CommandError, ErrorCode};
 use crate::feed::{FeedBatch, FeedEvent};
 use crate::{journal, net};
@@ -42,9 +46,29 @@ pub fn default_log_dir() -> Result<String, CommandError> {
 }
 
 /// Предупреждение о папке журналов: OneDrive или сетевой путь (FR-19).
+///
+/// Возвращается код и путь: интерфейс переводит код через `ru.json`, а текст ядра
+/// (английский, для журнала) на экран не попадает.
 #[tauri::command]
-pub fn log_dir_warning(dir: String) -> Option<String> {
-    bytetap_core::journal::log_dir_warning(dir)
+pub fn log_dir_warning(dir: String) -> Option<LogDirWarning> {
+    let kind = bytetap_core::journal::log_dir_warning_kind(dir.trim())?;
+    let params = BTreeMap::from([("dir".to_owned(), dir.trim().to_owned())]);
+    Some(LogDirWarning {
+        code: kind.as_str().to_owned(),
+        params,
+    })
+}
+
+/// Идёт ли запись и что вернул её старт (M2-AC1).
+///
+/// Нужно перезагруженной странице: лента после перезагрузки пуста, но сессия в ядре
+/// жива, и интерфейс должен предложить «Остановить», а не оставить её сиротой.
+#[tauri::command]
+pub fn session_status(state: State<'_, AppState>) -> SessionStatus {
+    SessionStatus {
+        running: state.sessions.is_running(),
+        start_info: state.sessions.status(),
+    }
 }
 
 /// Начинает запись и отдаёт события ленты в канал пачками (FR-25, M2-AC16).
@@ -110,14 +134,39 @@ pub async fn read_journal(
     journal::read_page(Path::new(&path), from, count, &state.journals).await
 }
 
+/// Длины событий журнала в байтах: по ним лента считает высоты HEX-строк (M2-AC5).
+///
+/// Отдельная команда, а не поле сводки: массив длин у сотен тысяч событий весит больше,
+/// чем сама сводка, а нужен только виду HEX.
+///
+/// # Errors
+///
+/// `journal`: файла нет или он не читается.
+#[tauri::command]
+pub async fn journal_lengths(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<u64>, CommandError> {
+    journal::lengths(Path::new(&path), &state.journals).await
+}
+
 /// Дописывает комментарий в остановленный журнал (FR-23).
 ///
 /// # Errors
 ///
-/// `journal`: журнал ещё пишется, занят другой программой или оборван.
+/// `journal`: журнал ещё пишется, занят другой программой, оборван, это не `.jsonl`.
 #[tauri::command]
 pub fn append_note(path: String, text: String) -> Result<(), CommandError> {
-    journal::append_note(Path::new(&path), &text)
+    let path = Path::new(&path);
+    let extension = path.extension().and_then(|ext| ext.to_str());
+    if !extension.is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl")) {
+        return Err(CommandError::new(
+            ErrorCode::Journal,
+            "дописать комментарий можно только в файл `.jsonl`",
+        )
+        .with_param("path", path.to_string_lossy()));
+    }
+    journal::append_note(path, &text)
 }
 
 /// Выбор журнала для просмотра; `null` — диалог закрыт (FR-29).
@@ -130,7 +179,7 @@ pub async fn pick_journal(app: AppHandle) -> Result<Option<String>, CommandError
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .add_filter("Журнал bytetap", &["jsonl"])
+        .add_filter("bytetap journal", &["jsonl"])
         .pick_file(move |path| {
             let _ = sender.send(path);
         });
@@ -154,30 +203,83 @@ pub async fn pick_log_dir(app: AppHandle) -> Result<Option<String>, CommandError
 /// Открывает папку журналов в проводнике (FR-29).
 ///
 /// Открывается только путь: URL и файлы не принимаются, чтобы команда не стала способом
-/// запустить что угодно (FR-33).
+/// запустить что угодно (FR-33). Путь обязан быть абсолютным и уже существующим: чужие
+/// пути команда не создаёт, а собственную папку по умолчанию — создаёт.
 ///
 /// # Errors
 ///
-/// `log_dir`: папку нельзя создать или открыть.
+/// `log_dir`: путь относительный, папки нет или это не папка.
 #[tauri::command]
 pub fn open_log_dir(app: AppHandle, dir: String) -> Result<(), CommandError> {
-    let path = Path::new(dir.trim());
-    if path.as_os_str().is_empty() || dir.contains("://") {
-        return Err(CommandError::new(
-            ErrorCode::LogDir,
-            format!("`{dir}` — не путь к папке журналов"),
-        ));
-    }
-    std::fs::create_dir_all(path).map_err(|err| {
-        CommandError::from_io_with(ErrorCode::LogDir, &err)
-            .with_param("dir", path.to_string_lossy())
-    })?;
+    let path = log_dir_to_open(&dir)?;
     app.opener()
         .open_path(path.to_string_lossy(), None::<&str>)
         .map_err(|err| {
             CommandError::new(ErrorCode::LogDir, err.to_string())
                 .with_param("dir", path.to_string_lossy())
         })
+}
+
+/// Проверяет путь папки журналов для [`open_log_dir`] и возвращает его в каноническом виде.
+///
+/// Создаётся только папка по умолчанию: её отсутствие — обычное состояние первого запуска.
+/// Любой другой путь должен существовать: создавать чужие каталоги по просьбе интерфейса
+/// команда не должна.
+fn log_dir_to_open(dir: &str) -> Result<PathBuf, CommandError> {
+    let text = dir.trim();
+    if text.is_empty() || text.contains("://") {
+        return Err(CommandError::new(
+            ErrorCode::LogDir,
+            format!("`{text}` — не путь к папке журналов"),
+        ));
+    }
+    let path = Path::new(text);
+    if !path.is_absolute() {
+        return Err(CommandError::new(
+            ErrorCode::LogDir,
+            format!("`{text}` — не абсолютный путь к папке журналов"),
+        )
+        .with_param("dir", text));
+    }
+    if let Some(default) = bytetap_core::journal::default_log_dir()
+        && path == default
+    {
+        std::fs::create_dir_all(path).map_err(|err| {
+            CommandError::from_io_with(ErrorCode::LogDir, &err)
+                .with_param("dir", path.to_string_lossy())
+        })?;
+    }
+    let resolved = path.canonicalize().map_err(|err| {
+        CommandError::from_io_with(ErrorCode::LogDir, &err)
+            .with_param("dir", path.to_string_lossy())
+    })?;
+    let metadata = std::fs::metadata(&resolved).map_err(|err| {
+        CommandError::from_io_with(ErrorCode::LogDir, &err)
+            .with_param("dir", resolved.to_string_lossy())
+    })?;
+    if !metadata.is_dir() {
+        return Err(
+            CommandError::new(ErrorCode::LogDir, format!("`{text}` — не папка"))
+                .with_param("dir", text),
+        );
+    }
+    Ok(resolved)
+}
+
+/// Копия испорченного `settings.json` рядом с оригиналом (AC11).
+///
+/// Копия делается до того, как настройки будут перезаписаны значениями по умолчанию:
+/// владелец должен найти свой файл, даже если прочитать его не удалось. Возвращается
+/// путь копии; `None` — копировать нечего или некуда.
+#[tauri::command]
+pub fn preserve_corrupt_settings(app: AppHandle) -> Option<String> {
+    let dir = app.path().app_data_dir().ok()?;
+    let source = dir.join(crate::SETTINGS_FILE);
+    std::fs::metadata(&source).ok()?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let copy = dir.join(format!("settings.corrupt-{stamp}.json"));
+    std::fs::copy(&source, &copy).ok()?;
+    Some(copy.to_string_lossy().into_owned())
 }
 
 /// Путь из диалога, дождавшись его закрытия.
@@ -190,4 +292,122 @@ async fn receive_pick(
     Ok(picked
         .and_then(|file| file.into_path().ok())
         .map(|path| path.to_string_lossy().into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_existing_absolute_directory_is_opened() {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let resolved = log_dir_to_open(&dir.path().to_string_lossy()).expect("существующая папка");
+        assert_eq!(
+            resolved,
+            dir.path().canonicalize().expect("канонический путь")
+        );
+
+        assert_eq!(
+            log_dir_to_open("").expect_err("пустая строка").code,
+            ErrorCode::LogDir
+        );
+        assert_eq!(
+            log_dir_to_open("https://example.com/logs")
+                .expect_err("URL")
+                .code,
+            ErrorCode::LogDir
+        );
+        assert_eq!(
+            log_dir_to_open("logs")
+                .expect_err("относительный путь")
+                .code,
+            ErrorCode::LogDir,
+            "относительный путь не превращается в папку рабочего каталога"
+        );
+
+        let missing = dir.path().join("no-such-dir");
+        assert_eq!(
+            log_dir_to_open(&missing.to_string_lossy())
+                .expect_err("папки нет")
+                .code,
+            ErrorCode::LogDir,
+            "чужие пути команда не создаёт"
+        );
+        assert!(!missing.exists(), "каталог не создан");
+
+        let file = dir.path().join("journal.jsonl");
+        std::fs::write(&file, "{}\n").expect("файл");
+        assert_eq!(
+            log_dir_to_open(&file.to_string_lossy())
+                .expect_err("это файл")
+                .code,
+            ErrorCode::LogDir
+        );
+    }
+
+    #[test]
+    fn the_default_log_dir_is_created_for_the_first_start() {
+        let Some(default) = bytetap_core::journal::default_log_dir() else {
+            return;
+        };
+        if default.exists() {
+            // Папка пользователя уже есть: создавать нечего, проверяем обычный путь.
+            assert!(log_dir_to_open(&default.to_string_lossy()).is_ok());
+            return;
+        }
+        let resolved = log_dir_to_open(&default.to_string_lossy()).expect("папка по умолчанию");
+        assert!(resolved.is_dir());
+        let _ = std::fs::remove_dir_all(&default);
+    }
+
+    #[test]
+    fn a_warning_is_a_code_and_a_path() {
+        let warning = log_dir_warning(r"C:\Users\user\OneDrive\Documents\bytetap".to_owned())
+            .expect("OneDrive");
+        assert_eq!(warning.code, "onedrive");
+        assert_eq!(
+            warning.params.get("dir").map(String::as_str),
+            Some(r"C:\Users\user\OneDrive\Documents\bytetap")
+        );
+        assert_eq!(
+            log_dir_warning(r"\\fileserver\share\bytetap".to_owned())
+                .expect("сеть")
+                .code,
+            "network"
+        );
+        assert!(log_dir_warning("/home/user/Documents/bytetap".to_owned()).is_none());
+    }
+
+    #[test]
+    fn notes_are_appended_only_to_jsonl_files() {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let path = dir.path().join("notes.jsonl");
+        let header = bytetap_core::journal::Event::Session(bytetap_core::journal::Session::new(
+            bytetap_core::journal::Mode::TcpServer,
+            bytetap_core::journal::Autoresponder::None,
+            serde_json::json!({}),
+            bytetap_core::journal::Host {
+                os: "Linux".to_owned(),
+            },
+        ));
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&header).unwrap()),
+        )
+        .expect("журнал");
+
+        assert_eq!(
+            append_note(path.to_string_lossy().into_owned(), "проба".to_owned()),
+            Ok(()),
+            ".jsonl принимается"
+        );
+        let other = dir.path().join("notes.txt");
+        std::fs::write(&other, "привет\n").expect("файл");
+        assert_eq!(
+            append_note(other.to_string_lossy().into_owned(), "проба".to_owned())
+                .expect_err("не журнал")
+                .code,
+            ErrorCode::Journal
+        );
+    }
 }

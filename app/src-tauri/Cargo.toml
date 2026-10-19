@@ -36,5 +36,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Тестовые хуки ядра: мост проверяет отказ журнала и зависшую фиксацию (NFR-5).
+bytetap-core = { workspace = true, features = ["test-hooks"] }
 bytetap-testkit.workspace = true
 tempfile.workspace = true

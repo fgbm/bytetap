@@ -77,6 +77,26 @@ pub struct Density {
     pub l2a: Vec<u64>,
 }
 
+/// Предупреждение о папке журналов: код для перевода и путь для подстановки (FR-19).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogDirWarning {
+    /// Код из контракта: `onedrive` | `network`.
+    pub code: String,
+    /// Подстановки текста интерфейса: `dir` — проверенная папка.
+    pub params: std::collections::BTreeMap<String, String>,
+}
+
+/// Нужна ли перезагрузка странице: идёт ли запись и что вернул её старт (M2-AC1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatus {
+    /// Сессия идёт или останавливается.
+    pub running: bool,
+    /// Параметры идущей сессии; `None`, если мост занят запуском или остановкой.
+    pub start_info: Option<StartInfo>,
+}
+
 /// Сводка открытого журнала (FR-29).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

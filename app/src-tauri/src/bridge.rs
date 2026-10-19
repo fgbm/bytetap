@@ -15,6 +15,7 @@ use bytetap_core::journal::{Autoresponder, Stats, default_log_dir};
 use bytetap_core::session::{
     Session, SessionConfig as CoreConfig, SessionHandle, journal_failure_reason,
 };
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::api::{SessionConfig, SessionStats, SessionSummary, StartInfo};
@@ -132,6 +133,8 @@ pub struct ActiveSession {
     pump: JoinHandle<PumpEnd>,
     sink: Arc<dyn FeedSink>,
     journal_path: PathBuf,
+    /// То, что мост вернул на старт: переживает перезагрузку страницы (M2-AC1).
+    info: StartInfo,
 }
 
 impl ActiveSession {
@@ -146,22 +149,31 @@ impl ActiveSession {
     ///
     /// Сначала ядро закрывает журнал, потом лента дописывает последние события и только
     /// затем уходит `stopped`: интерфейс не должен увидеть остановку раньше её событий.
+    /// Отказ на финальной фиксации заканчивает ленту той же причиной, что и ошибка команды:
+    /// интерфейс покажет баннер AC15, а не молча потеряет хвост журнала (NFR-5).
     async fn stop(self) -> Result<SessionSummary, CommandError> {
         let Self {
             handle,
             pump,
             sink,
             journal_path,
+            ..
         } = self;
         let path = journal_path.to_string_lossy().into_owned();
         let result = handle.stop().await;
         // Задача пересылки заканчивается сама: сессия выгрузила отправителя событий.
         let end = pump.await.unwrap_or(PumpEnd::Closed);
         if end == PumpEnd::Closed {
-            sink.send(batch::user_stopped_batch());
+            match result.as_ref().err().and_then(journal_failure_reason) {
+                Some(reason) => sink.send(batch::journal_failed_batch(reason)),
+                None => sink.send(batch::user_stopped_batch()),
+            }
         }
         let stats = result.map_err(|err| match journal_failure_reason(&err) {
-            Some(reason) => CommandError::new(ErrorCode::Journal, reason.to_owned()),
+            Some(reason) => CommandError::new(ErrorCode::Journal, reason.to_owned()).with_param(
+                "failure",
+                crate::feed::JournalFailureCode::from_reason(reason).as_str(),
+            ),
             None => CommandError::from_io(&err),
         })?;
         Ok(SessionSummary {
@@ -211,7 +223,13 @@ pub async fn start_session(
     let started_at =
         started_at_of(&journal_path).unwrap_or_else(bytetap_core::journal::now_rfc3339);
     let failure = handle.journal_failure();
-    let pump = tokio::spawn(batch::pump(feed, failure, Arc::clone(&sink), flush));
+    let pump = tokio::spawn(batch::pump(
+        feed,
+        failure,
+        handle.counters(),
+        Arc::clone(&sink),
+        flush,
+    ));
     let info = StartInfo {
         journal_path: journal_path.to_string_lossy().into_owned(),
         local_addr: handle.local_addr().to_string(),
@@ -223,6 +241,7 @@ pub async fn start_session(
             pump,
             sink,
             journal_path,
+            info: info.clone(),
         },
         info,
     ))
@@ -240,15 +259,50 @@ enum Slot {
     Running(Box<ActiveSession>),
 }
 
+/// Предел ожидания остановки при закрытии окна (NFR-5).
+///
+/// У писателя журнала свой предел в десять секунд; пятнадцать секунд здесь — запас на
+/// очередь и на медленную машину. По истечении окно закрывается принудительно, но
+/// пользователь об этом узнаёт: журнал мог быть дописан не полностью.
+pub const STOP_WAIT: Duration = Duration::from_secs(15);
+
 /// Одна активная сессия приложения.
 ///
 /// Замок здесь обычный, [`std::sync::Mutex`]: он не держится через `await`, поэтому
 /// команда и обработчик закрытия окна не могут заклинить друг друга. Пока сессия
 /// запускается или останавливается, слот занят: повторный старт получает
-/// [`ErrorCode::AlreadyRunning`], а не второй журнал.
-#[derive(Default)]
+/// [`ErrorCode::AlreadyRunning`], а не второй журнал. После отказа журнала мост
+/// останавливает сессию сам и освобождает слот (NFR-5).
+#[derive(Default, Clone)]
 pub struct Sessions {
-    slot: Mutex<Slot>,
+    slot: Arc<Mutex<Slot>>,
+}
+
+/// Сброс `Busy` при панике: замок не должен остаться занятым навсегда.
+struct BusyGuard<'a> {
+    slot: &'a Mutex<Slot>,
+    armed: bool,
+}
+
+impl<'a> BusyGuard<'a> {
+    fn new(slot: &'a Mutex<Slot>) -> Self {
+        Self { slot, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Slot::Idle;
+        }
+    }
 }
 
 impl Sessions {
@@ -262,22 +316,48 @@ impl Sessions {
         !matches!(*self.lock(), Slot::Idle)
     }
 
+    /// Идущая сессия: то, что вернул её старт. `None` — записи нет.
+    ///
+    /// Нужно перезагруженной странице: она не получала `StartInfo`, но может предложить
+    /// «Остановить» и не оставить сессию сиротой (M2-AC1).
+    #[must_use]
+    pub fn status(&self) -> Option<StartInfo> {
+        match &*self.lock() {
+            Slot::Running(session) => Some(session.info.clone()),
+            _ => None,
+        }
+    }
+
     /// Запускает сессию, если другой нет.
+    ///
+    /// Слот, занятый завершившейся сессией (отказ журнала), освобождается: ядро уже
+    /// ничего не пишет, и новый старт не должен получать `already_running`.
     ///
     /// # Errors
     ///
-    /// `already_running`, если запись уже идёт или останавливается; ошибки старта ядра.
+    /// `already_running`, если запись идёт или останавливается; ошибки старта ядра.
     pub async fn start(
         &self,
         config: SessionConfig,
         sink: Arc<dyn FeedSink>,
     ) -> Result<StartInfo, CommandError> {
-        {
+        let stale = {
             let mut slot = self.lock();
-            if !matches!(*slot, Slot::Idle) {
-                return Err(already_running());
+            match std::mem::replace(&mut *slot, Slot::Busy) {
+                Slot::Idle => None,
+                Slot::Running(session) if session.handle.is_finished() => Some(session),
+                other => {
+                    *slot = other;
+                    return Err(already_running());
+                }
             }
-            *slot = Slot::Busy;
+        };
+        let mut guard = BusyGuard::new(&self.slot);
+        if let Some(session) = stale {
+            // Дожидаемся ленты старой сессии в фоне: `stopped` должна уйти в её канал.
+            tokio::spawn(async move {
+                let _ = session.stop().await;
+            });
         }
         let started = match config.into_bridge() {
             Ok(config) => start_session(config, sink, FLUSH_INTERVAL).await,
@@ -286,14 +366,39 @@ impl Sessions {
         let mut slot = self.lock();
         match started {
             Ok((session, info)) => {
+                let failure = session.handle.journal_failure();
                 *slot = Slot::Running(Box::new(session));
+                guard.disarm();
+                drop(slot);
+                self.stop_after_failure(failure);
                 Ok(info)
             }
             Err(err) => {
                 *slot = Slot::Idle;
+                guard.disarm();
                 Err(err)
             }
         }
+    }
+
+    /// Останавливает сессию сама, как только писатель журнала откажет (NFR-5).
+    ///
+    /// Слот освобождается без участия интерфейса: перезагруженная страница не должна
+    /// оставлять мост занятым. Вызов `stop_session` из интерфейса после этого безвреден.
+    fn stop_after_failure(&self, mut failure: watch::Receiver<Option<String>>) {
+        let sessions = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if failure.borrow_and_update().is_some() {
+                    break;
+                }
+                if failure.changed().await.is_err() {
+                    // Сессия закончилась штатно: останавливать нечего.
+                    return;
+                }
+            }
+            let _ = sessions.stop().await;
+        });
     }
 
     /// Останавливает сессию и возвращает итоги.
@@ -303,10 +408,10 @@ impl Sessions {
     /// `journal`, если журнал отказал: записанное до сбоя сохранено, но `session_end`
     /// в файле может не быть. `io` — если записи не было.
     pub async fn stop(&self) -> Result<SessionSummary, CommandError> {
-        let session = {
+        let (session, mut guard) = {
             let mut slot = self.lock();
             match std::mem::replace(&mut *slot, Slot::Busy) {
-                Slot::Running(session) => session,
+                Slot::Running(session) => (session, BusyGuard::new(&self.slot)),
                 other => {
                     let error = match other {
                         Slot::Busy => {
@@ -324,29 +429,42 @@ impl Sessions {
         };
         let result = session.stop().await;
         *self.lock() = Slot::Idle;
+        guard.disarm();
         result
     }
 
     /// Останавливает сессию, если она идёт: закрытие окна во время записи (NFR-5).
     ///
     /// Если остановка уже начата командой «Стоп», окно ждёт её окончания, а не выходит
-    /// посреди записи журнала. Дольше пятнадцати секунд не ждём: зависшая фиксация не
-    /// должна держать окно вечно, у писателя журнала свой предел в десять секунд.
-    pub async fn stop_if_running(&self) {
-        for _ in 0..1500 {
-            let running = match &*self.lock() {
-                Slot::Idle => Some(false),
-                Slot::Busy => None,
-                Slot::Running(_) => Some(true),
+    /// посреди записи журнала. Дольше [`STOP_WAIT`] не ждёт: зависшая фиксация не должна
+    /// держать окно вечно, и вызывающий закрывает окно принудительно с предупреждением.
+    ///
+    /// # Errors
+    ///
+    /// `io`: остановка не уложилась в [`STOP_WAIT`].
+    pub async fn stop_if_running(&self) -> Result<(), CommandError> {
+        let deadline = tokio::time::Instant::now() + STOP_WAIT;
+        loop {
+            let state = match &*self.lock() {
+                Slot::Idle => 0,
+                Slot::Running(_) => 1,
+                Slot::Busy => 2,
             };
-            match running {
-                Some(false) => return,
-                Some(true) => {
+            match state {
+                0 => return Ok(()),
+                1 => {
                     let _ = self.stop().await;
-                    return;
+                    return Ok(());
                 }
-                None => tokio::time::sleep(Duration::from_millis(10)).await,
+                _ => {}
             }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CommandError::new(
+                    ErrorCode::Io,
+                    "сессия не остановилась за отведённое время",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -419,6 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_and_stop_record_a_session_and_end_the_feed() {
+        let _serial = serial().await;
         let dir = tempfile::tempdir().expect("временная папка");
         let sink = Arc::new(TestSink::default());
         let sessions = Sessions::default();
@@ -466,6 +585,7 @@ mod tests {
             events.last(),
             Some(&FeedEvent::Stopped {
                 reason: StopReason::User,
+                code: None,
                 message: None,
             }),
             "лента заканчивается штатной остановкой"
@@ -499,6 +619,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_start_while_running_is_refused() {
+        let _serial = serial().await;
         let dir = tempfile::tempdir().expect("временная папка");
         let sink = Arc::new(TestSink::default());
         let sessions = Sessions::default();
@@ -519,6 +640,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_busy_port_is_reported_as_port_in_use() {
+        let _serial = serial().await;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("занятый порт");
         let port = listener.local_addr().expect("адрес").port();
         let dir = tempfile::tempdir().expect("временная папка");
@@ -553,6 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unimplemented_responder_does_not_start_a_session() {
+        let _serial = serial().await;
         let sessions = Sessions::default();
         let mut cfg = config(Path::new("/tmp"), 0);
         cfg.responder = "astm".to_owned();
@@ -595,6 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn closing_the_window_stops_a_running_session() {
+        let _serial = serial().await;
         let dir = tempfile::tempdir().expect("временная папка");
         let sink = Arc::new(TestSink::default());
         let sessions = Sessions::default();
@@ -603,7 +727,10 @@ mod tests {
             .await
             .expect("старт");
 
-        sessions.stop_if_running().await;
+        sessions
+            .stop_if_running()
+            .await
+            .expect("остановка при закрытии");
 
         assert!(!sessions.is_running());
         let outcome = read_all(&info.journal_path).expect("чтение журнала");
@@ -612,7 +739,10 @@ mod tests {
             Some("session_end"),
             "журнал закрыт штатно, а не оборван"
         );
-        sessions.stop_if_running().await; // без сессии ничего не делает
+        sessions
+            .stop_if_running()
+            .await
+            .expect("без сессии ничего не делает");
     }
 
     /// Сквозная проверка M2: запись через мост, затем чтение того же журнала командами.
@@ -622,6 +752,7 @@ mod tests {
     /// а `open_journal` с `read_journal` возвращают те же события из файла.
     #[tokio::test]
     async fn a_recorded_session_is_read_back_through_the_journal_commands() {
+        let _serial = serial().await;
         let dir = tempfile::tempdir().expect("временная папка");
         let sink = Arc::new(TestSink::default());
         let sessions = Sessions::default();
@@ -686,6 +817,7 @@ mod tests {
             events.last(),
             Some(&FeedEvent::Stopped {
                 reason: StopReason::User,
+                code: None,
                 message: None,
             })
         );
@@ -724,5 +856,145 @@ mod tests {
         file.write_all(b"not a journal\n").expect("запись");
         assert!(started_at_of(&path).is_none());
         assert!(started_at_of(&dir.path().join("missing.jsonl")).is_none());
+    }
+
+    /// Хуки ядра — глобальные статики: тесты моста идут по одному, включая те,
+    /// что хуки включают. Иначе отказ журнала одного теста ломает соседний.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().await
+    }
+
+    /// Отказ журнала освобождает слот без участия интерфейса (NFR-5).
+    ///
+    /// `stop_session` после отказа возвращает ошибку, но и без него новый старт проходит:
+    /// мост сам остановил сессию в фоне и освободил слот.
+    #[tokio::test]
+    async fn a_journal_failure_frees_the_slot_and_a_new_start_passes() {
+        use std::sync::atomic::Ordering;
+
+        use bytetap_core::journal::writer::TEST_FAIL_AFTER_EVENTS;
+
+        let _serial = serial().await;
+        let dir = tempfile::tempdir().expect("временная папка");
+        let sink = Arc::new(TestSink::default());
+        let sessions = Sessions::default();
+        let info = sessions
+            .start(config(dir.path(), 0), sink.clone())
+            .await
+            .expect("старт");
+        let addr: SocketAddr = info.local_addr.parse().expect("адрес");
+
+        // Писатель отказывает на первой же пачке событий.
+        TEST_FAIL_AFTER_EVENTS.store(0, Ordering::Relaxed);
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("анализатор");
+        client
+            .write_all(b"\x0bMSH|^~\\&\r\x1c\r")
+            .await
+            .expect("фрагмент");
+        drop(client);
+
+        wait_for(|| {
+            sink.events().iter().any(|event| {
+                matches!(
+                    event,
+                    FeedEvent::Stopped {
+                        reason: StopReason::JournalFailure,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+        for _ in 0..200 {
+            if !sessions.is_running() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        TEST_FAIL_AFTER_EVENTS.store(u64::MAX, Ordering::Relaxed);
+
+        assert!(!sessions.is_running(), "мост освободил слот сам");
+        assert!(sessions.status().is_none());
+        // Вызов интерфейса после отказа безвреден: ошибка ожидаема.
+        assert!(sessions.stop().await.is_err(), "останавливать уже нечего");
+
+        let again = sessions
+            .start(config(dir.path(), 0), sink.clone())
+            .await
+            .expect("новый старт после отказа");
+        assert_ne!(again.journal_path, info.journal_path, "новый файл журнала");
+        sessions.stop().await.expect("остановка");
+    }
+
+    /// Отказ на финальной фиксации: лента заканчивается `journal_failure`, команда — ошибкой.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_flush_at_the_stop_ends_the_feed_with_a_journal_failure() {
+        use std::sync::atomic::Ordering;
+
+        use bytetap_core::journal::writer::{TEST_SYNC_DELAY_MS, TEST_SYNC_DELAYS};
+        use bytetap_core::session::TEST_JOURNAL_SHUTDOWN_MS;
+
+        let _serial = serial().await;
+        let dir = tempfile::tempdir().expect("временная папка");
+        let sink = Arc::new(TestSink::default());
+        let sessions = Sessions::default();
+        let mut cfg = config(dir.path(), 0);
+        cfg.responder = "hl7".to_owned();
+        let info = sessions.start(cfg, sink.clone()).await.expect("старт");
+        let addr: SocketAddr = info.local_addr.parse().expect("адрес");
+        let message = std::fs::read(fixtures_dir().join("hl7").join("analyzer_oru_r01.hl7"))
+            .expect("фикстура analyzer_oru_r01.hl7");
+
+        TEST_SYNC_DELAYS.store(0, Ordering::Relaxed);
+        TEST_SYNC_DELAY_MS.store(1_000, Ordering::Relaxed);
+        TEST_JOURNAL_SHUTDOWN_MS.store(50, Ordering::Relaxed);
+
+        AnalyzerEmulator::new(addr)
+            .with_messages([message])
+            .run()
+            .await
+            .expect("обмен с анализатором");
+        let waiting = std::time::Instant::now();
+        while TEST_SYNC_DELAYS.load(Ordering::Relaxed) == 0 {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(5),
+                "писатель журнала так и не был замедлен"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let error = sessions
+            .stop()
+            .await
+            .expect_err("остановка не дождалась журнала");
+        TEST_SYNC_DELAY_MS.store(0, Ordering::Relaxed);
+        TEST_JOURNAL_SHUTDOWN_MS.store(0, Ordering::Relaxed);
+
+        assert_eq!(error.code, ErrorCode::Journal);
+        assert_eq!(
+            error
+                .params
+                .as_ref()
+                .and_then(|params| params.get("failure")),
+            Some(&"timeout".to_owned())
+        );
+        assert!(!sessions.is_running(), "слот освобождён");
+        let events = sink.events();
+        assert!(
+            matches!(
+                events.last(),
+                Some(FeedEvent::Stopped {
+                    reason: StopReason::JournalFailure,
+                    code: Some(crate::feed::JournalFailureCode::Timeout),
+                    ..
+                })
+            ),
+            "лента закончилась отказом журнала: {:?}",
+            events.last()
+        );
     }
 }
