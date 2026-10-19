@@ -4,10 +4,11 @@ import { formatBytes, formatDateTime, formatDuration, formatTime } from "./forma
 const NBSP = "\u00a0";
 
 describe("formatBytes", () => {
-  it("показывает байты, мегабайты и гигабайты как в макете", () => {
+  it("показывает байты, килобайты, мегабайты и гигабайты как в счётчиках шапки", () => {
     expect(formatBytes(0)).toBe(`0${NBSP}Б`);
     expect(formatBytes(512)).toBe(`512${NBSP}Б`);
-    expect(formatBytes(10_240)).toBe(`10${NBSP}240${NBSP}Б`);
+    expect(formatBytes(10_240)).toBe(`10${NBSP}КБ`);
+    expect(formatBytes(10_450)).toBe(`10,2${NBSP}КБ`);
     expect(formatBytes(1_258_291)).toBe(`1,2${NBSP}МБ`);
     expect(formatBytes(3_650_000_000)).toBe(`3,4${NBSP}ГБ`);
   });

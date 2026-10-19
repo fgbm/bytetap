@@ -48,7 +48,7 @@ function mountJournal(view: "text" | "hex" = "text", journal: JournalSummary = s
   const calls: number[] = [];
   const feed = shallowReactive(new JournalFeed(journal.path, journal.events, slowLoader(calls)));
   const wrapper = mount(FeedView, {
-    props: { feed, journal, view, encoding: "cp1251" as const },
+    props: { feed, journal, view, encoding: "cp1251" as const, dropped: 0 },
     global: { plugins: [i18n] },
   });
   return { wrapper, feed, calls };

@@ -4,6 +4,9 @@
  * Модель строки — чистые данные: время `HH:MM:SS.mmm`, направление, соединение,
  * иконка и класс. Текст фрагмента собирается сегментами по кодировке, служебные
  * строки переводятся через i18n и не хранят русских слов в коде.
+ *
+ * UI v2: управляющие символы — не плашки, а `‹CR›` (глиф в угловых скобках),
+ * поэтому сегмент-чип здесь же получает угловые скобки-глифы.
  */
 
 import type { FeedEvent } from "../api/types";
@@ -21,7 +24,7 @@ export interface FeedRow {
   /** Порядковый номер события в буфере — ключ строки и позиция прокрутки. */
   index: number;
   kind: FeedEvent["type"];
-  /** CSS-класс строки: `a2l`, `l2a`, `syn`, `ev`, `wn`. */
+  /** CSS-класс строки: `a2l`, `l2a`, `svc`, `ev`, `err`. */
   cls: string;
   time: string;
   conn: string;
@@ -41,30 +44,28 @@ const CLOSED_BY_KEYS: Record<string, string> = {
   bytetap: "feed.byApp",
 };
 
-/** Причина закрытия — коды формата журнала. */
-const CLOSE_REASON_KEYS: Record<string, string> = {
-  eof: "feed.reasonEof",
-  reset: "feed.reasonReset",
-  stop: "feed.reasonStop",
-  error: "feed.reasonError",
-  timeout: "feed.reasonTimeout",
-};
-
 function localized(codes: Record<string, string>, code: string, t: Translate): string {
   const key = codes[code];
   return key === undefined ? code : t(key);
 }
 
+/** «#1 подключился 192.168.1.51:49152» и «#1 отключился · анализатор» (UI v2). */
 function closeText(event: Extract<FeedEvent, { type: "close" }>, t: Translate): string {
-  if (event.by === "" && event.reason === "") return t("feed.closed");
-  return t("feed.closedBy", {
+  if (event.by === "") return t("feed.closed", { conn: event.conn });
+  return t("feed.closedSimple", {
+    conn: event.conn,
     by: localized(CLOSED_BY_KEYS, event.by, t),
-    reason: localized(CLOSE_REASON_KEYS, event.reason, t),
   });
 }
 
 function connLabel(conn: number | undefined): string {
   return conn === undefined ? "" : `#${conn}`;
+}
+
+/** `<CR>` → `‹CR›`: глиф вместо плашки, фоном управляющие символы больше не выделяются. */
+function glyph(segment: Segment): Segment {
+  if (!segment.chip) return segment;
+  return { chip: true, value: `‹${segment.value.slice(1, -1)}›` };
 }
 
 /**
@@ -94,25 +95,26 @@ export function eventRow(
     case "data":
       return {
         ...base,
-        cls: event.dir + (event.synthetic ? " syn" : ""),
+        cls: event.dir,
         conn: connLabel(event.conn),
         icon: event.dir,
         synthetic: event.synthetic,
-        segments: eventSegments(event, encoding),
+        segments: eventSegments(event, encoding).map(glyph),
       };
     case "open":
       return {
         ...base,
+        cls: "svc",
         conn: connLabel(event.conn),
         icon: "open",
-        text: t("feed.opened", { peer: event.peer, local: event.local }),
+        text: t("feed.opened", { conn: event.conn, peer: event.peer }),
       };
     case "close":
-      return { ...base, conn: connLabel(event.conn), icon: "close", text: closeText(event, t) };
+      return { ...base, cls: "svc", conn: connLabel(event.conn), icon: "close", text: closeText(event, t) };
     case "error":
       return {
         ...base,
-        cls: "wn",
+        cls: "err",
         conn: connLabel(event.conn),
         icon: "error",
         text: event.message,

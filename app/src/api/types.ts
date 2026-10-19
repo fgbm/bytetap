@@ -1,27 +1,69 @@
 /**
- * Контракт моста M2 между интерфейсом и ядром.
+ * Контракт моста между интерфейсом и ядром.
  *
- * Формы повторяют `docs/dev/stages/M2.md` (раздел «Контракт моста») один в один:
- * команды Tauri называются так же, в snake_case, поля — в camelCase.
+ * Формы повторяют `docs/dev/stages/M2.md` и `M3.md` (раздел «Контракт моста») один
+ * в один: команды Tauri называются так же, в snake_case, поля — в camelCase.
  */
 
-/** Режим сессии. На M2 доступен только TCP-сервер «вместо ЛИС». */
-export type SessionMode = "tcp_server";
+/**
+ * Режим сессии. Прокси и прослушка COM появятся в M4 и M5 и в интерфейсе не показываются:
+ * в макете v2 нет несуществующих режимов.
+ */
+export type SessionMode = "tcp_server" | "tcp_client" | "serial";
 
-/** Автоответчик. `hl7` — синтетический ACK, `none` — запись без ответов. */
-export type Responder = "hl7" | "none";
+/** Автоответчик: `auto` решает по первому байту, `hl7` — MLLP, `astm` — E1381. */
+export type Responder = "auto" | "hl7" | "astm" | "none";
 
-/** Направление фрагмента: анализатор → ЛИС или ЛИС → анализатор. */
-export type Dir = "a2l" | "l2a";
+/** Чётность COM-порта. */
+export type SerialParity = "none" | "even" | "odd" | "mark" | "space";
 
+/** Управление потоком COM-порта. */
+export type SerialFlow = "none" | "rtscts" | "xonxoff";
+
+/** Настройки порта FR-11: фактические значения попадают в заголовок журнала. */
+export interface SerialSettings {
+  port: string;
+  baud: number;
+  dataBits: 7 | 8;
+  parity: SerialParity;
+  stopBits: 1 | 2;
+  flow: SerialFlow;
+  dtr: boolean;
+  rts: boolean;
+}
+
+/**
+ * Параметры сессии. Поля чужого режима необязательны, лишние ядро отвергает
+ * до создания журнала, поэтому интерфейс отправляет только свой режим.
+ */
 export interface SessionConfig {
   mode: SessionMode;
-  listenHost: string;
-  listenPort: number;
+  listenHost?: string;
+  listenPort?: number;
+  connectHost?: string;
+  connectPort?: number;
+  reconnectSec?: number;
+  serial?: SerialSettings;
   responder: Responder;
+  astmNakOnBadChecksum: boolean;
   analyzer: string;
   note: string;
   logDir: string;
+}
+
+/** Порт из `list_serial_ports`: имя для открытия и понятное описание (FR-12). */
+export interface SerialPort {
+  name: string;
+  description: string;
+}
+
+/** Запись в папке журналов для стартового экрана (`list_recent_journals`). */
+export interface RecentJournal {
+  path: string;
+  startedAt: string;
+  analyzer: string;
+  durationUs: number;
+  mode: string;
 }
 
 export interface StartInfo {
@@ -83,6 +125,8 @@ export interface ErrorEvent {
   monoUs: number;
   conn?: number;
   message: string;
+  /** Код из `session-format.md`: интерфейс берёт по нему русскую строку. */
+  code?: string;
 }
 
 export interface InfoEvent {
@@ -91,6 +135,7 @@ export interface InfoEvent {
   monoUs: number;
   conn?: number;
   message: string;
+  code?: string;
 }
 
 export interface NoteEvent {
@@ -107,6 +152,9 @@ export interface StoppedEvent {
   message?: string;
 }
 
+/** Направление фрагмента: анализатор → ЛИС или ЛИС → анализатор. */
+export type Dir = "a2l" | "l2a";
+
 /** Дискриминированный union по `type`; те же события уходят в журнал. */
 export type FeedEvent =
   | DataEvent
@@ -120,7 +168,7 @@ export type FeedEvent =
 export interface FeedBatch {
   events: FeedEvent[];
   dropped: number;
-  /** Счётчики ядра на момент пачки: строка состояния берёт их, а не считает по ленте. */
+  /** Счётчики ядра на момент пачки: шапка берёт их, а не считает по ленте. */
   stats?: SessionStats;
 }
 
@@ -128,11 +176,16 @@ export interface FeedBatch {
 export type BridgeErrorCode =
   | "port_in_use"
   | "address_unavailable"
+  | "address_invalid"
   | "permission_denied"
   | "log_dir"
   | "already_running"
   | "journal"
   | "journal_open"
+  | "port_not_found"
+  | "port_busy"
+  | "port_settings"
+  | "serial"
   | "io";
 
 export interface BridgeErrorPayload {

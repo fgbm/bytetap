@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   defaultConfig,
   defaultSettings,
+  sessionConfigFor,
   findProfile,
   normalizeConfig,
   normalizeSettings,
@@ -39,14 +40,40 @@ describe("normalizeSettings", () => {
     expect(loaded.profiles[0].config.listenPort).toBe(5000);
   });
 
-  it("не доверяет режиму и нереализованному автоответчику", () => {
+  it("принимает три режима M3 и отвергает неизвестный", () => {
     const raw = normalizeConfig(
       { mode: "tcp_client", responder: "astm", listenHost: "192.168.1.10" },
       config,
     );
-    expect(raw.mode).toBe("tcp_server");
-    expect(raw.responder).toBe("hl7");
+    expect(raw.mode).toBe("tcp_client");
+    expect(raw.responder).toBe("astm");
     expect(raw.listenHost).toBe("192.168.1.10");
+    expect(normalizeConfig({ mode: "proxy" }, config).mode).toBe("tcp_server");
+  });
+
+  it("по умолчанию «Авто» и три режима M3 в настройках порта", () => {
+    const settings = defaultSettings();
+    expect(settings.config.responder).toBe("auto");
+    expect(settings.config.serial.dataBits).toBe(8);
+    expect(settings.config.serial.baud).toBe(9600);
+    expect(settings.config.astmNakOnBadChecksum).toBe(false);
+    expect(normalizeConfig({ responder: "astm" }, config).responder).toBe("astm");
+  });
+
+  it("собирает конфигурацию только выбранного режима", () => {
+    const serial = sessionConfigFor({ ...config, mode: "serial" });
+    expect(serial.serial?.baud).toBe(9600);
+    expect(serial.listenPort).toBeUndefined();
+    expect(serial.connectHost).toBeUndefined();
+
+    const client = sessionConfigFor({ ...config, mode: "tcp_client" });
+    expect(client.connectHost).toBe("192.168.1.50");
+    expect(client.listenPort).toBeUndefined();
+    expect(client.serial).toBeUndefined();
+
+    const server = sessionConfigFor(config);
+    expect(server.listenPort).toBe(5000);
+    expect(server.connectPort).toBeUndefined();
   });
 
   it("запоминает вид и кодировку ленты, отвергая неизвестные значения", () => {

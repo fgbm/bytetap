@@ -3,23 +3,15 @@
  * Лента обмена: виртуализированный список фрагментов и служебных событий (FR-26,
  * FR-28). В DOM живут только видимые строки; кольцевой буфер держит 10 000 событий.
  *
- * Вид «Текст» — время, направление, соединение, текст плашками; вид «HEX» —
- * дамп по 16 байт, каждая строка дампа — отдельный элемент виртуализации.
+ * UI v2 — «тихая» лента: без рамок между строками, без полосы направления и штриховки
+ * автоответа. Вид «Текст» — время, глиф стрелки, соединение и текст с `‹CR›`;
+ * вид «HEX» — дамп по 16 байт. Панель над лентой 32px: вид, кодировка (только текст),
+ * фильтр соединений (только если их было больше одного) и счётчик пропущенного.
+ * Автопрокрутка без кнопки: при прокрутке вверх появляется таблетка «↓ N новых».
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Component } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import {
-  ArrowDown,
-  ArrowLeft,
-  ArrowRight,
-  Bot,
-  Info,
-  PenLine,
-  Plug,
-  Square,
-  TriangleAlert,
-  Unplug,
-} from "@lucide/vue";
+import { ArrowDown } from "@lucide/vue";
 import type { FeedEvent, JournalSummary } from "../api/types";
 import {
   base64ByteLength,
@@ -48,12 +40,15 @@ import {
 } from "../feed/virtual";
 import { DENSITY_BINS, fractionAtEvent } from "../trace/model";
 import type { FeedViewMode } from "../settings/settings";
+import MenuButton from "../components/MenuButton.vue";
 
 const props = defineProps<{
   feed: FeedSource<FeedEvent>;
   journal: JournalSummary | null;
   view: FeedViewMode;
   encoding: Encoding;
+  /** Сколько событий ленты потеряно переполненной очередью интерфейса (AC16). */
+  dropped: number;
 }>();
 
 const emit = defineEmits<{
@@ -66,16 +61,10 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const translate: Translate = (key, params) => t(key, params ?? {});
 
-/** Иконка строки по типу события. */
-const ICONS: Record<RowIcon, Component> = {
-  a2l: ArrowRight,
-  l2a: ArrowLeft,
-  open: Plug,
-  close: Unplug,
-  error: TriangleAlert,
-  info: Info,
-  note: PenLine,
-  stopped: Square,
+/** Глиф направления в строке: цвет вместе с формой, а не вместо неё. */
+const GLYPH: Record<string, string> = {
+  a2l: "→",
+  l2a: "←",
 };
 
 interface HexRow {
@@ -83,7 +72,7 @@ interface HexRow {
   lineIndex: number;
   cls: string;
   time: string;
-  icon: RowIcon | null;
+  dir: RowIcon | null;
   conn: string;
   offset: string;
   bytes: HexByte[];
@@ -100,6 +89,8 @@ const anchor = ref<ScrollAnchor | null>(null);
 const viewportHeight = ref(DEFAULT_VIEWPORT_HEIGHT);
 /** Догонять ли новые строки; ручная прокрутка вверх выключает (AC8). */
 const follow = ref(true);
+/** Сколько строк пришло после ручной прокрутки вверх — для таблетки «↓ N новых». */
+const pending = ref(0);
 const connFilter = ref<number | null>(null);
 
 /** Просмотр журнала: строки читаются страницами, высоты HEX берутся из индекса (FR-29). */
@@ -137,12 +128,24 @@ function byteLengthAt(index: number, event: FeedEvent | undefined): number | nul
   return event.type === "data" ? base64ByteLength(event.b64) : 0;
 }
 
-/** Номера соединений для чипов фильтра. */
+/** Номера соединений для фильтра. */
 const conns = computed<number[]>(() => {
   void props.feed.version;
   if (viewing.value) return [];
   return connChips(props.feed);
 });
+
+/**
+ * Колонка номера соединения — только если соединений когда-либо было больше одного:
+ * иначе она повторяет одну и ту же цифру в каждой строке.
+ */
+const showConn = computed(() => {
+  if (viewing.value) return (props.journal?.stats.connections ?? 0) > 1;
+  return conns.value.length > 1;
+});
+
+/** Фильтр соединений — текстовые таблетки и только при нескольких соединениях. */
+const showFilter = computed(() => !viewing.value && conns.value.length > 1);
 
 /** Выбранное соединение исчезло из буфера — фильтр снимается. */
 watch(conns, (list) => {
@@ -277,9 +280,9 @@ const hexRows = computed<HexRow[]>(() => {
       rows.push({
         key: `${index}:${local}`,
         lineIndex: line,
-        cls: row.kind === "data" ? row.cls : row.cls === "wn" ? "ev wn" : "ev",
+        cls: row.cls,
         time: local === 0 ? row.time : "",
-        icon: local === 0 ? row.icon : null,
+        dir: local === 0 && (row.icon === "a2l" || row.icon === "l2a") ? row.icon : null,
         conn: local === 0 ? row.conn : "",
         offset: dump.offset,
         bytes: dump.bytes,
@@ -334,6 +337,15 @@ function measure(): void {
   scrollTop.value = element.scrollTop;
 }
 
+/**
+ * Колесо вверх выключает догон сразу, не дожидаясь события прокрутки: пачка может
+ * прийти в том же кадре и вернуть ленту вниз раньше, чем сработает `scroll`.
+ */
+function onWheel(event: WheelEvent): void {
+  if (viewing.value) return;
+  if (event.deltaY < 0) follow.value = false;
+}
+
 function onScroll(): void {
   const element = scroller.value;
   if (element === null) return;
@@ -355,6 +367,7 @@ function onScroll(): void {
   follow.value =
     !viewing.value &&
     applyScroll(element.scrollTop, element.clientHeight, element.scrollHeight).follow;
+  if (follow.value) pending.value = 0;
   emitVisible();
 }
 
@@ -409,9 +422,10 @@ async function scrollToBottom(): Promise<void> {
   scrollTop.value = element.scrollTop;
   // Догон — прыжок: якорь сбрасывается, нижний край считается пропорцией.
   anchor.value = null;
+  pending.value = 0;
 }
 
-/** Кнопка «Автопрокрутка»: включает догон и прыгает вниз (AC8). */
+/** Таблетка «↓ N новых»: включает догон и прыгает вниз (AC8). */
 function enableFollow(): void {
   follow.value = true;
   void scrollToBottom();
@@ -445,10 +459,16 @@ function seekEvent(index: number): void {
 
 defineExpose({ seekEvent });
 
-/** Новая пачка в буфере: догоняем, если автопрокрутка включена. */
+/** Новая пачка в буфере: догоняем, если автопрокрутка включена, иначе считаем новые. */
+let lastLength = 0;
 watch(
   () => props.feed.version,
   () => {
+    const length = props.feed.length;
+    if (!viewing.value && !follow.value && length > lastLength) {
+      pending.value += length - lastLength;
+    }
+    lastLength = length;
     if (!follow.value || viewing.value) return;
     void scrollToBottom();
   },
@@ -467,6 +487,7 @@ watch(
   () => props.journal?.path ?? null,
   async () => {
     follow.value = !viewing.value;
+    pending.value = 0;
     await nextTick();
     const element = scroller.value;
     if (element !== null) element.scrollTop = 0;
@@ -480,6 +501,7 @@ watch(
 let resize: ResizeObserver | null = null;
 
 onMounted(() => {
+  lastLength = props.feed.length;
   measure();
   emitVisible();
   if (typeof ResizeObserver !== "undefined" && scroller.value !== null) {
@@ -496,41 +518,49 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="bt-feed-view">
-    <div class="bt-feed-bar">
-      <div class="bt-seg" role="group" :aria-label="t('feed.viewGroup')">
-        <button
-          type="button"
-          :class="{ on: view === 'text' }"
-          @click="emit('update:view', 'text')"
-        >
-          {{ t("feed.viewText") }}
-        </button>
-        <button
-          type="button"
-          :class="{ on: view === 'hex' }"
-          @click="emit('update:view', 'hex')"
-        >
-          {{ t("feed.viewHex") }}
-        </button>
-      </div>
-      <div class="bt-seg" role="group" :aria-label="t('feed.encoding')">
-        <button
-          v-for="encodingName in ENCODINGS"
-          :key="encodingName"
-          type="button"
-          :class="{ on: encoding === encodingName }"
-          @click="emit('update:encoding', encodingName)"
-        >
-          {{ t(ENCODING_KEYS[encodingName]) }}
-        </button>
-      </div>
+    <div class="bt-feedbar">
+      <MenuButton
+        :label="view === 'text' ? t('feed.viewText') : t('feed.viewHex')"
+        :title="t('feed.viewGroup')"
+        chevron
+        align="left"
+      >
+        <template #default="{ close }">
+          <button class="bt-menu-item" type="button" @click="emit('update:view', 'text'); close()">
+            {{ t("feed.viewText") }}
+          </button>
+          <button class="bt-menu-item" type="button" @click="emit('update:view', 'hex'); close()">
+            {{ t("feed.viewHex") }}
+          </button>
+        </template>
+      </MenuButton>
+
+      <MenuButton
+        v-if="view === 'text'"
+        :label="t(ENCODING_KEYS[encoding])"
+        :title="t('feed.encoding')"
+        chevron
+        align="left"
+      >
+        <template #default="{ close }">
+          <button
+            v-for="name in ENCODINGS"
+            :key="name"
+            class="bt-menu-item"
+            type="button"
+            @click="emit('update:encoding', name); close()"
+          >
+            {{ t(ENCODING_KEYS[name]) }}
+          </button>
+        </template>
+      </MenuButton>
+
       <span class="bt-spacer" />
-      <div v-if="!viewing" class="bt-conns" role="group" :aria-label="t('feed.connFilter')">
-        <button
-          type="button"
-          :class="{ on: connFilter === null }"
-          @click="connFilter = null"
-        >
+
+      <span v-if="dropped > 0" class="dropped">{{ t("feed.dropped", { count: dropped }) }}</span>
+
+      <div v-if="showFilter" class="bt-conns" role="group" :aria-label="t('feed.connFilter')">
+        <button type="button" :class="{ on: connFilter === null }" @click="connFilter = null">
           {{ t("feed.connAll") }}
         </button>
         <button
@@ -543,17 +573,6 @@ onBeforeUnmount(() => {
           #{{ conn }}
         </button>
       </div>
-      <button
-        v-if="!viewing"
-        class="bt-btn ghost autoscroll"
-        :class="{ on: !follow }"
-        type="button"
-        :title="follow ? t('feed.autoscrollOn') : t('feed.autoscrollOff')"
-        @click="enableFollow"
-      >
-        <ArrowDown :size="15" aria-hidden="true" />
-        {{ t("feed.autoscroll") }}
-      </button>
     </div>
 
     <div v-if="journalEmpty" class="bt-empty">
@@ -564,65 +583,69 @@ onBeforeUnmount(() => {
       <b>{{ t("feed.emptyTitle") }}</b>
       <span>{{ t("feed.emptyText") }}</span>
     </div>
-    <div v-else ref="scroller" class="bt-feed" @scroll.passive="onScroll">
-      <div class="bt-feed-list" :style="{ height: `${listHeightPx}px` }">
-        <template v-if="view === 'text'">
-          <div
-            v-for="row in textRows"
-            :key="row.index"
-            class="bt-feed-row"
-            :class="row.cls"
-            :style="rowStyle(row.index)"
-          >
-            <span class="ts">{{ row.time }}</span>
-            <span class="ar">
-              <component :is="ICONS[row.icon]" :size="14" aria-hidden="true" />
-            </span>
-            <span class="cn">{{ row.conn }}</span>
-            <span class="pl">
+    <div v-else class="bt-feed-wrap">
+      <div ref="scroller" class="bt-feed" @scroll.passive="onScroll" @wheel.passive="onWheel">
+        <div class="bt-feed-list" :style="{ height: `${listHeightPx}px` }">
+          <template v-if="view === 'text'">
+            <div
+              v-for="row in textRows"
+              :key="row.index"
+              class="bt-feed-row"
+              :class="row.cls"
+              :style="rowStyle(row.index)"
+            >
+              <span class="ts">{{ row.time }}</span>
               <template v-if="row.kind === 'data'">
-                <template v-for="(segment, position) in row.segments" :key="position">
-                  <span v-if="segment.chip" class="bt-cc">{{ segment.value }}</span>
-                  <template v-else>{{ segment.value }}</template>
+                <span class="ar">{{ GLYPH[row.icon] }}</span>
+                <span v-if="showConn" class="cn">{{ row.conn }}</span>
+                <span class="pl">
+                  <template v-for="(segment, position) in row.segments" :key="position">
+                    <span v-if="segment.chip" class="bt-cc">{{ segment.value }}</span>
+                    <template v-else>{{ segment.value }}</template>
+                  </template>
+                  <span v-if="row.synthetic" class="bt-syn">{{ t("feed.synthetic") }}</span>
+                </span>
+              </template>
+              <template v-else-if="row.kind === 'open' || row.kind === 'close'">
+                <span class="pl">{{ row.text }}</span>
+                <span class="svc-line" aria-hidden="true" />
+              </template>
+              <span v-else class="pl">{{ row.text }}</span>
+            </div>
+          </template>
+          <template v-else>
+            <div
+              v-for="row in hexRows"
+              :key="row.key"
+              class="bt-feed-hex"
+              :class="row.cls"
+              :style="hexStyle(row.lineIndex)"
+            >
+              <span class="o ts">{{ row.time }}</span>
+              <span v-if="row.dir !== null" class="ar">{{ GLYPH[row.dir] }}</span>
+              <span v-else class="ar" />
+              <span v-if="showConn" class="o cn">{{ row.conn }}</span>
+              <span class="o">{{ row.offset }}</span>
+              <span class="b">
+                <template v-for="(byte, position) in row.bytes" :key="position">
+                  <i v-if="byte.control">{{ byte.value }}</i>
+                  <template v-else>{{ byte.value }} </template>
                 </template>
-              </template>
-              <template v-else>{{ row.text }}</template>
-              <span v-if="row.synthetic" class="bt-tag">
-                <Bot :size="11" aria-hidden="true" />
-                {{ t("feed.synthetic") }}
               </span>
-            </span>
-          </div>
-        </template>
-        <template v-else>
-          <div
-            v-for="row in hexRows"
-            :key="row.key"
-            class="bt-feed-hex"
-            :class="row.cls"
-            :style="hexStyle(row.lineIndex)"
-          >
-            <span class="o">{{ row.time }}</span>
-            <span class="ar">
-              <component
-                :is="ICONS[row.icon ?? 'info']"
-                v-if="row.icon !== null"
-                :size="14"
-                aria-hidden="true"
-              />
-            </span>
-            <span class="o">{{ row.conn }}</span>
-            <span class="o">{{ row.offset }}</span>
-            <span class="b">
-              <template v-for="(byte, position) in row.bytes" :key="position">
-                <i v-if="byte.control">{{ byte.value }}</i>
-                <template v-else>{{ byte.value }} </template>
-              </template>
-            </span>
-            <span class="a">{{ row.ascii }}</span>
-          </div>
-        </template>
+              <span class="a">{{ row.ascii }}</span>
+            </div>
+          </template>
+        </div>
       </div>
+      <button
+        v-if="!viewing && !follow && pending > 0"
+        class="bt-newpill"
+        type="button"
+        @click="enableFollow"
+      >
+        <ArrowDown :size="13" aria-hidden="true" />
+        {{ t("feed.newRows", { count: pending }) }}
+      </button>
     </div>
   </div>
 </template>
@@ -635,25 +658,28 @@ onBeforeUnmount(() => {
   min-height: 0;
 }
 
-.bt-feed-list {
+.bt-feed-wrap {
   position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
 }
 
-.autoscroll.on {
-  color: var(--bt-ctrl);
-  border-color: var(--bt-ctrl);
+.dropped {
+  color: var(--bt-text-faint);
+  font-size: var(--bt-text-2xs);
 }
 
-/* Размер строки задаётся inline из констант виртуализации, не из CSS. */
-.bt-feed-row {
-  position: absolute;
-  left: 0;
-  right: 0;
+.bt-feed-hex .ar {
+  display: inline-block;
+  font-weight: 600;
 }
 
-.bt-feed-hex {
-  position: absolute;
-  left: 0;
-  right: 0;
+.bt-feed-hex.a2l .ar {
+  color: var(--bt-dir-a2l);
+}
+
+.bt-feed-hex.l2a .ar {
+  color: var(--bt-dir-l2a);
 }
 </style>

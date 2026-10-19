@@ -1,9 +1,13 @@
 /**
  * Заглушка моста для `npm run dev`, браузера и тестов.
  *
- * Отдаёт те же типы, что ядро, и синтетический HL7-обмен ANALYZER ↔ LIS ↔ PATIENT^TEST
- * по таймеру: два одновременных соединения анализатора, ORU^R01 в UTF-8 и в CP1251
- * (кириллица в имени пациента), синтетические ACK автоответчика, QRY.
+ * Отдаёт те же типы, что ядро, и синтетический обмен по таймеру для трёх сценариев
+ * UI v2: TCP-сервер (два одновременных соединения анализатора, HL7/MLLP в UTF-8
+ * и CP1251, QRY), TCP-клиент (анализатор — сервер, адрес из настроек) и COM-порт
+ * (порт с описанием, открытие порта вместо соединения). Автоответчик `hl7` шлёт ACK,
+ * `astm` — ENQ/кадры/EOT с `‹STX›‹ETX›` и контрольной суммой. Списки портов и
+ * последних журналов приходят готовыми: ядру для них нужна ОС, заглушке — нет.
+ *
  * Ошибки воспроизводятся сценарием из адреса страницы: `?scenario=port_in_use`
  * или `?scenario=journal_failure`. `?burst=1` (или `?scenario=burst`) заливает
  * ленту 12 000 фрагментов за 60 с — для проверки виртуализации и прокрутки.
@@ -18,6 +22,8 @@ import {
   type InterfaceInfo,
   type JournalSummary,
   type LogDirWarning,
+  type RecentJournal,
+  type SerialPort,
   type SessionConfig,
   type StartInfo,
 } from "./types";
@@ -27,6 +33,13 @@ import { DENSITY_BINS } from "../trace/model";
 export const MOCK_INTERFACES: InterfaceInfo[] = [
   { name: "Ethernet", addr: "192.168.1.10" },
   { name: "Wi-Fi", addr: "10.0.0.5" },
+];
+
+/** Порты заглушки FR-12: имя для открытия и понятное описание адаптера. */
+export const MOCK_SERIAL_PORTS: SerialPort[] = [
+  { name: "COM3", description: "Bluetooth link" },
+  { name: "COM5", description: "USB-SERIAL CH340" },
+  { name: "COM10", description: "Prolific USB-to-Serial" },
 ];
 
 const MOCK_LOG_DIR = "C:\\Users\\operator\\Documents\\bytetap";
@@ -57,8 +70,8 @@ function stamp(date: Date): string {
   );
 }
 
-function journalName(at: Date): string {
-  return `bytetap-${stamp(at)}-tcp_server.jsonl`;
+function journalName(at: Date, mode: SessionConfig["mode"]): string {
+  return `bytetap-${stamp(at)}-${mode}.jsonl`;
 }
 
 function joinPath(dir: string, name: string): string {
@@ -77,6 +90,12 @@ function cp1251Bytes(text: string): number[] {
     else if (code === 0x451) bytes.push(0xb8);
     else bytes.push(0x3f);
   }
+  return bytes;
+}
+
+function asciiBytes(text: string): number[] {
+  const bytes: number[] = [];
+  for (let index = 0; index < text.length; index += 1) bytes.push(text.charCodeAt(index) & 0x7f);
   return bytes;
 }
 
@@ -124,13 +143,41 @@ function resultFrameCp1251(messageId: string, at: Date, sample: number): string 
   );
 }
 
+/**
+ * Кадр ASTM E1381: `STX FN текст ETX|ETB C1 C2 CR LF`.
+ *
+ * Сумма — по модулю 256 от `FN` до `ETX`/`ETB` включительно, на отправку две hex-цифры
+ * верхнего регистра (FR-17).
+ */
+function astmFrame(fn: number, records: readonly string[], final = true): number[] {
+  const text = asciiBytes(records.join("\r"));
+  const body = [fn, ...text, final ? 0x03 : 0x17];
+  const sum = body.reduce((total, byte) => total + byte, 0) & 0xff;
+  return [0x02, ...body, ...asciiBytes(sum.toString(16).toUpperCase().padStart(2, "0")), 0x0d, 0x0a];
+}
+
+const ENQ = 0x05;
+const ACK = 0x06;
+const EOT = 0x04;
+
+/** Записи результата ASTM: те же данные пробы, что в HL7-кадре. */
+function astmRecords(sample: number): string[] {
+  return [
+    "H|\\^&|||ANALYZER^1|||||||P|1|20261019101500",
+    `P|1||${pad(sample, 6)}||PATIENT^TEST`,
+    `O|1|SAMPLE^${pad(sample, 4)}||^^^GLU|R`,
+    "R|1|^^^GLU|5.4|mmol/L|3.9-6.1|N||F||||20261019101500",
+    "L|1|N",
+  ];
+}
+
 interface MockSession {
   cfg: SessionConfig;
   startInfo: StartInfo;
   startedAtMono: number;
   /** Первое соединение цикла. */
   conn: number;
-  /** Второе соединение цикла: обмен идёт параллельно. */
+  /** Второе соединение цикла: у TCP-сервера обмен идёт параллельно. */
   second: number;
   step: number;
   sample: number;
@@ -140,20 +187,97 @@ interface MockSession {
   timer: ReturnType<typeof setInterval> | null;
   onBatch: (batch: FeedBatch) => void;
   failed: boolean;
+  /** Кто отвечает: `auto` в заглушке выбирает HL7, как по первому байту VT. */
+  responder: "hl7" | "astm" | "none";
+  /** Номер кадра ASTM 0–7 циклически. */
+  fn: number;
 }
 
 /** Сколько событий в журнале заглушки и какова его длительность. */
 const MOCK_JOURNAL_EVENTS = 128;
 const MOCK_JOURNAL_DURATION_US = 2_538_000_000;
 
+/** Автоответчик сессии заглушки: `auto` приходит первым байтом VT. */
+function effectiveResponder(cfg: SessionConfig): "hl7" | "astm" | "none" {
+  if (cfg.responder === "auto") return "hl7";
+  return cfg.responder;
+}
+
 /** Событие журнала заглушки по номеру: тот же обмен, что в живой ленте (FR-29). */
-function mockJournalEvent(index: number): FeedEvent {
+function mockJournalEvent(index: number, responder: "hl7" | "astm" = "hl7"): FeedEvent {
   const monoUs = Math.round((index / MOCK_JOURNAL_EVENTS) * MOCK_JOURNAL_DURATION_US);
   const when = new Date(Date.UTC(2026, 9, 19, 7, 15, 0) + Math.round(monoUs / 1000));
   const t = when.toISOString();
   const conn = Math.floor(index / 9) + 1;
   const messageId = `J${pad(index, 4)}`;
   const bytes = (text: string): string => bytesToBase64(Array.from(new TextEncoder().encode(text)));
+
+  if (responder === "astm") {
+    switch (index % 8) {
+      case 0:
+        return {
+          type: "open",
+          t,
+          monoUs,
+          conn,
+          peer: "192.168.1.51:49152",
+          local: "0.0.0.0:5000",
+        };
+      case 1:
+        return {
+          type: "data",
+          t,
+          monoUs,
+          conn,
+          dir: "a2l",
+          synthetic: false,
+          b64: bytesToBase64([ENQ]),
+        };
+      case 2:
+        return {
+          type: "data",
+          t,
+          monoUs,
+          conn,
+          dir: "l2a",
+          synthetic: true,
+          b64: bytesToBase64([ACK]),
+        };
+      case 3:
+      case 5:
+        return {
+          type: "data",
+          t,
+          monoUs,
+          conn,
+          dir: "a2l",
+          synthetic: false,
+          b64: bytesToBase64(astmFrame(index === 3 ? 1 : 2, astmRecords(index))),
+        };
+      case 4:
+        return {
+          type: "data",
+          t,
+          monoUs,
+          conn,
+          dir: "l2a",
+          synthetic: true,
+          b64: bytesToBase64([ACK]),
+        };
+      case 6:
+        return {
+          type: "data",
+          t,
+          monoUs,
+          conn,
+          dir: "a2l",
+          synthetic: false,
+          b64: bytesToBase64([EOT]),
+        };
+      default:
+        return { type: "close", t, monoUs, conn, by: "analyzer", reason: "eof" };
+    }
+  }
 
   switch (index % 9) {
     case 0:
@@ -233,12 +357,13 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
   let session: MockSession | null = null;
   let lastJournalPath: string | null = null;
   let journalDir = MOCK_LOG_DIR;
+  let lastJournalResponder: "hl7" | "astm" = "hl7";
   /** Комментарии, дописанные в журнал заглушки: их сразу видно в просмотре (FR-23). */
   const journalNotes: FeedEvent[] = [];
 
   function emit(target: MockSession, events: FeedEvent[], dropped = 0): void {
     if (events.length === 0) return;
-    // Счётчики — как у моста: строка состояния берёт их, а не считает по ленте.
+    // Счётчики — как у моста: шапка берёт их, а не считает по ленте.
     target.onBatch({
       events,
       dropped,
@@ -291,13 +416,21 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
     };
   }
 
-  function openEvent(target: MockSession, conn: number, peerHost: number): FeedEvent {
+  /** Адрес анализатора для TCP-клиента и порт для COM: `peer` события `open`. */
+  function peerOf(target: MockSession, conn: number): string {
+    const cfg = target.cfg;
+    if (cfg.mode === "serial") return cfg.serial?.port ?? "COM5";
+    if (cfg.mode === "tcp_client") return `${cfg.connectHost}:${cfg.connectPort}`;
+    return `192.168.1.${50 + conn}:${49152 + target.step}`;
+  }
+
+  function openEvent(target: MockSession, conn: number): FeedEvent {
     return {
       type: "open",
       ...at(target),
       conn,
-      peer: `192.168.1.${peerHost}:${49152 + target.step}`,
-      local: target.startInfo.localAddr,
+      peer: peerOf(target, conn),
+      local: target.cfg.mode === "serial" ? "" : target.startInfo.localAddr,
     };
   }
 
@@ -305,25 +438,14 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
     return { type: "close", ...at(target), conn, by: "analyzer", reason: "eof" };
   }
 
-  /**
-   * Один шаг обмена: два одновременных соединения анализатора, результаты в UTF-8
-   * и CP1251, синтетический автоответ, запрос, отключения — затем по кругу.
-   */
-  function nextEvents(target: MockSession): FeedEvent[] {
+  /** Обмен HL7/MLLP: два соединения у сервера, результаты в UTF-8 и CP1251, ACK, QRY. */
+  function hl7Events(target: MockSession): FeedEvent[] {
     const phase = target.step % 9;
     const messageId = `MSG${pad(target.step + 1, 4)}`;
     const now = new Date();
+    const second = target.cfg.mode === "tcp_server" ? target.second : target.conn;
 
     switch (phase) {
-      case 0: {
-        target.conn += 1;
-        target.second = target.conn + 1;
-        target.connections += 2;
-        return [
-          openEvent(target, target.conn, 50 + target.conn),
-          openEvent(target, target.second, 51 + target.conn),
-        ];
-      }
       case 1: {
         target.sample += 1;
         return [textData(target, target.conn, "a2l", resultFrame(messageId, now, target.sample), false)];
@@ -331,20 +453,20 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
       case 2:
         return [cp1251Data(target, target.conn, "a2l", resultFrameCp1251(messageId, now, target.sample))];
       case 3: {
-        if (target.cfg.responder !== "hl7") return [];
+        if (target.responder !== "hl7") return [];
         return [textData(target, target.conn, "l2a", ackFrame(messageId, now), true)];
       }
       case 4: {
         target.sample += 1;
         return [
-          textData(target, target.second, "a2l", resultFrame(`${messageId}B`, now, target.sample), false),
+          textData(target, second, "a2l", resultFrame(`${messageId}B`, now, target.sample), false),
         ];
       }
       case 5:
         return [textData(target, target.conn, "a2l", queryFrame(messageId, now), false)];
       case 6: {
-        if (target.cfg.responder !== "hl7") return [];
-        return [textData(target, target.second, "l2a", ackFrame(`${messageId}B`, now), true)];
+        if (target.responder !== "hl7") return [];
+        return [textData(target, second, "l2a", ackFrame(`${messageId}B`, now), true)];
       }
       case 7:
         return [
@@ -356,8 +478,69 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
           },
         ];
       default:
-        return [closeEvent(target, target.conn), closeEvent(target, target.second)];
+        return [closeEvent(target, target.conn), closeEvent(target, second)];
     }
+  }
+
+  /** Обмен ASTM E1381: ENQ → ACK, кадры с ETX и ETB → ACK, EOT. */
+  function astmEvents(target: MockSession): FeedEvent[] {
+    const phase = target.step % 10;
+    const conn = target.conn;
+    const frames: Record<number, number[]> = {
+      3: astmFrame(target.fn, astmRecords(target.sample + 1)),
+      5: astmFrame((target.fn + 1) % 8, astmRecords(target.sample + 1), false),
+      7: astmFrame((target.fn + 2) % 8, astmRecords(target.sample + 1)),
+    };
+
+    switch (phase) {
+      case 1:
+        target.sample += 1;
+        return [dataEvent(target, conn, "a2l", [ENQ], false)];
+      case 3:
+      case 5:
+      case 7: {
+        const frame = frames[phase] ?? [];
+        target.fn = (target.fn + 1) % 8;
+        return [dataEvent(target, conn, "a2l", frame, false)];
+      }
+      case 2:
+      case 4:
+      case 6:
+        if (target.responder !== "astm") return [];
+        return [dataEvent(target, conn, "l2a", [ACK], true)];
+      case 8:
+        return [dataEvent(target, conn, "a2l", [EOT], false)];
+      case 9:
+        return [
+          {
+            type: "info",
+            ...at(target),
+            conn,
+            message: "Автоответ: ACK отправлен",
+          },
+        ];
+      default:
+        return [closeEvent(target, conn)];
+    }
+  }
+
+  /**
+   * Один шаг обмена. Первый шаг — открытие соединений, последний — закрытие:
+   * у TCP-сервера два соединения, у клиента и COM — одно.
+   */
+  function nextEvents(target: MockSession): FeedEvent[] {
+    if (target.step % 10 === 0) {
+      const next = target.conn + 1;
+      const second = target.cfg.mode === "tcp_server" ? next + 1 : next;
+      target.conn = next;
+      target.second = second;
+      target.connections += target.cfg.mode === "tcp_server" ? 2 : 1;
+      return target.cfg.mode === "tcp_server"
+        ? [openEvent(target, target.conn), openEvent(target, target.second)]
+        : [openEvent(target, target.conn)];
+    }
+    if (target.responder === "astm") return astmEvents(target);
+    return hl7Events(target);
   }
 
   /** Сколько фрагментов заливает сценарий `burst` и по сколько в пачке. */
@@ -403,7 +586,7 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
     target.startedAtMono -= 60_000;
     const opens: FeedEvent[] = [];
     for (let conn = 1; conn <= BURST_CONNECTIONS; conn += 1) {
-      opens.push(openEvent(target, conn, 60 + conn));
+      opens.push(openEvent(target, conn));
     }
     target.conn = BURST_CONNECTIONS;
     target.second = BURST_CONNECTIONS;
@@ -441,9 +624,24 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
     ]);
   }
 
+  /** Адрес, который ядро вернуло бы в `StartInfo.localAddr` для выбранного режима. */
+  function localAddrOf(cfg: SessionConfig): string {
+    if (cfg.mode === "serial") return cfg.serial?.port ?? "";
+    if (cfg.mode === "tcp_client") return "192.168.1.10:49812";
+    const host =
+      cfg.listenHost === "" || cfg.listenHost === undefined
+        ? MOCK_INTERFACES[0].addr
+        : cfg.listenHost;
+    return `${host}:${cfg.listenPort ?? 5000}`;
+  }
+
   return {
     async listInterfaces() {
       return [...MOCK_INTERFACES];
+    },
+
+    async listSerialPorts() {
+      return MOCK_SERIAL_PORTS.map((port) => ({ ...port }));
     },
 
     async defaultLogDir() {
@@ -461,6 +659,41 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
       return null;
     },
 
+    async listRecentJournals(dir, limit) {
+      const target = dir.trim() === "" ? MOCK_LOG_DIR : dir;
+      const now = new Date();
+      const day = (offset: number, hours: number, minutes: number): Date => {
+        const value = new Date(now);
+        value.setDate(value.getDate() - offset);
+        value.setHours(hours, minutes, 0, 0);
+        return value;
+      };
+      const journals: RecentJournal[] = [
+        {
+          path: joinPath(target, journalName(day(0, 10, 15), "tcp_server")),
+          startedAt: day(0, 10, 15).toISOString(),
+          analyzer: "ANALYZER",
+          durationUs: MOCK_JOURNAL_DURATION_US,
+          mode: "tcp_server",
+        },
+        {
+          path: joinPath(target, journalName(day(1, 18, 2), "tcp_client")),
+          startedAt: day(1, 18, 2).toISOString(),
+          analyzer: "Sysmex XN-1000",
+          durationUs: 1_260_000_000,
+          mode: "tcp_client",
+        },
+        {
+          path: joinPath(target, journalName(day(2, 9, 40), "serial")),
+          startedAt: day(2, 9, 40).toISOString(),
+          analyzer: "",
+          durationUs: 480_000_000,
+          mode: "serial",
+        },
+      ];
+      return journals.slice(0, Math.max(0, limit));
+    },
+
     async sessionStatus() {
       return {
         running: session !== null && !session.failed,
@@ -469,28 +702,36 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
     },
 
     async startSession(cfg, onBatch) {
-      if (scenario === "port_in_use") {
-        throw new BridgeError("port_in_use", "порт занят", { port: String(cfg.listenPort) });
+      if (scenario === "port_in_use" && cfg.mode !== "serial") {
+        throw new BridgeError("port_in_use", "порт занят", {
+          port: String(cfg.listenPort ?? cfg.connectPort ?? 0),
+        });
+      }
+      if (scenario === "port_in_use" && cfg.mode === "serial") {
+        throw new BridgeError("port_busy", "порт занят другой программой", {
+          port: cfg.serial?.port ?? "",
+        });
       }
       if (session && !session.failed) {
         throw new BridgeError("already_running", "сессия уже идёт");
       }
 
       const startedAt = new Date();
-      const journalPath = joinPath(cfg.logDir || MOCK_LOG_DIR, journalName(startedAt));
+      const journalPath = joinPath(
+        cfg.logDir || MOCK_LOG_DIR,
+        journalName(startedAt, cfg.mode),
+      );
       lastJournalPath = journalPath;
       journalDir = cfg.logDir || MOCK_LOG_DIR;
-      const host =
-        cfg.listenHost === "" || cfg.listenHost === "0.0.0.0"
-          ? MOCK_INTERFACES[0].addr
-          : cfg.listenHost;
+      const responder = effectiveResponder(cfg);
+      lastJournalResponder = responder === "astm" ? "astm" : "hl7";
 
       const target: MockSession = {
         cfg,
         startInfo: {
           generation: 0,
           journalPath,
-          localAddr: `${host}:${cfg.listenPort}`,
+          localAddr: localAddrOf(cfg),
           startedAt: startedAt.toISOString(),
         },
         startedAtMono: performance.now(),
@@ -504,6 +745,8 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
         timer: null,
         onBatch,
         failed: false,
+        responder,
+        fn: 0,
       };
       lastGeneration += 1;
       target.startInfo.generation = lastGeneration;
@@ -558,10 +801,19 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
     },
 
     async openJournal(path) {
-      const density = Array.from({ length: 600 }, (_, index) =>
-        Math.round(Math.abs(Math.sin(index / 17)) * 400),
-      );
+      // Плотность заглушки — редкие всплески с тишиной между ними: так трасса
+      // читается как карта сессии, а не как ровная синусоида.
+      const density = Array.from({ length: 600 }, (_, index) => {
+        const noise = Math.sin(index * 91.7 + 7.3) * 10_000;
+        const value = noise - Math.floor(noise);
+        return value > 0.82 ? Math.round(80 + value * 320) : 0;
+      });
       const events = MOCK_JOURNAL_EVENTS + journalNotes.length;
+      const mode = path.includes("-tcp_client")
+        ? "tcp_client"
+        : path.includes("-serial")
+          ? "serial"
+          : "tcp_server";
       // События заглушки идут ровно по времени: первое событие корзины — её начало.
       const firstEvent = Array.from({ length: DENSITY_BINS + 1 }, (_, point) =>
         Math.min(events, Math.round((point / DENSITY_BINS) * events)),
@@ -572,10 +824,10 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
           format: "bytetap-session/1",
           app_version: "0.1.0",
           started_at: "2026-10-19T10:15:00.000000+03:00",
-          mode: "tcp_server",
-          autoresponder: "hl7_mllp",
+          mode,
+          autoresponder: lastJournalResponder === "astm" ? "astm_e1381" : "hl7_mllp",
           settings: { listen: "0.0.0.0:5000" },
-          analyzer: "ANALYZER, зав. № 1234",
+          analyzer: "ANALYZER",
           note: "3 пробы, 1 запрос",
           host: { os: "Windows 11 23H2" },
         },
@@ -593,7 +845,9 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
       for (let index = from; index < Math.min(from + count, total); index += 1) {
         const appended = journalNotes[index - MOCK_JOURNAL_EVENTS];
         if (appended !== undefined) events.push(appended);
-        else if (index < MOCK_JOURNAL_EVENTS) events.push(mockJournalEvent(index));
+        else if (index < MOCK_JOURNAL_EVENTS) {
+          events.push(mockJournalEvent(index, lastJournalResponder));
+        }
       }
       return events;
     },
@@ -603,7 +857,7 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
       const total = MOCK_JOURNAL_EVENTS + journalNotes.length;
       return Array.from({ length: total }, (_, index) => {
         if (index >= MOCK_JOURNAL_EVENTS) return 0;
-        const event = mockJournalEvent(index);
+        const event = mockJournalEvent(index, lastJournalResponder);
         return event.type === "data" ? base64ByteLength(event.b64) : 0;
       });
     },
@@ -613,7 +867,9 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
     },
 
     async pickJournal() {
-      return lastJournalPath ?? joinPath(MOCK_LOG_DIR, "bytetap-20261019-101500-tcp_server.jsonl");
+      return (
+        lastJournalPath ?? joinPath(MOCK_LOG_DIR, "bytetap-20261019-101500-tcp_server.jsonl")
+      );
     },
 
     async pickLogDir() {

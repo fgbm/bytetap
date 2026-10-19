@@ -12,6 +12,8 @@ import type {
   InterfaceInfo,
   JournalSummary,
   LogDirWarning,
+  RecentJournal,
+  SerialPort,
   SessionConfig,
   SessionStatus,
   SessionSummary,
@@ -23,10 +25,17 @@ import { createTauriBridge } from "./tauri-bridge";
 export interface Bridge {
   /** IPv4-адреса ноутбука без loopback. */
   listInterfaces(): Promise<InterfaceInfo[]>;
+  /** Порты COM для формы режима «Кабель COM-порта» (FR-12). */
+  listSerialPorts(): Promise<SerialPort[]>;
   /** Папка журналов по умолчанию. */
   defaultLogDir(): Promise<string>;
   /** Предупреждение о OneDrive или сетевом пути; `null` — папка в порядке. */
   logDirWarning(dir: string): Promise<LogDirWarning | null>;
+  /**
+   * Последние журналы папки для стартового экрана. `null` — команды в мосте ещё нет:
+   * блок «Последние записи» скрывается, а не показывает ошибку.
+   */
+  listRecentJournals(dir: string, limit: number): Promise<RecentJournal[] | null>;
   /** Идёт ли запись и что вернул её старт: для перезагруженной страницы (AC1). */
   sessionStatus(): Promise<SessionStatus>;
   /**

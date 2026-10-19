@@ -4,6 +4,9 @@
  * Всё локальное (FR-33): файловые команды ядра — `pick_journal`, `pick_log_dir`,
  * `open_log_dir` (диалог и проводник на стороне Rust), настройки и профили —
  * plugin-store в `settings.json`. Сети приложение не касается.
+ *
+ * Список портов и последних журналов — команды ядра M3. Если мост их ещё не знает,
+ * `listRecentJournals` возвращает `null`: стартовый экран просто не показывает блок.
  */
 
 import { Channel, invoke } from "@tauri-apps/api/core";
@@ -17,6 +20,8 @@ import {
   type InterfaceInfo,
   type JournalSummary,
   type LogDirWarning,
+  type RecentJournal,
+  type SerialPort,
   type SessionConfig,
   type SessionStatus,
   type SessionSummary,
@@ -26,11 +31,16 @@ import {
 const CODES: BridgeErrorCode[] = [
   "port_in_use",
   "address_unavailable",
+  "address_invalid",
   "permission_denied",
   "log_dir",
   "already_running",
   "journal",
   "journal_open",
+  "port_not_found",
+  "port_busy",
+  "port_settings",
+  "serial",
   "io",
 ];
 
@@ -62,9 +72,26 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
   }
 }
 
+/** Команда ещё не зарегистрирована в мосте: Tauri отвечает «command … not found». */
+function isUnknownCommand(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error);
+  return /not found|unknown command|Command .* not found/i.test(text);
+}
+
 export function createTauriBridge(): Bridge {
   return {
     listInterfaces: () => call<InterfaceInfo[]>("list_interfaces"),
+    listSerialPorts: () => call<SerialPort[]>("list_serial_ports"),
+
+    async listRecentJournals(dir, limit) {
+      try {
+        return await call<RecentJournal[]>("list_recent_journals", { dir, limit });
+      } catch (error) {
+        if (isUnknownCommand(error)) return null;
+        throw error;
+      }
+    },
+
     defaultLogDir: () => call<string>("default_log_dir"),
     logDirWarning: (dir) => call<LogDirWarning | null>("log_dir_warning", { dir }),
     sessionStatus: () => call<SessionStatus>("session_status"),

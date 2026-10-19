@@ -7,15 +7,17 @@
 
 import { reactive } from "vue";
 import { bridgeKind } from "../api/bridge";
-import type { SessionConfig } from "../api/types";
 import type { Encoding } from "../feed/bytes";
 import { applyTheme } from "../theme";
 import {
   defaultSettings,
   findProfile,
+  lastRunOf,
   normalizeSettings,
   removeProfile,
+  type AppConfig,
   type FeedViewMode,
+  type LastRun,
   type Profile,
   type Settings,
   type ThemeMode,
@@ -51,10 +53,14 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
 function snapshot(): Settings {
   return {
-    config: { ...state.config },
+    config: { ...state.config, serial: { ...state.config.serial } },
     theme: state.theme,
-    profiles: state.profiles.map((profile) => ({ ...profile, config: { ...profile.config } })),
+    profiles: state.profiles.map((profile) => ({
+      ...profile,
+      config: { ...profile.config, serial: { ...profile.config.serial } },
+    })),
     feed: { ...state.feed },
+    lastRun: state.lastRun === null ? null : { ...state.lastRun },
   };
 }
 
@@ -76,9 +82,9 @@ export async function flushSettings(): Promise<void> {
 }
 
 /**
- * Читает сохранённые настройки и никогда не бросает: ошибка чтения — баннер и значения
- * по умолчанию, а не оборванная загрузка окружения (AC11). Испорченный файл перед
- * перезаписью копируется рядом: `settings.corrupt-<дата>.json`.
+ * Читает сохранённые настройки и никогда не бросает: ошибка чтения — строка предупреждения
+ * и значения по умолчанию, а не оборванная загрузка окружения (AC11). Испорченный файл
+ * перед перезаписью копируется рядом: `settings.corrupt-<дата>.json`.
  */
 export async function loadSettings(): Promise<void> {
   let raw: unknown = null;
@@ -95,12 +101,13 @@ export async function loadSettings(): Promise<void> {
   state.theme = loaded.theme;
   state.profiles = loaded.profiles;
   state.feed = loaded.feed;
+  state.lastRun = loaded.lastRun;
   state.loaded = true;
   applyTheme(state.theme);
   if (state.warning !== null) void flushSettings();
 }
 
-/** Закрыть баннер о настройках. */
+/** Закрыть предупреждение о настройках. */
 export function dismissSettingsWarning(): void {
   state.warning = null;
 }
@@ -113,8 +120,23 @@ export function ensureLogDir(dir: string): void {
   }
 }
 
-export function updateConfig(patch: Partial<SessionConfig>): void {
+export function updateConfig(patch: Partial<AppConfig>): void {
   state.config = { ...state.config, ...patch };
+  scheduleSave();
+}
+
+/** Поля COM-порта правятся по одному: вложенный объект не должен теряться. */
+export function updateSerial(patch: Partial<AppConfig["serial"]>): void {
+  state.config = { ...state.config, serial: { ...state.config.serial, ...patch } };
+  scheduleSave();
+}
+
+/**
+ * Старт состоялся: карточка этого сценария выделяется на стартовом экране,
+ * а к описанию добавляется «последний раз: …» (UI v2).
+ */
+export function rememberLastRun(config: AppConfig = state.config): void {
+  state.lastRun = lastRunOf(config);
   scheduleSave();
 }
 
@@ -149,7 +171,7 @@ export function deleteProfile(name: string): void {
 export function applyProfile(name: string): boolean {
   const profile: Profile | null = findProfile(state.profiles, name);
   if (profile === null) return false;
-  state.config = { ...profile.config };
+  state.config = { ...profile.config, serial: { ...profile.config.serial } };
   scheduleSave();
   // Смена профиля — заметное решение: пишем сразу, а не через отложенный таймер (AC11).
   void flushSettings();
@@ -167,6 +189,8 @@ export function useSettings() {
     loadSettings,
     ensureLogDir,
     updateConfig,
+    updateSerial,
+    rememberLastRun,
     setTheme,
     setFeedView,
     setFeedEncoding,
@@ -177,3 +201,5 @@ export function useSettings() {
     dismissSettingsWarning,
   };
 }
+
+export type { LastRun };

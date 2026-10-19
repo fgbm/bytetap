@@ -39,9 +39,17 @@ export function applyTheme(mode: ThemeMode, root: HTMLElement = document.documen
   }
 }
 
-/** Цикл переключателя: системная → светлая → тёмная → системная. */
-export function nextTheme(mode: ThemeMode): ThemeMode {
-  if (mode === "system") return "light";
-  if (mode === "light") return "dark";
-  return "system";
+/**
+ * Тема, которая сейчас на экране: системная разворачивается по `prefers-color-scheme`.
+ *
+ * Переключатель в шапке показывает глиф темы, в которую переведёт (Sun/Moon),
+ * поэтому ему нужна фактическая тема, а не режим.
+ */
+export function resolvedTheme(mode: ThemeMode): "light" | "dark" {
+  if (mode !== "system") return mode;
+  const dark =
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-color-scheme: dark)").matches;
+  return dark ? "dark" : "light";
 }

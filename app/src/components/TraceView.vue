@@ -7,13 +7,11 @@
  * 600 корзин с рамкой видимой области ленты; клик и перетаскивание переходят
  * к месту. Отрисовка идёт не чаще кадра и только когда данные или время изменились.
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowLeft, ArrowRight } from "@lucide/vue";
 import type { Dir, FeedEvent } from "../api/types";
 import { base64ByteLength } from "../feed/bytes";
 import type { FeedBuffer } from "../feed/ring";
-import type { SessionStatus } from "../session/reducer";
 import {
   densityBars,
   fractionFromX,
@@ -24,7 +22,6 @@ import {
 } from "../trace/model";
 
 const props = defineProps<{
-  status: SessionStatus;
   feed: FeedBuffer<FeedEvent>;
   /** Микросекунды от начала сессии: по ним движется окно во время записи. */
   nowUs: number;
@@ -47,12 +44,8 @@ const brush = ref(frameRect(props.window));
 const FALLBACK = {
   a2l: "#0a7d4f",
   l2a: "#b4530a",
+  border: "#e2e5e9",
 } as const;
-
-const hasSignals = computed(() => {
-  void props.feed.version;
-  return props.density !== null || props.feed.length > 0;
-});
 
 function cssColor(element: HTMLElement, name: string, fallback: string): string {
   if (typeof getComputedStyle !== "function") return fallback;
@@ -100,6 +93,7 @@ function prepare(canvas: HTMLCanvasElement): CanvasRenderingContext2D | null {
 function drawWindow(
   canvas: HTMLCanvasElement,
   color: string,
+  baseline: string,
   dir: Dir,
   fromUs: number,
   toUs: number,
@@ -110,14 +104,19 @@ function drawWindow(
   const height = canvas.clientHeight;
   const bottom = height - 1.5;
 
-  context.strokeStyle = color;
-  context.globalAlpha = 0.35;
+  // Базовая линия — токен border: дорожка читается как ось графика, а не как цвет.
+  context.strokeStyle = baseline;
+  context.globalAlpha = 1;
+  context.lineWidth = 1;
   context.beginPath();
   context.moveTo(0, bottom);
   context.lineTo(width, bottom);
   context.stroke();
 
+  context.strokeStyle = color;
+  // Импульс — столбик 2px: тоньше не видно на дорожке 22px, толще — уже плашка.
   context.globalAlpha = 0.9;
+  context.lineWidth = 2;
   context.beginPath();
   for (const impulse of impulses(pointsFor(dir, fromUs, toUs), fromUs, toUs)) {
     const x = Math.round(impulse.x * width) + 0.5;
@@ -158,14 +157,15 @@ function draw(): void {
 
   const a2lColor = cssColor(a2l, "--bt-dir-a2l", FALLBACK.a2l);
   const l2aColor = cssColor(l2a, "--bt-dir-l2a", FALLBACK.l2a);
+  const baseline = cssColor(a2l, "--bt-border", FALLBACK.border);
 
   if (props.density !== null) {
     drawDensity(a2l, a2lColor, props.density.a2l);
     drawDensity(l2a, l2aColor, props.density.l2a);
   } else {
     const { fromUs, toUs } = windowRange(Math.max(props.nowUs, latestMonoUs()));
-    drawWindow(a2l, a2lColor, "a2l", fromUs, toUs);
-    drawWindow(l2a, l2aColor, "l2a", fromUs, toUs);
+    drawWindow(a2l, a2lColor, baseline, "a2l", fromUs, toUs);
+    drawWindow(l2a, l2aColor, baseline, "l2a", fromUs, toUs);
   }
   brush.value = frameRect(props.window);
 }
@@ -266,17 +266,11 @@ function onPointerUp(): void {
 <template>
   <div class="bt-trace">
     <div class="bt-lane">
-      <label>
-        <ArrowRight :size="12" aria-hidden="true" />
-        {{ t("trace.a2l") }}
-      </label>
+      <label :title="t('trace.a2l')">→</label>
       <canvas ref="a2lCanvas" class="wave" aria-hidden="true" />
     </div>
     <div class="bt-lane">
-      <label>
-        <ArrowLeft :size="12" aria-hidden="true" />
-        {{ t("trace.l2a") }}
-      </label>
+      <label :title="t('trace.l2a')">←</label>
       <canvas ref="l2aCanvas" class="wave" aria-hidden="true" />
     </div>
 
@@ -296,8 +290,6 @@ function onPointerUp(): void {
       />
     </div>
 
-    <span v-if="status === 'viewing'" class="idle">{{ t("trace.viewing") }}</span>
-    <span v-else-if="!hasSignals" class="idle">{{ t("trace.idle") }}</span>
   </div>
 </template>
 
@@ -305,16 +297,16 @@ function onPointerUp(): void {
 .wave {
   display: block;
   flex: 1;
-  height: 18px;
+  height: 22px;
   width: 100%;
 }
 
 /* Область карты сессии: клик и перетаскивание переходят к месту (AC9). */
 .brush-area {
   position: absolute;
-  top: 9px;
-  bottom: 7px;
-  left: calc(var(--bt-space-3) + 118px + var(--bt-space-2));
+  top: 6px;
+  bottom: 8px;
+  left: calc(var(--bt-space-3) + 16px + var(--bt-space-2));
   right: var(--bt-space-3);
   cursor: pointer;
   touch-action: none;

@@ -41,6 +41,10 @@
   --bt-lane-height: 28px;
   --bt-dir-width: 3px;
 
+  /* Окно: системных рамок нет, крестик закрытия — как в Windows */
+  --bt-title-height: 44px;
+  --bt-window-close: #c42b1c;
+
   /* Движение: длительности, при prefers-reduced-motion обнуляются */
   --bt-flash-duration: 1.4s;
   --bt-pulse-duration: 1.6s;
@@ -53,6 +57,8 @@
   --bt-border-faint: #eef0f2;
   --bt-text: #0f1418;
   --bt-text-muted: #5f6873;
+  --bt-text-faint: #8a939c;
+  --bt-hover: #f1f3f5;
   --bt-dir-a2l: #0a7d4f;
   --bt-dir-l2a: #b4530a;
   --bt-ctrl: #2f3fbf;
@@ -78,6 +84,8 @@
   --bt-border-faint: #eef0f2;
   --bt-text: #0f1418;
   --bt-text-muted: #5f6873;
+  --bt-text-faint: #8a939c;
+  --bt-hover: #f1f3f5;
   --bt-dir-a2l: #0a7d4f;
   --bt-dir-l2a: #b4530a;
   --bt-ctrl: #2f3fbf;
@@ -107,6 +115,8 @@ html.dark {
   --bt-border-faint: #1a2027;
   --bt-text: #dde4ea;
   --bt-text-muted: #7d8995;
+  --bt-text-faint: #5a6570;
+  --bt-hover: #161c22;
   --bt-dir-a2l: #3ee08f;
   --bt-dir-l2a: #ffb23e;
   --bt-ctrl: #8fb4ff;

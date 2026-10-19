@@ -66,6 +66,7 @@ describe("i18n", () => {
 
   it("покрывает все коды ошибок контракта", () => {
     expect(Object.keys(ERROR_KEYS).sort()).toEqual([
+      "address_invalid",
       "address_unavailable",
       "already_running",
       "io",
@@ -73,7 +74,11 @@ describe("i18n", () => {
       "journal_open",
       "log_dir",
       "permission_denied",
+      "port_busy",
       "port_in_use",
+      "port_not_found",
+      "port_settings",
+      "serial",
     ]);
   });
 
