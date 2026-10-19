@@ -101,7 +101,10 @@ impl JournalFailureCode {
         }
     }
 
-    /// Вид по номеру ошибки ОС: неизвестный номер уточняется видом ошибки, иначе `io`.
+    /// Вид по номеру ошибки ОС: номер чужого семейства значит не то, что в этом.
+    ///
+    /// Неизвестный номер — `io`: вид ошибки здесь не подсказка, потому что он вычислен
+    /// на этой машине, а номер пришёл из причины, помеченной другим семейством ОС.
     fn from_os_code(os: OsFamily, code: i32) -> Self {
         match os {
             OsFamily::Windows => match code {
@@ -115,8 +118,7 @@ impl JournalFailureCode {
                 53 | 55 | 59 | 64 => Self::Network,
                 // ERROR_SHARING_VIOLATION и ERROR_LOCK_VIOLATION.
                 32 | 33 => Self::Busy,
-                // Неизвестный номер: вид ошибки всё равно подсказывает «нет места» и «нет прав».
-                _ => Self::from_kind(io::Error::from_raw_os_error(code).kind()),
+                _ => Self::Io,
             },
             OsFamily::Unix => match code {
                 // ENOSPC.
@@ -125,7 +127,7 @@ impl JournalFailureCode {
                 13 | 1 => Self::PermissionDenied,
                 // ENOENT.
                 2 => Self::NotFound,
-                _ => Self::from_kind(io::Error::from_raw_os_error(code).kind()),
+                _ => Self::Io,
             },
         }
     }
@@ -442,13 +444,7 @@ mod tests {
 
     /// Причина отказа по коду ОС: тест собирает её для любой системы.
     fn reason(os: OsFamily, code: i32) -> JournalFailureReason {
-        let kind = match (os, code) {
-            (OsFamily::Unix, 28) => io::ErrorKind::StorageFull,
-            (OsFamily::Unix, 13 | 1) => io::ErrorKind::PermissionDenied,
-            (OsFamily::Unix, 2) => io::ErrorKind::NotFound,
-            _ => io::ErrorKind::Other,
-        };
-        JournalFailureReason::from_code(kind, Some(code), os)
+        JournalFailureReason::from_code(io::ErrorKind::Other, Some(code), os)
     }
 
     #[test]
