@@ -2,16 +2,18 @@
 //!
 //! Правила и примеры — `docs/reference/autoresponder.md`. Коротко:
 //!
+//! - входящее подтверждение (`MSH-9.1 = ACK`) не подтверждается: иначе два прибора
+//!   подтверждали бы подтверждения друг друга бесконечно;
 //! - разделители (`MSH-1`, `MSH-2`) берутся из входящего и копируются в ACK байтово;
 //! - `MSH-3/4` и `MSH-5/6` меняются местами, `MSH-7` — время отправки, `MSH-10` — новый
-//!   идентификатор, `MSH-11` и `MSH-12` копируются из входящего;
+//!   идентификатор, `MSH-11` и `MSH-12` копируются из входящего (пустой `MSH-11` → `P`);
 //! - `MSH-9` ACK — `ACK` или `ACK<компонент><событие из MSH-9.2>`;
 //! - `MSA|AA|<MSH-10 входящего>` на разобранное сообщение, `MSA|AE|<MSH-10>` на неразбираемое;
 //! - копируются только ASCII-поля: не-ASCII поле остаётся пустым и даёт [`ResponderEvent::Info`].
 
 use chrono::{DateTime, FixedOffset};
 
-use crate::responder::ResponderEvent;
+use crate::responder::{ControlIdSource, ResponderEvent};
 
 /// Разделители ACK на неразбираемое сообщение: у такого сообщения брать нечего.
 const DEFAULT_SEPARATOR: u8 = b'|';
@@ -33,13 +35,20 @@ pub(crate) struct Answer {
 
 /// Разбирает сообщение и строит ACK на него.
 ///
-/// `next_id` — сквозной счётчик нового `MSH-10`: он не сбрасывается на новое соединение,
+/// `ids` — общий на сессию счётчик нового `MSH-10`: он не сбрасывается на новое соединение,
 /// чтобы идентификаторы не повторялись в пределах сессии.
-pub(crate) fn answer(message: &[u8], now: DateTime<FixedOffset>, next_id: &mut u64) -> Answer {
+pub(crate) fn answer(message: &[u8], now: DateTime<FixedOffset>, ids: &ControlIdSource) -> Answer {
     let mut events = Vec::new();
     match parse(message) {
+        // Подтверждать подтверждение — значит завести петлю ACK↔ACK.
+        Ok(msh) if msh.is_acknowledgement() => {
+            events.push(ResponderEvent::Info {
+                message: "incoming ACK is not acknowledged".to_owned(),
+            });
+            Answer { ack: None, events }
+        }
         Ok(msh) => Answer {
-            ack: Some(build_ack(&msh, now, next_id, &mut events)),
+            ack: Some(build_ack(&msh, now, ids, &mut events)),
             events,
         },
         Err(problem) => {
@@ -48,7 +57,9 @@ pub(crate) fn answer(message: &[u8], now: DateTime<FixedOffset>, next_id: &mut u
             });
             // Без MSH-10 подтверждать нечего: анализатор не сопоставит AE со своим сообщением.
             Answer {
-                ack: problem.control_id.map(|id| build_ae(&id, now, next_id)),
+                ack: problem
+                    .recovered
+                    .map(|recovered| build_ae(&recovered, now, ids, &mut events)),
                 events,
             }
         }
@@ -63,43 +74,75 @@ struct Msh<'a> {
     sending_facility: &'a [u8],
     receiving_app: &'a [u8],
     receiving_facility: &'a [u8],
+    message_type: &'a [u8],
     event: Option<&'a [u8]>,
     control_id: &'a [u8],
     processing_id: &'a [u8],
     version: &'a [u8],
 }
 
-/// Почему сообщение не разобрано и что из него всё-таки удалось взять.
-struct Problem {
-    message: String,
-    control_id: Option<Vec<u8>>,
+impl Msh<'_> {
+    /// `MSH-9.1` — тип сообщения.
+    fn message_type_code(&self) -> &[u8] {
+        match self.encoding.first() {
+            Some(&component) => self
+                .message_type
+                .split(|&byte| byte == component)
+                .next()
+                .unwrap_or_default(),
+            None => self.message_type,
+        }
+    }
+
+    /// Входящее сообщение само является подтверждением (`MSH-9.1 = ACK`).
+    fn is_acknowledgement(&self) -> bool {
+        self.message_type_code() == b"ACK"
+    }
 }
 
-fn parse(message: &[u8]) -> Result<Msh<'_>, Problem> {
+/// Почему сообщение не разобрано и что из него всё-таки удалось взять.
+struct Problem<'a> {
+    message: String,
+    /// `MSH-10` и разделители того сегмента, откуда он извлечён, — для `MSA|AE`.
+    ///
+    /// В `Box`, чтобы вариант `Err` оставался маленьким.
+    recovered: Option<Box<Recovered<'a>>>,
+}
+
+/// `MSH`, из которого удалось извлечь `MSH-10` неразбираемого сообщения.
+struct Recovered<'a> {
+    /// Поля этого сегмента: `MSH-3`…`MSH-6`, `MSH-10`, `MSH-12`.
+    msh: Msh<'a>,
+    /// Разделители сегмента пригодны для ACK: `MSH-1` — печатный ASCII (проверено при поиске),
+    /// `MSH-2` — печатный ASCII или пуст.
+    usable_separators: bool,
+}
+
+fn parse(message: &[u8]) -> Result<Msh<'_>, Problem<'_>> {
     let segments = split_segments(message);
     let Some(first) = segments.first().copied() else {
         return Err(Problem {
             message: "empty message between the MLLP frame delimiters".to_owned(),
-            control_id: None,
+            recovered: None,
         });
     };
     if !first.starts_with(b"MSH") {
         return Err(Problem {
             message: "message does not start with an MSH segment".to_owned(),
-            control_id: control_id_of(&segments),
+            recovered: control_id_of(&segments),
         });
     }
     if first.len() < 4 {
         return Err(Problem {
             message: "MSH segment is too short: MSH-1 is missing".to_owned(),
-            control_id: None,
+            recovered: control_id_of(&segments),
         });
     }
     let field_sep = first[3];
     if !is_separator(field_sep) {
         return Err(Problem {
             message: format!("MSH-1 is not a printable ASCII separator (0x{field_sep:02X})"),
-            control_id: control_id_of(&segments),
+            recovered: control_id_of(&segments),
         });
     }
     let fields: Vec<&[u8]> = first.split(|&byte| byte == field_sep).collect();
@@ -107,21 +150,29 @@ fn parse(message: &[u8]) -> Result<Msh<'_>, Problem> {
     if let Some(bad) = encoding.iter().find(|byte| !is_ascii_printable(**byte)) {
         return Err(Problem {
             message: format!("MSH-2 contains a non-ASCII byte (0x{bad:02X})"),
-            control_id: control_id_of(&segments),
+            recovered: control_id_of(&segments),
         });
     }
-    Ok(Msh {
+    Ok(msh(&fields, field_sep))
+}
+
+/// Собирает поля `MSH` из полей сегмента, разбитых по `MSH-1`.
+fn msh<'a>(fields: &[&'a [u8]], field_sep: u8) -> Msh<'a> {
+    let encoding = field(fields, 1);
+    let message_type = field(fields, 8);
+    Msh {
         field_sep,
         encoding,
-        sending_app: field(&fields, 2),
-        sending_facility: field(&fields, 3),
-        receiving_app: field(&fields, 4),
-        receiving_facility: field(&fields, 5),
-        event: trigger_event(field(&fields, 8), encoding),
-        control_id: field(&fields, 9),
-        processing_id: field(&fields, 10),
-        version: field(&fields, 11),
-    })
+        sending_app: field(fields, 2),
+        sending_facility: field(fields, 3),
+        receiving_app: field(fields, 4),
+        receiving_facility: field(fields, 5),
+        message_type,
+        event: trigger_event(message_type, encoding),
+        control_id: field(fields, 9),
+        processing_id: field(fields, 10),
+        version: field(fields, 11),
+    }
 }
 
 /// Делит сообщение на сегменты по `CR`; `LF` и `CRLF` допускаются как разделитель (FR-16).
@@ -166,11 +217,11 @@ fn is_ascii_printable(byte: u8) -> bool {
     (0x20..=0x7E).contains(&byte)
 }
 
-/// `MSH-10`, извлекаемый из любого `MSH`-сегмента сообщения.
+/// `MSH-10`, извлекаемый из любого `MSH`-сегмента сообщения, вместе с разделителями сегмента.
 ///
 /// Нужен для `MSA|AE`: подтверждение без идентификатора анализатор не сопоставит со своим
 /// сообщением, поэтому неразбираемое сообщение подтверждается только при извлекаемом `MSH-10`.
-fn control_id_of(segments: &[&[u8]]) -> Option<Vec<u8>> {
+fn control_id_of<'a>(segments: &[&'a [u8]]) -> Option<Box<Recovered<'a>>> {
     segments
         .iter()
         .filter(|segment| segment.starts_with(b"MSH") && segment.len() > 3)
@@ -180,9 +231,19 @@ fn control_id_of(segments: &[&[u8]]) -> Option<Vec<u8>> {
                 return None;
             }
             let fields: Vec<&[u8]> = segment.split(|&byte| byte == field_sep).collect();
-            let id = field(&fields, 9);
-            let ascii = !id.is_empty() && id.iter().all(|byte| is_ascii_printable(*byte));
-            ascii.then(|| id.to_vec())
+            let control_id = field(&fields, 9);
+            let ascii = !control_id.is_empty() && control_id.iter().all(|b| is_ascii_printable(*b));
+            if !ascii {
+                return None;
+            }
+            let recovered = msh(&fields, field_sep);
+            Some(Box::new(Recovered {
+                usable_separators: recovered
+                    .encoding
+                    .iter()
+                    .all(|byte| is_ascii_printable(*byte)),
+                msh: recovered,
+            }))
         })
 }
 
@@ -190,7 +251,7 @@ fn control_id_of(segments: &[&[u8]]) -> Option<Vec<u8>> {
 fn build_ack(
     msh: &Msh<'_>,
     now: DateTime<FixedOffset>,
-    next_id: &mut u64,
+    ids: &ControlIdSource,
     events: &mut Vec<ResponderEvent>,
 ) -> Vec<u8> {
     let sep = msh.field_sep;
@@ -198,7 +259,14 @@ fn build_ack(
     let sending_facility = copyable(msh.sending_facility, "MSH-4", events);
     let receiving_app = copyable(msh.receiving_app, "MSH-5", events);
     let receiving_facility = copyable(msh.receiving_facility, "MSH-6", events);
-    let control_id = copyable(msh.control_id, "MSH-10", events);
+    let control_id = if msh.control_id.is_empty() {
+        events.push(ResponderEvent::Info {
+            message: "MSH-10 is empty: MSA-2 is left empty in the ACK".to_owned(),
+        });
+        &[][..]
+    } else {
+        copyable(msh.control_id, "MSH-10", events)
+    };
     let version = copyable(msh.version, "MSH-12", events);
     let processing_id = if msh.processing_id.is_empty() {
         DEFAULT_PROCESSING_ID
@@ -222,7 +290,7 @@ fn build_ack(
         sep,
         &message_type(msh.event, msh.encoding, events),
     );
-    push_field(&mut out, sep, next_control_id(now, next_id).as_bytes());
+    push_field(&mut out, sep, next_control_id(now, ids).as_bytes());
     push_field(&mut out, sep, processing_id);
     push_field(&mut out, sep, version);
     out.extend_from_slice(b"\rMSA");
@@ -232,27 +300,73 @@ fn build_ack(
     out
 }
 
-/// Строит ACK на неразбираемое сообщение: `MSA|AE` и разделители по умолчанию.
-fn build_ae(control_id: &[u8], now: DateTime<FixedOffset>, next_id: &mut u64) -> Vec<u8> {
-    let sep = DEFAULT_SEPARATOR;
+/// Строит ACK на неразбираемое сообщение: `MSA|AE` на разделителях сегмента с `MSH-10`.
+fn build_ae(
+    recovered: &Recovered<'_>,
+    now: DateTime<FixedOffset>,
+    ids: &ControlIdSource,
+    events: &mut Vec<ResponderEvent>,
+) -> Vec<u8> {
+    let msh = &recovered.msh;
+    // Разделители негодны — берём по умолчанию и экранируем то, что копируем: иначе значение
+    // могло бы развалить структуру ACK своим `|`, `^`, `~`, `\` или `&`.
+    let (sep, encoding): (u8, &[u8]) = if recovered.usable_separators {
+        (msh.field_sep, msh.encoding)
+    } else {
+        (DEFAULT_SEPARATOR, DEFAULT_ENCODING)
+    };
+    let escape = !recovered.usable_separators;
+    let sending_app = ae_field(msh.sending_app, "MSH-3", escape, events);
+    let sending_facility = ae_field(msh.sending_facility, "MSH-4", escape, events);
+    let receiving_app = ae_field(msh.receiving_app, "MSH-5", escape, events);
+    let receiving_facility = ae_field(msh.receiving_facility, "MSH-6", escape, events);
+    let control_id = ae_field(msh.control_id, "MSH-10", escape, events);
+    let version = ae_field(msh.version, "MSH-12", escape, events);
+
     let mut out = Vec::with_capacity(128);
     out.extend_from_slice(b"MSH");
     out.push(sep);
-    out.extend_from_slice(DEFAULT_ENCODING);
-    // MSH-3…MSH-6 взять неоткуда.
-    for _ in 0..4 {
-        push_field(&mut out, sep, b"");
-    }
+    out.extend_from_slice(encoding);
+    push_field(&mut out, sep, &receiving_app);
+    push_field(&mut out, sep, &receiving_facility);
+    push_field(&mut out, sep, &sending_app);
+    push_field(&mut out, sep, &sending_facility);
     push_field(&mut out, sep, timestamp(now).as_bytes());
     push_field(&mut out, sep, b"");
     push_field(&mut out, sep, b"ACK");
-    push_field(&mut out, sep, next_control_id(now, next_id).as_bytes());
+    push_field(&mut out, sep, next_control_id(now, ids).as_bytes());
     push_field(&mut out, sep, DEFAULT_PROCESSING_ID);
-    push_field(&mut out, sep, b"");
+    push_field(&mut out, sep, &version);
     out.extend_from_slice(b"\rMSA");
     push_field(&mut out, sep, b"AE");
-    push_field(&mut out, sep, control_id);
+    push_field(&mut out, sep, &control_id);
     out.push(b'\r');
+    out
+}
+
+/// Поле ACK на неразбираемое сообщение: ASCII-значение, при дефолтных разделителях —
+/// с экранированием `\F\`, `\S\`, `\R\`, `\E\`, `\T\`.
+fn ae_field(value: &[u8], name: &str, escape: bool, events: &mut Vec<ResponderEvent>) -> Vec<u8> {
+    if !value.iter().all(|byte| is_ascii_printable(*byte)) {
+        events.push(ResponderEvent::Info {
+            message: format!("{name} is not ASCII: the field is left empty in the ACK"),
+        });
+        return Vec::new();
+    }
+    if !escape {
+        return value.to_vec();
+    }
+    let mut out = Vec::with_capacity(value.len());
+    for &byte in value {
+        match byte {
+            b'|' => out.extend_from_slice(b"\\F\\"),
+            b'^' => out.extend_from_slice(b"\\S\\"),
+            b'~' => out.extend_from_slice(b"\\R\\"),
+            b'\\' => out.extend_from_slice(b"\\E\\"),
+            b'&' => out.extend_from_slice(b"\\T\\"),
+            _ => out.push(byte),
+        }
+    }
     out
 }
 
@@ -303,12 +417,17 @@ fn timestamp(now: DateTime<FixedOffset>) -> String {
     now.format("%Y%m%d%H%M%S%z").to_string()
 }
 
-/// Новый `MSH-10` ACK: `BT`, время отправки и сквозной счётчик — только печатный ASCII.
+/// Новый `MSH-10` ACK: `BT`, время отправки `YYMMDDHHMMSS` и номер из общего счётчика.
 ///
-/// Счётчик не сбрасывается на новое соединение, а время отсекает совпадения между соединениями.
-fn next_control_id(now: DateTime<FixedOffset>, next_id: &mut u64) -> String {
-    *next_id += 1;
-    format!("BT{}{:04}", now.format("%Y%m%d%H%M%S"), *next_id)
+/// Ровно 20 знаков — предел длины поля, — и только печатный ASCII. Время отсекает совпадения
+/// между секундами и соединениями, номер — внутри секунды; модуль держит поле в 20 знаках,
+/// а миллион ответов за одну секунду недостижим для прибора.
+fn next_control_id(now: DateTime<FixedOffset>, ids: &ControlIdSource) -> String {
+    format!(
+        "BT{}{:06}",
+        now.format("%y%m%d%H%M%S"),
+        ids.next() % 1_000_000
+    )
 }
 
 #[cfg(test)]
@@ -325,8 +444,7 @@ mod tests {
     }
 
     fn answer_of(message: &[u8]) -> Answer {
-        let mut next_id = 0;
-        answer(message, now(), &mut next_id)
+        answer(message, now(), &ControlIdSource::new())
     }
 
     fn ack_of(message: &[u8]) -> (String, Vec<ResponderEvent>) {
@@ -340,7 +458,7 @@ mod tests {
         let (ack, events) = ack_of(MSG);
         assert_eq!(
             ack,
-            "MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK^R01|BT202610191015300001|P|2.3.1\r\
+            "MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK^R01|BT261019101530000001|P|2.3.1\r\
              MSA|AA|MSG0001\r"
         );
         assert!(events.is_empty(), "{events:?}");
@@ -354,7 +472,7 @@ mod tests {
         );
         assert_eq!(
             ack,
-            "MSH#$%\\*#LIS#LAB#ANALYZER#LAB#20261019101530+0300##ACK$R01#BT202610191015300001#P#2.4\r\
+            "MSH#$%\\*#LIS#LAB#ANALYZER#LAB#20261019101530+0300##ACK$R01#BT261019101530000001#P#2.4\r\
              MSA#AA#MSG0002\r"
         );
         assert!(events.is_empty(), "{events:?}");
@@ -366,7 +484,7 @@ mod tests {
             ack_of(b"MSH|^~\\#|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|MSG0003|P|2.3.1\r");
         assert_eq!(
             ack,
-            "MSH|^~\\#|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK^R01|BT202610191015300001|P|2.3.1\r\
+            "MSH|^~\\#|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK^R01|BT261019101530000001|P|2.3.1\r\
              MSA|AA|MSG0003\r"
         );
         assert!(events.is_empty(), "{events:?}");
@@ -377,7 +495,7 @@ mod tests {
         let (ack, events) = ack_of(b"MSH|^~\\&|||||20261019101500||ORU^R01|MSG0004\r");
         assert_eq!(
             ack,
-            "MSH|^~\\&|||||20261019101530+0300||ACK^R01|BT202610191015300001|P|\rMSA|AA|MSG0004\r"
+            "MSH|^~\\&|||||20261019101530+0300||ACK^R01|BT261019101530000001|P|\rMSA|AA|MSG0004\r"
         );
         assert!(events.is_empty(), "{events:?}");
     }
@@ -385,11 +503,24 @@ mod tests {
     #[test]
     fn message_type_without_event_has_no_component_separator() {
         let (ack, _) =
-            ack_of(b"MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101500||ACK|MSG0005|P|2.3.1\r");
+            ack_of(b"MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101500||ORU|MSG0005|P|2.3.1\r");
         assert_eq!(
             ack,
-            "MSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101530+0300||ACK|BT202610191015300001|P|2.3.1\r\
+            "MSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101530+0300||ACK|BT261019101530000001|P|2.3.1\r\
              MSA|AA|MSG0005\r"
+        );
+    }
+
+    #[test]
+    fn incoming_ack_is_not_acknowledged() {
+        let answer =
+            answer_of(b"MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101500||ACK^R01|MSG0005|P|2.3.1\r");
+        assert!(answer.ack.is_none(), "подтверждение не подтверждается");
+        assert!(
+            matches!(&answer.events[..], [ResponderEvent::Info { message }]
+                if message.contains("incoming ACK")),
+            "{:?}",
+            answer.events
         );
     }
 
@@ -399,7 +530,7 @@ mod tests {
             ack_of(b"MSH|^~\\&|ANALYZ\xe9R|LAB|LIS|LAB|20261019101500||ORU^R01|MSG0006|P|2.3.1\r");
         assert_eq!(
             ack,
-            "MSH|^~\\&|LIS|LAB||LAB|20261019101530+0300||ACK^R01|BT202610191015300001|P|2.3.1\r\
+            "MSH|^~\\&|LIS|LAB||LAB|20261019101530+0300||ACK^R01|BT261019101530000001|P|2.3.1\r\
              MSA|AA|MSG0006\r"
         );
         assert!(ack.is_ascii(), "кодировка ACK — ASCII");
@@ -422,6 +553,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_control_id_gives_an_empty_msa2_and_a_note() {
+        let (ack, events) =
+            ack_of(b"MSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01||P|2.3.1\r");
+        assert!(ack.ends_with("MSA|AA|\r"), "{ack:?}");
+        assert!(
+            matches!(&events[..], [ResponderEvent::Info { message }]
+                if message.contains("MSH-10 is empty")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
     fn segment_separators_may_be_lf_or_crlf() {
         let lf = b"MSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|MSG0007|P|2.3.1\nPID|1||PATIENT^TEST\n";
         let crlf = b"MSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|MSG0007|P|2.3.1\r\nPID|1||PATIENT^TEST\r\n";
@@ -440,9 +583,40 @@ mod tests {
         );
         assert_eq!(
             ack,
-            "MSH|^~\\&|||||20261019101530+0300||ACK|BT202610191015300001|P|\rMSA|AE|MSG0008\r"
+            "MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK|BT261019101530000001|P|2.3.1\r\
+             MSA|AE|MSG0008\r"
         );
         assert!(matches!(&events[0], ResponderEvent::Error { message } if message.contains("MSH")));
+    }
+
+    #[test]
+    fn ae_ack_uses_the_separators_of_the_msh_with_the_control_id() {
+        // MSH-10 = `ID|X^Y` из сегмента с разделителями `#` и `^~\\&`: `|` в нём — обычный байт.
+        let (ack, events) = ack_of(
+            b"OBX|1\rMSH#^~\\&#ANALYZER#LAB#LIS#LAB#20261019101500##ORU$R01#ID|X^Y#P#2.3.1\r",
+        );
+        assert_eq!(
+            ack,
+            "MSH#^~\\&#LIS#LAB#ANALYZER#LAB#20261019101530+0300##ACK#BT261019101530000001#P#2.3.1\r\
+             MSA#AE#ID|X^Y\r"
+        );
+        assert!(ack.ends_with("MSA#AE#ID|X^Y\r"), "{ack:?}");
+        assert!(matches!(&events[0], ResponderEvent::Error { .. }));
+    }
+
+    #[test]
+    fn ae_ack_escapes_copied_fields_when_separators_are_unusable() {
+        // MSH-2 с управляющим байтом: разделители по умолчанию, значения экранируются.
+        let (ack, events) =
+            ack_of(b"MSH|^~\\\x01&|ANALYZER^X|LAB|LIS|LAB|20261019101500||ORU^R01|ID&1|P|2.3.1\r");
+        assert_eq!(
+            ack,
+            "MSH|^~\\&|LIS|LAB|ANALYZER\\S\\X|LAB|20261019101530+0300||ACK|BT261019101530000001|P|2.3.1\r\
+             MSA|AE|ID\\T\\1\r"
+        );
+        assert!(
+            matches!(&events[0], ResponderEvent::Error { message } if message.contains("MSH-2"))
+        );
     }
 
     #[test]
@@ -454,12 +628,12 @@ mod tests {
 
     #[test]
     fn broken_separators_are_an_error_with_a_nack_when_the_id_survives() {
-        // MSH-2 с управляющим байтом: ACK строится по разделителям по умолчанию.
         let (ack, events) =
             ack_of(b"MSH|^~\\\x01&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|MSG0009|P|2.3.1\r");
         assert_eq!(
             ack,
-            "MSH|^~\\&|||||20261019101530+0300||ACK|BT202610191015300001|P|\rMSA|AE|MSG0009\r"
+            "MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK|BT261019101530000001|P|2.3.1\r\
+             MSA|AE|MSG0009\r"
         );
         assert!(
             matches!(&events[0], ResponderEvent::Error { message } if message.contains("MSH-2"))
@@ -477,6 +651,21 @@ mod tests {
     }
 
     #[test]
+    fn short_msh_falls_back_to_the_next_msh_segment() {
+        let (ack, events) = ack_of(
+            b"MSH\rMSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|MSG0010|P|2.3.1\r",
+        );
+        assert_eq!(
+            ack,
+            "MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK|BT261019101530000001|P|2.3.1\r\
+             MSA|AE|MSG0010\r"
+        );
+        assert!(
+            matches!(&events[0], ResponderEvent::Error { message } if message.contains("too short"))
+        );
+    }
+
+    #[test]
     fn empty_message_is_an_error() {
         let answer = answer_of(b"");
         assert!(answer.ack.is_none());
@@ -485,13 +674,19 @@ mod tests {
 
     #[test]
     fn control_ids_are_unique_within_the_counter() {
-        let mut next_id = 0;
-        let now = now();
-        let first = answer(MSG, now, &mut next_id).ack.expect("ACK");
-        let second = answer(MSG, now, &mut next_id).ack.expect("ACK");
+        let ids = ControlIdSource::new();
+        let first = answer(MSG, now(), &ids).ack.expect("ACK");
+        let second = answer(MSG, now(), &ids).ack.expect("ACK");
         let first = String::from_utf8(first).expect("ASCII");
         let second = String::from_utf8(second).expect("ASCII");
-        assert!(first.contains("|BT202610191015300001|"), "{first}");
-        assert!(second.contains("|BT202610191015300002|"), "{second}");
+        assert!(first.contains("|BT261019101530000001|"), "{first}");
+        assert!(second.contains("|BT261019101530000002|"), "{second}");
+    }
+
+    #[test]
+    fn control_id_is_at_most_twenty_characters() {
+        let id = next_control_id(now(), &ControlIdSource::new());
+        assert_eq!(id.len(), 20, "{id}");
+        assert_eq!(id, "BT261019101530000001");
     }
 }

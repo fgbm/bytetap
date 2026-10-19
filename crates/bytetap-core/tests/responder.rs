@@ -4,7 +4,7 @@
 //! Фикстуры лежат в `tests/fixtures/hl7/` и содержат только вымышленные данные
 //! (`ANALYZER`, `LIS`, `PATIENT^TEST`).
 
-use bytetap_core::responder::{Action, Hl7Mllp, Responder, ResponderEvent};
+use bytetap_core::responder::{Action, ControlIdSource, Hl7Mllp, Responder, ResponderEvent};
 use bytetap_testkit::fixtures_dir;
 use chrono::{DateTime, FixedOffset};
 use proptest::prelude::*;
@@ -32,7 +32,7 @@ fn framed(message: &[u8]) -> Vec<u8> {
 }
 
 fn feed(stream: &[u8]) -> Vec<Action> {
-    Hl7Mllp::new().feed(stream, now())
+    Hl7Mllp::new(ControlIdSource::new()).feed(stream, now())
 }
 
 fn acks(actions: &[Action]) -> Vec<Vec<u8>> {
@@ -95,19 +95,22 @@ fn analyzer_message_is_acknowledged_field_by_field() {
     assert!(events(&actions).is_empty(), "{actions:?}");
     assert_eq!(
         ack_text(&acks[0]),
-        "MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK^R01|BT202610191015300001|P|2.3.1\r\
+        "MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101530+0300||ACK^R01|BT261019101530000001|P|2.3.1\r\
          MSA|AA|MSG0001\r"
     );
 }
 
 #[test]
-fn lis_ack_without_trigger_event_gets_a_plain_ack_type() {
+fn an_incoming_ack_is_not_acknowledged() {
+    // FR-16: ответ на подтверждение завёл бы петлю ACK↔ACK.
     let actions = feed(&fixture("lis_ack_aa.hl7"));
-    let acks = acks(&actions);
-    assert_eq!(acks.len(), 1);
-    let text = ack_text(&acks[0]);
-    assert!(text.contains("||ACK|BT"), "{text}");
-    assert_eq!(msa(&acks[0]).0, "AA");
+    assert!(acks(&actions).is_empty(), "ответа нет: {actions:?}");
+    let events = events(&actions);
+    assert_eq!(events.len(), 1, "{actions:?}");
+    assert!(
+        matches!(events[0], ResponderEvent::Info { message } if message.contains("incoming ACK")),
+        "{events:?}"
+    );
 }
 
 #[test]
@@ -183,7 +186,7 @@ fn garbage_between_frames_is_reported_but_does_not_change_the_answers() {
     }
 }
 
-/// Пул сообщений для proptest: стандартные и нестандартные разделители, запрос, ACK ЛИС.
+/// Пул сообщений для proptest: стандартные и нестандартные разделители, запрос.
 const POOL: &[(&[u8], &str)] = &[
     (
         b"MSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|MSG0001|P|2.3.1\r\
@@ -200,12 +203,39 @@ const POOL: &[(&[u8], &str)] = &[
           PID#1##PATIENT$TEST\r",
         "MSG0004",
     ),
-    (
-        b"MSH|^~\\&|LIS|LAB|ANALYZER|LAB|20261019101501||ACK|MSG0003|P|2.3.1\r\
-          MSA|AA|MSG0001\r",
-        "MSG0003",
-    ),
 ];
+
+/// Байт потока: байты рамки и разделители попадаются чаще случайных — на них живёт автомат.
+fn stream_byte() -> impl Strategy<Value = u8> {
+    prop_oneof![
+        3 => Just(SB),
+        3 => Just(EB),
+        4 => Just(CR),
+        2 => Just(b'\n'),
+        4 => proptest::sample::select(b"MSH|^~\\&$%*".to_vec()),
+        20 => any::<u8>(),
+    ]
+}
+
+/// Кусок потока: мусор из случайных байтов или рамка с сообщением пула, иногда испорченным.
+fn piece() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        3 => proptest::collection::vec(stream_byte(), 0..=48),
+        5 => (0usize..POOL.len(), proptest::option::of((0usize..32, any::<u8>()))).prop_map(
+            |(pick, damage)| {
+                let mut message = POOL[pick].0.to_vec();
+                if let Some((at, byte)) = damage {
+                    if at < message.len() {
+                        message[at] = byte;
+                    } else {
+                        message.push(byte);
+                    }
+                }
+                framed(&message)
+            },
+        ),
+    ]
+}
 
 proptest! {
     /// Поток из нескольких сообщений при любом разбиении на фрагменты даёт те же действия,
@@ -223,10 +253,10 @@ proptest! {
             stream.extend_from_slice(&framed(POOL[*pick].0));
         }
 
-        let mut whole = Hl7Mllp::new();
+        let mut whole = Hl7Mllp::new(ControlIdSource::new());
         let expected = whole.feed(&stream, now());
 
-        let mut piecewise = Hl7Mllp::new();
+        let mut piecewise = Hl7Mllp::new(ControlIdSource::new());
         let mut actual = Vec::new();
         let mut offset = 0;
         let mut sizes = cuts.iter().cycle();
@@ -247,16 +277,70 @@ proptest! {
         prop_assert!(acks.iter().all(|ack| msa(ack).0 == "AA"));
     }
 
-    /// Любой мусор вне рамки не порождает ответов и не мешает следующей рамке.
+    /// Любые байты, испорченные сообщения и любая нарезка: автомат не паникует, разбиение
+    /// не меняет действий, а каждый ответ — ASCII `MSH` в рамке MLLP (M1-AC8, T-1).
     #[test]
-    fn garbage_never_produces_a_response(
-        garbage in proptest::collection::vec(0u8..=0x0A, 0..=32),
+    fn any_bytes_and_fragmentation_keep_the_invariants(
+        pieces in proptest::collection::vec(piece(), 0..=6),
+        cuts in proptest::collection::vec(1usize..=24, 1..=64),
+        limit in 8usize..=1024,
     ) {
+        let stream: Vec<u8> = pieces.concat();
+
+        let mut whole = Hl7Mllp::with_frame_limit(limit, ControlIdSource::new());
+        let mut expected = whole.feed(&stream, now());
+        expected.extend(whole.finish(now()));
+
+        let mut piecewise = Hl7Mllp::with_frame_limit(limit, ControlIdSource::new());
+        let mut actual = Vec::new();
+        let mut offset = 0;
+        let mut sizes = cuts.iter().cycle();
+        while offset < stream.len() {
+            let size = *sizes.next().expect("размеры фрагментов не кончаются");
+            let end = (offset + size).min(stream.len());
+            actual.extend(piecewise.feed(&stream[offset..end], now()));
+            offset = end;
+        }
+        actual.extend(piecewise.finish(now()));
+
+        prop_assert_eq!(&actual, &expected, "разбиение не меняет результат");
+        for action in &actual {
+            if let Action::Send(bytes) = action {
+                prop_assert_eq!(bytes.first(), Some(&SB), "рамка MLLP начинается с 0x0B");
+                prop_assert!(bytes.len() > 3, "в рамке есть тело и закрывающая пара");
+                prop_assert_eq!(
+                    bytes.get(bytes.len() - 2..),
+                    Some([EB, CR].as_slice()),
+                    "рамка закрыта 0x1C 0x0D"
+                );
+                let body = &bytes[1..bytes.len() - 2];
+                prop_assert!(body.starts_with(b"MSH"), "ACK начинается с MSH");
+                prop_assert!(
+                    body.iter()
+                        .all(|&byte| (0x20..=0x7E).contains(&byte) || byte == CR),
+                    "тело ACK — печатный ASCII и CR"
+                );
+            }
+        }
+    }
+
+    /// Мусор вне рамки: любой байт, кроме `0x0B`, не меняет ответ, а блок даёт ровно одно `Info`.
+    #[test]
+    fn garbage_never_changes_the_ack(
+        garbage in proptest::collection::vec(
+            any::<u8>().prop_filter("0x0B начинает рамку", |byte| *byte != SB),
+            1..=64,
+        ),
+    ) {
+        let clean = feed(&framed(POOL[0].0));
+
         let mut stream = garbage.clone();
         stream.extend_from_slice(&framed(POOL[0].0));
         let actions = feed(&stream);
-        let acks = acks(&actions);
-        prop_assert_eq!(acks.len(), 1);
-        prop_assert_eq!(msa(&acks[0]).1, "MSG0001");
+
+        prop_assert_eq!(acks(&actions), acks(&clean), "мусор не меняет ACK");
+        let events = events(&actions);
+        prop_assert_eq!(events.len(), 1, "одно Info на блок мусора: {:?}", events);
+        prop_assert!(matches!(events[0], ResponderEvent::Info { .. }), "{events:?}");
     }
 }

@@ -11,9 +11,12 @@
 //! - `0x1C`, за которым не идёт `0x0D`, — обычный байт сообщения, рамка не закрыта.
 //! - Незакрытая рамка дольше [`Hl7Mllp::frame_limit`] байт сбрасывается с
 //!   [`ResponderEvent::Error`]: бесконечно растущий буфер недопустим (NFR-5).
+//! - Подряд идущие `0x0B` с пустой рамкой — не ошибка: прибор мог начать сообщение заново.
+//! - При закрытии соединения [`Responder::finish`] сообщает о недособранной рамке и о хвосте
+//!   мусора вне неё: иначе они пропали бы из журнала молча.
 
 use crate::responder::hl7;
-use crate::responder::{Action, Now, Responder, ResponderEvent};
+use crate::responder::{Action, ControlIdSource, Now, Responder, ResponderEvent};
 
 /// Начало рамки MLLP — `VT`.
 pub const SB: u8 = 0x0B;
@@ -35,35 +38,31 @@ pub struct Hl7Mllp {
     pending_eb: bool,
     outside: usize,
     frame_limit: usize,
-    next_id: u64,
+    ids: ControlIdSource,
 }
 
 impl Hl7Mllp {
     /// Автоответчик с пределом рамки [`MAX_FRAME_BYTES`].
+    ///
+    /// `ids` — общий на сессию источник `MSH-10`: соединения сессии передают один и тот же
+    /// счётчик, поэтому их ответы не совпадают идентификаторами.
     #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            frame: Vec::new(),
-            in_frame: false,
-            pending_eb: false,
-            outside: 0,
-            frame_limit: MAX_FRAME_BYTES,
-            next_id: 0,
-        }
+    pub fn new(ids: ControlIdSource) -> Self {
+        Self::with_frame_limit(MAX_FRAME_BYTES, ids)
     }
 
     /// Автоответчик с другим пределом рамки.
     ///
     /// Нужен тестам: проверять переполнение на 16 МиБ значило бы гонять их впустую.
     #[must_use]
-    pub const fn with_frame_limit(frame_limit: usize) -> Self {
+    pub fn with_frame_limit(frame_limit: usize, ids: ControlIdSource) -> Self {
         Self {
             frame: Vec::new(),
             in_frame: false,
             pending_eb: false,
             outside: 0,
             frame_limit,
-            next_id: 0,
+            ids,
         }
     }
 
@@ -74,9 +73,11 @@ impl Hl7Mllp {
     }
 
     /// Открывает новую рамку: закрывает блок мусора и сообщает о потерянном сообщении.
+    ///
+    /// Пустая незакрытая рамка потерей не считается: прибор мог начать сообщение заново.
     fn start_frame(&mut self, actions: &mut Vec<Action>) {
         self.report_outside(actions);
-        if self.in_frame {
+        if self.in_frame && !self.frame.is_empty() {
             actions.push(
                 ResponderEvent::Error {
                     message: format!(
@@ -86,8 +87,8 @@ impl Hl7Mllp {
                 }
                 .into(),
             );
-            self.frame.clear();
         }
+        self.frame.clear();
         self.in_frame = true;
     }
 
@@ -123,7 +124,7 @@ impl Hl7Mllp {
             return;
         }
         self.in_frame = false;
-        let answer = hl7::answer(&self.frame, now, &mut self.next_id);
+        let answer = hl7::answer(&self.frame, now, &self.ids);
         self.frame.clear();
         actions.extend(answer.events.into_iter().map(Action::from));
         if let Some(ack) = answer.ack {
@@ -147,7 +148,7 @@ impl Hl7Mllp {
 
 impl Default for Hl7Mllp {
     fn default() -> Self {
-        Self::new()
+        Self::new(ControlIdSource::new())
     }
 }
 
@@ -173,12 +174,40 @@ impl Responder for Hl7Mllp {
         actions
     }
 
+    fn finish(&mut self, _now: Now) -> Vec<Action> {
+        let mut actions = Vec::new();
+        // `0x1C` в самом конце: либо байт незакрытой рамки, либо мусор вне неё.
+        if self.pending_eb {
+            self.pending_eb = false;
+            if self.in_frame {
+                self.frame.push(EB);
+            } else {
+                self.outside += 1;
+            }
+        }
+        if self.in_frame {
+            actions.push(
+                ResponderEvent::Error {
+                    message: format!(
+                        "incomplete MLLP frame at the end of the connection: {} bytes without 0x1C 0x0D",
+                        self.frame.len()
+                    ),
+                }
+                .into(),
+            );
+            self.frame.clear();
+            self.in_frame = false;
+        }
+        self.report_outside(&mut actions);
+        actions
+    }
+
     fn reset(&mut self) {
         self.frame.clear();
         self.in_frame = false;
         self.pending_eb = false;
         self.outside = 0;
-        // `next_id` не сбрасывается: MSH-10 должен оставаться уникальным в пределах сессии.
+        // Источник `MSH-10` общий на сессию и не сбрасывается: номера не должны повторяться.
     }
 }
 
@@ -228,7 +257,7 @@ mod tests {
 
     #[test]
     fn a_framed_message_is_answered_with_a_framed_ack() {
-        let mut responder = Hl7Mllp::new();
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
         let actions = responder.feed(&framed(MESSAGE), now());
         let sends = sends(&actions);
         assert_eq!(sends.len(), 1);
@@ -244,10 +273,10 @@ mod tests {
     #[test]
     fn byte_by_byte_feed_matches_whole_feed() {
         let stream = framed(MESSAGE);
-        let mut whole = Hl7Mllp::new();
+        let mut whole = Hl7Mllp::new(ControlIdSource::new());
         let expected = whole.feed(&stream, now());
 
-        let mut piecewise = Hl7Mllp::new();
+        let mut piecewise = Hl7Mllp::new(ControlIdSource::new());
         let mut actual = Vec::new();
         for byte in &stream {
             actual.extend(piecewise.feed(std::slice::from_ref(byte), now()));
@@ -259,7 +288,7 @@ mod tests {
     fn terminator_split_between_fragments_still_closes_the_frame() {
         let stream = framed(MESSAGE);
         let cut = stream.len() - 1;
-        let mut responder = Hl7Mllp::new();
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
         let mut actions = responder.feed(&stream[..cut], now());
         assert!(sends(&actions).is_empty(), "рамка ещё не закрыта");
         actions.extend(responder.feed(&stream[cut..], now()));
@@ -268,7 +297,7 @@ mod tests {
 
     #[test]
     fn garbage_outside_the_frame_is_reported_once_per_block() {
-        let mut responder = Hl7Mllp::new();
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
         let mut actions = responder.feed(b"junk", now());
         assert!(actions.is_empty(), "блок ещё не закончился");
         actions = responder.feed(b"more", now());
@@ -289,7 +318,7 @@ mod tests {
 
     #[test]
     fn a_new_frame_inside_an_open_frame_drops_the_previous_one() {
-        let mut responder = Hl7Mllp::new();
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
         let mut stream = Vec::new();
         stream.push(SB);
         stream.extend_from_slice(b"MSH|truncated");
@@ -305,7 +334,7 @@ mod tests {
 
     #[test]
     fn an_end_of_block_byte_not_followed_by_cr_is_message_data() {
-        let mut responder = Hl7Mllp::new();
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
         let mut message = MESSAGE.to_vec();
         // 0x1C внутри поля PID-3: за ним идёт не CR, поэтому рамка не закрывается.
         message.insert(message.len() - 8, EB);
@@ -316,7 +345,7 @@ mod tests {
 
     #[test]
     fn a_stray_terminator_outside_a_frame_is_garbage() {
-        let mut responder = Hl7Mllp::new();
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
         let actions = responder.feed(b"\x1c\r", now());
         assert!(sends(&actions).is_empty());
         assert!(actions.is_empty());
@@ -332,7 +361,7 @@ mod tests {
 
     #[test]
     fn an_empty_frame_is_an_error_without_a_response() {
-        let mut responder = Hl7Mllp::new();
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
         let actions = responder.feed(b"\x0b\x1c\r", now());
         assert!(sends(&actions).is_empty());
         assert!(
@@ -343,7 +372,7 @@ mod tests {
 
     #[test]
     fn an_overlong_frame_is_dropped_with_an_error() {
-        let mut responder = Hl7Mllp::with_frame_limit(256);
+        let mut responder = Hl7Mllp::with_frame_limit(256, ControlIdSource::new());
         assert_eq!(responder.frame_limit(), 256);
         let mut stream = Vec::new();
         stream.push(SB);
@@ -362,9 +391,9 @@ mod tests {
 
     #[test]
     fn reset_forgets_the_open_frame_but_keeps_the_id_counter() {
-        let mut responder = Hl7Mllp::new();
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
         let first = sender_id(&responder.feed(&framed(MESSAGE), now()));
-        assert_eq!(first, "BT202610191015300001");
+        assert_eq!(first, "BT261019101530000001");
 
         let mut stream = Vec::new();
         stream.push(SB);
@@ -373,7 +402,7 @@ mod tests {
         responder.reset();
 
         let second = sender_id(&responder.feed(&framed(MESSAGE), now()));
-        assert_eq!(second, "BT202610191015300002", "счётчик не сбрасывается");
+        assert_eq!(second, "BT261019101530000002", "счётчик не сбрасывается");
     }
 
     /// Поле MSH-10 из отправленного ACK.
@@ -389,8 +418,63 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_frame_starts_over_an_empty_frame_are_not_an_error() {
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
+        let actions = responder.feed(b"\x0b\x0b\x0b", now());
+        assert!(actions.is_empty(), "пустая рамка потерей не считается");
+        let actions = responder.feed(&framed(MESSAGE), now());
+        assert_eq!(sends(&actions).len(), 1);
+        assert!(events(&actions).is_empty(), "{actions:?}");
+    }
+
+    #[test]
+    fn finish_reports_an_unfinished_frame_and_a_garbage_tail() {
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
+        let mut stream = b"junk".to_vec();
+        stream.push(SB);
+        stream.extend_from_slice(b"MSH|^~\\&|ANALYZER");
+        let body_len = b"MSH|^~\\&|ANALYZER".len();
+        let actions = responder.feed(&stream, now());
+        assert!(
+            matches!(&actions[..], [Action::Event(ResponderEvent::Info { .. })]),
+            "блок мусора закончился на 0x0B: {actions:?}"
+        );
+
+        let actions = responder.finish(now());
+        assert!(sends(&actions).is_empty());
+        assert!(
+            matches!(&actions[..], [Action::Event(ResponderEvent::Error { message })]
+                if message.contains(&format!("{body_len} bytes"))),
+            "{actions:?}"
+        );
+        assert!(responder.finish(now()).is_empty(), "повторный finish пуст");
+
+        // Мусор в конце соединения: рамки не было вовсе.
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
+        assert!(responder.feed(b"tail\x1c", now()).is_empty());
+        let actions = responder.finish(now());
+        assert!(
+            matches!(&actions[..], [Action::Event(ResponderEvent::Info { message })]
+                if message.contains("5 bytes")),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn two_responders_of_one_session_do_not_repeat_control_ids() {
+        let ids = ControlIdSource::new();
+        let mut first = Hl7Mllp::new(ids.clone());
+        let mut second = Hl7Mllp::new(ids);
+        let first = sender_id(&first.feed(&framed(MESSAGE), now()));
+        let second = sender_id(&second.feed(&framed(MESSAGE), now()));
+        assert_ne!(first, second, "MSH-10 общий на сессию");
+        assert_eq!(first, "BT261019101530000001");
+        assert_eq!(second, "BT261019101530000002");
+    }
+
+    #[test]
     fn several_messages_in_one_fragment_get_one_ack_each() {
-        let mut responder = Hl7Mllp::new();
+        let mut responder = Hl7Mllp::new(ControlIdSource::new());
         let mut stream = Vec::new();
         for _ in 0..3 {
             stream.extend_from_slice(&framed(MESSAGE));
