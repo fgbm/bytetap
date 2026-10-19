@@ -28,6 +28,10 @@
   --vp-code-bg: var(--bt-ctrl-bg);
   --vp-code-block-bg: var(--bt-surface-1);
   --vp-code-line-highlight-color: var(--bt-border-faint);
+  /* Подпись на брендовой кнопке: акцент в обеих темах контрастирует с surface-0. */
+  --vp-button-brand-text: var(--bt-surface-0);
+  --vp-button-brand-hover-text: var(--bt-surface-0);
+  --vp-button-brand-active-text: var(--bt-surface-0);
 }
 
 /* Трасса в hero: заменяет декоративную картинку VitePress. */
