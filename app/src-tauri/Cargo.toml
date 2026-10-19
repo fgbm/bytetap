@@ -15,5 +15,25 @@ crate-type = ["rlib"]
 tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
+base64.workspace = true
 bytetap-core.workspace = true
+chrono.workspace = true
+if-addrs = "0.15.0"
+serde.workspace = true
+serde_json.workspace = true
 tauri = { version = "2.12", features = [] }
+tauri-plugin-dialog = "2.8.3"
+tauri-plugin-opener = "2.7.2"
+tauri-plugin-store = "2.5.0"
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Проверка WebView2 до создания окна (NFR-3): чтение реестра и системное окно сообщения.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
