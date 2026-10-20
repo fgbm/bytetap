@@ -39,7 +39,6 @@
 
   /* Лента обмена */
   --bt-lane-height: 28px;
-  --bt-dir-width: 3px;
 
   /* Окно: системных рамок нет, крестик закрытия — как в Windows */
   --bt-title-height: 44px;
@@ -70,7 +69,6 @@
   --bt-accent: #2f3fbf;
   --bt-warn: #8a5a00;
   --bt-warn-bg: #fff6e0;
-  --bt-hatch: rgb(15 20 24 / 9%);
 }
 
 :root[data-theme="light"] {
@@ -97,7 +95,6 @@
   --bt-accent: #2f3fbf;
   --bt-warn: #8a5a00;
   --bt-warn-bg: #fff6e0;
-  --bt-hatch: rgb(15 20 24 / 9%);
 }
 
 :root[data-theme="dark"] {
@@ -128,7 +125,6 @@ html.dark {
   --bt-accent: #8fb4ff;
   --bt-warn: #ffcf66;
   --bt-warn-bg: #2a2210;
-  --bt-hatch: rgb(221 228 234 / 9%);
 }
 
 @media (prefers-reduced-motion: reduce) {
