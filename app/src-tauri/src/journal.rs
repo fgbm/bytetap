@@ -972,6 +972,33 @@ mod tests {
         );
     }
 
+    /// Отказ журнала обрывает файл без `session_end`, а иногда и посреди строки:
+    /// просмотр открывает то, что успело записаться (FR-29, NFR-5).
+    #[tokio::test]
+    async fn a_journal_interrupted_by_a_failure_still_opens() {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let path = synthetic(
+            &dir,
+            &[(0, Dir::AnalyzerToLis, 10), (1_000, Dir::AnalyzerToLis, 20)],
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("дописывание");
+        std::io::Write::write_all(&mut file, br#"{"type":"data","#).expect("обрыв строки");
+        drop(file);
+
+        let cache = JournalCache::default();
+        let summary = open(&path, &cache)
+            .await
+            .expect("оборванный журнал открывается");
+        assert_eq!(summary.events, 2, "целые строки до обрыва видны");
+        assert_eq!(
+            summary.duration_us, 1_000,
+            "итогов нет — длительность по последнему фрагменту"
+        );
+    }
+
     #[test]
     fn a_line_longer_than_the_limit_is_broken() {
         let dir = tempfile::tempdir().expect("временная папка");

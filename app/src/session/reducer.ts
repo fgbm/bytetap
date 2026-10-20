@@ -37,6 +37,11 @@ export interface SessionState {
   status: SessionStatus;
   /** Запущенная сессия: путь к журналу, адрес прослушивания, время старта. */
   startInfo: StartInfo | null;
+  /**
+   * Журнал этой сессии из `StartInfo`: нужен и после «Стоп», и после отказа журнала,
+   * когда `startInfo` уже пуст, а файл с записанным остался (FR-29).
+   */
+  recordedPath: string | null;
   /** Настройки, с которыми стартовала сессия: чипы не меняются на ходу (AC3). */
   startedConfig: SessionConfig | null;
   /** Накопленная статистика; после стопа заменяется итогами `stop_session`. */
@@ -79,6 +84,7 @@ export function initialSessionState(): SessionState {
   return {
     status: "idle",
     startInfo: null,
+    recordedPath: null,
     startedConfig: null,
     stats: { ...EMPTY_STATS },
     dropped: 0,
@@ -125,6 +131,8 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         ...state,
         status: "recording",
         startInfo: action.info,
+        // Путь известен уже на старте: «Открыть записанное» работает и после отказа журнала.
+        recordedPath: action.info.journalPath,
         startedConfig: { ...action.config },
         error: null,
       };
@@ -136,6 +144,7 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         ...initialSessionState(),
         status: "recording",
         startInfo: action.info,
+        recordedPath: action.info.journalPath,
       };
 
     case "start_failed":
@@ -153,6 +162,8 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         ...state,
         status: "idle",
         startInfo: null,
+        // Итоги называют фактический файл; без них остаётся путь со старта.
+        recordedPath: action.summary?.journalPath ?? state.recordedPath,
         startedConfig: null,
         summary: action.summary,
         error: null,
@@ -168,6 +179,7 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         ...state,
         status: "failed",
         startInfo: null,
+        // `recordedPath` не сбрасывается: записанное до сбоя надо открыть (AC15).
         startedConfig: null,
         journalFailure: { code: action.code, message: action.message },
       };

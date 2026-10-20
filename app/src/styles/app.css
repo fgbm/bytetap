@@ -185,6 +185,16 @@ textarea {
   text-underline-offset: 2px;
 }
 
+.bt-link:disabled,
+.bt-link.danger:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.bt-link:disabled:hover {
+  background: transparent;
+}
+
 /* Меню: кнопка и всплывающий список */
 
 .bt-menu {

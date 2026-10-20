@@ -54,6 +54,40 @@ describe("заглушка моста: закрытие соединений", (
   });
 });
 
+describe("заглушка моста: отказ журнала", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("отдаёт путь журнала сессии: записанное открывается и после сбоя", async () => {
+    const bridge = createMockBridge("journal_failure");
+    const events: FeedEvent[] = [];
+    const info = await bridge.startSession(config("tcp_server"), (batch: FeedBatch) => {
+      events.push(...batch.events);
+    });
+    // Сбой наступает после нескольких шагов обмена: часть журнала уже записана.
+    vi.advanceTimersByTime(TICK_MS * 15);
+
+    expect(events.find((event) => event.type === "stopped")).toMatchObject({
+      reason: "journal_failure",
+      code: "disk_full",
+    });
+    expect(info.journalPath.endsWith("-tcp_server.jsonl")).toBe(true);
+
+    // Путь сессии виден и `session_status`: страница после перезагрузки открывает по нему.
+    const status = await bridge.sessionStatus();
+    expect(status).toMatchObject({ running: false, startInfo: { journalPath: info.journalPath } });
+
+    // Журнал, оборванный без `session_end`, просмотр открывает.
+    const summary = await bridge.openJournal(info.journalPath);
+    expect(summary.path).toBe(info.journalPath);
+  });
+});
+
 describe("заглушка моста: кадры ASTM E1381", () => {
   beforeEach(() => {
     vi.useFakeTimers();

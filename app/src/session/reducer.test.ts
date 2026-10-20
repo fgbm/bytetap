@@ -112,6 +112,29 @@ describe("reduceSession", () => {
     expect(dismissed.journalFailure).toBeNull();
   });
 
+  it("держит путь журнала со старта и после «Стоп», и после отказа журнала (FR-29)", () => {
+    const recordingState = recording();
+    expect(recordingState.recordedPath, "путь известен из StartInfo").toBe(
+      startedInfo.journalPath,
+    );
+
+    const failed = reduceSession(recordingState, {
+      type: "journal_failed",
+      code: "disk_full",
+      message: "storage full",
+    });
+    expect(failed.recordedPath, "записанное до сбоя открывается").toBe(startedInfo.journalPath);
+
+    const stopped = reduceSession(reduceSession(recordingState, { type: "stop_requested" }), {
+      type: "stopped",
+      summary,
+    });
+    expect(stopped.recordedPath).toBe(summary.journalPath);
+
+    // Новый старт начинает с чистого листа: пока журнал не создан, открывать нечего.
+    expect(reduceSession(stopped, { type: "start_requested" }).recordedPath).toBeNull();
+  });
+
   it("после отказа журнала события продолжают считаться, итогов стоп не будет", () => {
     const failed: SessionState = {
       ...recording(),

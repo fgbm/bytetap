@@ -79,7 +79,6 @@ const serialPorts = ref<SerialPort[]>([]);
 const recents = ref<RecentJournal[] | null>(null);
 const logDirWarning = ref<LogDirWarning | null>(null);
 const selectedProfile = ref("");
-const lastJournalPath = ref<string | null>(null);
 
 /** Методы ленты для перехода из трассы при просмотре журнала (AC9). */
 interface FeedViewHandle {
@@ -212,9 +211,8 @@ const settingsWarning = computed(() => {
 });
 
 const lastRun = computed<LastRun | null>(() => settings.lastRun);
-const journalPath = computed(
-  () => state.value.startInfo?.journalPath ?? lastJournalPath.value,
-);
+/** Журнал этой сессии: известен со старта или из `session_status` после перезагрузки. */
+const journalPath = computed(() => state.value.recordedPath);
 
 const promptTitle = computed(() => {
   if (prompt.kind === "note") return t("actions.noteTitle");
@@ -306,13 +304,6 @@ watch(
   },
 );
 
-watch(
-  () => state.value.startInfo,
-  (info) => {
-    if (info !== null) lastJournalPath.value = info.journalPath;
-  },
-);
-
 // Запись пошла: после «Стоп» человек возвращается к выбору сценария, а не к форме.
 watch(
   () => state.value.status,
@@ -339,14 +330,12 @@ async function onStart(patch: Partial<AppConfig>): Promise<void> {
     cfg.mode !== "tcp_server" || checkPort(String(cfg.listenPort)).problem === null;
   if (!portOk) return;
   settingsStore.rememberLastRun(cfg);
-  lastJournalPath.value = null;
   visibleWindow.value = null;
   await start(sessionConfigFor(cfg));
 }
 
 async function onStop(): Promise<void> {
   await stop();
-  if (state.value.summary !== null) lastJournalPath.value = state.value.summary.journalPath;
 }
 
 /**
@@ -434,12 +423,10 @@ async function onChooseDirFromFailure(): Promise<void> {
 }
 
 async function onOpenRecorded(): Promise<void> {
-  const path = lastJournalPath.value;
-  if (path !== null) {
-    await openJournal(path);
-    return;
-  }
-  await onOpenFolder();
+  // Журнала нет — открывать нечего: действие неактивно (FR-29).
+  const path = journalPath.value;
+  if (path === null) return;
+  await openJournal(path);
 }
 
 function onSelectProfile(name: string): void {
@@ -586,7 +573,12 @@ function onPromptConfirm(text: string): void {
         <button class="bt-link danger" type="button" @click="onChooseDirFromFailure">
           {{ t("banner.chooseOtherDir") }}
         </button>
-        <button class="bt-link danger" type="button" @click="onOpenRecorded">
+        <button
+          class="bt-link danger"
+          type="button"
+          :disabled="journalPath === null"
+          @click="onOpenRecorded"
+        >
           {{ t("banner.openRecorded") }}
         </button>
       </span>
