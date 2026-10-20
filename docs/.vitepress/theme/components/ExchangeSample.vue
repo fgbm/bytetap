@@ -1,8 +1,15 @@
 <script setup lang="ts">
-import { ArrowLeft, ArrowRight, Bot } from "@lucide/vue";
 import { segments } from "../../../../shared/control-chips";
 
-/** Строка примера обмена: время, направление, признак автоответа и текст фрагмента. */
+/**
+ * Пример обмена на главной: та же тихая лента, что в приложении (UI v2).
+ *
+ * Время — цветом text-faint, направление — цветным глифом стрелки, управляющие
+ * символы — приглушёнными обозначениями `‹CR›` без фона и рамки, автоответ — словом
+ * в конце строки цветом dir-l2a. Общий модуль разбора `shared/control-chips.ts`
+ * отдаёт сегменты с `<CR>`; угловые скобки-глифы ставит этот компонент, как `rows.ts`
+ * в приложении, поэтому тест общего модуля не меняется.
+ */
 export interface ExchangeRow {
   t: string;
   dir: "a2l" | "l2a";
@@ -11,6 +18,11 @@ export interface ExchangeRow {
 }
 
 defineProps<{ rows: ExchangeRow[] }>();
+
+/** `<CR>` → `‹CR›`: глиф вместо плашки, фоном управляющие символы не выделяются. */
+function glyph(value: string): string {
+  return `‹${value.slice(1, -1)}›`;
+}
 </script>
 
 <template>
@@ -19,23 +31,17 @@ defineProps<{ rows: ExchangeRow[] }>();
       v-for="(row, index) in rows"
       :key="index"
       class="row"
-      :class="[`dir-${row.dir}`, { 'is-synthetic': row.synthetic }]"
+      :class="`dir-${row.dir}`"
     >
       <time class="time">{{ row.t }}</time>
-      <component :is="row.dir === 'a2l' ? ArrowRight : ArrowLeft" class="arrow" :size="14" aria-hidden="true" />
+      <span class="arrow" aria-hidden="true">{{ row.dir === "a2l" ? "→" : "←" }}</span>
       <span class="sr-only">{{ row.dir === "a2l" ? "анализатор → ЛИС" : "ЛИС → анализатор" }}</span>
-      <span class="bar" aria-hidden="true" />
-      <span class="body">
-        <span v-if="row.synthetic" class="synthetic-label">
-          <Bot :size="12" aria-hidden="true" />
-          автоответ
-        </span>
-        <span class="text">
-          <template v-for="(part, partIndex) in segments(row.text)" :key="partIndex">
-            <span v-if="part.chip" class="chip">{{ part.value }}</span>
-            <template v-else>{{ part.value }}</template>
-          </template>
-        </span>
+      <span class="text">
+        <template v-for="(part, partIndex) in segments(row.text)" :key="partIndex">
+          <span v-if="part.chip" class="ctrl">{{ glyph(part.value) }}</span>
+          <template v-else>{{ part.value }}</template>
+        </template>
+        <span v-if="row.synthetic" class="synthetic">автоответ</span>
       </span>
     </li>
   </ol>
@@ -46,7 +52,6 @@ defineProps<{ rows: ExchangeRow[] }>();
   margin: var(--bt-space-4) 0;
   padding: var(--bt-space-2) 0;
   list-style: none;
-  border: 1px solid var(--bt-border);
   border-radius: var(--bt-radius-panel);
   background: var(--bt-trace-bg);
   overflow-x: auto;
@@ -54,30 +59,25 @@ defineProps<{ rows: ExchangeRow[] }>();
 
 .row {
   display: flex;
-  align-items: flex-start;
+  align-items: baseline;
   gap: var(--bt-space-2);
   min-height: var(--bt-lane-height);
-  padding: 2px var(--bt-space-3);
-  border-bottom: 1px solid var(--bt-border-faint);
+  padding: 0 var(--bt-space-3);
   font-family: var(--bt-font-mono);
   font-size: var(--bt-text-data);
   line-height: 1.5;
 }
 
-.row:last-child {
-  border-bottom: 0;
-}
-
 .time {
   flex: none;
-  padding-top: 1px;
-  color: var(--bt-text-muted);
+  color: var(--bt-text-faint);
   font-variant-numeric: tabular-nums;
 }
 
 .arrow {
   flex: none;
-  margin-top: 2px;
+  width: 12px;
+  font-weight: 600;
 }
 
 .dir-a2l .arrow {
@@ -88,66 +88,27 @@ defineProps<{ rows: ExchangeRow[] }>();
   color: var(--bt-dir-l2a);
 }
 
-.bar {
-  flex: none;
-  align-self: stretch;
-  width: var(--bt-dir-width);
-  border-radius: 2px;
-}
-
-.dir-a2l .bar {
-  background: var(--bt-dir-a2l);
-}
-
-.dir-l2a .bar {
-  background: var(--bt-dir-l2a);
-}
-
-.body {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-}
-
 .text {
-  overflow-wrap: anywhere;
+  min-width: 0;
   color: var(--bt-text);
+  overflow-wrap: anywhere;
 }
 
-.is-synthetic .body {
-  background-image: repeating-linear-gradient(
-    135deg,
-    var(--bt-hatch) 0,
-    var(--bt-hatch) 3px,
-    transparent 3px,
-    transparent 7px
-  );
-  border-radius: var(--bt-radius-chip);
-}
+/* Управляющие символы: только цвет и кегль, без плашек, фона и рамки (UI v2). */
 
-.synthetic-label {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--bt-space-1);
-  color: var(--bt-text-muted);
-  font-family: var(--bt-font-ui);
-  font-size: var(--bt-text-2xs);
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-}
-
-.chip {
-  display: inline-block;
-  margin: 0 1px;
-  padding: 0 3px;
-  border: 1px solid var(--bt-border);
-  border-radius: var(--bt-radius-chip);
-  background: var(--bt-ctrl-bg);
+.ctrl {
   color: var(--bt-ctrl);
   font-size: var(--bt-text-2xs);
-  line-height: 1.5;
-  white-space: nowrap;
+  opacity: 0.55;
+}
+
+/* Автоответ: слово в конце строки цветом ЛИС → анализатор, без штриховки и полосы. */
+
+.synthetic {
+  margin-left: 6px;
+  color: var(--bt-dir-l2a);
+  font-family: var(--bt-font-ui);
+  font-size: var(--bt-text-2xs);
 }
 
 .sr-only {
