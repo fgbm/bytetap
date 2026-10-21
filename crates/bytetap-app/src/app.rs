@@ -255,6 +255,9 @@ pub struct BytetapApp {
     frame_reapply: bool,
     /// Тестовый хук снимков: меню, которое надо открыть на следующем кадре.
     hook_menu: Option<&'static str>,
+    /// Кадров нарисовано с начала записи: итог уходит в журнал запуска при остановке
+    /// (NFR-5: сколько кадров стоила сессия).
+    frames: u64,
 }
 
 impl BytetapApp {
@@ -331,6 +334,7 @@ impl BytetapApp {
             restored_maximized: false,
             frame_reapply: false,
             hook_menu: None,
+            frames: 0,
         };
         app.preselect_last_card();
         app.interfaces = Loaded::Loading(Task::spawn(ctx, background::list_interfaces));
@@ -1167,6 +1171,7 @@ impl BytetapApp {
             return;
         }
         self.phase = live::reduce(self.phase, Action::StartRequested);
+        self.frames = 0;
         self.journal_failure = None;
         diag::info(format!("старт записи: {}", describe(&config.source)));
         let repaint = ctx.clone();
@@ -1286,6 +1291,15 @@ impl BytetapApp {
         {
             self.stop_task = None;
             crate::recording::log_outcome(&outcome);
+            // Кадры записи: частота перерисовки в живом окне — рядом с итогами сессии.
+            if let Some(rec) = &self.rec {
+                let seconds = rec.elapsed().as_secs_f64().max(0.001);
+                diag::info(format!(
+                    "кадров за запись: {}, {:.1} в секунду",
+                    self.frames,
+                    self.frames as f64 / seconds
+                ));
+            }
             self.recorded_path = Some(outcome.journal_path.clone());
             if let Some(failure) = outcome.failure {
                 self.phase = live::reduce(self.phase, Action::JournalFailed);
@@ -1804,6 +1818,7 @@ impl eframe::App for BytetapApp {
         if self.dirty && self.screen != Screen::Step(self.settings.config.mode) {
             self.save_settings();
         }
+        self.frames += 1;
         if !self.ready {
             self.ready = true;
             diag::info("интерфейс готов");

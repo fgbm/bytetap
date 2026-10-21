@@ -677,16 +677,32 @@ jobs:
             Start-Sleep -Seconds 10
             $p.Refresh()
             $busy = ($p.TotalProcessorTime.TotalSeconds - $t0) / 10 * 100
-            $line = "CPU при записи 100 фрагментов/с за 10 с: {0:N2} % одного ядра" -f $busy
+            $line = "CPU при записи 100 фрагментов/с за 10 с: {0:N2} % одного ядра (WARP, программный растр)" -f $busy
             Write-Host $line
             $line | Out-File -Encoding utf8 smoke/cpu-recording.txt
-            # Порог мягкий: цена кадра на WARP у раннера своя, важно, что процесс жив
-            # и не занимает ядро целиком.
-            if ($busy -ge 90.0) { Write-Host "CPU при записи $busy % — почти ядро"; $failed = $true }
-            Stop-Job $sender -ErrorAction SilentlyContinue
-            Remove-Job $sender -Force -ErrorAction SilentlyContinue
+            # Цена кадра на WARP у раннера своя, это диагностика: порог тут мягкий,
+            # а жёсткая проверка — частота кадров из журнала запуска ниже.
+            if ($busy -ge 450.0) { Write-Host "CPU при записи $busy % — заняты все ядра"; $failed = $true }
           }
-          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          # Остановка штатная (WM_CLOSE): журнал запуска получает итог кадров записи.
+          if (-not $p.HasExited) {
+            $null = $p.CloseMainWindow()
+            if (-not $p.WaitForExit(30000)) { Stop-Process -Id $p.Id -Force; $failed = $true }
+          }
+          if ($addr -and (Test-Path $log)) {
+            $frames = Select-String -Path $log -Pattern 'кадров за запись: (\d+), ([\d.]+) в секунду' -Encoding utf8 | Select-Object -Last 1
+            if ($frames) {
+              $count = [int]$frames.Matches[0].Groups[1].Value
+              $fps = [double]$frames.Matches[0].Groups[2].Value
+              $count | Out-File -Encoding utf8 smoke/cpu-recording.txt -Append
+              Write-Host ("кадров за запись: {0}, {1:N1} в секунду" -f $count, $fps)
+              if ($fps -gt 33.0) { Write-Host "перерисовка $fps кадров в секунду — чаще 30"; $failed = $true }
+            } else {
+              Write-Host 'в журнале запуска нет итога кадров записи'
+              $failed = $true
+            }
+          }
+          if (Get-Job -Id $sender.Id -ErrorAction SilentlyContinue) { Stop-Job $sender; Remove-Job $sender -Force }
           if ($failed) { exit 1 }
 
       # U1-AC21: снимки всех экранов в обеих темах из настоящего exe — владелец
