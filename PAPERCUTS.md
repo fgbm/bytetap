@@ -21,3 +21,19 @@ U1 шаг 1: `cargo test --workspace` и `gh run download` в `/tmp/opencode/...
 ## 2026-10-21 18:40 — claude-opus-5-5
 
 U1 шаг 3: `cargo test -p bytetap-app --test snapshots` изредка (≈1 из 6 прогонов) падает SIGSEGV в `libvulkan.so.1` — параллельные харнессы `egui_kittest` с wgpu на lavapipe одновременно создают и закрывают устройства. Обход: рендер-тесты берут общий `Mutex` (`gpu()` в `tests/snapshots.rs`); после этого 0 падений из 40. Ещё: тестовый бинарник снимков запускать из `crates/bytetap-app`, иначе эталоны ищутся не там (`Missing snapshot`).
+
+## 2026-10-22 00:20 — deepseek-v4.1-flash
+
+CI `native-windows`: `Write-Host "$name: снимок: $_"` в PowerShell — это не строка, а ссылка на переменную области видимости: `ParserError: Variable reference is not valid. ':' was not followed by a valid variable name character`, причём номер строки указывает на закрывающую скобку блока, а не на саму строку. Писать `"${name}: …"`.
+
+## 2026-10-22 00:20 — deepseek-v4.1-flash
+
+`egui_kittest`: у `Node` два прямоугольника — `Node::rect()` в точках и `AccessKitNode::bounding_box()` в физических пикселях AccessKit. На 125 % сравнение `bounding_box()` с размером окна в точках даёт «виджет вне окна». Брать `Node::rect()`.
+
+## 2026-10-22 00:21 — deepseek-v4.1-flash
+
+egui: `ui.spacing_mut().item_spacing` учитывается при размещении **предыдущего** виджета, а не следующего (`allocate_space` берёт интервал сразу после себя). Правка интервала после добавления виджета сдвигает не его, а уже следующую группу — в шапке окна кнопки уехали на 8 px за край.
+
+## 2026-10-22 00:21 — deepseek-v4.1-flash
+
+egui_kittest `check_accessibility` ловит только роли `is_input`: строка ленты (`Role::Label` с `actions: [Click, Focus]` и текстом в `value`, а не в `label`) проходит проверку без подписи. Своя проверка дерева должна смотреть `label().or(value())`.
