@@ -1,4 +1,4 @@
-//! Журнал сессии: события, писатель, читатель (FR-19…FR-24).
+//! Журнал сессии: события, писатель, читатель, просмотр (FR-19…FR-24, FR-29).
 //!
 //! Формат `bytetap-session/1` описан в `docs/reference/session-format.md` и в JSON Schema
 //! `docs/public/schema/bytetap-session-1.schema.json`. Решение о писателе — ADR
@@ -7,6 +7,7 @@
 mod event;
 pub mod reader;
 pub mod recent;
+pub mod view;
 pub mod writer;
 
 use std::io;
@@ -20,6 +21,7 @@ pub use event::{
 };
 pub use reader::{JournalLine, JournalReader, LineError, LineErrorKind, ReadOutcome, read_all};
 pub use recent::{MAX_RECENT_JOURNALS, RecentJournal, recent};
+pub use view::{Density, JournalCache, JournalIndex, JournalSummary, ViewError, ViewErrorKind};
 pub use writer::{
     Journal, LogDirWarningKind, append_note, default_log_dir, log_dir_warning,
     log_dir_warning_kind, session_file_name,
