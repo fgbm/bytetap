@@ -217,6 +217,13 @@ pub async fn start(config: SessionConfig, ctx: egui::Context) -> Result<LiveSess
 /// Приёмник ленты: всё, что накопилось в подписке, — в буфер под одним замком.
 ///
 /// Заканчивается, когда сессия выгрузила отправителя событий (остановка, отказ журнала).
+///
+/// Пачка ограничена [`crate::feed::FEED_CAPACITY`]: буфер ленты столько и вмещает, а
+/// лишнее всё равно вытеснило бы старое. Ограничение не даёт приёмнику разобрать всю
+/// очередь подписчика, если она вдруг окажется большой.
+///
+/// `Lagged` считает все события подписки, а лента без заголовка сессии и итогов: на
+/// число пропущенных это влияет в пределах двух событий (U1-AC13).
 pub async fn pump(
     mut events: broadcast::Receiver<SessionEvent>,
     feed: SharedFeed,
@@ -231,7 +238,7 @@ pub async fn pump(
             Err(broadcast::error::RecvError::Lagged(count)) => lagged += count,
             Err(broadcast::error::RecvError::Closed) => closed = true,
         }
-        while !closed {
+        while !closed && batch.len() < crate::feed::FEED_CAPACITY {
             match events.try_recv() {
                 Ok(event) => batch.extend(FeedEvent::from_session(&event)),
                 Err(broadcast::error::TryRecvError::Lagged(count)) => lagged += count,
@@ -240,10 +247,12 @@ pub async fn pump(
             }
         }
         if !batch.is_empty() || lagged > 0 {
+            // `Arc` создаётся до взятия замка: под замком только кладём готовые события.
+            let ready: Vec<Arc<FeedEvent>> = batch.drain(..).map(Arc::new).collect();
             let mut ring = lock(&feed);
             ring.lagged(lagged);
-            for event in batch.drain(..) {
-                ring.push(Arc::new(event));
+            for event in ready {
+                ring.push(event);
             }
             drop(ring);
             ctx.request_repaint_after(FRAME);
@@ -285,6 +294,14 @@ impl LiveSession {
 
     pub fn failure_watch(&self) -> watch::Receiver<Option<JournalFailureReason>> {
         self.handle.journal_failure()
+    }
+
+    /// Сессия ядра закончилась сама: отказ журнала, падение задачи или иное завершение.
+    ///
+    /// Окно замечает это и останавливает запись: слот освобождается без «Стоп», как в
+    /// UI v2 (слот занятой завершившейся сессии освобождается — `app/src-tauri/src/bridge.rs`).
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
     }
 
     /// Комментарий в идущую сессию (FR-23): событие `note` в журнал и ленту.
@@ -352,6 +369,8 @@ pub enum Action {
     StartFailed,
     StopRequested,
     Stopped,
+    /// Остановка завершилась ошибкой без отказа журнала: видно на стартовом экране.
+    StopFailed,
     JournalFailed,
     FailureDismissed,
 }
@@ -366,6 +385,7 @@ pub fn reduce(phase: Phase, action: Action) -> Phase {
         (P::Starting, A::StartFailed) => P::Idle,
         (P::Recording, A::StopRequested) => P::Stopping,
         (P::Stopping, A::Stopped) => P::Idle,
+        (P::Recording | P::Stopping, A::StopFailed) => P::Failed,
         (P::Recording | P::Stopping, A::JournalFailed) => P::Failed,
         (P::Failed, A::FailureDismissed) => P::Idle,
         (phase, _) => phase,

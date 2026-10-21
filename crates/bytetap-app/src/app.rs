@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytetap_core::journal::{LogDirWarningKind, RecentJournal};
@@ -40,6 +41,10 @@ pub const RECENT_SHOWN: usize = 3;
 /// Окно закрыто принудительно, не дождавшись остановки записи: `main` после выхода
 /// показывает системное сообщение — журнал мог быть дописан не полностью.
 pub static FORCED_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Текст последнего системного сообщения о неполном журнале: тест проверяет его, а
+/// пользователь видит окно с той же причиной (U1-AC17).
+pub static CLOSE_NOTICE: Mutex<Option<String>> = Mutex::new(None);
 
 /// Тестовый хук смоука записи (CI): `tcp_server:127.0.0.1:0` — запись стартует сразу.
 pub const AUTOSTART_ENV: &str = "BYTETAP_TEST_AUTOSTART";
@@ -126,6 +131,15 @@ pub struct BytetapApp {
     closing: Option<Instant>,
     /// Остановка не уложилась в предел: следующее закрытие не отменяется.
     force_close: bool,
+    /// Закрытие уже отменено один раз: повторно `CancelClose` не шлём.
+    ///
+    /// Пока идёт остановка, событие закрытия может висеть в кадре дольше одного
+    /// прохода (особенно у свёрнутого окна, где кадр рисует логика). Без этого флага
+    /// окно гоняло бы `CancelClose` по каждому кадру и никогда не дошло бы до
+    /// закрытия (U1-AC17).
+    close_canceled: bool,
+    /// Ошибка остановки записи: строка на стартовом экране (как `stop_failed` в UI v2).
+    pub(crate) stop_error: Option<String>,
     /// Снимки и тесты: данные окружения даны заранее, фоновых опросов нет.
     fixtures: bool,
     pub(crate) now: Option<DateTime<FixedOffset>>,
@@ -203,6 +217,8 @@ impl BytetapApp {
             journal_note: false,
             closing: None,
             force_close: false,
+            close_canceled: false,
+            stop_error: None,
             fixtures: false,
             now: None,
             dirty: false,
@@ -307,6 +323,11 @@ impl BytetapApp {
 
     pub fn journal_failure(&self) -> Option<&JournalFailure> {
         self.journal_failure.as_ref()
+    }
+
+    /// Ошибка остановки записи: видна на стартовом экране (U1-AC17).
+    pub fn stop_error(&self) -> Option<&str> {
+        self.stop_error.as_deref()
     }
 
     pub fn recorded_path(&self) -> Option<&PathBuf> {
@@ -871,6 +892,7 @@ impl BytetapApp {
                     self.recorded_path = Some(session.journal_path().to_path_buf());
                     self.live = Some(session);
                     self.start_error = None;
+                    self.stop_error = None;
                     self.screen = Screen::Recording;
                     if self.closing.is_some() {
                         self.stop_recording(ctx);
@@ -895,6 +917,18 @@ impl BytetapApp {
             self.phase = live::reduce(self.phase, Action::JournalFailed);
             self.journal_failure = Some(failure);
         }
+        // Сессия закончилась сама (отказ журнала, падение задачи): окно замечает это и
+        // освобождает слот — иначе запись «висит» в интерфейсе до «Стоп» (U1-AC17).
+        if self.live.is_some()
+            && self.stop_task.is_none()
+            && self
+                .live
+                .as_ref()
+                .is_some_and(live::LiveSession::is_finished)
+        {
+            diag::info("сессия ядра закончилась сама: запись останавливается");
+            self.stop_recording(ctx);
+        }
         if let Some(task) = &mut self.stop_task
             && let Some(outcome) = task.poll()
         {
@@ -904,6 +938,12 @@ impl BytetapApp {
             if let Some(failure) = outcome.failure {
                 self.phase = live::reduce(self.phase, Action::JournalFailed);
                 self.journal_failure = Some(failure);
+            } else if let Some(error) = outcome.error {
+                // Ошибка остановки без отказа журнала: её видно на стартовом экране,
+                // как `stop_failed` в UI v2 (U1-AC17).
+                diag::error(format!("остановка записи: {error}"));
+                self.phase = live::reduce(self.phase, Action::StopFailed);
+                self.stop_error = Some(error);
             } else {
                 self.phase = live::reduce(self.phase, Action::Stopped);
             }
@@ -923,15 +963,26 @@ impl BytetapApp {
 
     /// Закрытие окна во время записи: сначала штатная остановка (журнал заканчивается
     /// `session_end`), потом окно. Дольше [`live::STOP_WAIT`] окно не ждёт.
+    ///
+    /// Закрытие отменяется один раз: пока идёт остановка, событие закрытия может
+    /// висеть в кадре дольше одного прохода (у свёрнутого окна кадр рисует логика), и
+    /// без флага окно гоняло бы `CancelClose` по каждому кадру, не доходя до закрытия
+    /// (U1-AC17).
     fn handle_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
         if requested && self.session_busy() && !self.force_close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if self.closing.is_none() {
-                diag::info("закрытие окна во время записи: сначала остановка сессии");
-                self.closing = Some(Instant::now());
-                self.stop_recording(ctx);
+            if !self.close_canceled {
+                self.close_canceled = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if self.closing.is_none() {
+                    diag::info("закрытие окна во время записи: сначала остановка сессии");
+                    self.closing = Some(Instant::now());
+                    self.stop_recording(ctx);
+                }
             }
+        } else if !requested {
+            // Событие закрытия ушло: следующий раз закрыть можно будет снова.
+            self.close_canceled = false;
         }
         let Some(since) = self.closing else {
             return;
@@ -939,6 +990,7 @@ impl BytetapApp {
         if !self.session_busy() {
             diag::info("запись остановлена, окно закрывается");
             self.closing = None;
+            self.show_close_notice();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else if since.elapsed() >= live::STOP_WAIT {
             diag::error(format!(
@@ -950,8 +1002,27 @@ impl BytetapApp {
             FORCED_EXIT.store(true, Ordering::Relaxed);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else {
+            // Кадр раз в 100 мс: окно ждёт остановки, но не гоняет кадры зря.
             ctx.request_repaint_after(Duration::from_millis(100));
         }
+    }
+
+    /// Журнал мог быть дописан не полностью: системное окно с причиной, как при
+    /// принудительном выходе (U1-AC17).
+    ///
+    /// Показывается один раз и только если отказ журнала действительно был: без
+    /// него окно закрывается молча, как при обычной остановке.
+    fn show_close_notice(&mut self) {
+        let Some(failure) = self.journal_failure.take() else {
+            return;
+        };
+        let text = t!(
+            "record.journalIncomplete",
+            reason = crate::recording::failure_reason(failure.code)
+        );
+        diag::error(format!("окно закрывается: {text}"));
+        *CLOSE_NOTICE.lock().unwrap_or_else(PoisonError::into_inner) = Some(text.clone());
+        crate::diag::show_error(&text);
     }
 
     pub fn settings(&self) -> &Settings {
@@ -1110,6 +1181,7 @@ impl BytetapApp {
             self.home_title_bar(ui);
         }
         self.failure_notice(ui);
+        self.stop_error_notice(ui);
         self.settings_warning(ui);
         if recording {
             self.recording_screen(ui);
@@ -1136,6 +1208,40 @@ impl BytetapApp {
         // Рамка окна — последней, поверх всего: иначе панели ленты перекрывали бы её.
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         crate::window::draw_frame(ui, &p, maximized);
+    }
+
+    /// Ошибка остановки записи: строка под шапкой на стартовом экране (U1-AC17).
+    ///
+    /// Как `stop_failed` в UI v2: запись не началась заново, но человек видит, что
+    /// остановка сорвалась, и почему.
+    fn stop_error_notice(&mut self, ui: &mut Ui) {
+        let Some(error) = self.stop_error.clone() else {
+            return;
+        };
+        if self.screen == Screen::Recording {
+            return;
+        }
+        let p = self.pal();
+        let text = t!("record.stopFailed", reason = error);
+        egui::Frame::new()
+            .fill(mix(p.surface_0, p.danger, 0.12))
+            .inner_margin(egui::Margin::symmetric(SPACE_3 as i8, SPACE_2 as i8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(text).size(TEXT_XS).color(p.danger));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if widgets::icon_button(ui, &p, Icon::X, 14.0, t!("settings.dismiss"))
+                            .clicked()
+                        {
+                            self.stop_error = None;
+                        }
+                    });
+                });
+            });
+        let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+        ui.painter()
+            .hline(line.x_range(), line.center().y, Stroke::new(1.0, p.border));
     }
 
     /// Строка под шапкой о сброшенных настройках, как в Tauri-версии.

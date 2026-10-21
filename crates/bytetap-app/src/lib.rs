@@ -25,7 +25,9 @@ mod viewscreen;
 pub mod widgets;
 pub mod window;
 
-pub use app::{AUTOSTART_ENV, BytetapApp, FORCED_EXIT, Fixtures, Screen, resolve_dark};
+pub use app::{
+    AUTOSTART_ENV, BytetapApp, CLOSE_NOTICE, FORCED_EXIT, Fixtures, Screen, resolve_dark,
+};
 
 /// Размер окна при первом запуске (U1-AC3).
 pub const WINDOW_SIZE: [f32; 2] = [1200.0, 800.0];
