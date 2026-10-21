@@ -621,6 +621,13 @@ jobs:
       - name: Смоук — CPU в простое и при записи
         shell: pwsh
         run: |
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class CpuWin {
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
+          }
+          '@
           $out = New-Item -ItemType Directory -Force -Path smoke
           $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
           $ready = {
@@ -681,7 +688,8 @@ jobs:
               $stream = $client.GetStream()
               $stream.ReadTimeout = 500
               $buffer = New-Object byte[] 4096
-              for ($i = 0; $i -lt 100; $i++) {
+              # 25 с: поток идёт и во втором окне замера, со свёрнутым окном.
+              for ($i = 0; $i -lt 250; $i++) {
                 $text = "MSH|^~\&|ANALYZER|LAB|LIS||20261019101500||ORU^R01|MSG$i|P|2.3.1`rPID|1||000001||PATIENT^TEST`rOBX|1|NM|GLU^Glucose||5.4|mmol/L`r"
                 [byte[]]$frame = @(0x0b) + [System.Text.Encoding]::ASCII.GetBytes($text) + @(0x1c, 0x0d)
                 try { $stream.Write($frame, 0, $frame.Length) } catch { break }
@@ -700,6 +708,22 @@ jobs:
             $line = "CPU при записи 100 фрагментов/с за 10 с: {0:N2} % одного ядра (WARP, программный растр)" -f $busy
             Write-Host $line
             $line | Out-File -Encoding utf8 smoke/cpu-recording.txt
+            # Сколько из этого — кадры, а сколько — сама сессия: то же окно в том же
+            # потоке, но свёрнутое. Свёрнутое окно кадров не рисует
+            # (`sleep_if_invisible_or_minimized` в eframe), поток фрагментов идёт.
+            $hwnd = $p.MainWindowHandle
+            [void][CpuWin]::ShowWindow($hwnd, 6)
+            Start-Sleep -Seconds 2
+            $p.Refresh()
+            $t1 = $p.TotalProcessorTime.TotalSeconds
+            Start-Sleep -Seconds 6
+            $p.Refresh()
+            $hidden = ($p.TotalProcessorTime.TotalSeconds - $t1) / 6 * 100
+            $line = "CPU при записи со свёрнутым окном (без кадров) за 6 с: {0:N2} % одного ядра" -f $hidden
+            Write-Host $line
+            $line | Out-File -Encoding utf8 smoke/cpu-recording.txt -Append
+            [void][CpuWin]::ShowWindow($hwnd, 9)
+            Start-Sleep -Milliseconds 500
             # Замер до правки частоты кадров (run 28b98b3): 306 % одного ядра и 6.2
             # кадра/с — кадр WARP стоит ~160 мс и окно просило его 30 раз в секунду.
             # Теперь период выбирается по цене кадра (live::next_period): кадр 160 мс —
