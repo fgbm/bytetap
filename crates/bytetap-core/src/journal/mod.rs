@@ -6,6 +6,7 @@
 
 mod event;
 pub mod reader;
+pub mod recent;
 pub mod writer;
 
 use std::io;
@@ -18,6 +19,7 @@ pub use event::{
     Note, Open, Session, SessionEnd, Stats,
 };
 pub use reader::{JournalLine, JournalReader, LineError, LineErrorKind, ReadOutcome, read_all};
+pub use recent::{MAX_RECENT_JOURNALS, RecentJournal, recent};
 pub use writer::{
     Journal, LogDirWarningKind, append_note, default_log_dir, log_dir_warning,
     log_dir_warning_kind, session_file_name,
