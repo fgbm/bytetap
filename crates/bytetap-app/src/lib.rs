@@ -19,6 +19,7 @@ pub mod theme;
 mod titlebar;
 pub mod trace;
 pub mod widgets;
+pub mod window;
 
 pub use app::{AUTOSTART_ENV, BytetapApp, FORCED_EXIT, Fixtures, Screen, resolve_dark};
 

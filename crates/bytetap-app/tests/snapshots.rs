@@ -164,6 +164,26 @@ fn close_button_turns_red_on_hover() {
     harness.snapshot_options("titlebar-close-hover", &options());
 }
 
+/// Рамка окна 1 px по периметру, обе темы (жалоба владельца: окно без рамки сливается
+/// с фоном). Снимок — окно целиком: рамка идёт по периметру.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn the_window_has_a_one_pixel_frame() {
+    let _gpu = gpu();
+    let mut harness = harness(Screen::Scenarios, false, (400.0, 300.0));
+    harness.run_steps(2);
+    harness.snapshot_options("frame-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn the_window_has_a_one_pixel_frame_in_the_dark_theme() {
+    let _gpu = gpu();
+    let mut harness = harness(Screen::Scenarios, true, (400.0, 300.0));
+    harness.run_steps(2);
+    harness.snapshot_options("frame-dark", &options());
+}
+
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn scenarios_light() {

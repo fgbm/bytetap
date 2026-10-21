@@ -327,6 +327,74 @@ jobs:
       # адрес и журнал сессии exe пишет в журнал запуска. Клиент шлёт синтетическое
       # сообщение HL7 в рамке MLLP и ждёт ACK, затем окно получает WM_CLOSE: журнал
       # сессии должен закончиться session_end, а процесс — выйти сам.
+      # Рамка окна: на белом фоне окно без рамки сливается с фоном (решение владельца
+      # 2026-10-21). Снимок окна на белом фоне показывает рамку 1 px по периметру, а
+      # журнал запуска — результат вызовов DWM (скругление, цвет рамки, тень).
+      - name: Смоук — рамка окна на белом фоне
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class FrameWin {
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+            [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+            [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT rect, int size);
+            [DllImport("gdi32.dll")] public static extern IntPtr CreateSolidBrush(int color);
+            [DllImport("gdi32.dll")] public static extern bool FillRect(IntPtr hdc, ref RECT rect, IntPtr brush);
+            [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hWnd);
+            [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hdc);
+          }
+          '@
+          [void][FrameWin]::SetProcessDPIAware()
+          $out = New-Item -ItemType Directory -Force -Path smoke
+          $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
+          $null = $p.Handle
+          Start-Sleep -Seconds 15
+          $failed = $false
+          if ($p.HasExited) {
+            Write-Host "bytetap.exe завершился, код $($p.ExitCode)"
+            $failed = $true
+          } else {
+            try {
+              $p.Refresh()
+              $hwnd = $p.MainWindowHandle
+              [void][FrameWin]::SetForegroundWindow($hwnd)
+              Start-Sleep -Milliseconds 700
+              $rect = New-Object FrameWin+RECT
+              # DWMWA_EXTENDED_FRAME_BOUNDS = 9: границы окна без невидимой тени.
+              [void][FrameWin]::DwmGetWindowAttribute($hwnd, 9, [ref]$rect, [System.Runtime.InteropServices.Marshal]::SizeOf($rect))
+              $w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
+              Write-Host "окно ${w}x${h}"
+              # Белый фон под окном: без него рамку 1 px не видно.
+              $bmp = New-Object System.Drawing.Bitmap $w, $h
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.Clear([System.Drawing.Color]::White)
+              $brush = [FrameWin]::CreateSolidBrush(0x00FFFFFF)
+              $hdc = [FrameWin]::GetDC([IntPtr]::Zero)
+              [void][FrameWin]::FillRect($hdc, [ref]$rect, $brush)
+              [void][FrameWin]::ReleaseDC([IntPtr]::Zero, $hdc)
+              $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
+              $bmp.Save((Join-Path $out 'window-frame-white.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+              $g.Dispose(); $bmp.Dispose()
+            } catch { Write-Host "снимок окна на белом фоне: $_"; $failed = $true }
+            Stop-Process -Id $p.Id -Force
+          }
+          if (Test-Path $log) {
+            Copy-Item $log (Join-Path $out 'bytetap-frame.log')
+            Get-Content -Encoding utf8 $log
+          } else { Write-Host "журнала $log нет"; $failed = $true }
+          # Журнал запуска пишет результат вызовов DWM: рамка, скругление и тень.
+          if (-not (Select-String -Path $log -Pattern 'рамка окна' -Quiet -Encoding utf8)) {
+            Write-Host 'в журнале запуска нет записей о рамке окна'
+            $failed = $true
+          }
+          if ($failed) { exit 1 }
+
       - name: Смоук — запись HL7 и закрытие окна
         shell: pwsh
         run: |

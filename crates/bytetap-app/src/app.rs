@@ -116,6 +116,8 @@ pub struct BytetapApp {
     /// Запомненное положение окна (физические пиксели) и разворот: ставятся в первом
     /// кадре, когда известен масштаб монитора окна.
     restore: Option<(Option<[i32; 2]>, bool)>,
+    /// Окно приложения: нужно, чтобы поменять цвет рамки DWM при смене темы.
+    window_handle: Option<eframe::wgpu::rwh::RawWindowHandle>,
 }
 
 impl BytetapApp {
@@ -180,6 +182,7 @@ impl BytetapApp {
             now: None,
             dirty: false,
             restore: None,
+            window_handle: None,
         };
         app.preselect_last_card();
         app.interfaces = Loaded::Loading(Task::spawn(ctx, background::list_interfaces));
@@ -732,6 +735,10 @@ impl BytetapApp {
         if self.dark != dark {
             self.dark = dark;
             theme::apply(ctx, dark);
+            // Рамку окна рисует DWM: её цвет — тот же токен `--bt-border`, что и своя.
+            if let Some(handle) = self.window_handle {
+                crate::window::set_dwm_border(handle, self.pal().border);
+            }
         }
     }
 
@@ -783,6 +790,21 @@ impl BytetapApp {
         if maximized {
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         }
+    }
+
+    /// Рамка окна: скругление углов и цвет рамки средствами DWM (Windows 11).
+    ///
+    /// Вызывается один раз, в первом кадре: к этому моменту тема известна и цвет
+    /// рамки совпадает с токеном `--bt-border`. Вне Windows и в тестах вызов ничего
+    /// не делает — там рамку рисует приложение.
+    fn setup_window_frame(&mut self, frame: &eframe::Frame) {
+        use eframe::wgpu::rwh::HasWindowHandle as _;
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+        let raw = handle.as_raw();
+        self.window_handle = Some(raw);
+        crate::window::setup_dwm(raw, self.pal().border);
     }
 
     /// Размер и положение «обычного» окна: их окно получит при запуске. Развёрнутое
@@ -863,6 +885,9 @@ impl BytetapApp {
         }
         self.profile_prompt(&ctx);
         self.note_prompt(&ctx);
+        // Рамка окна — последней, поверх всего: иначе панели ленты перекрывали бы её.
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        crate::window::draw_frame(ui, &p, maximized);
     }
 
     /// Строка под шапкой о сброшенных настройках, как в Tauri-версии.
@@ -1001,6 +1026,8 @@ impl eframe::App for BytetapApp {
             self.track_window(&ctx, crate::placement::arranged(frame));
         } else {
             self.restore_window(&ctx);
+            // Рамка окна: скругление и цвет рамки средствами DWM (Windows 11).
+            self.setup_window_frame(frame);
         }
         self.draw(ui);
         if self.dirty && self.screen != Screen::Step(self.settings.config.mode) {
