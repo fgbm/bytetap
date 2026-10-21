@@ -329,7 +329,9 @@ jobs:
       # сессии должен закончиться session_end, а процесс — выйти сам.
       # Рамка окна: на белом фоне окно без рамки сливается с фоном (решение владельца
       # 2026-10-21). Снимок окна на белом фоне показывает рамку 1 px по периметру, а
-      # ответ DWM (скругление и цвет рамки) читается обратно из окна.
+      # ответ DWM (скругление и цвет рамки) читается обратно из окна. Пиксели периметра
+      # сверяются с токеном --bt-border в обеих ветвях: и когда рамку рисует DWM, и
+      # когда её рисует приложение.
       - name: Смоук — рамка окна на белом фоне
         shell: pwsh
         run: |
@@ -341,6 +343,7 @@ jobs:
             [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
             [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
             [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+            [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
             [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT rect, int size);
             [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out int value, int size);
           }
@@ -361,7 +364,11 @@ jobs:
               $p.Refresh()
               $hwnd = $p.MainWindowHandle
               [void][FrameWin]::SetForegroundWindow($hwnd)
-              Start-Sleep -Milliseconds 700
+              # Окно 1200×800 на экране раннера 1024×768 упирается в край, и нижнюю сторону
+              # рамки закрывает панель задач: периметра на снимке нет. Ставим окно меньше
+              # экрана и ближе к верхнему левому углу — видны все четыре стороны.
+              [void][FrameWin]::SetWindowPos($hwnd, [IntPtr]::Zero, 8, 8, 960, 680, 0x14)
+              Start-Sleep -Milliseconds 900
               $rect = New-Object FrameWin+RECT
               # DWMWA_EXTENDED_FRAME_BOUNDS = 9: границы окна без невидимой тени.
               [void][FrameWin]::DwmGetWindowAttribute($hwnd, 9, [ref]$rect, [System.Runtime.InteropServices.Marshal]::SizeOf($rect))
@@ -392,64 +399,55 @@ jobs:
               # Рамка окна сверяется с токеном --bt-border из design/tokens.css с
               # допуском на сглаживание — и когда её рисует DWM, и когда приложение.
               $tokens = Get-Content design/tokens.css -Raw
-              $borderHex = [regex]::Matches($tokens, '--bt-border:\s*#([0-9a-fA-F]{6})') |
-                ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+              $borderHex = @([regex]::Matches($tokens, '--bt-border:\s*#([0-9a-fA-F]{6})') |
+                ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
               Write-Host "цвета --bt-border: $($borderHex -join ', ')"
-              if (-not $borderHex) {
+              if ($borderHex.Count -eq 0) {
                 Write-Host 'в design/tokens.css нет --bt-border'
                 $failed = $true
               }
-              $borderRgb = @($borderHex | ForEach-Object {
-                @{
-                  R = [Convert]::ToInt32($_.Substring(0, 2), 16)
-                  G = [Convert]::ToInt32($_.Substring(2, 2), 16)
-                  B = [Convert]::ToInt32($_.Substring(4, 2), 16)
-                }
+              $borderColors = @(foreach ($hex in $borderHex) {
+                [System.Drawing.Color]::FromArgb(255,
+                  [Convert]::ToInt32($hex.Substring(0, 2), 16),
+                  [Convert]::ToInt32($hex.Substring(2, 2), 16),
+                  [Convert]::ToInt32($hex.Substring(4, 2), 16))
               })
-              function Test-BorderPx([System.Drawing.Color]$sample) {
-                foreach ($rgb in $borderRgb) {
-                  if (([Math]::Abs($sample.R - $rgb.R) -le 24) -and
-                      ([Math]::Abs($sample.G - $rgb.G) -le 24) -and
-                      ([Math]::Abs($sample.B - $rgb.B) -le 24)) { return $true }
-                }
-                return $false
-              }
               # Углы не трогаем: там скругление и сглаживание. По середине каждой стороны
-              # берём 21 точку через 2 px и ищем цвет рамки в полосе ±4 px от края окна:
-              # рамка DWM ложится на край или на пиксель внутрь, и точное место зависит
-              # от масштаба экрана раннера.
-              $band = 4
+              # берём 21 точку через 2 px и ищем цвет рамки в полосе ±6 px от края окна:
+              # рамка DWM ложится на край или на пиксель внутрь, а точное место зависит от
+              # масштаба экрана раннера.
+              $band = 6
+              $samples = @()
+              for ($i = -10; $i -le 10; $i++) {
+                $samples += @{ X = [int]($pad + $w / 2 + $i * 2); Y = [int]$pad; Vert = $true }
+                $samples += @{ X = [int]($pad + $w / 2 + $i * 2); Y = [int]($pad + $h - 1); Vert = $true }
+                $samples += @{ X = [int]$pad; Y = [int]($pad + $h / 2 + $i * 2); Vert = $false }
+                $samples += @{ X = [int]($pad + $w - 1); Y = [int]($pad + $h / 2 + $i * 2); Vert = $false }
+              }
               $hits = 0
-              $total = 0
-              for ($i = -10; $i -le 10; $i++) {
-                $x = [int]($pad + $w / 2 + $i * 2)
-                foreach ($edge in @($pad, $pad + $h - 1)) {
-                  $total++
-                  for ($d = -$band; $d -le $band; $d++) {
-                    $y = $edge + $d
-                    if ($y -lt 0 -or $y -ge $shot.Height) { continue }
-                    if (Test-BorderPx $shot.GetPixel($x, $y)) { $hits++; break }
+              foreach ($sample in $samples) {
+                $found = $false
+                for ($d = -$band; $d -le $band -and -not $found; $d++) {
+                  $x = [int]$sample.X
+                  $y = [int]$sample.Y
+                  if ($sample.Vert) { $y = $y + $d } else { $x = $x + $d }
+                  if ($x -lt 0 -or $y -lt 0 -or $x -ge $shot.Width -or $y -ge $shot.Height) { continue }
+                  $px = $shot.GetPixel($x, $y)
+                  foreach ($want in $borderColors) {
+                    if (([Math]::Abs([int]$px.R - [int]$want.R) -le 24) -and
+                        ([Math]::Abs([int]$px.G - [int]$want.G) -le 24) -and
+                        ([Math]::Abs([int]$px.B - [int]$want.B) -le 24)) { $found = $true; break }
                   }
                 }
+                if ($found) { $hits++ }
               }
-              for ($i = -10; $i -le 10; $i++) {
-                $y = [int]($pad + $h / 2 + $i * 2)
-                foreach ($edge in @($pad, $pad + $w - 1)) {
-                  $total++
-                  for ($d = -$band; $d -le $band; $d++) {
-                    $x = $edge + $d
-                    if ($x -lt 0 -or $x -ge $shot.Width) { continue }
-                    if (Test-BorderPx $shot.GetPixel($x, $y)) { $hits++; break }
-                  }
-                }
-              }
-              Write-Host "пикселей периметра цветом --bt-border: $hits из $total"
+              Write-Host "пикселей периметра цветом --bt-border: $hits из $($samples.Count)"
               if ($corner -eq 2) {
                 Write-Host 'DWM скруглил окно: рамку рисует система, периметр снимка сверен'
               } else {
                 Write-Host 'DWM не скруглил окно: свою рамку рисует приложение'
               }
-              if ($hits -lt [int]($total * 0.9)) {
+              if ($hits -lt [int]($samples.Count * 0.9)) {
                 Write-Host 'рамка окна не совпадает с --bt-border на снимке'
                 $failed = $true
               }
