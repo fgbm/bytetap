@@ -13,7 +13,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use bytetap_app::background::Interface;
-use bytetap_app::live::{FRAME, FRAME_QUIET};
+use bytetap_app::live::{FRAME, FRAME_SLOWEST};
 use bytetap_app::settings::{SessionMode, Settings};
 use bytetap_app::{BytetapApp, Fixtures, Screen};
 use egui_kittest::{Harness, kittest::Queryable as _};
@@ -124,7 +124,7 @@ fn a_quiet_recording_asks_for_one_frame_per_second() {
         "запись идёт: кадр просится по таймеру, а не по событию"
     );
     assert!(
-        slow.iter().all(|delay| *delay >= FRAME_QUIET),
+        slow.iter().all(|delay| *delay >= FRAME_SLOWEST),
         "без новых событий кадр не чаще раза в секунду: {slow:?}"
     );
 }

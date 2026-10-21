@@ -37,12 +37,12 @@ pub const FRAME: Duration = Duration::from_millis(33);
 /// драйвера GPU не вытянет, а ленте чаще и не нужно — она догоняет буфером.
 pub const FRAME_SOFTWARE: Duration = Duration::from_millis(100);
 
-/// Предел ожидания между кадрами записи: реже двух кадров в секунду лента не идёт.
-pub const FRAME_CRAWL: Duration = Duration::from_millis(400);
-
-/// Запись идёт, новых событий нет: кадр раз в секунду — по нему идут таймер и пульс
-/// «Стоп», а трасса и лента остаются прежними.
-pub const FRAME_QUIET: Duration = Duration::from_secs(1);
+/// Самый редкий кадр записи: раз в секунду.
+///
+/// Столько же окно ждёт кадр без новых событий — тогда по нему идут только таймер и
+/// пульс «Стоп», а трасса и лента остаются прежними. Реже лента перестаёт догонять на
+/// глаз, хотя данные и не теряются: их держит буфер.
+pub const FRAME_SLOWEST: Duration = Duration::from_secs(1);
 
 /// Период кадров записи: потолок по адаптеру и по цене прошлых кадров.
 ///
@@ -52,7 +52,7 @@ pub const FRAME_QUIET: Duration = Duration::from_secs(1);
 #[must_use]
 pub fn next_period(software: bool, cost: Duration) -> Duration {
     let floor = if software { FRAME_SOFTWARE } else { FRAME };
-    cost.saturating_mul(2).clamp(floor, FRAME_CRAWL)
+    cost.saturating_mul(2).clamp(floor, FRAME_SLOWEST)
 }
 
 /// Цена кадра по промежутку между кадрами: пока окно ждёт по таймеру, кадр стоит
@@ -467,8 +467,8 @@ mod tests {
             next_period(true, Duration::from_millis(160)),
             Duration::from_millis(320)
         );
-        // Медленнее предела — ждать не дольше 400 мс: лента должна идти.
-        assert_eq!(next_period(true, Duration::from_secs(1)), FRAME_CRAWL);
+        // Медленнее предела — ждать не дольше секунды: лента должна идти.
+        assert_eq!(next_period(true, Duration::from_secs(1)), FRAME_SLOWEST);
         // Цена кадра — промежуток минус ожидание, а в нехватке времени — весь промежуток.
         assert_eq!(
             frame_cost(Duration::from_millis(193), FRAME),
@@ -479,8 +479,8 @@ mod tests {
             frame_cost(Duration::from_millis(20), FRAME),
             Duration::from_millis(20)
         );
-        // Кадр без новых событий — раз в секунду, реже любого периода записи.
-        assert!(FRAME_QUIET > FRAME_CRAWL);
+        // Кадр без новых событий — тот же предел: раз в секунду.
+        assert_eq!(next_period(true, Duration::from_secs(10)), FRAME_SLOWEST);
         // Приёмник будит окно тем же периодом, который поставило окно.
         set_repaint_period(FRAME_SOFTWARE);
         assert_eq!(repaint_period(), FRAME_SOFTWARE);

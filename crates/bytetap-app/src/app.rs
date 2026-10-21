@@ -71,6 +71,10 @@ pub const HOOKS_ENV: &str = "BYTETAP_TEST_HOOKS";
 /// Журнал для снимка просмотра: файл, который откроется на экране просмотра.
 pub const JOURNAL_ENV: &str = "BYTETAP_TEST_JOURNAL";
 
+/// Промежуток между кадрами, который ещё считается кадром, а не паузой: свёрнутое или
+/// перекрытое окно не рисует, и ждать от него цену кадра нечего.
+const MAX_GAP: Duration = Duration::from_secs(2);
+
 /// Данные окружения для снимков и тестов вместо фонового опроса системы.
 #[derive(Clone, Debug)]
 pub struct Fixtures {
@@ -1690,7 +1694,11 @@ impl BytetapApp {
                 live::set_repaint_period(period);
                 // Новые строки — по периоду кадра. Без новых событий трассу и ленту
                 // перерисовывать незачем: раз в секунду идут таймер и пульс «Стоп».
-                let delay = if added > 0 { period } else { live::FRAME_QUIET };
+                let delay = if added > 0 {
+                    period
+                } else {
+                    live::FRAME_SLOWEST
+                };
                 self.frame_delay = Some(delay);
                 ctx.request_repaint_after(delay);
             }
@@ -1838,7 +1846,12 @@ impl BytetapApp {
         if self.live.is_none() {
             return;
         }
-        let cost = live::frame_cost(now.saturating_duration_since(last), delay);
+        let spacing = now.saturating_duration_since(last);
+        // Свёрнутое окно кадров не рисует: промежуток в секунды — не цена кадра.
+        if spacing > delay + MAX_GAP {
+            return;
+        }
+        let cost = live::frame_cost(spacing, delay);
         // Вверх — сразу, вниз — медленно: медленный кадр виден по первому же замеру, и
         // окно не тратит секунды, догоняя среднее; быстрый кадр после одного медленного
         // (загрузка шрифтов, первый показ) режим не переключает.
