@@ -104,6 +104,7 @@ export function createTauriBridge(): Bridge {
 
     stopSession: (generation) => call<SessionSummary>("stop_session", { generation }),
     addSessionNote: (text) => call<void>("add_session_note", { text }),
+    frontendReady: () => call<void>("frontend_ready"),
 
     openJournal: (path) => call<JournalSummary>("open_journal", { path }),
     readJournal: (path, from, count) => call<FeedEvent[]>("read_journal", { path, from, count }),

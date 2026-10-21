@@ -715,6 +715,8 @@ export function createMockBridge(scenario: MockScenario = scenarioFromLocation()
       return journals.slice(0, Math.max(0, limit));
     },
 
+    async frontendReady() {},
+
     async sessionStatus() {
       return {
         running: session !== null && !session.failed,

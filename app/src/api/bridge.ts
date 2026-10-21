@@ -57,6 +57,8 @@ export interface Bridge {
   pickJournal(): Promise<string | null>;
   pickLogDir(): Promise<string | null>;
   openLogDir(dir: string): Promise<void>;
+  /** Интерфейс смонтирован: последний этап журнала старта оболочки (NFR-3). */
+  frontendReady(): Promise<void>;
 }
 
 /** Работает ли приложение внутри Tauri (в браузере и тестах — нет). */

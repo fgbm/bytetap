@@ -19,6 +19,9 @@ export default defineConfig({
   },
   clearScreen: false,
   build: {
+    // Самый старый WebView2, который пропускает проверка `MIN_VERSION` в `src-tauri/src/webview2.rs`:
+    // менять вместе. Совпадает с Baseline Widely Available Vite 8.
+    target: ["chrome111", "edge111"],
     // CSP `font-src 'self'` без `data:`: шрифты идут отдельными файлами, не data-URL.
     assetsInlineLimit: (filePath: string) => (filePath.endsWith(".woff") || filePath.endsWith(".woff2") ? false : undefined),
   },

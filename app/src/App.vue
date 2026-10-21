@@ -293,6 +293,8 @@ async function restoreSession(): Promise<void> {
 }
 
 onMounted(() => {
+  // Журнал старта оболочки отмечает, что скрипты интерфейса запустились; сбой не важен.
+  void bridge.frontendReady().catch(() => undefined);
   void loadEnvironment().finally(() => void restoreSession());
 });
 

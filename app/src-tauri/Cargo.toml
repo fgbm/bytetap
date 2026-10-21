@@ -18,7 +18,9 @@ tauri-build = { version = "2.7", features = [] }
 base64.workspace = true
 bytetap-core.workspace = true
 chrono.workspace = true
+dirs.workspace = true
 if-addrs = "0.15.0"
+os_info.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2.12", features = [] }

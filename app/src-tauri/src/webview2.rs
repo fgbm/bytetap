@@ -1,17 +1,26 @@
 //! Проверка WebView2 до создания окна (NFR-3, M2-AC14).
 //!
 //! Без рантайма WebView2 окно не создаётся, и приложение падает необъяснимо. Поэтому на
-//! Windows до `tauri::Builder` проверяется запись установщика Edge Update, а если её нет —
-//! показывается системное окно с текстом из макета и выход с кодом 1.
+//! Windows до `tauri::Builder` проверяется запись установщика Edge Update: если рантайма
+//! нет или он старее [`MIN_VERSION`], показывается системное окно и выход с кодом 1.
 //!
 //! Проверка идёт по реестру, а не через `GetAvailableCoreWebView2BrowserVersionString`:
 //! та функция тянет за собой `WebView2Loader.dll` (ещё одна нативная зависимость в сборке
 //! и рядом с exe), а реестр читается тем же `windows-sys`, который уже есть у ядра на
 //! Windows. Ключи и значение `pv` — те же, по которым ищет рантайм сам установщик.
 
-/// Заголовок системного окна.
-#[cfg(windows)]
-pub const TITLE: &str = "bytetap";
+#[cfg(any(windows, test))]
+/// Версия WebView2: четыре числа `major.minor.build.patch`.
+pub type Version = [u32; 4];
+
+#[cfg(any(windows, test))]
+/// Самый старый WebView2, на котором работает bytetap.
+///
+/// wry 0.57 сам по себе создаёт окно на рантайме от 86 (`ICoreWebView2Controller2`), но
+/// интерфейс собирается Vite под `chrome111`/`edge111` (`build.target` в
+/// `app/vite.config.ts`): на более старом Chromium скрипты и стили интерфейса не работают.
+/// Поэтому граница — 111, и менять её нужно вместе с целью сборки.
+pub const MIN_VERSION: Version = [111, 0, 0, 0];
 
 /// Текст системного окна из макета (M2-AC14).
 #[cfg(any(windows, test))]
@@ -19,31 +28,102 @@ pub const MISSING_MESSAGE: &str = "Для работы bytetap нужен ком
 
 Установите WebView2 Runtime (автономный установщик можно принести на флешке) или используйте bytetap-cli.";
 
-/// `true`, если в списке версий есть установленный рантайм.
+#[cfg(any(windows, test))]
+/// Что нашлось в реестре.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runtime {
+    /// Рантайма нет: ключей нет, версия пустая или `0.0.0.0`.
+    Missing,
+    /// Рантайм есть, но старее [`MIN_VERSION`].
+    Outdated(Version),
+    /// Рантайм подходит.
+    Ok(Version),
+}
+
+#[cfg(any(windows, test))]
+/// Разбирает `pv`: от одного до четырёх чисел через точку, недостающие — нули.
+#[must_use]
+pub fn parse_version(text: &str) -> Option<Version> {
+    let mut version = [0; 4];
+    let mut parts = text.trim().split('.');
+    for slot in &mut version {
+        match parts.next() {
+            Some(part) => *slot = part.parse().ok()?,
+            None => break,
+        }
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(version)
+}
+
+#[cfg(any(windows, test))]
+/// `major.minor.build.patch` для текста сообщений и журнала.
+#[must_use]
+pub fn format_version(version: Version) -> String {
+    version.map(|part| part.to_string()).join(".")
+}
+
+#[cfg(any(windows, test))]
+/// Самая новая установленная версия из найденных `pv` против [`MIN_VERSION`].
 ///
 /// Установщик пишет в `pv` версию, а отсутствие рантайма — `0.0.0.0` или пустую строку.
 /// Поэтому проверяется именно версия, а не наличие ключа: ключ с `0.0.0.0` встречается
 /// после удаления рантайма.
-#[cfg(any(windows, test))]
 #[must_use]
-pub fn runtime_present<'a>(versions: impl IntoIterator<Item = &'a str>) -> bool {
-    versions.into_iter().any(|version| {
-        let version = version.trim();
-        !version.is_empty() && version != "0.0.0.0"
-    })
+pub fn check<'a>(versions: impl IntoIterator<Item = &'a str>) -> Runtime {
+    let newest = versions
+        .into_iter()
+        .filter_map(parse_version)
+        .filter(|version| *version != [0; 4])
+        .max();
+    match newest {
+        None => Runtime::Missing,
+        Some(version) if version < MIN_VERSION => Runtime::Outdated(version),
+        Some(version) => Runtime::Ok(version),
+    }
+}
+
+#[cfg(any(windows, test))]
+/// Текст системного окна об устаревшем рантайме.
+#[must_use]
+pub fn outdated_message(found: Version) -> String {
+    format!(
+        "Компонент WebView2 устарел (версия {}, нужна {} или новее).
+
+Обновите Microsoft Edge WebView2 Runtime: автономный установщик Evergreen Standalone (x64) можно принести на флешке. Без WebView2 работает bytetap-cli.",
+        format_version(found),
+        format_version(MIN_VERSION)
+    )
 }
 
 /// Проверяет рантайм и завершает программу, если его нет. На других ОС ничего не делает.
 #[cfg(not(windows))]
-pub fn ensure_or_exit() {}
+pub fn ensure_or_exit() {
+    crate::diag::info("WebView2: проверка нужна только на Windows");
+}
 
 #[cfg(windows)]
 pub fn ensure_or_exit() {
+    use crate::diag;
+
     let versions = read_versions();
-    if runtime_present(versions.iter().map(String::as_str)) {
-        return;
+    diag::info(format!("WebView2: pv в реестре {versions:?}"));
+    match check(versions.iter().map(String::as_str)) {
+        Runtime::Ok(version) => diag::info(format!(
+            "WebView2 {} (нужна {} или новее)",
+            format_version(version),
+            format_version(MIN_VERSION)
+        )),
+        Runtime::Outdated(version) => diag::fatal(&outdated_message(version)),
+        Runtime::Missing => {
+            // Текст из макета без приписки о журнале: причина и так ясна (M2-AC14).
+            diag::error("WebView2 не найден");
+            diag::show_error(MISSING_MESSAGE);
+            std::process::exit(1);
+        }
     }
-    show_missing_and_exit();
 }
 
 /// Ключи, куда установщик Edge Update пишет версию WebView2 Runtime.
@@ -107,42 +187,91 @@ fn read_pv(root: &str, key: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&buffer[..chars.min(buffer.len())]))
 }
 
-/// Системное окно с текстом из макета и выход с кодом 1.
-#[cfg(windows)]
-fn show_missing_and_exit() -> ! {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
-
-    let text: Vec<u16> = MISSING_MESSAGE.encode_utf16().chain([0]).collect();
-    let title: Vec<u16> = TITLE.encode_utf16().chain([0]).collect();
-    // SAFETY: строки с завершающим NUL живут до конца вызова, других требований у функции нет.
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONERROR,
-        );
-    }
-    std::process::exit(1);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn a_real_version_means_the_runtime_is_there() {
-        assert!(runtime_present(["120.0.2210.144"]));
-        assert!(runtime_present(["", "120.0.2210.144"]));
+        assert_eq!(check(["120.0.2210.144"]), Runtime::Ok([120, 0, 2210, 144]));
+        assert_eq!(
+            check(["", "120.0.2210.144"]),
+            Runtime::Ok([120, 0, 2210, 144])
+        );
     }
 
     #[test]
     fn a_missing_or_removed_runtime_is_detected() {
-        assert!(!runtime_present(std::iter::empty::<&str>()));
-        assert!(!runtime_present([""]));
-        assert!(!runtime_present(["  "]));
-        assert!(!runtime_present(["0.0.0.0"]));
-        assert!(!runtime_present(["0.0.0.0", ""]));
+        assert_eq!(check(std::iter::empty::<&str>()), Runtime::Missing);
+        assert_eq!(check([""]), Runtime::Missing);
+        assert_eq!(check(["  "]), Runtime::Missing);
+        assert_eq!(check(["0.0.0.0"]), Runtime::Missing);
+        assert_eq!(check(["0.0.0.0", ""]), Runtime::Missing);
+        assert_eq!(check(["мусор"]), Runtime::Missing);
+    }
+
+    #[test]
+    fn an_old_runtime_is_outdated() {
+        // Windows 11 21H2 из коробки: WebView2 94, если Edge Update не обновлял его.
+        assert_eq!(check(["94.0.992.31"]), Runtime::Outdated([94, 0, 992, 31]));
+        assert_eq!(
+            check(["110.0.1587.69"]),
+            Runtime::Outdated([110, 0, 1587, 69])
+        );
+        assert_eq!(check(["111.0.1661.41"]), Runtime::Ok([111, 0, 1661, 41]));
+    }
+
+    #[test]
+    fn the_newest_of_several_keys_wins() {
+        // Устаревший пользовательский рантайм не мешает свежему системному.
+        assert_eq!(
+            check(["94.0.992.31", "141.0.3537.71"]),
+            Runtime::Ok([141, 0, 3537, 71])
+        );
+        assert_eq!(
+            check(["0.0.0.0", "94.0.992.31"]),
+            Runtime::Outdated([94, 0, 992, 31])
+        );
+    }
+
+    #[test]
+    fn versions_compare_by_number_not_by_text() {
+        assert!(parse_version("111.0.0.0") > parse_version("94.0.992.31"));
+        assert!(parse_version("120.0.10.0") > parse_version("120.0.9.99"));
+    }
+
+    #[test]
+    fn a_version_is_parsed_strictly() {
+        assert_eq!(parse_version(" 94.0.992.31 "), Some([94, 0, 992, 31]));
+        assert_eq!(parse_version("111"), Some([111, 0, 0, 0]));
+        assert_eq!(parse_version("1.2.3.4.5"), None);
+        assert_eq!(parse_version("94.0.x.31"), None);
+        assert_eq!(parse_version("94..992.31"), None);
+        assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn the_outdated_message_names_both_versions() {
+        let text = outdated_message([94, 0, 992, 31]);
+        assert!(text.starts_with(
+            "Компонент WebView2 устарел (версия 94.0.992.31, нужна 111.0.0.0 или новее)."
+        ));
+        assert!(text.contains("Evergreen Standalone"));
+        assert!(text.contains("bytetap-cli"));
+    }
+
+    #[test]
+    fn the_minimum_follows_the_frontend_build_target() {
+        let vite = include_str!("../../vite.config.ts");
+        let major = MIN_VERSION[0];
+        assert!(
+            vite.contains(&format!("\"chrome{major}\"")),
+            "build.target в vite.config.ts"
+        );
+        assert!(
+            vite.contains(&format!("\"edge{major}\"")),
+            "build.target в vite.config.ts"
+        );
     }
 
     #[test]
