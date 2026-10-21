@@ -559,12 +559,14 @@ impl BytetapApp {
     }
 
     /// Тело экрана записи под шапкой: трасса, панель ленты, лента.
-    pub(crate) fn recording_screen(&mut self, ui: &mut Ui) {
+    /// Экран записи: шапка, трасса, панель и лента. Возвращает, сколько событий пришло
+    /// в ленту за этот кадр: без новых окно не просит следующий кадр так часто.
+    pub(crate) fn recording_screen(&mut self, ui: &mut Ui) -> u64 {
         let p = self.pal();
         let hex = self.settings.feed.view == FeedView::Hex;
         let encoding = self.settings.feed.encoding;
         let Some(rec) = &mut self.rec else {
-            return;
+            return 0;
         };
         let added = rec.sync(hex);
         let now_us = u64::try_from(rec.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -579,6 +581,7 @@ impl BytetapApp {
             feed.encoding = chosen_encoding;
             self.save_settings();
         }
+        added
     }
 
     /// Комментарий во время записи и в просмотре журнала (FR-23): Ctrl+Enter или
@@ -698,12 +701,9 @@ impl BytetapApp {
             match target {
                 Some(NoteTarget::Journal(path)) => {
                     // Файл и сводка — в фоне; диалог закроется, когда комментарий ляжет.
-                    if let Some(note) = &mut self.note {
-                        note.text.clone_from(&text);
-                        note.sending = true;
-                        note.error = None;
-                    }
-                    self.append_journal_note(ctx, path, &text);
+                    // Ответ придёт с номером этой отправки: диалог, открытый заново,
+                    // он не тронет.
+                    self.send_journal_note(ctx, path, &text);
                 }
                 Some(NoteTarget::Session) => {
                     self.add_note(&text);

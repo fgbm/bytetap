@@ -12,6 +12,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -29,6 +30,56 @@ use crate::feed::{FeedEvent, FeedRing};
 
 /// Не чаще одной перерисовки на столько: ~30 кадров в секунду во время записи.
 pub const FRAME: Duration = Duration::from_millis(33);
+
+/// Потолок кадров на программном растре (WARP): 10 кадров в секунду.
+///
+/// Кадр 1200×800 на WARP стоит ~160 мс и несколько ядер: 30 кадров в секунду ноутбук без
+/// драйвера GPU не вытянет, а ленте чаще и не нужно — она догоняет буфером.
+pub const FRAME_SOFTWARE: Duration = Duration::from_millis(100);
+
+/// Предел ожидания между кадрами записи: реже двух кадров в секунду лента не идёт.
+pub const FRAME_CRAWL: Duration = Duration::from_millis(400);
+
+/// Запись идёт, новых событий нет: кадр раз в секунду — по нему идут таймер и пульс
+/// «Стоп», а трасса и лента остаются прежними.
+pub const FRAME_QUIET: Duration = Duration::from_secs(1);
+
+/// Период кадров записи: потолок по адаптеру и по цене прошлых кадров.
+///
+/// `cost` — скользящее среднее цены кадра (см. [`frame_cost`]). Кадр стоит столько,
+/// сколько он рисуется, поэтому ждать между кадрами надо не меньше, чем он рисуется:
+/// два бюджета кадра на кадр не дают окну занять все ядра, а лента всё равно догоняет.
+#[must_use]
+pub fn next_period(software: bool, cost: Duration) -> Duration {
+    let floor = if software { FRAME_SOFTWARE } else { FRAME };
+    cost.saturating_mul(2).clamp(floor, FRAME_CRAWL)
+}
+
+/// Цена кадра по промежутку между кадрами: пока окно ждёт по таймеру, кадр стоит
+/// `spacing − delay`, а когда не успевает за своим периодом — весь промежуток.
+#[must_use]
+pub fn frame_cost(spacing: Duration, delay: Duration) -> Duration {
+    if spacing >= delay {
+        spacing - delay
+    } else {
+        spacing
+    }
+}
+
+/// Период, которым приёмник будит окно: его ставит окно из [`frame_period`].
+static FRAME_PERIOD_US: AtomicU64 = AtomicU64::new(FRAME.as_micros() as u64);
+
+/// Период перерисовки для приёмника ленты: пока окно не сказало иначе — [`FRAME`].
+#[must_use]
+pub fn repaint_period() -> Duration {
+    Duration::from_micros(FRAME_PERIOD_US.load(Ordering::Relaxed))
+}
+
+/// Задать период перерисовки: окно зовёт это каждый кадр записи.
+pub fn set_repaint_period(period: Duration) {
+    let micros = u64::try_from(period.as_micros()).unwrap_or(u64::MAX);
+    FRAME_PERIOD_US.store(micros, Ordering::Relaxed);
+}
 
 /// Предел ожидания остановки при закрытии окна (NFR-5): у писателя журнала свой
 /// предел в 10 с, 15 с — запас на очередь и медленную машину.
@@ -258,7 +309,9 @@ pub async fn pump(
                 ring.push(event);
             }
             drop(ring);
-            ctx.request_repaint_after(FRAME);
+            // Окно само решает, как часто просить кадр: на WARP это 10 кадров в секунду,
+            // на медленном кадре — реже (`frame_period`).
+            ctx.request_repaint_after(repaint_period());
         }
         if closed {
             ctx.request_repaint();
@@ -401,6 +454,39 @@ mod tests {
 
     use super::*;
     use bytetap_core::transport::serial::SerialFormat;
+
+    /// Период кадра записи: аппаратный растр держит 30 кадров в секунду, WARP — 10,
+    /// а медленный кадр задаёт своё ожидание.
+    #[test]
+    fn the_frame_period_follows_the_cost_of_a_frame() {
+        // Быстрый кадр: на аппаратном растре 30 кадров в секунду, на WARP — 10.
+        assert_eq!(next_period(false, Duration::from_millis(4)), FRAME);
+        assert_eq!(next_period(true, Duration::from_millis(4)), FRAME_SOFTWARE);
+        // Кадр 160 мс на WARP: ждать вдвое дольше, чем он рисуется.
+        assert_eq!(
+            next_period(true, Duration::from_millis(160)),
+            Duration::from_millis(320)
+        );
+        // Медленнее предела — ждать не дольше 400 мс: лента должна идти.
+        assert_eq!(next_period(true, Duration::from_secs(1)), FRAME_CRAWL);
+        // Цена кадра — промежуток минус ожидание, а в нехватке времени — весь промежуток.
+        assert_eq!(
+            frame_cost(Duration::from_millis(193), FRAME),
+            Duration::from_millis(160)
+        );
+        // Не успевает за своим периодом — промежуток и есть цена кадра.
+        assert_eq!(
+            frame_cost(Duration::from_millis(20), FRAME),
+            Duration::from_millis(20)
+        );
+        // Кадр без новых событий — раз в секунду, реже любого периода записи.
+        assert!(FRAME_QUIET > FRAME_CRAWL);
+        // Приёмник будит окно тем же периодом, который поставило окно.
+        set_repaint_period(FRAME_SOFTWARE);
+        assert_eq!(repaint_period(), FRAME_SOFTWARE);
+        set_repaint_period(FRAME);
+        assert_eq!(repaint_period(), FRAME);
+    }
 
     #[test]
     fn the_phase_follows_the_session() {

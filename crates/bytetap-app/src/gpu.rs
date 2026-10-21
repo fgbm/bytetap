@@ -9,6 +9,7 @@
 //! ([`retry_with_warp`]).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
 use eframe::wgpu;
@@ -31,6 +32,18 @@ pub const RETRY_ENV: &str = "BYTETAP_WARP_RETRY";
 #[must_use]
 pub fn retry_with_warp(wgpu_failed: bool, adapter_set: bool, retried: bool) -> bool {
     wgpu_failed && !adapter_set && !retried
+}
+
+/// Выбранный адаптер рисует кадр на процессоре (`Microsoft Basic Render Driver`).
+///
+/// Такой кадр стоит сотни миллисекунд на 1200×800, поэтому окно во время записи просит
+/// его реже (`live::frame_period`). Флаг ставится при выборе адаптера, до первого кадра.
+static SOFTWARE: AtomicBool = AtomicBool::new(false);
+
+/// Кадры рисует программный растр: WARP или адаптер без GPU.
+#[must_use]
+pub fn software() -> bool {
+    SOFTWARE.load(Ordering::Relaxed)
 }
 
 /// Бэкенды wgpu: DX12 на Windows, на остальных ОС — как у egui по умолчанию.
@@ -80,7 +93,9 @@ pub fn configuration() -> WgpuConfiguration {
                 count = candidates.len()
             )
         })?;
-        diag::info(format!("выбран адаптер wgpu: {}", candidates[index].name));
+        let chosen = &candidates[index];
+        SOFTWARE.store(chosen.software(), Ordering::Relaxed);
+        diag::info(format!("выбран адаптер wgpu: {}", chosen.name));
         Ok(adapters[index].clone())
     }));
     WgpuConfiguration {
@@ -96,6 +111,14 @@ pub struct Candidate {
     pub device_type: wgpu::DeviceType,
     /// Адаптер умеет выводить в поверхность окна.
     pub compatible: bool,
+}
+
+impl Candidate {
+    /// Программный растр: WARP или адаптер без GPU — кадр рисует процессор.
+    #[must_use]
+    pub fn software(&self) -> bool {
+        self.device_type == wgpu::DeviceType::Cpu || self.name.to_lowercase().contains(WARP_ADAPTER)
+    }
 }
 
 /// Номер адаптера: из тех, что рисуют в окно, — по части имени из `wanted`, иначе
@@ -172,6 +195,18 @@ mod tests {
     #[test]
     fn the_warp_selector_picks_warp() {
         assert_eq!(select(&machine(), Some(WARP_ADAPTER)), Some(0));
+    }
+
+    /// Программный растр узнаётся и по типу устройства, и по имени WARP.
+    #[test]
+    fn a_software_adapter_is_not_a_gpu() {
+        let warp = candidate("Microsoft Basic Render Driver", DeviceType::Cpu, true);
+        assert!(warp.software());
+        // WARP назван по имени, но тип устройства у него не `Cpu`.
+        let named = candidate("Microsoft Basic Render Driver", DeviceType::Other, true);
+        assert!(named.software());
+        assert!(!machine()[1].software(), "встроенная графика — не WARP");
+        assert!(!machine()[2].software());
     }
 
     #[test]

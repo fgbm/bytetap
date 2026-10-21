@@ -13,7 +13,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use bytetap_app::background::Interface;
-use bytetap_app::live::FRAME;
+use bytetap_app::live::{FRAME, FRAME_QUIET};
 use bytetap_app::settings::{SessionMode, Settings};
 use bytetap_app::{BytetapApp, Fixtures, Screen};
 use egui_kittest::{Harness, kittest::Queryable as _};
@@ -74,6 +74,129 @@ fn an_idle_window_asks_for_no_frames() {
         "в простое запрошено {} кадров: {asked:?}",
         asked.len()
     );
+}
+
+/// Запись идёт, новых событий нет: кадр просится раз в секунду — по таймеру, а трассу и
+/// ленту без новых строк перерисовывать незачем (NFR-5, U1-AC24).
+#[test]
+fn a_quiet_recording_asks_for_one_frame_per_second() {
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("свободный порт");
+        listener.local_addr().expect("адрес").port()
+    };
+    let dir = tempfile::tempdir().expect("временная папка");
+    let log_dir = dir.path().to_string_lossy().into_owned();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let handle = runtime.handle().clone();
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            let mut settings = Settings::with_log_dir(&log_dir);
+            settings.config.mode = SessionMode::TcpServer;
+            settings.config.listen_host = "127.0.0.1".into();
+            settings.config.listen_port = port;
+            BytetapApp::new(&cc.egui_ctx, settings, None, None)
+                .with_fixtures(fixtures())
+                .with_runtime(handle)
+                .with_test_autostart(&cc.egui_ctx, &format!("tcp_server:127.0.0.1:{port}"))
+        });
+    // Никто не подключается: событий в ленте нет, запись ждёт.
+    harness.run_steps(4);
+    assert!(harness.state().recording().is_some(), "запись началась");
+    let mut asked = Vec::new();
+    for _ in 0..8 {
+        harness.step();
+        asked.push(repaint_delay(&harness));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let slow: Vec<Duration> = asked
+        .iter()
+        .copied()
+        .filter(|delay| *delay != Duration::MAX)
+        .collect();
+    assert_eq!(
+        slow.len(),
+        asked.len(),
+        "запись идёт: кадр просится по таймеру, а не по событию"
+    );
+    assert!(
+        slow.iter().all(|delay| *delay >= FRAME_QUIET),
+        "без новых событий кадр не чаще раза в секунду: {slow:?}"
+    );
+}
+
+/// Профиль кадра записи без GPU: сколько стоит раскладка и тесселяция egui.
+///
+/// Запуск руками: `cargo test -p bytetap-app --test performance -- --ignored --nocapture`.
+/// В CI не идёт: время кадра зависит от машины. На 2026-10-22 (1200×800, лента «Текст»)
+/// кадр целиком — 0.13 мс на 8 событиях, 0.22 на 400 и 0.30 на 2000 в release-сборке
+/// (в debug — 0.8…2.0 мс). Отсюда решение не кешировать галлеи строк: на фоне 160 мс
+/// кадра WARP экономить нечего, а цена кадра — растр программного адаптера, а не
+/// раскладка текста.
+#[test]
+#[ignore = "профиль машины, не проверка"]
+fn frame_cost_probe() {
+    use std::time::Instant;
+
+    for rows in [8usize, 400, 2000] {
+        let mut harness = Harness::builder()
+            .with_size(WINDOW)
+            .build_eframe(move |cc| {
+                BytetapApp::new(&cc.egui_ctx, settings(), None, None)
+                    .with_fixtures(fixtures())
+                    .with_recording_fixture(feed_fixture(rows))
+            });
+        harness.run_steps(6);
+        let mut times = Vec::new();
+        for _ in 0..30 {
+            let started = Instant::now();
+            harness.step();
+            times.push(started.elapsed());
+        }
+        times.sort_unstable();
+        let drawn = harness.state().recording().map_or(0, |rec| rec.rows());
+        eprintln!(
+            "{rows} событий, строк {drawn}: медиана кадра {:?}",
+            times[times.len() / 2]
+        );
+    }
+}
+
+/// Запись с `events` фрагментами HL7 для профиля: столько же строк ленты.
+fn feed_fixture(events: usize) -> bytetap_app::recording::RecordingFixture {
+    use bytetap_core::journal::{Data, Dir, Event, Stats};
+
+    let list = (0..events)
+        .map(|index| {
+            let body = format!(
+                "\x0bMSH|^~\\&|ANALYZER|LAB|LIS||20261019232710||ORU^R01|MSG{index:06}|P|2.3.1\rOBX|1|NM|GLU^Glucose||5.4|mmol/L\r\x1c\r"
+            );
+            Event::Data(Data::new(
+                "2026-10-19T23:27:10.046000+03:00",
+                index as u64 * 100_000 + 1,
+                1,
+                Dir::AnalyzerToLis,
+                false,
+                body.as_bytes(),
+            ))
+        })
+        .collect();
+    bytetap_app::recording::RecordingFixture {
+        events: list,
+        stats: Stats {
+            connections: 1,
+            bytes_analyzer_to_lis: 1000,
+            bytes_lis_to_analyzer: 0,
+        },
+        elapsed: Duration::from_secs(10),
+        local_addr: "0.0.0.0:5000".into(),
+        journal_path: None,
+        dropped: 0,
+    }
 }
 
 /// Запись с потоком фрагментов: приложение просит кадр не чаще раза в [`FRAME`],
