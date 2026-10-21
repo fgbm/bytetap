@@ -169,6 +169,12 @@ pub struct NoteDialog {
     pub error: Option<String>,
     /// Запись идёт в фоне: повторное «Дописать» не запускает вторую.
     pub sending: bool,
+    /// Номер отправки, которую ждёт этот диалог; 0 — отправки нет.
+    ///
+    /// Диалог закрывают и открывают заново, пока комментарий ложится в файл: ответ
+    /// прежней отправки не должен ни закрыть новый диалог, ни показать в нём свою
+    /// ошибку. Поэтому ответ сверяется с номером, а не с самим фактом открытого диалога.
+    pub request: u64,
 }
 
 pub struct BytetapApp {
@@ -207,7 +213,12 @@ pub struct BytetapApp {
     /// Пул чтения страниц журнала: 1–2 потока с очередью, а не поток на страницу.
     view_reader: Option<PageReader>,
     /// Дописывание комментария и повторное открытие сводки — в фоне.
-    view_note: Option<Task<Result<NoteWritten, PageError>>>,
+    ///
+    /// Вместе с задачей хранится номер отправки: ответ трогает только тот диалог,
+    /// который эту отправку начал.
+    view_note: Option<(u64, Task<Result<NoteWritten, PageError>>)>,
+    /// Номер последней отправки комментария: выдаётся [`BytetapApp::send_journal_note`].
+    note_request: u64,
     /// Кеш индексов журналов: общий на приложение, индекс переживает просмотр.
     ///
     /// Кеш ядра потокобезопасен сам: внешнего замка нет, поток окна его не держит.
@@ -248,16 +259,20 @@ pub struct BytetapApp {
     window_handle: Option<eframe::wgpu::rwh::RawWindowHandle>,
     /// Рамка DWM применена после первого кадра, когда окно уже видимо.
     frame_applied: bool,
-    /// Восстановленное окно было развёрнуто: рамку DWM надо применить ещё раз.
-    restored_maximized: bool,
-    /// Настройку DWM повторить на следующем кадре: развёрнутое окно приходит из
-    /// `DWMWA_CLOAK`, и часть атрибутов окна сбрасывается.
-    frame_reapply: bool,
     /// Тестовый хук снимков: меню, которое надо открыть на следующем кадре.
     hook_menu: Option<&'static str>,
     /// Кадров нарисовано с начала записи: итог уходит в журнал запуска при остановке
     /// (NFR-5: сколько кадров стоила сессия).
     frames: u64,
+    /// Скользящее среднее цены кадра записи: по нему окно выбирает период следующего
+    /// (`live::next_period`). Меряется только во время записи: в простое окно спит по
+    /// своему таймеру, и промежуток между кадрами — не цена кадра.
+    frame_cost: Duration,
+    /// Промежуток, который окно попросило в прошлом кадре: без него не отделить
+    /// ожидание по таймеру от работы над кадром.
+    frame_delay: Option<Duration>,
+    /// Когда начался прошлый кадр — по часам, а не по `unstable_dt` egui.
+    frame_started: Option<Instant>,
 }
 
 impl BytetapApp {
@@ -310,6 +325,7 @@ impl BytetapApp {
             view_open: None,
             view_reader: None,
             view_note: None,
+            note_request: 0,
             journal_cache: Arc::new(JournalCache::default()),
             pending: None,
             runtime: None,
@@ -331,10 +347,11 @@ impl BytetapApp {
             restore: None,
             window_handle: None,
             frame_applied: false,
-            restored_maximized: false,
-            frame_reapply: false,
             hook_menu: None,
             frames: 0,
+            frame_cost: Duration::ZERO,
+            frame_delay: None,
+            frame_started: None,
         };
         app.preselect_last_card();
         app.interfaces = Loaded::Loading(Task::spawn(ctx, background::list_interfaces));
@@ -819,6 +836,7 @@ impl BytetapApp {
             text: String::new(),
             error: None,
             sending: false,
+            request: 0,
         });
     }
 
@@ -834,12 +852,44 @@ impl BytetapApp {
 
     /// Дописать комментарий в журнал (FR-23): файл и повторное открытие сводки — в
     /// фоне, поток окна не ждёт ввод-вывод.
-    pub(crate) fn append_journal_note(&mut self, ctx: &egui::Context, path: PathBuf, text: &str) {
+    ///
+    /// Возвращает номер отправки: по нему ответ находит свой диалог.
+    pub(crate) fn append_journal_note(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        text: &str,
+    ) -> u64 {
         let cache = Arc::clone(&self.journal_cache);
         let text = text.to_owned();
-        self.view_note = Some(Task::spawn(ctx, move || {
-            JournalOpen::append_and_reopen(&cache, &path, &text)
-        }));
+        self.note_request += 1;
+        let request = self.note_request;
+        self.view_note = Some((
+            request,
+            Task::spawn(ctx, move || {
+                JournalOpen::append_and_reopen(&cache, &path, &text)
+            }),
+        ));
+        request
+    }
+
+    /// Отправить комментарий из диалога: диалог ждёт ответа своего номера.
+    pub(crate) fn send_journal_note(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        text: &str,
+    ) -> u64 {
+        if let Some(note) = &mut self.note {
+            note.text = text.to_owned();
+            note.sending = true;
+            note.error = None;
+        }
+        let request = self.append_journal_note(ctx, path, text);
+        if let Some(note) = &mut self.note {
+            note.request = request;
+        }
+        request
     }
 
     /// Перечитать журнал после комментария: сводка и лента видят новое событие.
@@ -937,24 +987,32 @@ impl BytetapApp {
                 view.source.path().to_path_buf(),
             ));
         }
-        let Some(reader) = &mut self.view_reader else {
-            return;
-        };
-        for (page, start) in missing {
-            let generation = view.source.request_page(page);
-            let queued = reader.request(PageJob {
-                page,
-                start,
-                count: crate::journal::PAGE_SIZE,
-                generation,
-            });
-            if !queued {
-                // Очередь пула закрыта: ответа не будет, и «…» не должен висеть вечно.
-                diag::error(format!(
-                    "страница журнала {page} не поставлена в очередь: пул чтения закрыт"
-                ));
-                view.source.page_lost(page, generation);
+        let mut dead = false;
+        {
+            let Some(reader) = &mut self.view_reader else {
+                return;
+            };
+            for (page, start) in missing {
+                let generation = view.source.request_page(page);
+                let queued = reader.request(PageJob {
+                    page,
+                    start,
+                    count: crate::journal::PAGE_SIZE,
+                    generation,
+                });
+                if !queued {
+                    // Очередь пула закрыта: ответа не будет, и «…» не должен висеть вечно.
+                    diag::error(format!(
+                        "страница журнала {page} не поставлена в очередь: пул чтения закрыт"
+                    ));
+                    view.source.page_lost(page, generation);
+                    dead = true;
+                }
             }
+        }
+        if dead {
+            // Пул без живых потоков не оживёт: следующий запрос страниц заведёт новый.
+            self.view_reader = None;
         }
     }
 
@@ -983,10 +1041,17 @@ impl BytetapApp {
                 }
             }
         }
-        if let Some(task) = &mut self.view_note
+        if let Some((request, task)) = &mut self.view_note
             && let Some(result) = task.poll()
         {
+            let request = *request;
             self.view_note = None;
+            // Ответ трогает диалог, только если это тот же его экземпляр: диалог
+            // закрывают и открывают заново, пока комментарий ложится в файл.
+            let mine = self
+                .note
+                .as_ref()
+                .is_some_and(|note| note.sending && note.request == request);
             match result {
                 Ok(written) => {
                     // Диалог закрывается, как только комментарий лёг в файл: сбой
@@ -995,11 +1060,17 @@ impl BytetapApp {
                         .reopened
                         .as_ref()
                         .is_some_and(|opened| self.note_answer_fits(opened));
-                    self.note = None;
+                    if mine {
+                        self.note = None;
+                        // Комментарий лёг в файл: прежняя строка об ошибке просмотра
+                        // больше не про этот журнал.
+                        self.view_error = None;
+                    }
                     match written.reopened {
                         Some(opened) if fits => {
                             diag::info("комментарий добавлен в журнал");
                             self.apply_opened(opened);
+                            self.view_error = None;
                             // Последняя страница — сразу: дописанный комментарий виден
                             // в ленте, когда её прокрутить до конца (U1-AC19).
                             self.request_last_page(ctx);
@@ -1022,11 +1093,13 @@ impl BytetapApp {
                 Err(err) => {
                     diag::error(format!("комментарий не записан: {err}"));
                     // Диалог не закрывается молча: причина — строкой в диалоге. Без
-                    // открытого диалога та же строка идёт под шапку просмотра.
+                    // своего диалога та же строка идёт под шапку просмотра.
                     let text = t!("journal.noteFailed", reason = err.message);
-                    if let Some(note) = &mut self.note {
-                        note.sending = false;
-                        note.error = Some(text);
+                    if mine {
+                        if let Some(note) = &mut self.note {
+                            note.sending = false;
+                            note.error = Some(text);
+                        }
                     } else {
                         self.view_error = Some(text);
                     }
@@ -1305,6 +1378,13 @@ impl BytetapApp {
                     self.frames,
                     self.frames as f64 / seconds
                 ));
+                // Цена кадра и период: по ним видно, почему кадров столько (NFR-5).
+                let period = live::next_period(crate::gpu::software(), self.frame_cost);
+                diag::info(format!(
+                    "цена кадра записи: {} мс, период запроса кадра {} мс",
+                    self.frame_cost.as_millis(),
+                    period.as_millis()
+                ));
             }
             self.recorded_path = Some(outcome.journal_path.clone());
             if let Some(failure) = outcome.failure {
@@ -1473,9 +1553,6 @@ impl BytetapApp {
             )));
         }
         if maximized {
-            // Запомним: развёрнутое окно — путь через `DWMWA_CLOAK`, и рамку DWM
-            // придётся применить повторно.
-            self.restored_maximized = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         }
     }
@@ -1492,31 +1569,27 @@ impl BytetapApp {
     /// Рамка окна: скругление углов, расширение рамки и цвет средствами DWM (Windows 11).
     ///
     /// Применяется, когда окно уже видимо, и только по номеру кадра
-    /// (`cumulative_frame_nr`), а не по флагу прохода: первый проход eframe заканчивает
-    /// показом окна (`post_rendering` в wgpu_integration), и атрибуты, заданные до
-    /// показа, DWM теряет — рамка появлялась только после смены темы (U1-AC18).
+    /// (`cumulative_frame_nr`), а не по флагу прохода: в eframe 0.37 окно создаётся
+    /// скрытым (`with_visible(false)`), кадр 0 рисуется в скрытое окно, и только потом
+    /// `EpiIntegration::post_rendering` показывает его (`set_visible(true)`). Атрибуты,
+    /// заданные до показа, DWM теряет — рамка появлялась только после смены темы
+    /// (U1-AC18).
     ///
-    /// Развёрнутое окно приходит сюда ещё раз на следующем кадре: egui-winit
-    /// разворачивает скрытое окно через `ShowWindow(SW_MAXIMIZE)` под `DWMWA_CLOAK`,
-    /// чтобы окно не мелькнуло, и снятие маскировки сбрасывает часть атрибутов окна.
+    /// Повтора для развёрнутого окна нет: `Maximized` при восстановлении проходит через
+    /// `egui_winit::set_maximized` → `set_maximized_while_hidden`, который маскирует окно
+    /// `DWMWA_CLOAK` и снимает маску сразу же, до первого кадра; `ViewportCommand::
+    /// Maximized` на видимом окне (`toggle_maximized` в шапке) вызывает
+    /// `window.set_maximized` вовсе без маскировки. К кадру 1 окно и так видимо и
+    /// развёрнуто, поэтому настройка DWM применяется к нему один раз.
     ///
     /// Вне Windows и в тестах вызов ничего не делает — там рамку рисует приложение.
     fn apply_window_frame(&mut self, ctx: &egui::Context) {
         // Кадр 0 — тот, до показа окна: DWM ещё нечего настраивать.
-        let frame = ctx.cumulative_frame_nr();
-        if frame == 0 {
+        if ctx.cumulative_frame_nr() == 0 {
             return;
         }
         if !self.frame_applied {
             self.frame_applied = true;
-            self.frame_reapply = self.restored_maximized;
-            self.setup_window_frame();
-            if self.frame_reapply {
-                // Повтор — следующим кадром: в простое кадра не будет, заказываем сами.
-                ctx.request_repaint();
-            }
-        } else if self.frame_reapply {
-            self.frame_reapply = false;
             self.setup_window_frame();
         }
     }
@@ -1609,10 +1682,17 @@ impl BytetapApp {
         self.stop_error_notice(ui);
         self.settings_warning(ui);
         if recording {
-            self.recording_screen(ui);
+            let added = self.recording_screen(ui);
             if self.live.is_some() {
-                // Пульс точки «Стоп» и таймер: ~30 кадров в секунду только во время записи.
-                ctx.request_repaint_after(live::FRAME);
+                // Период кадра выбирается по цене прошлых кадров: аппаратный растр
+                // держит 30 кадров в секунду, WARP — 10 и реже (NFR-5, U1-AC24).
+                let period = live::next_period(crate::gpu::software(), self.frame_cost);
+                live::set_repaint_period(period);
+                // Новые строки — по периоду кадра. Без новых событий трассу и ленту
+                // перерисовывать незачем: раз в секунду идут таймер и пульс «Стоп».
+                let delay = if added > 0 { period } else { live::FRAME_QUIET };
+                self.frame_delay = Some(delay);
+                ctx.request_repaint_after(delay);
             }
         } else if viewing {
             crate::viewscreen::error(self, ui);
@@ -1741,6 +1821,32 @@ impl BytetapApp {
             Screen::Recording | Screen::Viewing => {}
         }
     }
+
+    /// Цена кадра записи: промежуток между кадрами минус то, что окно просило подождать.
+    ///
+    /// Меряется по часам, а не по `unstable_dt` egui: в тестах и на первом кадре он
+    /// равен предсказанному, а не прожитому. Когда окно не успевает за своим периодом,
+    /// промежуток и есть цена кадра.
+    fn measure_frame_cost(&mut self) {
+        let now = Instant::now();
+        let last = self.frame_started.replace(now);
+        let (Some(last), Some(delay)) = (last, self.frame_delay) else {
+            return;
+        };
+        // Только запись: в простое окно спит по своему таймеру, и промежуток между
+        // кадрами — не цена кадра.
+        if self.live.is_none() {
+            return;
+        }
+        let cost = live::frame_cost(now.saturating_duration_since(last), delay);
+        // Среднее с весом 1/4: одна медленная загрузка шрифтов режим не задаёт, а
+        // устойчиво медленный кадр задаёт.
+        self.frame_cost = if self.frame_cost.is_zero() {
+            cost
+        } else {
+            self.frame_cost.mul_f32(0.75) + cost.mul_f32(0.25)
+        };
+    }
 }
 
 /// Колонка экрана по центру: не шире `max_width`, с полями `SPACE_5` по краям.
@@ -1788,6 +1894,7 @@ impl eframe::App for BytetapApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.measure_frame_cost();
         if !self.ready
             && let Some(state) = frame.wgpu_render_state()
         {
@@ -1925,6 +2032,11 @@ mod tests {
     /// Журнал на диске: заголовок сессии и один фрагмент. Путь и сводка — то, что
     /// приходит из фонового открытия журнала.
     fn journal_file(dir: &std::path::Path, name: &str) -> (PathBuf, JournalOpen) {
+        journal_file_rows(dir, name, 1)
+    }
+
+    /// Журнал с `rows` фрагментами: страниц столько, сколько их покрывает индекс.
+    fn journal_file_rows(dir: &std::path::Path, name: &str, rows: usize) -> (PathBuf, JournalOpen) {
         use bytetap_core::journal::{Autoresponder, Data, Dir, Event, Host, Mode, Session};
 
         let path = dir.join(name);
@@ -1938,16 +2050,18 @@ mod tests {
         );
         let mut text = serde_json::to_string(&Event::Session(header)).expect("заголовок");
         text.push('\n');
-        let data = Event::Data(Data::new(
-            "2026-10-19T10:15:03.000000+03:00",
-            1,
-            1,
-            Dir::AnalyzerToLis,
-            false,
-            b"A",
-        ));
-        text.push_str(&serde_json::to_string(&data).expect("событие"));
-        text.push('\n');
+        for index in 0..rows {
+            let data = Event::Data(Data::new(
+                "2026-10-19T10:15:03.000000+03:00",
+                index as u64 + 1,
+                1,
+                Dir::AnalyzerToLis,
+                false,
+                b"A",
+            ));
+            text.push_str(&serde_json::to_string(&data).expect("событие"));
+            text.push('\n');
+        }
         std::fs::write(&path, text).expect("журнал");
         let cache = JournalCache::default();
         let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
@@ -2034,5 +2148,103 @@ mod tests {
         assert_eq!(view.source.total(), opened_b.summary.events);
         // Диалог закрылся вместе с журналом A: он был про A.
         assert!(app.note.is_none());
+    }
+
+    /// Мёртвый пул чтения пересоздаётся: страница не ждёт ответа, которого не будет.
+    #[test]
+    fn a_dead_page_reader_is_recreated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, opened) = journal_file_rows(dir.path(), "a.jsonl", 600);
+        let ctx = egui::Context::default();
+        let mut app = BytetapApp::new(&ctx, Settings::default(), None, None);
+        show(&mut app, &opened);
+        // Пул без живых потоков: очередь заданий закрыта.
+        app.view_reader = Some(PageReader::dead(path.clone()));
+        app.request_pages(&ctx, 0, 1);
+        assert!(
+            app.view_reader.is_none(),
+            "мёртвый пул сброшен: следующий запрос заведёт новый"
+        );
+        // Вторая страница ещё не просилась: следующий запрос поднимает живой пул.
+        app.request_pages(&ctx, 500, 501);
+        assert!(app.view_reader.is_some(), "пул чтения заведён заново");
+        for _ in 0..200 {
+            app.poll_view(&ctx);
+            let stored = app
+                .viewing_mut()
+                .is_some_and(|view| view.source.event(500).is_some());
+            if stored {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("страница не пришла из нового пула");
+    }
+
+    /// Дождаться ответа дописывания: окно опрашивает задачу из кадра.
+    fn wait_note(app: &mut BytetapApp, ctx: &egui::Context) {
+        for _ in 0..300 {
+            app.poll_view(ctx);
+            if app.view_note.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("ответ дописывания не пришёл");
+    }
+
+    /// Ошибка дописывания остаётся в том диалоге, который отправил комментарий.
+    #[test]
+    fn a_note_error_lands_in_the_dialog_that_sent_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_a, opened_a) = journal_file(dir.path(), "a.jsonl");
+        // Папки нет: дописывание сорвётся на открытии файла.
+        let missing = dir.path().join("нет-папки").join("b.jsonl");
+        let ctx = egui::Context::default();
+        let mut app = BytetapApp::new(&ctx, Settings::default(), None, None);
+        show(&mut app, &opened_a);
+        app.open_note(NoteTarget::Journal(missing.clone()));
+        app.note.as_mut().expect("диалог").text = "проба".into();
+        let request = app.send_journal_note(&ctx, missing, "проба");
+        assert!(app.note.as_ref().expect("диалог").sending);
+        wait_note(&mut app, &ctx);
+        let note = app.note.as_ref().expect("диалог не закрыт");
+        assert_eq!(note.request, request);
+        assert!(!note.sending, "диалог больше не ждёт ответа");
+        assert!(note.error.is_some(), "причина — строкой в диалоге");
+    }
+
+    /// Отмена во время отправки: ответ первой записи не трогает новый диалог.
+    ///
+    /// Диалог закрыли, не дождавшись записи, и открыли заново с набранным текстом.
+    /// Ответ первой отправки идёт в свой номер запроса, поэтому новый диалог остаётся
+    /// открытым и с текстом, а причина первой ошибки — строкой под шапкой.
+    #[test]
+    fn a_cancelled_note_answer_does_not_touch_a_new_dialog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path_a, opened_a) = journal_file(dir.path(), "a.jsonl");
+        let missing = dir.path().join("нет-папки").join("b.jsonl");
+        let ctx = egui::Context::default();
+        let mut app = BytetapApp::new(&ctx, Settings::default(), None, None);
+        show(&mut app, &opened_a);
+        app.open_note(NoteTarget::Journal(missing.clone()));
+        let first = app.send_journal_note(&ctx, missing, "первый");
+        // Отмена: диалог уходит, новый открыт уже с текстом.
+        app.note = None;
+        app.open_note(NoteTarget::Journal(path_a.clone()));
+        app.note.as_mut().expect("диалог").text = "второй".into();
+        wait_note(&mut app, &ctx);
+        let note = app.note.as_ref().expect("новый диалог открыт");
+        assert_ne!(note.request, first, "ответ был не про этот диалог");
+        assert_eq!(note.text, "второй", "набранный текст на месте");
+        assert!(!note.sending, "новый диалог не ждёт ответа");
+        assert!(
+            note.error.is_none(),
+            "ошибка первой записи не попала в новый диалог"
+        );
+        assert!(
+            app.view_error().is_some(),
+            "причина первой записи — строкой под шапкой просмотра"
+        );
     }
 }

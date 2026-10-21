@@ -126,11 +126,11 @@ impl FeedScroll {
         if ui.rect_contains_pointer(outer) {
             self.wheel(ui, row_height, max_offset);
         }
-        // Клавиши — когда фокус не в поле ввода и не на другом виджете экрана: в
-        // диалоге комментария Home и End принадлежат тексту, а не ленте. На ползунке
-        // полосы они прокручивают ленту — иначе фокус на полосе отнял бы клавиши.
-        let thumb = id.with("thumb");
-        if ui.memory(|m| m.focused().is_none_or(|focused| focused == thumb)) {
+        // Клавиши — когда фокус не в поле ввода: в диалоге комментария Home и End
+        // принадлежат тексту, а не ленте. На остальных виджетах экрана (кнопки,
+        // ползунок полосы, таблетки соединений) PageUp/PageDown/Home/End свободны,
+        // и лента их забирает — так они работают и после Tab (U1-AC25).
+        if !ui.ctx().text_edit_focused() {
             self.keys(ui, visible, max_offset);
         }
         self.offset = self.offset.clamp(0.0, max_offset);

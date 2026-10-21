@@ -480,6 +480,34 @@ pub struct PageDone {
     pub result: Result<Vec<Event>, PageError>,
 }
 
+/// Прочитать страницу, превратив панику в ошибку страницы.
+///
+/// Паника в чтении — это битый индекс или ошибка в кеше ядра. Пока она уносила поток
+/// пула, страница не приходила никогда: окно ждало ответа, а очередь заданий оставалась
+/// открытой, и [`PageReader::request`] отвечал «поставлено». Теперь паника становится
+/// ответом `PageDone` с ошибкой, а поток пула читает следующую страницу.
+fn catch_read(
+    read: impl FnOnce() -> Result<Vec<Event>, bytetap_core::journal::view::ViewError>,
+) -> Result<Vec<Event>, PageError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)) {
+        Ok(result) => result.map_err(|err| PageError {
+            message: err.to_string(),
+        }),
+        Err(payload) => Err(PageError {
+            message: format!("page read panicked: {}", panic_text(payload.as_ref())),
+        }),
+    }
+}
+
+/// Текст паники из `catch_unwind`: `panic!` с текстом, `String` или неизвестный тип.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no panic message")
+}
+
 /// Пул чтения страниц: [`PAGE_WORKERS`] потока и очередь заданий.
 ///
 /// Потоков ровно столько, сколько задано: прокрутка не плодит поток на страницу.
@@ -506,11 +534,10 @@ impl PageReader {
             let ctx = ctx.clone();
             std::thread::spawn(move || {
                 while let Ok(job) = receiver.recv() {
-                    let result = cache
-                        .read(&path, job.start, job.count)
-                        .map_err(|err| PageError {
-                            message: err.to_string(),
-                        });
+                    // Паника в чтении (битый индекс, ошибка в кеше ядра) не должна
+                    // убивать поток пула: страница не пришла бы никогда, а очередь
+                    // осталась бы живой. Паника становится ошибкой страницы.
+                    let result = catch_read(|| cache.read(&path, job.start, job.count));
                     let page = PageDone {
                         page: job.page,
                         generation: job.generation,
@@ -557,6 +584,21 @@ impl PageReader {
     /// Готовый ответ, если он уже пришёл.
     pub fn poll(&self) -> Option<PageDone> {
         self.done.try_recv().ok()
+    }
+
+    /// Пул без живых потоков: очередь закрыта, задание не принимается.
+    ///
+    /// Так выглядит пул, у которого умерли потоки: страницы ждать неоткуда, и окно
+    /// обязано завести новый (`BytetapApp::request_pages`).
+    #[cfg(test)]
+    pub(crate) fn dead(path: PathBuf) -> Self {
+        let (_sender, done) = mpsc::channel();
+        Self {
+            path,
+            jobs: Vec::new(),
+            next: 0,
+            done,
+        }
     }
 }
 
@@ -972,6 +1014,27 @@ mod tests {
         assert!(
             source.event(600).is_none(),
             "за последним событием ничего нет"
+        );
+    }
+
+    /// Паника в чтении становится ошибкой страницы, а не смертью потока пула.
+    #[test]
+    fn a_panicking_read_becomes_a_page_error() {
+        use bytetap_core::journal::view::{ViewError, ViewErrorKind};
+
+        let result = catch_read(|| {
+            Err(ViewError {
+                path: PathBuf::from("journal.jsonl"),
+                kind: ViewErrorKind::NotAJournal,
+            })
+        });
+        assert!(result.is_err(), "ошибка чтения остаётся ошибкой");
+        let result = catch_read(|| panic!("broken index"));
+        let error = result.expect_err("паника — ошибка страницы");
+        assert!(
+            error.message.contains("broken index"),
+            "текст паники в причине: {}",
+            error.message
         );
     }
 }
