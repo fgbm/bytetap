@@ -17,13 +17,19 @@ name = "bytetap"
 path = "src/main.rs"
 
 [dependencies]
+bytetap-core.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 # Окно без WebView2 (ADR 0003): wgpu (DX12, без GPU — WARP), AccessKit, буфер обмена.
 eframe = { version = "0.37", default-features = false, features = ["wgpu", "accesskit", "clipboard", "default_fonts", "x11", "wayland"] }
 # SVG-иконки Lucide растеризует resvg.
 egui_extras = { version = "0.37", features = ["svg"] }
+# Адреса ноутбука для подсказки анализатору: локальный перебор, без запросов в сеть.
+if-addrs = "0.15"
 os_info.workspace = true
+# Системные диалоги выбора папки журналов и файла журнала. На Linux — GTK3, как у
+# диалогов Tauri в том же workspace: `gtk3` и `xdg-portal` у rfd несовместимы.
+rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
 serde.workspace = true
 serde_json.workspace = true
 

@@ -15,16 +15,23 @@ fn main() {
     ));
 
     let store = Store::default_location();
-    let (settings, warning) = match &store {
+    // Папка журналов по умолчанию — `Документы\bytetap`, пока пользователь не выбрал свою.
+    let log_dir = bytetap_core::journal::default_log_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (mut settings, warning) = match &store {
         Some(store) => {
             diag::info(format!("настройки: {}", store.path().display()));
-            store.load("")
+            store.load(&log_dir)
         }
         None => {
             diag::error("каталог конфигурации пользователя не определён: настройки не сохраняются");
-            (Settings::default(), None)
+            (Settings::with_log_dir(&log_dir), None)
         }
     };
+    if settings.config.log_dir.trim().is_empty() {
+        settings.config.log_dir = log_dir;
+    }
     if let Some(warning) = &warning {
         diag::error(format!("настройки сброшены: {warning:?}"));
     }

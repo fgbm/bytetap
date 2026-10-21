@@ -92,7 +92,13 @@ pub fn text(key: &'static str) -> &'static str {
 
 /// Строка по ключу с подстановкой `{имя}`.
 pub fn format(key: &'static str, args: &[(&str, String)]) -> String {
-    let mut out = text(key).to_owned();
+    fill(text(key), args)
+}
+
+/// Подстановка `{имя}` в готовую строку каталога: когда ключ выбирается по коду
+/// (`t!` в ветках `match`), а подстановки собираются отдельно.
+pub fn fill(template: &str, args: &[(&str, String)]) -> String {
+    let mut out = template.to_owned();
     for (name, value) in args {
         out = out.replace(&format!("{{{name}}}"), value);
     }

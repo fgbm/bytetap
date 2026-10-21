@@ -7,22 +7,42 @@ use eframe::egui::{self, Color32, ImageSource, Rect, Ui, Vec2};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
+    ArrowLeft,
+    Check,
+    ChevronDown,
+    ChevronRight,
     Copy,
+    FolderOpen,
+    Info,
     Minus,
+    MonitorDown,
     Moon,
+    Network,
+    RefreshCw,
     Square,
     Sun,
+    Usb,
     X,
 }
 
 impl Icon {
     pub fn source(self) -> ImageSource<'static> {
         match self {
+            Self::ArrowLeft => egui::include_image!("../assets/icons/arrow-left.svg"),
+            Self::Check => egui::include_image!("../assets/icons/check.svg"),
+            Self::ChevronDown => egui::include_image!("../assets/icons/chevron-down.svg"),
+            Self::ChevronRight => egui::include_image!("../assets/icons/chevron-right.svg"),
             Self::Copy => egui::include_image!("../assets/icons/copy.svg"),
+            Self::FolderOpen => egui::include_image!("../assets/icons/folder-open.svg"),
+            Self::Info => egui::include_image!("../assets/icons/info.svg"),
             Self::Minus => egui::include_image!("../assets/icons/minus.svg"),
+            Self::MonitorDown => egui::include_image!("../assets/icons/monitor-down.svg"),
             Self::Moon => egui::include_image!("../assets/icons/moon.svg"),
+            Self::Network => egui::include_image!("../assets/icons/network.svg"),
+            Self::RefreshCw => egui::include_image!("../assets/icons/refresh-cw.svg"),
             Self::Square => egui::include_image!("../assets/icons/square.svg"),
             Self::Sun => egui::include_image!("../assets/icons/sun.svg"),
+            Self::Usb => egui::include_image!("../assets/icons/usb.svg"),
             Self::X => egui::include_image!("../assets/icons/x.svg"),
         }
     }

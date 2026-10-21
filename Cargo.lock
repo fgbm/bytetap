@@ -763,12 +763,15 @@ dependencies = [
 name = "bytetap-app"
 version = "0.1.0"
 dependencies = [
+ "bytetap-core",
  "chrono",
  "dirs",
  "eframe",
  "egui_extras",
  "egui_kittest",
+ "if-addrs",
  "os_info",
+ "rfd",
  "serde",
  "serde_json",
  "tempfile",

@@ -144,11 +144,41 @@ impl BytetapApp {
         );
     }
 
-    /// Шапка экранов: бренд, переключатель темы, кнопки окна.
+    /// «Журналы»: открыть журнал на просмотр или папку журналов в проводнике.
+    fn journals_menu(&mut self, ui: &mut Ui) {
+        let p = self.pal();
+        let button =
+            widgets::link_button(ui, &p, Icon::FolderOpen, 15.0, t!("header.journals"), false);
+        let recording = self.screen == crate::Screen::Recording;
+        let mut open_journal = false;
+        let mut open_folder = false;
+        egui::Popup::menu(&button)
+            .id(egui::Id::unique("bt-journals-menu"))
+            .width(224.0)
+            .gap(4.0)
+            .show(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                open_journal =
+                    widgets::menu_item(ui, &p, t!("header.openJournal"), !recording).clicked();
+                open_folder = widgets::menu_item(ui, &p, t!("header.openFolder"), true).clicked();
+            });
+        let ctx = ui.ctx().clone();
+        if open_journal {
+            self.pick_journal(&ctx);
+        }
+        if open_folder {
+            self.open_log_dir(&ctx);
+        }
+    }
+
+    /// Шапка экранов: бренд, «Журналы», переключатель темы, кнопки окна.
     pub(crate) fn home_title_bar(&mut self, ui: &mut Ui) {
         self.title_bar(
             ui,
-            |app, ui| app.brand(ui),
+            |app, ui| {
+                app.brand(ui);
+                app.journals_menu(ui);
+            },
             |app, ui| {
                 let p = app.pal();
                 let (icon, label) = if app.dark() {
