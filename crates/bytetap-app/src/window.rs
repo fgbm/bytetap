@@ -10,6 +10,10 @@
 //!   (`DWMWA_WINDOW_CORNER_PREFERENCE`, `DWMWA_BORDER_COLOR`): своя рамка поверх
 //!   скругления дала бы квадратные углы. Там, где DWM скругление не поддерживает
 //!   (сборки до 22000), рамку рисует приложение.
+//! - Пока DWM не настроен (первый кадр), на Windows 11 своя рамка тоже не рисуется:
+//!   скругление появится следующим кадром, и квадратные углы мелькнули бы на один
+//!   кадр. Ожидание скругления берётся из сборки ОС (`RtlGetVersion`), а не из ответа
+//!   DWM: ответа на первом кадре ещё нет.
 //!
 //! Тень окна — системная: egui-winit включает тень для окна без декораций
 //! (`with_undecorated_shadow`). `DwmExtendFrameIntoClientArea` с полями в 1 px даёт
@@ -50,12 +54,41 @@ impl DwmSetup {
 
 /// Поддерживает ли система скругление окон DWM: Windows 11 build 22000 и новее.
 ///
-/// Версию ОС спрашивать нельзя: `GetVersionExW` без манифеста совместимости
-/// возвращает 6.2 на любой Windows 10 и новее. Поэтому скругление проверяется по
-/// ответу DWM: атрибут принят — скругление есть.
+/// `GetVersionExW` без манифеста совместимости отдаёт 6.2 на любой Windows 10 и новее,
+/// поэтому номер сборки спрашивается у `RtlGetVersion` — она возвращает настоящий.
+/// Ответ нужен до первого вызова DWM: в самом первом кадре свою рамку рисовать нельзя,
+/// если система вот-вот нарисует скруглённую, иначе на кадр мелькают квадратные углы.
 #[must_use]
-pub fn dwm_round_supported() -> bool {
-    cfg!(windows)
+pub fn dwm_expected() -> bool {
+    windows_build().is_some_and(round_from_build)
+}
+
+/// Номер сборки Windows без манифеста совместимости; вне Windows — `None`.
+#[cfg(windows)]
+fn windows_build() -> Option<u32> {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    let mut info = OSVERSIONINFOW {
+        dwOSVersionInfoSize: u32::try_from(std::mem::size_of::<OSVERSIONINFOW>())
+            .unwrap_or_default(),
+        ..OSVERSIONINFOW::default()
+    };
+    // SAFETY: структура на стеке нужного размера; `RtlGetVersion` заполняет её поля.
+    let status = unsafe { RtlGetVersion(&raw mut info) };
+    // NTSTATUS: 0 — успех, остальное — отказ вызова.
+    (status == 0 && info.dwBuildNumber > 0).then_some(info.dwBuildNumber)
+}
+
+#[cfg(not(windows))]
+fn windows_build() -> Option<u32> {
+    None
+}
+
+/// Windows 11 ли сборка: скругление окон DWM появилось в сборке 22000.
+#[must_use]
+fn round_from_build(build: u32) -> bool {
+    build >= 22_000
 }
 
 /// Настроить окно средствами DWM: скругление, расширение рамки и цвет рамки.
@@ -203,10 +236,10 @@ pub fn frame_color(p: &Palette) -> Color32 {
 /// Рисует рамку окна 1 px по периметру содержимого.
 ///
 /// Рамка идёт по внутреннему краю окна: линия в 1 px не съедает содержимое.
-/// Развёрнутое окно рамки не получает: периметр ушёл за край экрана, и линия была бы
-/// обрезана.
-pub fn draw_frame(ui: &mut egui::Ui, p: &Palette, maximized: bool) {
-    if maximized || dwm_border() {
+/// `system` — рамку рисует система: DWM уже настроен, DWM ожидается на Windows 11
+/// (первый кадр, до `setup_dwm`), или окно развёрнуто и его периметр ушёл за край экрана.
+pub fn draw_frame(ui: &mut egui::Ui, p: &Palette, system: bool) {
+    if system {
         return;
     }
     let rect = ui.max_rect();
@@ -222,11 +255,16 @@ pub fn draw_frame(ui: &mut egui::Ui, p: &Palette, maximized: bool) {
 mod tests {
     use super::*;
 
-    /// Скругление DWM проверяется по ответу DWM, а не по версии ОС: версию без
-    /// манифеста совместимости Windows отдаёт как 6.2 на любой Windows 10 и новее.
+    /// Скругление DWM ожидается на Windows 11: сборка 22000 и новее.
     #[test]
-    fn the_dwm_rounding_is_asked_only_on_windows() {
-        assert_eq!(dwm_round_supported(), cfg!(windows));
+    fn the_dwm_rounding_is_expected_from_windows_11() {
+        assert!(!round_from_build(19_045), "Windows 10 22H2");
+        assert!(!round_from_build(20_348), "Windows Server 2022");
+        assert!(round_from_build(22_000), "первая сборка Windows 11");
+        assert!(round_from_build(26_100), "Windows 11 24H2");
+        // Вне Windows скругления не ждём: там рамку рисует приложение.
+        #[cfg(not(windows))]
+        assert!(!dwm_expected());
     }
 
     #[test]

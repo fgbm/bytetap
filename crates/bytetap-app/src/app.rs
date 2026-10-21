@@ -23,7 +23,7 @@ use crate::errors::StartError;
 use crate::form::FormState;
 use crate::icons::Icon;
 use crate::journal::{
-    JournalCache, JournalOpen, PageDone, PageError, PageJob, PageLoad, PageReader,
+    JournalCache, JournalOpen, NoteWritten, PageDone, PageError, PageJob, PageLoad, PageReader,
 };
 use crate::live::{self, Action, JournalFailure, LiveSession, Phase, StopOutcome};
 use crate::recording::{RecordingFixture, RecordingView};
@@ -144,7 +144,7 @@ pub struct BytetapApp {
     /// Пул чтения страниц журнала: 1–2 потока с очередью, а не поток на страницу.
     view_reader: Option<PageReader>,
     /// Дописывание комментария и повторное открытие сводки — в фоне.
-    view_note: Option<Task<Result<JournalOpen, PageError>>>,
+    view_note: Option<Task<Result<NoteWritten, PageError>>>,
     /// Кеш индексов журналов: общий на приложение, индекс переживает просмотр.
     ///
     /// Кеш ядра потокобезопасен сам: внешнего замка нет, поток окна его не держит.
@@ -185,6 +185,11 @@ pub struct BytetapApp {
     window_handle: Option<eframe::wgpu::rwh::RawWindowHandle>,
     /// Рамка DWM применена после первого кадра, когда окно уже видимо.
     frame_applied: bool,
+    /// Восстановленное окно было развёрнуто: рамку DWM надо применить ещё раз.
+    restored_maximized: bool,
+    /// Настройку DWM повторить на следующем кадре: развёрнутое окно приходит из
+    /// `DWMWA_CLOAK`, и часть атрибутов окна сбрасывается.
+    frame_reapply: bool,
 }
 
 impl BytetapApp {
@@ -258,6 +263,8 @@ impl BytetapApp {
             restore: None,
             window_handle: None,
             frame_applied: false,
+            restored_maximized: false,
+            frame_reapply: false,
         };
         app.preselect_last_card();
         app.interfaces = Loaded::Loading(Task::spawn(ctx, background::list_interfaces));
@@ -573,7 +580,17 @@ impl BytetapApp {
         self.viewing = None;
         self.view_error = None;
         self.view_reader = None;
-        self.note = None;
+        // Ответ дописывания в прежний журнал больше не нужен: задача бросается вместе
+        // с приёмником ответа, и сводка нового журнала им не обновится (U1-AC19).
+        self.view_note = None;
+        // Диалог комментария к журналу закрывается вместе с журналом, как и по «×».
+        if self
+            .note
+            .as_ref()
+            .is_some_and(|note| matches!(note.target, NoteTarget::Journal(_)))
+        {
+            self.note = None;
+        }
         self.screen = Screen::Viewing;
         let cache = Arc::clone(&self.journal_cache);
         self.view_open = Some(Task::spawn(ctx, move || JournalOpen::open(&cache, &path)));
@@ -685,6 +702,36 @@ impl BytetapApp {
         view.seek = Some(view.event_at_fraction(fraction));
     }
 
+    /// Ответ дописывания относится к тому журналу, который открыт сейчас.
+    ///
+    /// Пока комментарий ложился в файл, человек мог закрыть журнал и открыть другой:
+    /// ответ для A не обновляет сводку B. Диалог тоже должен быть про этот журнал —
+    /// цель задаётся при его открытии и живёт вместе с ним (U1-AC19).
+    fn note_answer_fits(&self, opened: &JournalOpen) -> bool {
+        let dialog_fits = match self.note.as_ref().map(|note| &note.target) {
+            Some(NoteTarget::Journal(path)) => *path == opened.path,
+            Some(NoteTarget::Session) => false,
+            // Диалог закрыли (отмена): ответ всё равно просил тот, кто его открыл.
+            None => true,
+        };
+        dialog_fits
+            && self
+                .viewing
+                .as_ref()
+                .is_some_and(|view| view.path == opened.path)
+    }
+
+    /// Попросить последнюю страницу журнала: дописанный комментарий виден и в ленте,
+    /// когда её прокрутить до конца, а не только строкой под шапкой (U1-AC19).
+    fn request_last_page(&mut self, ctx: &egui::Context) {
+        let Some(total) = self.viewing.as_ref().map(|view| view.source.total()) else {
+            return;
+        };
+        if total > 0 {
+            self.request_pages(ctx, total - 1, total);
+        }
+    }
+
     /// Рамка видимой области ленты на карте сессии.
     pub(crate) fn set_visible(&mut self, visible: Option<(f32, f32)>) {
         if let Some(view) = &mut self.viewing {
@@ -717,12 +764,19 @@ impl BytetapApp {
         };
         for (page, start) in missing {
             let generation = view.source.request_page(page);
-            reader.request(PageJob {
+            let queued = reader.request(PageJob {
                 page,
                 start,
                 count: crate::journal::PAGE_SIZE,
                 generation,
             });
+            if !queued {
+                // Очередь пула закрыта: ответа не будет, и «…» не должен висеть вечно.
+                diag::error(format!(
+                    "страница журнала {page} не поставлена в очередь: пул чтения закрыт"
+                ));
+                view.source.page_lost(page, generation);
+            }
         }
     }
 
@@ -756,12 +810,36 @@ impl BytetapApp {
         {
             self.view_note = None;
             match result {
-                Ok(opened) => {
-                    diag::info("комментарий добавлен в журнал");
-                    self.apply_opened(opened);
-                    // Диалог закрывается только после того, как комментарий лёг в файл.
+                Ok(written) => {
+                    // Диалог закрывается, как только комментарий лёг в файл: сбой
+                    // перечитывания сводки — не сбой записи (U1-AC19).
+                    let fits = written
+                        .reopened
+                        .as_ref()
+                        .is_some_and(|opened| self.note_answer_fits(opened));
                     self.note = None;
-                    self.request_pages(ctx, 0, 1);
+                    match written.reopened {
+                        Some(opened) if fits => {
+                            diag::info("комментарий добавлен в журнал");
+                            self.apply_opened(opened);
+                            // Последняя страница — сразу: дописанный комментарий виден
+                            // в ленте, когда её прокрутить до конца (U1-AC19).
+                            self.request_last_page(ctx);
+                        }
+                        Some(opened) => diag::info(format!(
+                            "ответ для {} отброшен: открыт другой журнал",
+                            opened.path.display()
+                        )),
+                        None => {
+                            let reason = written.reread_error.unwrap_or_default();
+                            diag::error(format!(
+                                "комментарий записан, журнал не перечитан: {reason}"
+                            ));
+                            // Причина — строкой под шапкой просмотра: комментарий уже
+                            // в файле, и закрывать ради неё диалог незачем.
+                            self.view_error = Some(t!("journal.noteRereadFailed", reason = reason));
+                        }
+                    }
                 }
                 Err(err) => {
                     diag::error(format!("комментарий не записан: {err}"));
@@ -1207,6 +1285,9 @@ impl BytetapApp {
             )));
         }
         if maximized {
+            // Запомним: развёрнутое окно — путь через `DWMWA_CLOAK`, и рамку DWM
+            // придётся применить повторно.
+            self.restored_maximized = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
         }
     }
@@ -1222,14 +1303,42 @@ impl BytetapApp {
 
     /// Рамка окна: скругление углов, расширение рамки и цвет средствами DWM (Windows 11).
     ///
-    /// Вызывается после первого кадра, когда окно уже видимо: атрибуты, заданные до
-    /// первой отрисовки, DWM теряет, и цвет рамки появлялся только после смены темы.
+    /// Применяется, когда окно уже видимо, и только по номеру кадра
+    /// (`cumulative_frame_nr`), а не по флагу прохода: первый проход eframe заканчивает
+    /// показом окна (`post_rendering` в wgpu_integration), и атрибуты, заданные до
+    /// показа, DWM теряет — рамка появлялась только после смены темы (U1-AC18).
+    ///
+    /// Развёрнутое окно приходит сюда ещё раз на следующем кадре: egui-winit
+    /// разворачивает скрытое окно через `ShowWindow(SW_MAXIMIZE)` под `DWMWA_CLOAK`,
+    /// чтобы окно не мелькнуло, и снятие маскировки сбрасывает часть атрибутов окна.
+    ///
     /// Вне Windows и в тестах вызов ничего не делает — там рамку рисует приложение.
-    fn apply_window_frame(&mut self) {
+    fn apply_window_frame(&mut self, ctx: &egui::Context) {
+        // Кадр 0 — тот, до показа окна: DWM ещё нечего настраивать.
+        let frame = ctx.cumulative_frame_nr();
+        if frame == 0 {
+            return;
+        }
+        if !self.frame_applied {
+            self.frame_applied = true;
+            self.frame_reapply = self.restored_maximized;
+            self.setup_window_frame();
+            if self.frame_reapply {
+                // Повтор — следующим кадром: в простое кадра не будет, заказываем сами.
+                ctx.request_repaint();
+            }
+        } else if self.frame_reapply {
+            self.frame_reapply = false;
+            self.setup_window_frame();
+        }
+    }
+
+    /// Вызов DWM и запись итога в журнал запуска: по нему смоук CI видит, рисует ли
+    /// рамку система.
+    fn setup_window_frame(&mut self) {
         let Some(handle) = self.window_handle else {
             return;
         };
-        self.frame_applied = true;
         let setup = crate::window::setup_dwm(handle, self.pal().border);
         diag::info(format!(
             "рамка окна: DWM {}",
@@ -1334,8 +1443,13 @@ impl BytetapApp {
         self.profile_prompt(&ctx);
         self.note_dialog(&ctx);
         // Рамка окна — последней, поверх всего: иначе панели ленты перекрывали бы её.
+        // Пока DWM не настроен, на Windows 11 свою рамку не рисуем: скругление
+        // появится следующим кадром, и квадратные углы мелькнули бы на один кадр.
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-        crate::window::draw_frame(ui, &p, maximized);
+        let system_frame = maximized
+            || crate::window::dwm_border()
+            || (!self.frame_applied && crate::window::dwm_expected());
+        crate::window::draw_frame(ui, &p, system_frame);
     }
 
     /// Итоги или ошибка остановки записи: строка под шапкой на стартовом экране
@@ -1509,11 +1623,9 @@ impl eframe::App for BytetapApp {
         if self.window_handle.is_none() {
             self.capture_window_handle(frame);
         }
-        // Рамка окна: скругление, расширение и цвет средствами DWM — после первого
-        // кадра, когда окно уже видимо (иначе DWM теряет атрибуты).
-        if self.ready && !self.frame_applied {
-            self.apply_window_frame();
-        }
+        // Рамка окна: скругление, расширение и цвет средствами DWM — на первом видимом
+        // кадре, когда окно уже показано (иначе DWM теряет атрибуты).
+        self.apply_window_frame(&ctx);
         self.draw(ui);
         if self.dirty && self.screen != Screen::Step(self.settings.config.mode) {
             self.save_settings();
@@ -1567,5 +1679,119 @@ mod tests {
             ThemeMode::Dark
         };
         assert_eq!(saved.theme, expected);
+    }
+
+    /// Журнал на диске: заголовок сессии и один фрагмент. Путь и сводка — то, что
+    /// приходит из фонового открытия журнала.
+    fn journal_file(dir: &std::path::Path, name: &str) -> (PathBuf, JournalOpen) {
+        use bytetap_core::journal::{Autoresponder, Data, Dir, Event, Host, Mode, Session};
+
+        let path = dir.join(name);
+        let header = Session::new(
+            Mode::TcpServer,
+            Autoresponder::None,
+            serde_json::json!({"listen": "127.0.0.1:5000"}),
+            Host {
+                os: "Linux".to_owned(),
+            },
+        );
+        let mut text = serde_json::to_string(&Event::Session(header)).expect("заголовок");
+        text.push('\n');
+        let data = Event::Data(Data::new(
+            "2026-10-19T10:15:03.000000+03:00",
+            1,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            b"A",
+        ));
+        text.push_str(&serde_json::to_string(&data).expect("событие"));
+        text.push('\n');
+        std::fs::write(&path, text).expect("журнал");
+        let cache = JournalCache::default();
+        let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
+        (path, opened)
+    }
+
+    /// Экран просмотра на готовой сводке: без фонового открытия.
+    fn show(app: &mut BytetapApp, opened: &JournalOpen) {
+        app.viewing = Some(JournalView::new(
+            opened.path.clone(),
+            opened.summary.clone(),
+            opened.lengths.clone(),
+            opened.first_event.clone(),
+        ));
+        app.screen = Screen::Viewing;
+    }
+
+    /// Ответ дописывания применяется только к своему журналу и только к диалогу про
+    /// него: иначе ответ для A обновил бы сводку открытого B (U1-AC19).
+    #[test]
+    fn a_comment_answer_is_applied_only_to_its_own_journal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_a, opened_a) = journal_file(dir.path(), "a.jsonl");
+        let (_b, opened_b) = journal_file(dir.path(), "b.jsonl");
+        let ctx = egui::Context::default();
+        let mut app = BytetapApp::new(&ctx, Settings::default(), None, None);
+        show(&mut app, &opened_a);
+        app.open_note(NoteTarget::Journal(opened_a.path.clone()));
+        assert!(app.note_answer_fits(&opened_a), "открыт A, диалог про A");
+        // Открыли B, а ответ пришёл для A: чужой журнал не трогаем.
+        show(&mut app, &opened_b);
+        assert!(!app.note_answer_fits(&opened_a));
+        // Диалог всё ещё про A — ответ для B его тоже не касается.
+        assert!(!app.note_answer_fits(&opened_b));
+        app.open_note(NoteTarget::Journal(opened_b.path.clone()));
+        assert!(app.note_answer_fits(&opened_b));
+        // Комментарий к сессии — не к журналу.
+        app.open_note(NoteTarget::Session);
+        assert!(!app.note_answer_fits(&opened_b));
+    }
+
+    /// Гонка: ответ дописывания для A приходит после открытия B и не трогает B.
+    #[test]
+    fn the_answer_of_a_comment_does_not_touch_another_journal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path_a, opened_a) = journal_file(dir.path(), "a.jsonl");
+        let (path_b, opened_b) = journal_file(dir.path(), "b.jsonl");
+        let ctx = egui::Context::default();
+        let mut app = BytetapApp::new(&ctx, Settings::default(), None, None);
+        show(&mut app, &opened_a);
+        app.open_note(NoteTarget::Journal(path_a.clone()));
+        app.append_journal_note(&ctx, path_a.clone(), "проба A");
+        // Пока комментарий ложился в файл, открыли другой журнал.
+        app.open_journal(&ctx, path_b.clone());
+        for _ in 0..200 {
+            app.poll_view(&ctx);
+            if app.view_open.is_none() && app.viewing.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Комментарий в A всё равно записан: задачу открытия другого журнала это не
+        // отменяет.
+        let written = (0..200).any(|_| {
+            let text = std::fs::read_to_string(&path_a).unwrap_or_default();
+            if text.contains("проба A") {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            false
+        });
+        assert!(written, "комментарий не попал в A");
+        // Ни одного кадра ответа для A: сводка B остаётся своей.
+        for _ in 0..10 {
+            app.poll_view(&ctx);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let view = app.viewing.as_ref().expect("журнал B открыт");
+        assert_eq!(view.path, path_b);
+        assert_eq!(
+            view.summary.events, opened_b.summary.events,
+            "сводка B не тронута ответом для A"
+        );
+        assert_eq!(view.source.total(), opened_b.summary.events);
+        // Диалог закрылся вместе с журналом A: он был про A.
+        assert!(app.note.is_none());
     }
 }

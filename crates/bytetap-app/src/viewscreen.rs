@@ -413,6 +413,7 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
         },
     );
     view.scroll = scroll;
+    view.feed_rect = Some(out.inner);
     // Видимая область — рамка на карте сессии; страницы — по событиям, а не по строкам:
     // одна строка HEX — кусок события, и номер строки не номер события.
     let last = (out.first + out.visible).min(total.saturating_sub(1));

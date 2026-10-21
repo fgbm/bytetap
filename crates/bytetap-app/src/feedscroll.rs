@@ -7,8 +7,9 @@
 //! внутри неё в `f64`, а строки рисуются от верхнего края видимой области, поэтому
 //! координаты отрисовки всегда маленькие.
 //!
-//! Прокрутка — колесом над лентой, полосой справа (перетаскивание ползунка, клик по
-//! дорожке) и клавишами PageUp/PageDown/Home/End.
+//! Прокрутка — колесом над лентой (и над полосой тоже), полосой справа (перетаскивание
+//! ползунка, клик по дорожке) и клавишами PageUp/PageDown/Home/End, когда фокус не в поле
+//! ввода: иначе Home и End уводили бы каретку в тексте.
 
 use std::ops::Range;
 
@@ -37,8 +38,10 @@ pub struct ScrollOut {
     pub range: Range<usize>,
     /// Первая видимая строка.
     pub first: usize,
-    /// Сколько строк помещается в ленте.
+    /// Сколько строк помещается в ленте (целое вверх).
     pub visible: usize,
+    /// Видимая область ленты без полосы прокрутки.
+    pub inner: Rect,
 }
 
 impl FeedScroll {
@@ -63,9 +66,22 @@ impl FeedScroll {
         self.offset = row as f64;
     }
 
-    /// Прокрутить к концу: `rows` строк, `visible` помещается.
-    pub fn set_bottom(&mut self, rows: usize, visible: usize) {
-        self.offset = rows.saturating_sub(visible) as f64;
+    /// Предел смещения в строках: последняя строка ленты видна до конца.
+    ///
+    /// В высоту `height` помещается `height / row_height` строк — число дробное, если
+    /// высота ленты не кратна строке. Целое `rows − ceil(...)` оставляло низ последней
+    /// строки за краем ленты: до неё было не доскроллить, а `End` показывал строку
+    /// обрезанной на долю строки. Поэтому предел дробный, а `ceil` остаётся только у
+    /// диапазона отрисовки.
+    #[must_use]
+    pub fn max_offset(rows: usize, row_height: f32, height: f32) -> f64 {
+        let fit = f64::from(height) / f64::from(row_height);
+        (rows as f64 - fit).max(0.0)
+    }
+
+    /// Прокрутить к концу: `rows` строк в ленте высотой `height`.
+    pub fn set_bottom(&mut self, rows: usize, row_height: f32, height: f32) {
+        self.offset = Self::max_offset(rows, row_height, height);
     }
 
     /// Лента на всю доступную высоту: строки, полоса прокрутки и видимое окно.
@@ -81,11 +97,14 @@ impl FeedScroll {
         add: impl FnOnce(&mut Ui, Range<usize>),
     ) -> ScrollOut {
         let height = ui.available_height().max(row_height);
-        let (outer, response) =
+        let (outer, _) =
             ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click_and_drag());
-        let visible = ((outer.height() / row_height).ceil() as usize).max(1);
-        let max_offset = rows.saturating_sub(visible) as f64;
-        let bar = rows > visible;
+        // Полоса нужна, когда строки не помещаются целиком: `rows·h > h_ленты`. Высота
+        // последней страницы бывает больше высоты ленты на доли строки — это уже прокрутка.
+        let fit = f64::from(outer.height()) / f64::from(row_height);
+        let bar = rows as f64 > fit;
+        let visible = (fit.ceil() as usize).max(1);
+        let max_offset = (rows as f64 - fit).max(0.0);
         let inner = Rect::from_min_max(
             outer.min,
             pos2(
@@ -94,8 +113,14 @@ impl FeedScroll {
             ),
         );
 
-        if response.hovered() {
+        // Колесо — над всей лентой, включая полосу: `ui.rect_contains_pointer` смотрит
+        // только на слой, а не на виджеты поверх (ползунок перехватил бы наведение).
+        if ui.rect_contains_pointer(outer) {
             self.wheel(ui, row_height, max_offset);
+        }
+        // Клавиши — когда фокус не в поле ввода: в диалоге комментария Home и End
+        // принадлежат тексту, а не ленте.
+        if ui.memory(|m| m.focused().is_none()) {
             self.keys(ui, visible, max_offset);
         }
         self.offset = self.offset.clamp(0.0, max_offset);
@@ -122,6 +147,7 @@ impl FeedScroll {
             range,
             first,
             visible,
+            inner,
         }
     }
 
@@ -174,7 +200,10 @@ impl FeedScroll {
             pos2(outer.right() - BAR_WIDTH, outer.top()),
             pos2(outer.right(), outer.bottom()),
         );
-        let thumb_height = (track.height() * visible as f32 / rows as f32)
+        // Ползунок — доля видимого от всего журнала: строк помещается `rows − max_offset`,
+        // дробное число, если высота ленты не кратна строке.
+        let fit = (rows as f64 - max_offset).clamp(0.0, rows as f64);
+        let thumb_height = (track.height() * fit as f32 / rows as f32)
             .max(THUMB_MIN)
             .min(track.height());
         let span = (track.height() - thumb_height).max(0.0);
@@ -274,10 +303,51 @@ mod tests {
     }
 
     #[test]
-    fn the_last_row_can_be_the_first_visible_one() {
+    fn the_offset_at_the_end_keeps_the_last_row_whole() {
+        // Высота ленты не кратна строке: 500 / 18 = 27.78 строки. Целое смещение
+        // `rows − ceil(...)` оставляло низ последней строки за краем ленты.
+        let height = 500.0;
+        let row_height = 18.0;
+        let fit = f64::from(height) / f64::from(row_height);
+        let rows = 1_000_000;
         let mut scroll = FeedScroll::default();
-        scroll.set_bottom(1_000_000, 28);
-        assert_eq!(scroll.first_row(1_000_000), 1_000_000 - 28);
+        scroll.set_bottom(rows, row_height, height);
+        assert!(
+            (scroll.offset() + fit - rows as f64).abs() < 1e-9,
+            "низ последней строки — по низу ленты: смещение {}",
+            scroll.offset()
+        );
+        assert!(
+            scroll.offset() - scroll.offset().floor() > 0.0,
+            "смещение дробное: {}",
+            scroll.offset()
+        );
+        assert_eq!(scroll.first_row(rows), rows - 28);
+    }
+
+    #[test]
+    fn a_journal_a_hair_taller_than_the_feed_scrolls_to_the_end() {
+        // 28 строк по 18 px при ленте 500 px: помещается 27.78 — последняя строка уже
+        // не влезает, и лента обязана прокрутиться, хоть целых строк и хватает.
+        let height = 500.0;
+        let row_height = 18.0;
+        let rows = 28;
+        let mut scroll = FeedScroll::default();
+        scroll.set_bottom(rows, row_height, height);
+        assert!(scroll.offset() > 0.0, "смещение {}", scroll.offset());
+        assert!(
+            (scroll.offset() + f64::from(height) / f64::from(row_height) - rows as f64).abs()
+                < 1e-9
+        );
+        assert_eq!(scroll.first_row(rows), 0);
+    }
+
+    #[test]
+    fn a_feed_shorter_than_its_rows_does_not_scroll() {
+        // 10 строк по 18 px в ленте 500 px: прокрутки нет, полосы тоже.
+        assert_eq!(FeedScroll::max_offset(10, 18.0, 500.0), 0.0);
+        // Ровно по высоте — тоже без прокрутки.
+        assert_eq!(FeedScroll::max_offset(25, 20.0, 500.0), 0.0);
     }
 
     #[test]

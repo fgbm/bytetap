@@ -878,6 +878,220 @@ fn a_comment_error_keeps_the_dialog_open() {
     assert!(!text.contains("не ляжет"), "{text}");
 }
 
+/// Приложение с журналом, открытым из файла: страницу ленты просит пул чтения.
+fn harness_with_journal(path: &std::path::Path) -> Harness<'static, BytetapApp> {
+    let journal = path.to_path_buf();
+    Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            let cache = JournalCache::default();
+            let opened = JournalOpen::open(&cache, &journal).expect("журнал открывается");
+            let view = JournalView::new(
+                opened.path,
+                opened.summary,
+                opened.lengths,
+                opened.first_event,
+            );
+            BytetapApp::new(&cc.egui_ctx, settings(false), None, None)
+                .with_fixtures(fixtures())
+                .with_journal_fixture(view)
+        })
+}
+
+/// Видимая область ленты и сколько строк в неё помещается — число дробное, если
+/// высота ленты не кратна строке.
+fn feed_fit(harness: &Harness<'static, BytetapApp>, row_height: f32) -> (egui::Rect, f64) {
+    let view = harness.state().viewing().expect("журнал открыт");
+    let rect = view.feed_rect.expect("лента нарисована");
+    (rect, f64::from(rect.height()) / f64::from(row_height))
+}
+
+/// `End` в ленте высотой не кратной строке: низ последней строки — по низу ленты, и
+/// она видна целиком. Смещение в целых строках резало последнюю строку на долю.
+#[test]
+fn the_end_key_shows_the_last_row_whole() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("journal.jsonl");
+    let (text, times) = long_journal(2000);
+    std::fs::write(&path, text).expect("журнал");
+    let mut harness = harness_with_journal(&path);
+    step_until(&mut harness, "первая страница", |h| {
+        h.state()
+            .viewing()
+            .is_some_and(|view| view.source.pages_in_memory() > 0)
+    });
+    let (feed, fit) = feed_fit(&harness, TEXT_ROW_HEIGHT);
+    assert!(
+        fit.fract() > 0.01,
+        "высота ленты не кратна строке: {fit} строк"
+    );
+    harness.key_press(Key::End);
+    harness.run_steps(2);
+    // Последняя строка — из последней страницы: ждём, пока пул её прочитает.
+    step_until(&mut harness, "последняя строка", |h| {
+        shown(h, &times[1999])
+    });
+    let view = harness.state().viewing().expect("журнал открыт");
+    let offset = view.scroll.offset();
+    assert!(
+        (offset + fit - 2000.0).abs() < 1e-6,
+        "низ последней строки — по низу ленты: смещение {offset}, помещается {fit}"
+    );
+    let row = harness.get_by_label_contains(&times[1999]).rect();
+    assert!(
+        row.bottom() <= feed.bottom() + 0.5,
+        "низ строки {} ниже ленты {}",
+        row.bottom(),
+        feed.bottom()
+    );
+    assert!(
+        row.top() >= feed.top() - 0.5,
+        "верх строки {} выше ленты {}",
+        row.top(),
+        feed.top()
+    );
+    assert!(
+        (row.height() - TEXT_ROW_HEIGHT).abs() < 0.5,
+        "строка целиком: высота {}",
+        row.height()
+    );
+}
+
+/// Журнал, который выше ленты на доли строки, всё равно прокручивается до конца:
+/// последняя строка иначе оставалась срезанной снизу.
+#[test]
+fn a_journal_a_hair_taller_than_the_feed_scrolls_to_its_end() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    // Сколько строк помещается в ленте — узнаём по настоящей отрисовке.
+    let path = dir.path().join("measure.jsonl");
+    let (text, _times) = long_journal(2000);
+    std::fs::write(&path, text).expect("журнал");
+    let mut harness = harness_with_journal(&path);
+    step_until(&mut harness, "первая страница", |h| {
+        h.state()
+            .viewing()
+            .is_some_and(|view| view.source.pages_in_memory() > 0)
+    });
+    let (_feed, fit) = feed_fit(&harness, TEXT_ROW_HEIGHT);
+    let rows = fit.ceil() as usize;
+    drop(harness);
+
+    // Столько строк лишь чуть выше ленты: rows·h > высоты ленты, но целых строк
+    // помещается ровно столько, сколько их есть.
+    let path = dir.path().join("short.jsonl");
+    let (text, times) = long_journal(rows);
+    std::fs::write(&path, text).expect("журнал");
+    let mut harness = harness_with_journal(&path);
+    step_until(&mut harness, "первая страница", |h| {
+        h.state()
+            .viewing()
+            .is_some_and(|view| view.source.pages_in_memory() > 0)
+    });
+    harness.key_press(Key::End);
+    harness.run_steps(2);
+    let (feed, fit) = feed_fit(&harness, TEXT_ROW_HEIGHT);
+    let view = harness.state().viewing().expect("журнал открыт");
+    let offset = view.scroll.offset();
+    assert!(offset > 0.0, "лента не прокрутилась: смещение {offset}");
+    assert!(
+        (offset + fit - rows as f64).abs() < 1e-6,
+        "смещение {offset}, помещается {fit}, строк {rows}"
+    );
+    let row = harness.get_by_label_contains(&times[rows - 1]).rect();
+    assert!(
+        row.bottom() <= feed.bottom() + 0.5,
+        "низ последней строки {} ниже ленты {}",
+        row.bottom(),
+        feed.bottom()
+    );
+}
+
+/// После дописывания лента просит последнюю страницу: комментарий виден и в ленте,
+/// когда её прокрутить до конца, а не только строкой под шапкой (U1-AC19).
+#[test]
+fn a_long_journal_shows_the_appended_comment_at_its_end() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("journal.jsonl");
+    let (text, _times) = long_journal(2000);
+    std::fs::write(&path, text).expect("журнал");
+    let mut harness = harness_with_journal(&path);
+    step_until(&mut harness, "первая страница", |h| {
+        h.state()
+            .viewing()
+            .is_some_and(|view| view.source.pages_in_memory() > 0)
+    });
+    harness
+        .get_by_role_and_label(Role::Button, "Комментарий")
+        .click();
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(Role::MultilineTextInput, "Что дописать в конец журнала")
+        .type_text("перезалили пробу");
+    harness.run_steps(2);
+    harness.get_by_label("Дописать").click();
+    step_until(&mut harness, "комментарий в файле", |h| {
+        h.query_by_label("Комментарий к журналу").is_none()
+    });
+    // Последняя страница в памяти: комментарий — последнее событие журнала.
+    step_until(&mut harness, "последняя страница", |h| {
+        h.state_mut().viewing_mut().is_some_and(|view| {
+            let last = view.source.total().saturating_sub(1);
+            view.source.event(last).is_some()
+        })
+    });
+    harness.get_by_label_contains("«перезалили пробу»");
+    // И в ленте: прокрутка до конца показывает строку комментария. Подпись не одна —
+    // та же строка есть под шапкой, поэтому считаем совпадения: подпись ленты
+    // начинается со времени события.
+    harness.key_press(Key::End);
+    step_until(&mut harness, "комментарий в ленте", |h| {
+        // Та же строка есть и под шапкой, в «…»: строка ленты начинается со времени.
+        h.query_all_by_label_contains("перезалили пробу")
+            .filter_map(|node| node.value())
+            .any(|value| !value.starts_with('«'))
+    });
+}
+
+/// Комментарий лёг в файл, а перечитать сводку не удалось: диалог закрыт, причина —
+/// строкой под шапкой. Это не «комментарий не записан» (U1-AC19).
+#[test]
+fn a_written_comment_is_reported_even_when_the_reread_fails() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("journal.jsonl");
+    std::fs::write(&path, journal_text()).expect("журнал");
+    let mut harness = harness_with_journal(&path);
+    step_until(&mut harness, "первая страница", |h| {
+        h.state()
+            .viewing()
+            .is_some_and(|view| view.source.pages_in_memory() > 0)
+    });
+    // Файл испортили после открытия: заголовок стал неполным. Дописать комментарий
+    // ещё можно — `append_note` смотрит только на `type` первой строки и на хвост
+    // файла, — а индекс журнала такой файл уже не собирает.
+    let text = std::fs::read_to_string(&path).expect("журнал");
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines[0] = r#"{"type":"session"}"#;
+    std::fs::write(&path, lines.join("\n") + "\n").expect("журнал");
+    harness
+        .get_by_role_and_label(Role::Button, "Комментарий")
+        .click();
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(Role::MultilineTextInput, "Что дописать в конец журнала")
+        .type_text("не ляжет в сводку");
+    harness.run_steps(2);
+    harness.get_by_label("Дописать").click();
+    // Диалог закрывается: текст в файле. Причина сбоя перечитывания — под шапкой.
+    step_until(&mut harness, "диалог закрылся", |h| {
+        h.query_by_label("Комментарий к журналу").is_none()
+    });
+    step_until(&mut harness, "строка под шапкой", |h| {
+        shown(h, "Комментарий записан, но журнал не перечитан")
+    });
+    let text = std::fs::read_to_string(&path).expect("журнал");
+    assert!(text.contains("не ляжет в сводку"), "{text}");
+}
+
 /// Клик мышью по точке экрана: наведение, нажатие и отпускание.
 fn click(harness: &mut Harness<'static, BytetapApp>, at: egui::Pos2) {
     harness.event(egui::Event::PointerMoved(at));

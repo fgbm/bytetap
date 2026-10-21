@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use bytetap_core::journal::view::DENSITY_BUCKETS;
 use bytetap_core::journal::{Event, JournalSummary};
+use eframe::egui::Rect;
 
 use crate::feed::FeedEvent;
 use crate::feedscroll::FeedScroll;
@@ -38,6 +39,9 @@ pub struct JournalView {
     pub seek: Option<usize>,
     /// Прокрутка ленты в единицах строк: смещение не теряет точность на миллионах строк.
     pub scroll: FeedScroll,
+    /// Видимая область ленты без полосы прокрутки: по ней видно, помещается ли строка
+    /// целиком (лента высотой не кратной строке режет последнюю строку).
+    pub feed_rect: Option<Rect>,
     /// Префиксные суммы строк HEX-дампа: считаются один раз при первом HEX-виде.
     hex_prefix: Option<Vec<u64>>,
 }
@@ -59,6 +63,7 @@ impl JournalView {
             visible: None,
             seek: None,
             scroll: FeedScroll::default(),
+            feed_rect: None,
             hex_prefix: None,
         }
     }

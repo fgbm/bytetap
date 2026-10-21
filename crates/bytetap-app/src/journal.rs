@@ -292,6 +292,31 @@ impl PageSource {
         tries >= PAGE_TRIES
     }
 
+    /// Страница не прочитается никогда: очередь пула закрыта (потоки кончились).
+    ///
+    /// Страница помечается неудачной сразу, без повторов: иначе лента вечно рисовала бы
+    /// на её месте «…» и ждала ответа, которого не будет.
+    pub fn page_lost(&mut self, page: usize, generation: u64) {
+        let Some(PageState::Loading {
+            generation: current,
+            ..
+        }) = self.states.get(&page).copied()
+        else {
+            return;
+        };
+        if current != generation {
+            return;
+        }
+        self.states.insert(
+            page,
+            PageState::Failed {
+                tries: PAGE_TRIES,
+                at: Instant::now(),
+            },
+        );
+        self.version += 1;
+    }
+
     /// Через сколько окну повторить запрос страниц, которые ждут повтора.
     pub fn next_retry(&self) -> Option<Duration> {
         let now = Instant::now();
@@ -513,13 +538,20 @@ impl PageReader {
     }
 
     /// Поставить страницу в очередь; задания распределяются по потокам по кругу.
-    pub fn request(&mut self, job: PageJob) {
-        if self.jobs.is_empty() {
-            return;
+    ///
+    /// `false` — очередь закрыта: ни один поток пула не принимает задания, и страница
+    /// не прочитается. Окно помечает её неудачной, а не ждёт ответа вечно.
+    #[must_use]
+    pub fn request(&mut self, job: PageJob) -> bool {
+        let workers = self.jobs.len();
+        for step in 0..workers {
+            let at = (self.next + step) % workers;
+            if self.jobs[at].send(job).is_ok() {
+                self.next = (at + 1) % workers;
+                return true;
+            }
         }
-        let sender = &self.jobs[self.next];
-        self.next = (self.next + 1) % self.jobs.len();
-        let _ = sender.send(job);
+        false
     }
 
     /// Готовый ответ, если он уже пришёл.
@@ -579,17 +611,49 @@ impl JournalOpen {
     /// Кеш журнала вместе с путём: [`JournalOpen::open`] и [`JournalOpen::append_note`]
     /// в одной фоновой задаче.
     ///
+    /// Запись и перечитывание различаются: комментарий, который лёг в файл, — уже
+    /// успех, и диалог закрывается; сбой перечитывания сводки показывается строкой под
+    /// шапкой просмотра, а не как «комментарий не записан» (FR-23, U1-AC19).
+    ///
     /// # Errors
     ///
-    /// Ошибки те же, что у обоих вызовов.
+    /// Комментарий не записан: журнал идёт или занят другой программой, файл оборван
+    /// или только для чтения, это не журнал bytetap.
     pub fn append_and_reopen(
         cache: &JournalCache,
         path: &Path,
         text: &str,
-    ) -> Result<Self, PageError> {
+    ) -> Result<NoteWritten, PageError> {
         Self::append_note(path, text)?;
-        Self::open(cache, path)
+        Ok(Self::reopen_outcome(cache, path))
     }
+
+    /// Итог перечитывания журнала после комментария: сводка или причина, почему её нет.
+    #[must_use]
+    pub fn reopen_outcome(cache: &JournalCache, path: &Path) -> NoteWritten {
+        match Self::open(cache, path) {
+            Ok(opened) => NoteWritten {
+                reopened: Some(opened),
+                reread_error: None,
+            },
+            Err(err) => NoteWritten {
+                reopened: None,
+                reread_error: Some(err.message),
+            },
+        }
+    }
+}
+
+/// Комментарий дописан: сводка перечитана, а если не удалось — почему.
+///
+/// Отдельный тип, а не `Result`: запись и перечитывание — разные шаги, и сбой второго
+/// не отменяет первого (FR-23, U1-AC19).
+#[derive(Debug)]
+pub struct NoteWritten {
+    /// Журнал с новым событием; `None` — файл перечитать не удалось.
+    pub reopened: Option<JournalOpen>,
+    /// Почему журнал не перечитан: строка под шапкой просмотра.
+    pub reread_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -617,6 +681,72 @@ mod tests {
 
     fn source_with(total: usize) -> PageSource {
         PageSource::new(PathBuf::from("journal.jsonl"), total, vec![0; total])
+    }
+
+    /// Журнал на диске: заголовок сессии и один фрагмент.
+    fn journal_file(path: &Path) {
+        use bytetap_core::journal::{Autoresponder, Host, Mode, Session};
+
+        let header = Session::new(
+            Mode::TcpServer,
+            Autoresponder::None,
+            serde_json::json!({}),
+            Host {
+                os: "Linux".to_owned(),
+            },
+        );
+        let mut text = serde_json::to_string(&Event::Session(header)).expect("заголовок");
+        text.push('\n');
+        text.push_str(&serde_json::to_string(&event(0)).expect("событие"));
+        text.push('\n');
+        std::fs::write(path, text).expect("журнал");
+    }
+
+    #[test]
+    fn a_page_that_cannot_be_queued_is_marked_unreadable() {
+        let mut source = source_with(1000);
+        let generation = source.request_page(0);
+        source.page_lost(0, generation);
+        // Строка ошибки вместо вечного «…»: повторов не будет, ответа тоже.
+        assert!(source.page_has_error(0));
+        assert!(source.missing_pages(0, 10).is_empty());
+        // Ответ от прошлого запроса не помечает свежую страницу.
+        let mut source = source_with(1000);
+        let stale = source.request_page(0);
+        source.request_page(0);
+        source.page_lost(0, stale);
+        assert!(!source.page_has_error(0));
+    }
+
+    #[test]
+    fn a_written_comment_is_not_a_failed_one_when_the_reread_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("journal.jsonl");
+        journal_file(&path);
+        let cache = JournalCache::default();
+        // Заголовок испорчен до дописывания: комментарий ляжет — `append_note` сверяет
+        // только `type` первой строки и хвост файла, — а индекс журнала такой файл уже
+        // не соберёт.
+        let text = std::fs::read_to_string(&path).expect("журнал");
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines[0] = r#"{"type":"session"}"#;
+        std::fs::write(&path, lines.join("\n") + "\n").expect("журнал");
+
+        let written = JournalOpen::append_and_reopen(&cache, &path, "перезалили пробу")
+            .expect("комментарий записан");
+        assert!(
+            written.reopened.is_none(),
+            "сводки нет: журнал не перечитан"
+        );
+        assert!(
+            written
+                .reread_error
+                .is_some_and(|reason| !reason.is_empty()),
+            "причина сбоя перечитывания"
+        );
+        // Сбой перечитывания не отменяет записи: комментарий в файле.
+        let text = std::fs::read_to_string(&path).expect("журнал");
+        assert!(text.contains("перезалили пробу"), "{text}");
     }
 
     #[test]
