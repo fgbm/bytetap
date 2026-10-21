@@ -667,7 +667,9 @@ jobs:
           Write-Host $line
           $line | Out-File -Encoding utf8 smoke/cpu-idle.txt
           if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
-          if ($idle -ge 2.0) { Write-Host "CPU в простое $idle % — больше 2 % одного ядра"; $failed = $true }
+          # В простое окно не рисует вовсе: замеры дают 0.00 % (U1-AC24), порог 0.5 %
+          # пропускает шум раннера и ловит возврат к кадрам без событий.
+          if ($idle -ge 0.5) { Write-Host "CPU в простое $idle % — больше 0.5 % одного ядра"; $failed = $true }
 
           # Запись: клиент шлёт 10 сообщений HL7 каждые 100 мс — поток 100 фрагментов/с,
           # лента и трасса перерисовываются на каждый кадр.
@@ -758,6 +760,10 @@ jobs:
               $line = "цена кадра {0} мс, период запроса кадра {1} мс" -f $cost.Matches[0].Groups[1].Value, $cost.Matches[0].Groups[2].Value
               Write-Host $line
               $line | Out-File -Encoding utf8 smoke/cpu-recording.txt -Append
+              # Цена кадра WARP на раннере — 16…250 мс (U1-AC24); период растёт вместе с
+              # ценой (live::next_period), но не дальше секунды.
+              if ([int]$cost.Matches[0].Groups[1].Value -ge 1000) { Write-Host 'кадр дороже секунды'; $failed = $true }
+              if ([int]$cost.Matches[0].Groups[2].Value -gt 1000) { Write-Host 'кадр просится реже раза в секунду'; $failed = $true }
             } else {
               Write-Host 'в журнале запуска нет цены кадра записи'
               $failed = $true
