@@ -35,7 +35,7 @@ serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Системное окно сообщения о фатальной ошибке и панике (NFR-3).
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Graphics_Gdi"] }
 
 [dev-dependencies]
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu", "snapshot"] }

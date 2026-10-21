@@ -38,6 +38,13 @@ fn main() {
     for name in dark.keys() {
         assert!(base.contains_key(name), "{name} есть только в тёмной теме");
     }
+    // У обеих тем один набор цветов: переменная только в одной из них — забытое значение.
+    let light_keys: Vec<_> = light.keys().collect();
+    let dark_keys: Vec<_> = dark.keys().collect();
+    assert_eq!(
+        light_keys, dark_keys,
+        "наборы переменных светлой и тёмной темы в design/tokens.css расходятся"
+    );
 
     let mut out = String::from("// Сгенерировано build.rs из design/tokens.css. Не править.\n\n");
     let mut lookup = String::new();

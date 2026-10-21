@@ -19,6 +19,10 @@ use std::sync::{Mutex, PoisonError};
 
 use chrono::{DateTime, Local, TimeZone};
 
+// Свой модуль по полному имени: проверка i18n узнаёт строки журнала по `diag::info(` и
+// `diag::error(`.
+use crate::diag;
+
 /// Папка журнала старта — та же, что у Tauri-версии v0.1.0: путь из руководства
 /// (`docs/guide/troubleshooting.md`) не меняется.
 pub const IDENTIFIER: &str = "io.github.fgbm.bytetap";
@@ -134,14 +138,25 @@ pub fn error(message: impl AsRef<str>) {
 /// Фатальная ошибка старта: журнал, системное окно со ссылкой на журнал и выход с кодом 1.
 pub fn fatal(text: &str) -> ! {
     error(text);
-    show_error(&with_details(text, log_path().as_deref()));
+    show_error(&with_details(text, opened_log().as_deref()));
     std::process::exit(1);
+}
+
+/// Путь журнала, если он открыт: окно о сбое не ссылается на файл, которого нет.
+fn opened_log() -> Option<PathBuf> {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let opened = LOG.lock().unwrap_or_else(PoisonError::into_inner).is_some();
+    opened.then(log_path).flatten()
 }
 
 /// Системное окно с ошибкой. Вне Windows — строка в stderr.
 #[cfg(windows)]
 pub fn show_error(text: &str) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW,
+    };
 
     let text: Vec<u16> = text.encode_utf16().chain([0]).collect();
     let title: Vec<u16> = "bytetap".encode_utf16().chain([0]).collect();
@@ -151,7 +166,8 @@ pub fn show_error(text: &str) {
             std::ptr::null_mut(),
             text.as_ptr(),
             title.as_ptr(),
-            MB_OK | MB_ICONERROR,
+            // Поверх всех окон: окно приложения могло не успеть появиться или зависнуть.
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
         );
     }
 }
@@ -208,18 +224,18 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let summary = panic_summary(info);
         let thread = std::thread::current();
-        let name = thread.name().unwrap_or("<без имени>").to_owned();
-        let location = info.location().map_or_else(
-            || "место неизвестно".to_owned(),
-            |at| format!("{}:{}:{}", at.file(), at.line(), at.column()),
-        );
+        let location = info
+            .location()
+            .map(|at| format!("{}:{}:{}", at.file(), at.line(), at.column()));
         let backtrace = std::backtrace::Backtrace::force_capture();
-        error(format!(
-            "паника в потоке {name} ({location}): {summary}\n{backtrace}"
+        diag::error(format!(
+            "паника в потоке {} ({}): {summary}\n{backtrace}",
+            thread.name().unwrap_or("<без имени>"),
+            location.as_deref().unwrap_or("место неизвестно")
         ));
         previous(info);
-        if name == "main" {
-            let text = crash_message(&summary, log_path().as_deref());
+        if thread.name() == Some("main") {
+            let text = crash_message(&summary, opened_log().as_deref());
             // Окно показывается из отдельного потока: модальный цикл в главном потоке
             // доставлял бы сообщения окну, чей обработчик сейчас паникует.
             let _ = std::thread::spawn(move || show_error(&text)).join();
@@ -229,8 +245,7 @@ fn install_panic_hook() {
 
 fn panic_summary(info: &PanicHookInfo<'_>) -> String {
     info.payload_as_str()
-        .unwrap_or("паника без текста")
-        .to_owned()
+        .map_or_else(|| crate::t!("diag.panicNoText").to_owned(), str::to_owned)
 }
 
 #[cfg(test)]

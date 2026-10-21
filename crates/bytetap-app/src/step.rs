@@ -862,8 +862,14 @@ impl BytetapApp {
                     }
                 });
                 let filled = !name.trim().is_empty();
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // «Сохранить», «Отмена» — справа, в порядке Windows; кнопки добавляются
+                // слева направо, чтобы Tab шёл в том же порядке, что видит глаз.
+                ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = SPACE_2;
+                    let buttons = widgets::confirm_button_width(ui, t!("actions.save"))
+                        + SPACE_2
+                        + widgets::chip_button_width(ui, false, t!("actions.cancel"));
+                    ui.add_space((ui.available_width() - buttons - SPACE_2).max(0.0));
                     confirm |=
                         widgets::confirm_button(ui, &p, t!("actions.save"), filled).clicked();
                     cancel =

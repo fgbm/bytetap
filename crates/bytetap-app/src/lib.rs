@@ -8,6 +8,7 @@ pub mod form;
 pub mod gpu;
 pub mod i18n;
 pub mod icons;
+pub mod placement;
 pub mod scenarios;
 pub mod settings;
 mod step;

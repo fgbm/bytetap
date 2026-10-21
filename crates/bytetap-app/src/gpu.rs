@@ -4,7 +4,9 @@
 //! каждой Windows 10/11: на виртуальной машине без GPU окно рисуется им. Аппаратный
 //! адаптер предпочтительнее, `WGPU_ADAPTER_NAME` выбирает адаптер по части имени
 //! (например, `WGPU_ADAPTER_NAME=basic render` включает WARP принудительно), `WGPU_BACKEND`
-//! переопределяет бэкенд. Список адаптеров и выбор пишутся в журнал запуска.
+//! переопределяет бэкенд. Список адаптеров и выбор пишутся в журнал запуска. Если wgpu
+//! на выбранном адаптере не поднялся, `main` один раз перезапускает процесс с WARP
+//! ([`retry_with_warp`]).
 
 use std::sync::Arc;
 
@@ -12,6 +14,24 @@ use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
 use eframe::wgpu;
 
 use crate::diag;
+
+/// Переменная окружения с частью имени адаптера, который выбрать.
+pub const ADAPTER_ENV: &str = "WGPU_ADAPTER_NAME";
+
+/// Часть имени WARP (`Microsoft Basic Render Driver`) для [`ADAPTER_ENV`].
+pub const WARP_ADAPTER: &str = "basic render";
+
+/// Метка перезапуска с WARP: второй сбой графики уже не перезапускает процесс.
+pub const RETRY_ENV: &str = "BYTETAP_WARP_RETRY";
+
+/// Перезапустить ли процесс с WARP после ошибки запуска графики: только если wgpu не
+/// поднялся (`wgpu_failed`, на Windows), адаптер не выбран явно (`adapter_set`) и это
+/// ещё не повтор (`retried`). Аппаратный адаптер может «рисовать в окно» по ответу
+/// драйвера и всё же падать при создании устройства — тогда помогает WARP.
+#[must_use]
+pub fn retry_with_warp(wgpu_failed: bool, adapter_set: bool, retried: bool) -> bool {
+    wgpu_failed && !adapter_set && !retried
+}
 
 /// Бэкенды wgpu: DX12 на Windows, на остальных ОС — как у egui по умолчанию.
 fn backends() -> wgpu::Backends {
@@ -27,7 +47,7 @@ fn backends() -> wgpu::Backends {
 pub fn configuration() -> WgpuConfiguration {
     let mut setup = WgpuSetupCreateNew::without_display_handle();
     setup.instance_descriptor.backends = backends();
-    let wanted = std::env::var("WGPU_ADAPTER_NAME").ok();
+    let wanted = std::env::var(ADAPTER_ENV).ok();
     setup.native_adapter_selector = Some(Arc::new(move |adapters, surface| {
         let candidates: Vec<Candidate> = adapters
             .iter()
@@ -52,11 +72,12 @@ pub fn configuration() -> WgpuConfiguration {
                 }
             ));
         }
+        // Текст ошибки попадает в системное окно «Не удалось запустить bytetap».
         let index = select(&candidates, wanted.as_deref()).ok_or_else(|| {
-            format!(
-                "нет адаптера wgpu для окна (бэкенды {:?}, адаптеров {})",
-                backends(),
-                candidates.len()
+            crate::t!(
+                "diag.noAdapter",
+                backends = format!("{:?}", backends()),
+                count = candidates.len()
             )
         })?;
         diag::info(format!("выбран адаптер wgpu: {}", candidates[index].name));
@@ -146,6 +167,22 @@ mod tests {
         // Адаптер, который не рисует в окно, не выбирается и по имени.
         assert_eq!(select(&machine(), Some("nvidia")), Some(1));
         assert_eq!(select(&machine(), Some("")), Some(1));
+    }
+
+    #[test]
+    fn the_warp_selector_picks_warp() {
+        assert_eq!(select(&machine(), Some(WARP_ADAPTER)), Some(0));
+    }
+
+    #[test]
+    fn a_graphics_failure_is_retried_with_warp_once() {
+        assert!(retry_with_warp(true, false, false));
+        // Повтор уже был — второй раз не перезапускается.
+        assert!(!retry_with_warp(true, false, true));
+        // Адаптер выбран явно — выбор пользователя не меняется.
+        assert!(!retry_with_warp(true, true, false));
+        // Ошибка не графики — перезапуск не поможет.
+        assert!(!retry_with_warp(false, false, false));
     }
 
     #[test]

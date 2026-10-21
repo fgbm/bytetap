@@ -279,6 +279,25 @@ fn label_galley(ui: &Ui, text: &str, size: f32, color: Color32) -> std::sync::Ar
         .layout_no_wrap(text.to_owned(), theme::sans(size), color)
 }
 
+/// Ширина [`chip_button`]: чтобы ставить кнопки справа в порядке слева направо.
+pub fn chip_button_width(ui: &Ui, icon: bool, text: &str) -> f32 {
+    let icon_width = if icon { 13.0 + 5.0 } else { 0.0 };
+    20.0 + icon_width
+        + label_galley(ui, text, TEXT_XS, Color32::PLACEHOLDER)
+            .size()
+            .x
+}
+
+/// Ширина [`confirm_button`].
+pub fn confirm_button_width(ui: &Ui, text: &str) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        theme::sans_semibold(TEXT_XS),
+        Color32::PLACEHOLDER,
+    );
+    galley.size().x + 24.0
+}
+
 /// Кнопка-пилюля второго уровня: «Скопировать», «Выбрать», «Сохранить» — 26px, рамка,
 /// текст 12px `text-muted`.
 pub fn chip_button(
@@ -290,7 +309,7 @@ pub fn chip_button(
 ) -> Response {
     let galley = label_galley(ui, text, TEXT_XS, p.text_muted);
     let icon_width = if icon.is_some() { 13.0 + 5.0 } else { 0.0 };
-    let size = vec2(20.0 + icon_width + galley.size().x, CHIP_HEIGHT);
+    let size = vec2(chip_button_width(ui, icon.is_some(), text), CHIP_HEIGHT);
     let sense = if enabled {
         Sense::click()
     } else {
@@ -488,7 +507,8 @@ pub fn confirm_button(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -> Re
     } else {
         Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x + 24.0, 28.0), sense);
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(confirm_button_width(ui, text), 28.0), sense);
     response.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, text));
     let corner = radius(RADIUS_RECORD.min(127.0));
     let mut fill = if enabled && response.hovered() {

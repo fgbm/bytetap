@@ -17,9 +17,9 @@ use eframe::egui::{self, Key, Theme, accesskit::Role};
 use egui_kittest::{Harness, SnapshotOptions, kittest::Queryable as _};
 
 /// Допуск сравнения: версии lavapipe на машине разработчика и в CI сглаживают немного
-/// по-разному.
+/// по-разному, но не больше чем в 20 пикселях и на 0.6 по цветовой разнице.
 fn options() -> SnapshotOptions {
-    SnapshotOptions::new().threshold(1.0).max_failed_pixels(200)
+    SnapshotOptions::new().threshold(0.6).max_failed_pixels(20)
 }
 
 const LOG_DIR: &str = r"C:\Users\operator\Documents\bytetap";
@@ -576,6 +576,158 @@ fn every_screen_has_its_heading() {
             harness.get_by_label(button);
         }
     }
+}
+
+/// Команды окна, которые приложение отправит на событие, кадр за кадром.
+fn commands_after(
+    harness: &mut Harness<'static, BytetapApp>,
+    events: impl IntoIterator<Item = egui::Event>,
+) -> Vec<egui::ViewportCommand> {
+    let mut commands = Vec::new();
+    for event in events {
+        harness.event(event);
+        harness.step();
+        commands.extend(
+            harness
+                .output()
+                .viewport_output
+                .values()
+                .flat_map(|viewport| viewport.commands.clone()),
+        );
+    }
+    commands
+}
+
+/// Стартовый экран с кадром 1/60 с: два клика в соседних кадрах — двойной клик
+/// (по умолчанию кадр харнесса — 0.25 с, больше задержки двойного клика).
+fn window_harness() -> Harness<'static, BytetapApp> {
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .with_step_dt(1.0 / 60.0)
+        .build_eframe(|cc| {
+            BytetapApp::new(&cc.egui_ctx, settings(false), None, None).with_fixtures(fixtures())
+        });
+    harness.run_steps(2);
+    harness
+}
+
+fn press_release(pos: egui::Pos2) -> [egui::Event; 3] {
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    [egui::Event::PointerMoved(pos), button(true), button(false)]
+}
+
+/// Край окна выше кнопок и шапки (U1-AC3): нажатие в углу над «Закрыть» начинает
+/// ресайз, а не закрывает окно; двойной клик по верхней кромке не разворачивает.
+#[test]
+fn the_resize_edge_takes_the_press_from_the_buttons_under_it() {
+    use egui::ViewportCommand as Cmd;
+    let mut harness = window_harness();
+    let (w, _) = WINDOW;
+    let commands = commands_after(&mut harness, press_release(egui::pos2(w - 2.0, 2.0)));
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, Cmd::BeginResize(egui::ResizeDirection::NorthEast))),
+        "{commands:?}"
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|c| matches!(c, Cmd::Close | Cmd::Minimized(_) | Cmd::Maximized(_))),
+        "{commands:?}"
+    );
+
+    // Двойной клик по верхней кромке над пустым местом шапки.
+    let mut harness = window_harness();
+    let top = egui::pos2(w / 2.0, 2.0);
+    let mut events = press_release(top).to_vec();
+    events.extend(press_release(top));
+    let commands = commands_after(&mut harness, events);
+    assert!(
+        !commands
+            .iter()
+            .any(|c| matches!(c, Cmd::Maximized(_) | Cmd::StartDrag)),
+        "{commands:?}"
+    );
+
+    // Чуть ниже кромки двойной клик по шапке по-прежнему разворачивает окно.
+    let mut harness = window_harness();
+    let below = egui::pos2(w / 2.0, 20.0);
+    let mut events = press_release(below).to_vec();
+    events.extend(press_release(below));
+    let commands = commands_after(&mut harness, events);
+    assert!(
+        commands.iter().any(|c| matches!(c, Cmd::Maximized(true))),
+        "{commands:?}"
+    );
+}
+
+/// Диалог имени профиля: «Сохранить», «Отмена» слева направо, и Tab идёт так же.
+#[test]
+fn the_profile_dialog_tabs_in_visual_order() {
+    let mut settings = settings(false);
+    settings.config.analyzer = "Прибор 1".into();
+    let mut harness = plain(settings, None, Screen::Step(SessionMode::Serial));
+    harness.get_by_label("Дополнительно").click();
+    harness.run_steps(2);
+    harness
+        .get_all_by_label("Сохранить")
+        .next()
+        .unwrap()
+        .click();
+    harness.run_steps(3);
+    let save = harness.get_all_by_label("Сохранить").last().unwrap().rect();
+    let cancel = harness.get_by_label("Отмена").rect();
+    assert!(save.right() < cancel.left(), "{save:?} {cancel:?}");
+    harness.key_press(Key::Tab);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .get_all_by_label("Сохранить")
+            .last()
+            .unwrap()
+            .is_focused()
+    );
+    harness.key_press(Key::Tab);
+    harness.run_steps(2);
+    assert!(harness.get_by_label("Отмена").is_focused());
+}
+
+/// Настройки не прочитаны: хранилище до конца сессии ничего не пишет (U1-AC7).
+#[test]
+fn unread_settings_are_never_overwritten() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, b"{\"theme\": \"dark\"}").unwrap();
+    let store = Store::new(path.clone());
+    let warning = LoadWarning::Reset {
+        reason: "Access is denied. (os error 5)".into(),
+    };
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            BytetapApp::new(
+                &cc.egui_ctx,
+                Settings::default(),
+                Some(warning),
+                Some(store),
+            )
+            .with_fixtures(fixtures())
+        });
+    harness.run_steps(2);
+    assert!(harness.state().settings_read_only());
+    harness.get_by_label_contains("Access is denied. (os error 5)");
+    harness.get_by_label_contains("изменения не сохранятся");
+    harness.key_press(Key::Enter);
+    harness.run_steps(2);
+    harness.get_by_label("Сценарии").click();
+    harness.run_steps(2);
+    assert_eq!(std::fs::read(&path).unwrap(), b"{\"theme\": \"dark\"}");
 }
 
 /// Испорченный файл настроек — строка под шапкой с путём копии (U1-AC7).

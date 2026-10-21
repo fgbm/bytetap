@@ -199,7 +199,12 @@ fn toggle_maximized(ctx: &egui::Context) {
     ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
 }
 
-/// Без системной рамки у окна нет краёв: изменение размера — полосой 5px по периметру.
+/// Без системной рамки у окна нет краёв: изменение размера — полосами 5px по периметру.
+///
+/// Полосы — отдельные области слоя `Foreground` с `Sense::drag()`: они выше шапки и
+/// кнопок окна, поэтому нажатие на краю не достаётся ни «Закрыть» под углом, ни
+/// перетаскиванию и двойному клику шапки под верхней кромкой. Вызывается до отрисовки
+/// экрана.
 pub fn resize_edges(ctx: &egui::Context) {
     let (maximized, rect, pos, pressed) = ctx.input(|i| {
         (
@@ -209,10 +214,30 @@ pub fn resize_edges(ctx: &egui::Context) {
             i.pointer.primary_pressed(),
         )
     });
-    let Some(pos) = pos else { return };
     if maximized {
         return;
     }
+    let strips = [
+        ("top", rect.with_max_y(rect.top() + RESIZE_EDGE)),
+        ("bottom", rect.with_min_y(rect.bottom() - RESIZE_EDGE)),
+        ("left", rect.with_max_x(rect.left() + RESIZE_EDGE)),
+        ("right", rect.with_min_x(rect.right() - RESIZE_EDGE)),
+    ];
+    let mut on_strip = false;
+    for (name, strip) in strips {
+        let response = egui::Area::new(egui::Id::unique(("bt-resize-edge", name)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(strip.min)
+            .constrain(false)
+            .show(ctx, |ui| {
+                ui.allocate_exact_size(strip.size(), Sense::drag()).1
+            })
+            .inner;
+        on_strip |= response.hovered();
+    }
+    let Some(pos) = pos.filter(|_| on_strip) else {
+        return;
+    };
     let l = pos.x < rect.left() + RESIZE_EDGE;
     let r = pos.x > rect.right() - RESIZE_EDGE;
     let t = pos.y < rect.top() + RESIZE_EDGE;

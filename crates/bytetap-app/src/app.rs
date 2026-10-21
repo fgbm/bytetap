@@ -82,6 +82,9 @@ pub struct BytetapApp {
     pub(crate) now: Option<DateTime<FixedOffset>>,
     /// Настройки изменены и ещё не записаны.
     dirty: bool,
+    /// Запомненное положение окна (физические пиксели) и разворот: ставятся в первом
+    /// кадре, когда известен масштаб монитора окна.
+    restore: Option<(Option<[i32; 2]>, bool)>,
 }
 
 impl BytetapApp {
@@ -96,6 +99,19 @@ impl BytetapApp {
         let dark = resolve_dark(settings.theme, ctx.system_theme());
         theme::apply(ctx, dark);
         let form = FormState::new(&settings.config);
+        // Файл настроек не прочитан или испорчен без копии: до конца сессии он не
+        // перезаписывается, иначе пропали бы настройки пользователя.
+        let store = store.map(|store| {
+            if warning.as_ref().is_some_and(LoadWarning::read_only) {
+                diag::error(format!(
+                    "настройки в {} не будут записаны до перезапуска",
+                    store.path().display()
+                ));
+                store.into_read_only()
+            } else {
+                store
+            }
+        });
         let mut app = Self {
             screen: Screen::Scenarios,
             settings,
@@ -121,6 +137,7 @@ impl BytetapApp {
             fixtures: false,
             now: None,
             dirty: false,
+            restore: None,
         };
         app.preselect_last_card();
         app.interfaces = Loaded::Loading(Task::spawn(ctx, background::list_interfaces));
@@ -148,6 +165,19 @@ impl BytetapApp {
         self.recents = Loaded::Ready(fixtures.recents);
         self.now = Some(fixtures.now);
         self
+    }
+
+    /// Положение окна в физических пикселях (уже проверенное на видимость) и разворот,
+    /// которые окно получит в первом кадре.
+    #[must_use]
+    pub fn with_window_restore(mut self, position: Option<[i32; 2]>, maximized: bool) -> Self {
+        self.restore = Some((position, maximized));
+        self
+    }
+
+    /// Хранилище настроек ничего не пишет до конца сессии.
+    pub fn settings_read_only(&self) -> bool {
+        self.store.as_ref().is_some_and(Store::is_read_only)
     }
 
     /// Раскрыть «Дополнительно» шага сценария.
@@ -416,6 +446,7 @@ impl BytetapApp {
     pub(crate) fn save_settings(&mut self) {
         self.dirty = false;
         if let Some(store) = &self.store
+            && !store.is_read_only()
             && let Err(err) = store.save(&self.settings)
         {
             diag::error(format!(
@@ -431,8 +462,29 @@ impl BytetapApp {
         self.set_dark(ctx, dark);
     }
 
-    /// Размер и положение окна вне развёрнутого состояния: их окно получит при запуске.
-    fn track_window(&mut self, ctx: &egui::Context) {
+    /// Первый кадр: запомненное положение и разворот. Физические пиксели переводятся в
+    /// точки по масштабу монитора, на котором окно создано, — egui-winit переведёт их
+    /// обратно по тому же масштабу, и окно встанет ровно в запомненный пиксель.
+    fn restore_window(&mut self, ctx: &egui::Context) {
+        let Some((position, maximized)) = self.restore.take() else {
+            return;
+        };
+        if let Some([x, y]) = position {
+            let scale = ctx.pixels_per_point();
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                x as f32 / scale,
+                y as f32 / scale,
+            )));
+        }
+        if maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+    }
+
+    /// Размер и положение «обычного» окна: их окно получит при запуске. Развёрнутое
+    /// окно запоминает только разворот, прижатое к краю (`arranged`) — ничего: его
+    /// размер — половина экрана, а не выбор пользователя.
+    fn track_window(&mut self, ctx: &egui::Context, arranged: bool) {
         let (outer, inner, maximized, minimized) = ctx.input(|i| {
             let v = i.viewport();
             (
@@ -451,9 +503,20 @@ impl BytetapApp {
                 maximized: true,
                 ..w
             })
+        } else if arranged {
+            previous.map(|w| WindowState {
+                maximized: false,
+                ..w
+            })
         } else {
+            let scale = ctx.pixels_per_point();
             inner.map(|inner| WindowState {
-                position: outer.map(|outer| [outer.min.x, outer.min.y]),
+                position: outer.map(|outer| {
+                    [
+                        (outer.min.x * scale).round() as i32,
+                        (outer.min.y * scale).round() as i32,
+                    ]
+                }),
                 size: [inner.width(), inner.height()],
                 maximized: false,
             })
@@ -466,6 +529,8 @@ impl BytetapApp {
     /// Весь интерфейс: шапка-заголовок окна, предупреждение о настройках и экран.
     pub fn draw(&mut self, ui: &mut Ui) {
         self.poll_background(&ui.ctx().clone());
+        // Края — раньше шапки: нажатие на краю не должно достаться кнопкам под ним.
+        titlebar::resize_edges(ui.ctx());
         let p = self.pal();
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0, p.surface_0);
@@ -476,7 +541,6 @@ impl BytetapApp {
             .auto_shrink(false)
             .show(ui, |ui| self.screen_body(ui));
         self.profile_prompt(ui.ctx());
-        titlebar::resize_edges(ui.ctx());
     }
 
     /// Строка под шапкой о сброшенных настройках, как в Tauri-версии.
@@ -485,14 +549,11 @@ impl BytetapApp {
             return;
         };
         let text = match warning {
-            LoadWarning::Reset => t!("settings.warningReset").to_owned(),
-            LoadWarning::Corrupt { copy } => t!(
-                "settings.warningCorrupt",
-                path = copy
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default()
-            ),
+            LoadWarning::Reset { reason } => t!("settings.warningReset", reason = reason),
+            LoadWarning::Corrupt { copy: None } => t!("settings.warningCorruptNoCopy").to_owned(),
+            LoadWarning::Corrupt { copy: Some(copy) } => {
+                t!("settings.warningCorrupt", path = copy.display())
+            }
         };
         let p = self.pal();
         let fill = mix(p.surface_0, p.warn, 0.12);
@@ -600,8 +661,17 @@ impl eframe::App for BytetapApp {
                 info.backend, info.name, info.device_type, info.driver, info.driver_info
             ));
         }
+        // Смоук окна о сбое в CI (NFR-3): паника главного потока в первом кадре.
+        if !self.ready && std::env::var_os("BYTETAP_TEST_PANIC").is_some_and(|v| v == "1") {
+            panic!("BYTETAP_TEST_PANIC=1: test panic in the first frame");
+        }
         self.follow_system_theme(&ctx);
-        self.track_window(&ctx);
+        if self.ready {
+            // В первом кадре окно ещё не встало на запомненное место.
+            self.track_window(&ctx, crate::placement::arranged(frame));
+        } else {
+            self.restore_window(&ctx);
+        }
         self.draw(ui);
         if self.dirty && self.screen != Screen::Step(self.settings.config.mode) {
             self.save_settings();

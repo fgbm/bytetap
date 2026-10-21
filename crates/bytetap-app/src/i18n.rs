@@ -123,9 +123,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    /// Модули журнала запуска: их строки — не интерфейс, а то, что они показывают
-    /// пользователю (системное окно), идёт через `t!`.
-    const LOG_ONLY: [&str; 2] = ["diag.rs", "gpu.rs"];
+    /// Вызовы журнала запуска: их строки — не интерфейс. Всё, что видит пользователь, в
+    /// том числе текст системного окна о сбое, идёт через `t!`.
+    const LOG_CALLS: [&str; 2] = ["diag::info(", "diag::error("];
 
     fn sources() -> Vec<(PathBuf, String)> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -145,9 +145,196 @@ mod tests {
         out
     }
 
-    /// Код без тестового модуля: строки тестов — не интерфейс.
-    fn code(text: &str) -> &str {
-        text.split("#[cfg(test)]").next().unwrap_or(text)
+    /// Строковый литерал исходника: содержимое без кавычек (экранирование не
+    /// раскрывается), строка файла и место в [`Lexed::code`].
+    #[derive(Debug, PartialEq)]
+    struct Literal {
+        text: String,
+        line: usize,
+        at: usize,
+    }
+
+    /// Исходник, разобранный настолько, насколько нужно проверкам: код без комментариев,
+    /// где каждый строковый литерал заменён одним символом `\u{1}`, и сами литералы.
+    struct Lexed {
+        code: String,
+        literals: Vec<Literal>,
+    }
+
+    /// Разбор исходника Rust: комментарии `//` и `/* */` (вложенные), строки с `\"`,
+    /// сырые строки `r"…"` и `r#"…"#`, байтовые строки, символы `'"'` и времена жизни.
+    fn lex(source: &str) -> Lexed {
+        let chars: Vec<char> = source.chars().collect();
+        let mut code = String::new();
+        let mut literals = Vec::new();
+        let mut line = 1;
+        let mut i = 0;
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            let prev_ident = i > 0 && ident(chars[i - 1]);
+            if c == '/' && next == Some('/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            } else if c == '/' && next == Some('*') {
+                let mut depth = 0;
+                while i < chars.len() {
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        if chars[i] == '\n' {
+                            line += 1;
+                            code.push('\n');
+                        }
+                        i += 1;
+                    }
+                }
+            } else if !prev_ident && (c == 'r' || (c == 'b' && next == Some('r'))) && {
+                let start = if c == 'b' { i + 2 } else { i + 1 };
+                let hashes = chars[start..].iter().take_while(|&&h| h == '#').count();
+                chars.get(start + hashes) == Some(&'"')
+            } {
+                let start = if c == 'b' { i + 2 } else { i + 1 };
+                let hashes = chars[start..].iter().take_while(|&&h| h == '#').count();
+                let body = start + hashes + 1;
+                let mut end = body;
+                while end < chars.len()
+                    && !(chars[end] == '"'
+                        && chars[end + 1..].iter().take_while(|&&h| h == '#').count() >= hashes)
+                {
+                    end += 1;
+                }
+                let text: String = chars[body..end.min(chars.len())].iter().collect();
+                literals.push(Literal {
+                    line,
+                    at: code.len(),
+                    text: text.clone(),
+                });
+                line += text.matches('\n').count();
+                code.push('\u{1}');
+                i = end + 1 + hashes;
+            } else if c == '"' {
+                let mut end = i + 1;
+                while end < chars.len() && chars[end] != '"' {
+                    end += if chars[end] == '\\' { 2 } else { 1 };
+                }
+                let text: String = chars[i + 1..end.min(chars.len())].iter().collect();
+                literals.push(Literal {
+                    line,
+                    at: code.len(),
+                    text: text.clone(),
+                });
+                line += text.matches('\n').count();
+                code.push('\u{1}');
+                i = end + 1;
+            } else if c == '\'' {
+                // Символ `'x'`, `'\n'`, `'\u{..}'` или время жизни `'a`.
+                if next == Some('\\') {
+                    let mut end = i + 2;
+                    while end < chars.len() && chars[end] != '\'' {
+                        end += 1;
+                    }
+                    code.push_str("' '");
+                    i = end + 1;
+                } else if chars.get(i + 2) == Some(&'\'') {
+                    code.push_str("' '");
+                    i += 3;
+                } else {
+                    code.push(c);
+                    i += 1;
+                }
+            } else {
+                if c == '\n' {
+                    line += 1;
+                }
+                code.push(c);
+                i += 1;
+            }
+        }
+        let mut lexed = Lexed { code, literals };
+        drop_test_modules(&mut lexed);
+        lexed
+    }
+
+    /// Тестовые модули `#[cfg(test)] mod … { … }` выпадают целиком: строки тестов — не
+    /// интерфейс. Прочие элементы с `#[cfg(test)]` остаются под проверкой.
+    fn drop_test_modules(lexed: &mut Lexed) {
+        let mut from = 0;
+        while let Some(found) = lexed.code[from..].find("#[cfg(test)]") {
+            let start = from + found;
+            let after = lexed.code[start + "#[cfg(test)]".len()..].trim_start();
+            if !after.starts_with("mod ") {
+                from = start + 1;
+                continue;
+            }
+            let Some(open) = lexed.code[start..].find('{').map(|o| start + o) else {
+                break;
+            };
+            let mut depth = 0;
+            let mut end = lexed.code.len();
+            for (offset, ch) in lexed.code[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + offset + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            lexed
+                .literals
+                .retain(|literal| literal.at < start || literal.at >= end);
+            let removed = end - start;
+            for literal in &mut lexed.literals {
+                if literal.at >= end {
+                    literal.at -= removed;
+                }
+            }
+            lexed.code.replace_range(start..end, "");
+            from = start;
+        }
+    }
+
+    /// Места литералов внутри аргументов вызовов журнала запуска.
+    fn in_log_calls(lexed: &Lexed) -> Vec<std::ops::Range<usize>> {
+        let mut ranges = Vec::new();
+        for call in LOG_CALLS {
+            let mut from = 0;
+            while let Some(found) = lexed.code[from..].find(call) {
+                let open = from + found + call.len() - 1;
+                let mut depth = 0;
+                let mut end = lexed.code.len();
+                for (offset, ch) in lexed.code[open..].char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + offset;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                ranges.push(open..end);
+                from = open + 1;
+            }
+        }
+        ranges
     }
 
     /// Ключи из вызовов `t!("…")`.
@@ -157,37 +344,60 @@ mod tests {
             if path.ends_with("i18n.rs") {
                 continue;
             }
-            let mut rest = code(&text);
-            while let Some(start) = rest.find("t!(") {
+            let lexed = lex(&text);
+            let mut from = 0;
+            while let Some(found) = lexed.code[from..].find("t!(") {
+                let start = from + found;
+                from = start + 3;
                 // `format!(` и `print!(` — не `t!(`.
-                let macro_name = rest[..start]
+                if lexed.code[..start]
                     .chars()
                     .next_back()
-                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-                rest = rest[start + 3..].trim_start();
-                if !macro_name {
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
                     continue;
                 }
-                let key = rest.strip_prefix('"').expect("ключ t! — строковый литерал");
-                let end = key.find('"').expect("ключ t! без кавычки");
-                keys.insert(key[..end].to_owned());
-                rest = &key[end..];
+                let rest = &lexed.code[from..];
+                let key_at = from + (rest.len() - rest.trim_start().len());
+                let key = lexed
+                    .literals
+                    .iter()
+                    .find(|literal| literal.at == key_at)
+                    .unwrap_or_else(|| panic!("{}: ключ t! — строковый литерал", path.display()));
+                keys.insert(key.text.clone());
             }
         }
         keys
     }
 
-    /// Строковые литералы строки кода без комментария.
-    fn literals(line: &str) -> Vec<&str> {
-        let code = line.split("//").next().unwrap_or(line);
-        let mut out = Vec::new();
-        let mut parts = code.split('"');
-        parts.next();
-        while let Some(literal) = parts.next() {
-            out.push(literal);
-            parts.next();
-        }
-        out
+    #[test]
+    fn the_lexer_understands_escapes_raw_strings_and_comments() {
+        let source = concat!(
+            "let a = \"он сказал \\\"привет\\\"\"; // «комментарий»\n",
+            "let b = r#\"сырая \"строка\"\"#; /* «блок /* вложенный */» */\n",
+            "let c = '\"'; let d: &'static str = r\"x\";\n",
+            "#[cfg(test)]\nfn helper() { \"тест-функция\" }\n",
+            "#[cfg(test)]\nmod tests { fn f() { \"тест\"; } }\n",
+            "let e = \"после\";\n",
+        );
+        let lexed = lex(source);
+        let texts: Vec<(&str, usize)> = lexed
+            .literals
+            .iter()
+            .map(|literal| (literal.text.as_str(), literal.line))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ("он сказал \\\"привет\\\"", 1),
+                ("сырая \"строка\"", 2),
+                ("x", 3),
+                ("тест-функция", 5),
+                ("после", 8),
+            ]
+        );
+        assert!(!lexed.code.contains("комментарий"));
+        assert!(!lexed.code.contains("mod tests"));
     }
 
     #[test]
@@ -217,34 +427,21 @@ mod tests {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            if name == "i18n.rs" || LOG_ONLY.contains(&name) {
+            if name == "i18n.rs" {
                 continue;
             }
-            // Глубина скобок вызова `diag::…(…)`: строки журнала запуска — не интерфейс.
-            let mut in_log = 0i32;
-            for (index, line) in code(&text).lines().enumerate() {
-                let line = line.trim_start();
-                if line.starts_with("//") {
+            let lexed = lex(&text);
+            let log = in_log_calls(&lexed);
+            for literal in &lexed.literals {
+                if log.iter().any(|range| range.contains(&literal.at)) {
                     continue;
                 }
-                let starts_log = in_log == 0 && line.contains("diag::");
-                if starts_log || in_log > 0 {
-                    let from = if starts_log {
-                        &line[line.find("diag::").unwrap_or(0)..]
-                    } else {
-                        line
-                    };
-                    in_log += from.matches('(').count() as i32 - from.matches(')').count() as i32;
-                    in_log = in_log.max(0);
-                    continue;
-                }
-                for literal in literals(line) {
-                    if literal
-                        .chars()
-                        .any(|c| ('\u{0400}'..='\u{04ff}').contains(&c))
-                    {
-                        found.push(format!("{name}:{}: {literal}", index + 1));
-                    }
+                if literal
+                    .text
+                    .chars()
+                    .any(|c| ('\u{0400}'..='\u{04ff}').contains(&c))
+                {
+                    found.push(format!("{name}:{}: {}", literal.line, literal.text));
                 }
             }
         }

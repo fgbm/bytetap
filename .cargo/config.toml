@@ -1,3 +1,5 @@
 # Статическая CRT на Windows MSVC: bytetap.exe не требует VC++ Redistributable (U1-AC1).
-[target.x86_64-pc-windows-msvc]
+# Внимание: переменная окружения RUSTFLAGS (и CARGO_ENCODED_RUSTFLAGS) полностью
+# перекрывает этот rustflags — при сборке с ней `+crt-static` надо добавить вручную.
+[target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]

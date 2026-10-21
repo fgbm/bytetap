@@ -6,7 +6,10 @@
 //! нет или которое не того типа, заменяется значением по умолчанию — так переносятся
 //! файлы прошлых версий. Файл, который не разбирается как JSON, копируется рядом в
 //! `settings.corrupt-<дата>.json`, приложение стартует с умолчаниями и показывает
-//! предупреждение. Запись атомарна: временный файл рядом и переименование.
+//! предупреждение. Файл, который не прочитать (права, блокировка), не перезаписывается:
+//! хранилище до конца сессии только читает. Настройки v0.1.0 (Tauri, plugin-store в
+//! `%APPDATA%\io.github.fgbm.bytetap\settings.json`) переносятся при первом запуске.
+//! Запись атомарна: временный файл рядом и переименование.
 
 use std::fs;
 use std::io::{self, Write as _};
@@ -191,11 +194,12 @@ pub struct FeedSettings {
     pub encoding: Encoding,
 }
 
-/// Размер и положение окна в точках интерфейса.
+/// Размер окна в точках интерфейса и положение в физических пикселях экрана.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct WindowState {
-    /// Левый верхний угол окна; `None` — окно по центру экрана.
-    pub position: Option<[f32; 2]>,
+    /// Левый верхний угол окна в физических пикселях: так положение не зависит от
+    /// масштаба монитора, на котором окно создаётся. `None` — окно по центру экрана.
+    pub position: Option<[i32; 2]>,
     pub size: [f32; 2],
     pub maximized: bool,
 }
@@ -367,8 +371,9 @@ fn normalize_window(raw: Option<&Value>) -> Option<WindowState> {
         }
     };
     let size = pair(raw.get("size")).filter(|[w, h]| *w > 0.0 && *h > 0.0)?;
+    let pixel = |n: f32| (n.abs() < 1e6).then(|| n.round() as i32);
     Some(WindowState {
-        position: pair(raw.get("position")),
+        position: pair(raw.get("position")).and_then(|[x, y]| Some([pixel(x)?, pixel(y)?])),
         size,
         maximized: flag(raw.get("maximized"), false),
     })
@@ -424,52 +429,166 @@ pub fn remove_profile(profiles: &mut Vec<Profile>, name: &str) {
 /// Что случилось с файлом при чтении: показывается строкой под шапкой.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadWarning {
-    /// Файл не прочитать (права, блокировка): работают значения по умолчанию.
-    Reset,
-    /// Файл не JSON: копия сохранена по пути (`None` — скопировать не удалось).
+    /// Файл не прочитать (права, блокировка): работают значения по умолчанию, а файл
+    /// до конца сессии не перезаписывается — в нём могут быть настройки пользователя.
+    Reset { reason: String },
+    /// Файл не JSON: копия сохранена по пути (`None` — скопировать не удалось, и тогда
+    /// файл не перезаписывается).
     Corrupt { copy: Option<PathBuf> },
 }
+
+impl LoadWarning {
+    /// Хранилище после этого предупреждения только читает: записать умолчания поверх
+    /// файла — потерять то, что в нём было.
+    pub fn read_only(&self) -> bool {
+        matches!(self, Self::Reset { .. } | Self::Corrupt { copy: None })
+    }
+}
+
+/// Имя файла настроек v0.1.0 внутри `%APPDATA%\io.github.fgbm.bytetap`.
+pub const LEGACY_FILE: &str = "settings.json";
+
+/// Ключ plugin-store Tauri, под которым v0.1.0 хранила настройки.
+const LEGACY_KEY: &str = "settings";
+
+/// Пауза между попытками переименования: файл может держать антивирус или индексатор.
+const RENAME_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Файл настроек на диске.
 #[derive(Clone, Debug)]
 pub struct Store {
     path: PathBuf,
+    /// Файл настроек v0.1.0: читается, если своего файла ещё нет.
+    legacy: Option<PathBuf>,
+    /// Запись выключена до конца сессии: файл не прочитан или испорчен без копии.
+    read_only: bool,
 }
 
 impl Store {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            legacy: None,
+            read_only: false,
+        }
+    }
+
+    /// Хранилище, которое переносит настройки v0.1.0 из `legacy`.
+    #[must_use]
+    pub fn with_legacy(mut self, legacy: PathBuf) -> Self {
+        self.legacy = Some(legacy);
+        self
+    }
+
+    /// Хранилище, которое ничего не пишет.
+    #[must_use]
+    pub fn into_read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     /// `settings.json` в каталоге конфигурации пользователя; `None` — каталог не определить.
+    /// Настройки v0.1.0 — в папке данных Tauri (`app_data_dir`, тот же `%APPDATA%`).
     pub fn default_location() -> Option<Self> {
-        dirs::config_dir().map(|dir| Self::new(dir.join(DIR).join(FILE)))
+        let store = Self::new(dirs::config_dir()?.join(DIR).join(FILE));
+        Some(match dirs::data_dir() {
+            Some(data) => store.with_legacy(data.join(crate::diag::IDENTIFIER).join(LEGACY_FILE)),
+            None => store,
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// Читает настройки и никогда не падает: ошибка — предупреждение и значения по
     /// умолчанию. Испорченный файл перед перезаписью копируется рядом, а умолчания сразу
-    /// записываются, чтобы предупреждение не повторялось при каждом запуске.
+    /// записываются, чтобы предупреждение не повторялось при каждом запуске; без копии
+    /// файл остаётся как есть.
     pub fn load(&self, log_dir: &str) -> (Settings, Option<LoadWarning>) {
+        self.load_at(log_dir, &chrono::Local::now())
+    }
+
+    fn load_at<Tz: chrono::TimeZone>(
+        &self,
+        log_dir: &str,
+        now: &chrono::DateTime<Tz>,
+    ) -> (Settings, Option<LoadWarning>)
+    where
+        Tz::Offset: std::fmt::Display,
+    {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return (Settings::with_log_dir(log_dir), None);
+                return (self.migrate(log_dir), None);
             }
-            Err(_) => return (Settings::with_log_dir(log_dir), Some(LoadWarning::Reset)),
+            Err(err) => {
+                let reason = err.to_string();
+                return (
+                    Settings::with_log_dir(log_dir),
+                    Some(LoadWarning::Reset { reason }),
+                );
+            }
         };
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(raw) => (normalize(&raw, log_dir), None),
             Err(_) => {
-                let copy = self.preserve_corrupt(&chrono::Local::now());
+                let copy = self.preserve_corrupt(now);
                 let settings = Settings::with_log_dir(log_dir);
-                let _ = self.save(&settings);
+                if copy.is_some() && !self.read_only {
+                    let _ = self.save(&settings);
+                }
                 (settings, Some(LoadWarning::Corrupt { copy }))
             }
         }
+    }
+
+    /// Своего файла нет: настройки v0.1.0, если они есть, переносятся в новое место.
+    fn migrate(&self, log_dir: &str) -> Settings {
+        let Some(legacy) = &self.legacy else {
+            return Settings::with_log_dir(log_dir);
+        };
+        let raw = match fs::read(legacy) {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Settings::with_log_dir(log_dir);
+            }
+            Err(err) => {
+                crate::diag::error(format!(
+                    "настройки v0.1.0 не прочитаны из {}: {err}",
+                    legacy.display()
+                ));
+                return Settings::with_log_dir(log_dir);
+            }
+        };
+        let Some(raw) = raw
+            .ok()
+            .and_then(|mut raw| raw.get_mut(LEGACY_KEY).map(Value::take))
+        else {
+            crate::diag::error(format!(
+                "настройки v0.1.0 в {} не разобраны: остаются значения по умолчанию",
+                legacy.display()
+            ));
+            return Settings::with_log_dir(log_dir);
+        };
+        let settings = normalize(&raw, log_dir);
+        match self.save(&settings) {
+            Ok(()) => crate::diag::info(format!(
+                "настройки v0.1.0 перенесены из {} в {}",
+                legacy.display(),
+                self.path.display()
+            )),
+            Err(err) => crate::diag::error(format!(
+                "настройки v0.1.0 прочитаны из {}, но не сохранены в {}: {err}",
+                legacy.display(),
+                self.path.display()
+            )),
+        }
+        settings
     }
 
     /// Копия испорченного файла `settings.corrupt-<дата>.json` рядом с оригиналом.
@@ -484,21 +603,42 @@ impl Store {
         Some(copy)
     }
 
-    /// Атомарная запись: временный файл в той же папке, затем переименование поверх.
+    /// Атомарная запись: временный файл `settings.json.<pid>.tmp` в той же папке (два
+    /// окна не пишут в один временный файл), затем переименование поверх — до трёх
+    /// попыток: на Windows файл ненадолго держат антивирус и индексатор.
     pub fn save(&self, settings: &Settings) -> io::Result<()> {
+        if self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "settings store is read-only for this session",
+            ));
+        }
         let dir = self.path.parent().unwrap_or(Path::new("."));
         fs::create_dir_all(dir)?;
         let mut json = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
         json.push(b'\n');
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = self
+            .path
+            .with_extension(format!("json.{}.tmp", std::process::id()));
         {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(&json)?;
             file.sync_all()?;
         }
-        fs::rename(&tmp, &self.path).inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })
+        let mut attempt = 1;
+        loop {
+            match fs::rename(&tmp, &self.path) {
+                Ok(()) => return Ok(()),
+                Err(_) if attempt < 3 => {
+                    attempt += 1;
+                    std::thread::sleep(RENAME_RETRY);
+                }
+                Err(err) => {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(err);
+                }
+            }
+        }
     }
 }
 
@@ -531,7 +671,7 @@ mod tests {
             baud: 9600,
         });
         settings.window = Some(WindowState {
-            position: Some([40.0, 30.0]),
+            position: Some([-1880, 30]),
             size: [1000.0, 700.0],
             maximized: false,
         });
@@ -601,6 +741,113 @@ mod tests {
         assert_eq!(fs::read(&copy).unwrap(), b"{\"config\": {");
         // Умолчания уже записаны: следующий запуск без предупреждения.
         assert_eq!(store.load(""), (Settings::default(), None));
+    }
+
+    #[test]
+    fn a_corrupt_file_without_a_copy_is_left_alone() {
+        let (_dir, store) = store();
+        let dir = store.path().parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        fs::write(store.path(), b"{\"config\": {").unwrap();
+        // Каталог на месте копии: скопировать не выйдет, а писать в папку можно.
+        fs::create_dir(dir.join("settings.corrupt-20261021-090507.json")).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-21T09:05:07+03:00").unwrap();
+        let (settings, warning) = store.load_at("", &now);
+        assert_eq!(settings, Settings::default());
+        let warning = warning.expect("предупреждение");
+        assert_eq!(warning, LoadWarning::Corrupt { copy: None });
+        assert!(warning.read_only());
+        assert_eq!(fs::read(store.path()).unwrap(), b"{\"config\": {");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_makes_the_store_read_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, store) = store();
+        store.save(&sample()).expect("save");
+        let before = fs::read(store.path()).unwrap();
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(store.path()).is_ok() {
+            // root читает и без прав: проверять нечего.
+            return;
+        }
+        let (settings, warning) = store.load("");
+        assert_eq!(settings, Settings::default());
+        let warning = warning.expect("предупреждение");
+        assert!(matches!(&warning, LoadWarning::Reset { reason } if !reason.is_empty()));
+        assert!(warning.read_only());
+        let store = store.into_read_only();
+        assert!(store.save(&Settings::default()).is_err());
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(store.path()).unwrap(), before);
+        let names: Vec<_> = fs::read_dir(store.path().parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [FILE], "временных файлов нет");
+    }
+
+    /// Файл plugin-store Tauri v0.1.0: объект «ключ → значение», настройки под `settings`.
+    const LEGACY_SAMPLE: &str = r#"{
+  "settings": {
+    "config": {
+      "mode": "serial",
+      "listenHost": "",
+      "listenPort": 5000,
+      "connectHost": "192.168.1.50",
+      "connectPort": 5000,
+      "reconnectSec": 5,
+      "serial": { "port": "COM4", "baud": 19200, "dataBits": 8, "parity": "none", "stopBits": 1, "flow": "none", "dtr": true, "rts": true },
+      "responder": "astm",
+      "astmNakOnBadChecksum": false,
+      "analyzer": "Прибор",
+      "note": "",
+      "logDir": "D:\\journals"
+    },
+    "theme": "dark",
+    "profiles": [{ "name": "Прибор", "config": { "mode": "serial", "serial": { "port": "COM4" } } }],
+    "feed": { "view": "hex", "encoding": "utf8" },
+    "lastRun": { "mode": "serial", "port": "COM4", "host": "", "baud": 19200 }
+  }
+}"#;
+
+    #[test]
+    fn v0_1_0_settings_are_migrated_once() {
+        let (dir, store) = store();
+        let legacy = dir.path().join("io.github.fgbm.bytetap").join(LEGACY_FILE);
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, LEGACY_SAMPLE).unwrap();
+        let store = store.with_legacy(legacy.clone());
+        let (settings, warning) = store.load("C:/default");
+        assert_eq!(warning, None);
+        assert_eq!(settings.config.mode, SessionMode::Serial);
+        assert_eq!(settings.config.serial.port, "COM4");
+        assert_eq!(settings.config.serial.baud, 19200);
+        assert_eq!(settings.config.responder, Responder::Astm);
+        assert_eq!(settings.config.log_dir, r"D:\journals");
+        assert_eq!(settings.theme, ThemeMode::Dark);
+        assert_eq!(settings.profiles.len(), 1);
+        assert_eq!(settings.feed.encoding, Encoding::Utf8);
+        assert_eq!(settings.last_run.as_ref().map(|r| r.baud), Some(19200));
+        // Перенесённое лежит в новом месте; старый файл не тронут.
+        assert_eq!(
+            Store::new(store.path().to_owned()).load("C:/default").0,
+            settings
+        );
+        assert_eq!(fs::read_to_string(&legacy).unwrap(), LEGACY_SAMPLE);
+    }
+
+    #[test]
+    fn a_broken_v0_1_0_file_gives_defaults() {
+        let (dir, store) = store();
+        let legacy = dir.path().join("legacy.json");
+        for content in ["{", r#"{"other": 1}"#] {
+            fs::write(&legacy, content).unwrap();
+            let store = store.clone().with_legacy(legacy.clone());
+            assert_eq!(store.load(""), (Settings::default(), None));
+            assert!(!store.path().exists());
+        }
     }
 
     #[test]

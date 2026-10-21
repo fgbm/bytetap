@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use bytetap_app::settings::{Settings, Store, WindowState};
-use bytetap_app::{BytetapApp, WINDOW_MIN_SIZE, WINDOW_SIZE, diag, gpu, t};
+use bytetap_app::{BytetapApp, WINDOW_MIN_SIZE, WINDOW_SIZE, diag, gpu, placement, t};
 use eframe::egui;
 
 fn main() {
@@ -36,11 +36,24 @@ fn main() {
         diag::error(format!("настройки сброшены: {warning:?}"));
     }
 
+    // Положение — только если шапка окна попадает на монитор, иначе окно по центру.
+    let position = placement::visible_position(
+        settings.window.and_then(|w| w.position),
+        placement::on_monitor,
+    );
+    if let Some(saved) = settings.window.and_then(|w| w.position)
+        && position.is_none()
+    {
+        diag::info(format!(
+            "запомненное положение окна {saved:?} вне мониторов: окно по центру"
+        ));
+    }
+    let maximized = settings.window.is_some_and(|w| w.maximized);
     let options = eframe::NativeOptions {
         viewport: viewport(settings.window.as_ref()),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: gpu::configuration(),
-        centered: settings.window.and_then(|w| w.position).is_none(),
+        centered: position.is_none(),
         // Размер и положение окна хранятся в settings.json, а не в хранилище eframe.
         persist_window: false,
         ..Default::default()
@@ -50,20 +63,60 @@ fn main() {
         "bytetap",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(BytetapApp::new(
-                &cc.egui_ctx,
-                settings,
-                warning,
-                store,
-            )))
+            Ok(Box::new(
+                BytetapApp::new(&cc.egui_ctx, settings, warning, store)
+                    .with_window_restore(position, maximized),
+            ))
         }),
     );
     if let Err(err) = result {
+        let wgpu_failed = matches!(err, eframe::Error::Wgpu(_));
+        if gpu::retry_with_warp(
+            cfg!(windows) && wgpu_failed,
+            std::env::var_os(gpu::ADAPTER_ENV).is_some(),
+            std::env::var_os(gpu::RETRY_ENV).is_some(),
+        ) {
+            diag::error(format!(
+                "графика не запустилась: {err}; перезапуск с {}={}",
+                gpu::ADAPTER_ENV,
+                gpu::WARP_ADAPTER
+            ));
+            relaunch_with_warp();
+        }
         diag::fatal(&t!("diag.startFailed", reason = err));
     }
 }
 
-/// Окно без рамки: запомненные размер и положение или 1200×800 по центру.
+/// Перезапуск себя с WARP: тот же exe и аргументы, `WGPU_ADAPTER_NAME=basic render` и
+/// метка повтора против цикла. Возвращается, только если запустить не удалось.
+fn relaunch_with_warp() {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            diag::error(format!("перезапуск с WARP: путь exe не определён: {err}"));
+            return;
+        }
+    };
+    let status = std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .env(gpu::ADAPTER_ENV, gpu::WARP_ADAPTER)
+        .env(gpu::RETRY_ENV, "1")
+        .status();
+    match status {
+        // Процесс ждёт перезапущенный: код выхода и PID для смоука — те же.
+        Ok(status) => {
+            diag::info(format!("перезапуск с WARP завершился: {status}"));
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Err(err) => diag::error(format!(
+            "перезапуск с WARP не удался ({}): {err}",
+            exe.display()
+        )),
+    }
+}
+
+/// Окно без рамки: запомненный размер или 1200×800. Положение и разворот ставятся в
+/// первом кадре (`BytetapApp::with_window_restore`), когда известен масштаб монитора.
 fn viewport(saved: Option<&WindowState>) -> egui::ViewportBuilder {
     let size = saved.map_or(WINDOW_SIZE, |w| {
         [
@@ -71,18 +124,11 @@ fn viewport(saved: Option<&WindowState>) -> egui::ViewportBuilder {
             w.size[1].max(WINDOW_MIN_SIZE[1]),
         ]
     });
-    let mut builder = egui::ViewportBuilder::default()
+    egui::ViewportBuilder::default()
         .with_title("bytetap")
         .with_app_id("bytetap")
         .with_inner_size(size)
         .with_min_inner_size(WINDOW_MIN_SIZE)
         .with_decorations(false)
-        .with_resizable(true);
-    if let Some(saved) = saved {
-        if let Some(position) = saved.position {
-            builder = builder.with_position(position);
-        }
-        builder = builder.with_maximized(saved.maximized);
-    }
-    builder
+        .with_resizable(true)
 }
