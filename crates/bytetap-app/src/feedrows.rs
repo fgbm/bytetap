@@ -319,6 +319,42 @@ pub fn hex_row(
     row_menu(&response, p, event, &text, encoding);
 }
 
+/// Строка, чья страница ещё едет: заполнитель той же высоты, чтобы лента не сдвигалась.
+pub fn pending_row(ui: &mut Ui, p: &Palette, height: f32) {
+    let text = t!("journal.rowPending");
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(Role::Label, false, text));
+    ui.painter().text(
+        pos2(
+            rect.left() + SPACE_3 + TIME_WIDTH + SPACE_2,
+            rect.center().y,
+        ),
+        Align2::LEFT_CENTER,
+        text,
+        theme::mono(TEXT_XS),
+        p.text_faint,
+    );
+}
+
+/// Строка ошибки: страницу не удалось прочитать после всех попыток.
+pub fn error_row(ui: &mut Ui, p: &Palette, height: f32) {
+    let text = t!("journal.rowUnreadable");
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(Role::Alert, false, text));
+    ui.painter().text(
+        pos2(
+            rect.left() + SPACE_3 + TIME_WIDTH + SPACE_2,
+            rect.center().y,
+        ),
+        Align2::LEFT_CENTER,
+        text,
+        theme::mono(TEXT_XS),
+        p.danger,
+    );
+}
+
 /// Контекстное меню строки: текст, HEX и Base64 фрагмента (U1-AC16).
 ///
 /// Текст фрагмента копируется целиком, без предела показа в строке: строка ленты

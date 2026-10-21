@@ -6,6 +6,7 @@ pub mod diag;
 pub mod errors;
 pub mod feed;
 pub mod feedrows;
+pub mod feedscroll;
 pub mod form;
 pub mod gpu;
 pub mod i18n;

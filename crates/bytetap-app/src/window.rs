@@ -58,10 +58,12 @@ pub fn dwm_round_supported() -> bool {
     cfg!(windows)
 }
 
-/// Настроить окно средствами DWM: скругление, цвет рамки, тень.
+/// Настроить окно средствами DWM: скругление, расширение рамки и цвет рамки.
 ///
-/// Вызывается один раз, когда окно уже создано и `HWND` известен. Результат пишется
-/// в журнал запуска: без него не понять, применились ли настройки на этой системе.
+/// Вызывается после первого кадра, когда окно уже видимо: атрибуты, заданные до того,
+/// как окно показано, DWM теряет при первой отрисовке — рамка появлялась только после
+/// смены темы (U1-AC18). Результат пишется в журнал запуска: без него не понять,
+/// применились ли настройки на этой системе.
 #[cfg(windows)]
 pub fn setup_dwm(handle: RawWindowHandle, border: Color32) -> DwmSetup {
     use windows_sys::Win32::Foundation::HWND;
@@ -132,9 +134,17 @@ pub fn setup_dwm(_handle: RawWindowHandle, _border: Color32) -> DwmSetup {
     DwmSetup::NONE
 }
 
+/// Цвет рамки в виде `#RRGGBB`: по этой строке смоук CI проверяет журнал запуска.
+#[must_use]
+pub fn hex_color(color: Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
+}
+
 /// Цвет рамки, который рисует DWM: меняется вместе с темой.
 ///
 /// Вне Windows и без скругления DWM вызов ничего не делает: рамку рисует приложение.
+/// Результат пишется в журнал запуска — первая установка после первого кадра и есть
+/// та, которую проверяет смоук.
 pub fn set_dwm_border(handle: RawWindowHandle, border: Color32) {
     #[cfg(windows)]
     {
@@ -156,7 +166,7 @@ pub fn set_dwm_border(handle: RawWindowHandle, border: Color32) {
             )
         };
         if ok == 0 {
-            diag::info("рамка окна: DWM рисует рамку цветом border (DWMWA_BORDER_COLOR)");
+            diag::info(format!("цвет рамки DWM принят: {}", hex_color(border)));
         } else {
             diag::error(format!(
                 "рамка окна: DWM не принял цвет рамки: HRESULT {ok:#x}"
@@ -222,5 +232,13 @@ mod tests {
     #[test]
     fn the_frame_is_one_pixel_wide() {
         assert_eq!(FRAME_WIDTH, 1.0);
+    }
+
+    /// Цвет рамки идёт в журнал запуска как `#RRGGBB`: по этой строке смоук CI видит,
+    /// что DWM принял цвет без переключения темы.
+    #[test]
+    fn the_dwm_colour_is_written_as_a_hex_token() {
+        assert_eq!(hex_color(Color32::from_rgb(1, 2, 3)), "#010203");
+        assert_eq!(hex_color(Color32::from_rgb(0xab, 0xcd, 0xef)), "#abcdef");
     }
 }

@@ -7,14 +7,14 @@
 //! журнала по 500 событий.
 
 use eframe::egui::{
-    self, Align, Align2, CursorIcon, Frame, Id, Layout, Popup, Rect, RectAlign, Role, ScrollArea,
-    Sense, Stroke, Ui, UiBuilder, WidgetInfo, pos2, vec2,
+    self, Align, Align2, CursorIcon, Frame, Id, Layout, Popup, Rect, RectAlign, Role, Sense,
+    Stroke, Ui, UiBuilder, WidgetInfo, pos2, vec2,
 };
 
 use bytetap_core::journal::view::DENSITY_BUCKETS;
 
 use crate::app::BytetapApp;
-use crate::feedrows::{HEX_ROW_HEIGHT, TEXT_ROW_HEIGHT, hex_row, text_row};
+use crate::feedrows::{HEX_ROW_HEIGHT, TEXT_ROW_HEIGHT, error_row, hex_row, pending_row, text_row};
 use crate::icons::{self, Icon};
 use crate::settings::{Encoding, FeedView};
 use crate::theme::tokens::{RADIUS_CHIP, SPACE_2, SPACE_3, TEXT_2XS, TEXT_XS};
@@ -344,7 +344,7 @@ fn view_button(ui: &mut Ui, p: &Palette, text: &str, name: &str) -> egui::Respon
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-/// Лента журнала: видимые строки через `show_rows`, страницы по требованию.
+/// Лента журнала: видимые строки своей прокруткой в строках, страницы по требованию.
 pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     let p = app.pal();
     let hex = app.settings.feed.view == FeedView::Hex;
@@ -374,48 +374,63 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     // Колонка номера соединения — когда соединений было больше одного: как в UI v2,
     // где в просмотре берутся итоги сессии из сводки журнала.
     let multi = view.summary.stats.connections > 1;
-    ui.spacing_mut().item_spacing.y = 0.0;
-    let mut scroll = ScrollArea::vertical()
-        .id_salt("bt-journal-feed")
-        .auto_shrink(false);
     if let Some(event) = view.seek.take() {
-        // Переход к событию: строка прокрутки — по номеру строки события.
+        // Переход к событию: строка — по номеру строки события в текущем виде.
         let target = if hex { view.hex_row_of(event) } else { event };
-        scroll = scroll.vertical_scroll_offset(target as f32 * row_height);
+        view.scroll.set_top(target);
     }
-    let output = scroll.show_rows(ui, row_height, total, |ui, range| {
-        for row in range {
-            let Some((index, line)) = view.event_of_row(row, hex) else {
-                break;
-            };
-            let Some(event) = view.source.event(index) else {
-                // Страница ещё едет: строка появится, когда страница придёт.
-                continue;
-            };
-            let Some(event) = crate::viewing::feed_event(event) else {
-                continue;
-            };
-            if hex {
-                hex_row(ui, &p, &event, line, multi, encoding);
-            } else {
-                text_row(ui, &p, &event, multi, encoding);
+    // Прокрутка копируется на кадр: замыкание строк держит изменяемую ссылку на журнал.
+    let mut scroll = view.scroll;
+    let out = scroll.show(
+        ui,
+        Id::unique("bt-journal-feed"),
+        total,
+        row_height,
+        |ui, range| {
+            for row in range {
+                let Some((index, line)) = view.event_of_row(row, hex) else {
+                    break;
+                };
+                // Страница в пути: заполнитель той же высоты — строки не сдвигаются.
+                if view.source.page_has_error(index) {
+                    error_row(ui, &p, row_height);
+                    continue;
+                }
+                let Some(event) = view.source.event(index) else {
+                    pending_row(ui, &p, row_height);
+                    continue;
+                };
+                let Some(event) = crate::viewing::feed_event(event) else {
+                    pending_row(ui, &p, row_height);
+                    continue;
+                };
+                if hex {
+                    hex_row(ui, &p, &event, line, multi, encoding);
+                } else {
+                    text_row(ui, &p, &event, multi, encoding);
+                }
             }
-        }
-    });
-    // Видимая область — рамка на карте сессии.
-    let first = (output.state.clamped_offset().y / row_height).floor() as usize;
-    let visible = (output.inner_rect.height() / row_height).ceil() as usize;
-    let last = (first + visible).min(total.saturating_sub(1));
-    if visible > 0 && total > 0 {
-        let start = view.event_of_row(first, hex).map_or(0, |(index, _)| index);
-        let end = view
-            .event_of_row(last, hex)
-            .map_or(start, |(index, _)| index);
-        let start = view.fraction_at_event(start);
-        let end = (view.fraction_at_event(end) + 1.0 / DENSITY_BUCKETS as f32).min(1.0);
-        app.set_visible(Some((start, end)));
+        },
+    );
+    view.scroll = scroll;
+    // Видимая область — рамка на карте сессии; страницы — по событиям, а не по строкам:
+    // одна строка HEX — кусок события, и номер строки не номер события.
+    let last = (out.first + out.visible).min(total.saturating_sub(1));
+    let first_event = view
+        .event_of_row(out.first, hex)
+        .map_or(0, |(index, _)| index);
+    let last_event = view
+        .event_of_row(last, hex)
+        .map_or(total, |(index, _)| index + 1);
+    let start = view.fraction_at_event(first_event);
+    let end = (view.fraction_at_event(last_event.saturating_sub(1)) + 1.0 / DENSITY_BUCKETS as f32)
+        .min(1.0);
+    app.set_visible(Some((start, end)));
+    let ctx = ui.ctx().clone();
+    app.request_pages(&ctx, first_event, last_event.max(first_event + 1));
+    if let Some(pause) = app.retry_pages() {
+        ctx.request_repaint_after(pause);
     }
-    app.request_pages(ui.ctx(), first, first + visible + 1);
 }
 
 /// Количество корзин плотности — как в UI v2.

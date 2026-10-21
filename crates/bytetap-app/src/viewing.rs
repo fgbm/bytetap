@@ -15,6 +15,7 @@ use bytetap_core::journal::view::DENSITY_BUCKETS;
 use bytetap_core::journal::{Event, JournalSummary};
 
 use crate::feed::FeedEvent;
+use crate::feedscroll::FeedScroll;
 use crate::journal::{PAGE_SIZE, PageSource};
 use crate::theme::Palette;
 
@@ -35,6 +36,8 @@ pub struct JournalView {
     pub visible: Option<(f32, f32)>,
     /// Прокрутка к номеру события: `None` — не прокручивать.
     pub seek: Option<usize>,
+    /// Прокрутка ленты в единицах строк: смещение не теряет точность на миллионах строк.
+    pub scroll: FeedScroll,
     /// Префиксные суммы строк HEX-дампа: считаются один раз при первом HEX-виде.
     hex_prefix: Option<Vec<u64>>,
 }
@@ -55,6 +58,7 @@ impl JournalView {
             first_event,
             visible: None,
             seek: None,
+            scroll: FeedScroll::default(),
             hex_prefix: None,
         }
     }

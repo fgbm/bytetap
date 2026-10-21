@@ -20,7 +20,7 @@ use eframe::egui::{
 };
 use tokio::sync::watch;
 
-use crate::app::BytetapApp;
+use crate::app::{BytetapApp, NoteTarget};
 use crate::feed::{self, Detected, ENCODINGS, FeedEvent, FeedRing};
 use crate::feedrows::{HEX_ROW_HEIGHT, TEXT_ROW_HEIGHT, hex_row, text_format, text_row, truncated};
 use crate::icons::{self, Icon};
@@ -493,7 +493,8 @@ impl BytetapApp {
             });
         let ctx = ui.ctx().clone();
         if note {
-            self.note_prompt = Some(String::new());
+            // Цель задаётся при открытии: комментарий в сессию, а не в просмотр.
+            self.open_note(NoteTarget::Session);
         }
         if folder {
             self.open_log_dir(&ctx);
@@ -577,13 +578,20 @@ impl BytetapApp {
         }
     }
 
-    /// Комментарий во время записи (FR-23): Ctrl+Enter или «Добавить», Escape — отмена.
-    pub(crate) fn note_prompt(&mut self, ctx: &egui::Context) {
-        let Some(mut text) = self.note_prompt.take() else {
+    /// Комментарий во время записи и в просмотре журнала (FR-23): Ctrl+Enter или
+    /// «Добавить», Escape — отмена.
+    ///
+    /// Цель берётся из диалога: комментарий к сессии и комментарий к журналу — разные
+    /// записи, и флаг «куда» не переживает закрытие диалога (U1-AC17, U1-AC19).
+    pub(crate) fn note_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.note.as_ref() else {
             return;
         };
+        let journal = matches!(dialog.target, NoteTarget::Journal(_));
+        let mut text = dialog.text.clone();
+        let error = dialog.error.clone();
+        let sending = dialog.sending;
         let p = self.pal();
-        let journal = self.journal_note;
         let mut confirm = false;
         let mut cancel = false;
         let modal = egui::Modal::new(Id::unique("bt-note-prompt"))
@@ -655,8 +663,15 @@ impl BytetapApp {
                         confirm = true;
                     }
                 });
-                let filled = !text.trim().is_empty();
-                let add_label = if journal {
+                // Ошибка дописывания — строкой в диалоге: диалог не закрывается молча.
+                if let Some(error) = &error {
+                    let label = ui.label(RichText::new(error).size(TEXT_XS).color(p.danger));
+                    label.widget_info(|| WidgetInfo::labeled(Role::Alert, true, error));
+                }
+                let filled = !text.trim().is_empty() && !sending;
+                let add_label = if sending {
+                    t!("actions.saving")
+                } else if journal {
                     t!("journal.noteAdd")
                 } else {
                     t!("actions.noteAdd")
@@ -675,14 +690,29 @@ impl BytetapApp {
         if modal.should_close() {
             cancel = true;
         }
-        if confirm && !text.trim().is_empty() {
-            if journal {
-                self.append_journal_note(&text);
-            } else {
-                self.add_note(&text);
+        if confirm && !text.trim().is_empty() && !sending {
+            let target = self.note.as_ref().map(|note| note.target.clone());
+            match target {
+                Some(NoteTarget::Journal(path)) => {
+                    // Файл и сводка — в фоне; диалог закроется, когда комментарий ляжет.
+                    if let Some(note) = &mut self.note {
+                        note.text.clone_from(&text);
+                        note.sending = true;
+                        note.error = None;
+                    }
+                    self.append_journal_note(ctx, path, &text);
+                }
+                Some(NoteTarget::Session) => {
+                    self.add_note(&text);
+                    self.note = None;
+                }
+                None => {}
             }
-        } else if !cancel {
-            self.note_prompt = Some(text);
+        } else if cancel {
+            // Отмена: цель комментария уходит вместе с диалогом.
+            self.note = None;
+        } else if let Some(note) = &mut self.note {
+            note.text = text;
         }
     }
 }

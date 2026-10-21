@@ -4,15 +4,16 @@
 //! Журнал синтетический: сообщения прибора — выдуманные, персональных данных нет.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use bytetap_app::journal::JournalCacheHandle;
-use bytetap_app::journal::JournalOpen;
+use bytetap_app::feedrows::TEXT_ROW_HEIGHT;
+use bytetap_app::journal::{JournalCache, JournalOpen, PAGE_SIZE};
+use bytetap_app::live::Phase;
 use bytetap_app::settings::{FeedView, Settings, Store};
 use bytetap_app::viewing::JournalView;
 use bytetap_app::{BytetapApp, Fixtures, Screen, theme};
 use bytetap_core::journal::{Autoresponder, Data, Dir, Event, Host, Mode, Open, Session};
-use eframe::egui::{self, accesskit::Role};
+use eframe::egui::{self, Key, accesskit::Role};
 use egui_kittest::{Harness, SnapshotOptions, kittest::Queryable as _};
 
 /// Рендер-тесты по одному: загрузчик Vulkan (lavapipe) изредка падает с SIGSEGV.
@@ -129,12 +130,67 @@ fn journal_text() -> String {
     text
 }
 
+/// Кадры харнесса до условия, с паузой: страницы журнала читает фоновый пул.
+fn step_until(
+    harness: &mut Harness<'static, BytetapApp>,
+    what: &str,
+    mut done: impl FnMut(&mut Harness<'static, BytetapApp>) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        harness.step();
+        if done(harness) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "не дождались: {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Видна ли в дереве AccessKit строка с такой подписью.
+fn shown(harness: &Harness<'static, BytetapApp>, label: &str) -> bool {
+    harness.query_by_label_contains(label).is_some()
+}
+
+/// Длинный синтетический журнал: у каждого события своё время, 50 байт — 4 строки HEX.
+fn long_journal(events: usize) -> (String, Vec<String>) {
+    let base =
+        chrono::DateTime::parse_from_rfc3339("2026-10-19T10:15:00.000+03:00").expect("время");
+    let mut header = Session::new(
+        Mode::TcpServer,
+        Autoresponder::None,
+        serde_json::json!({"listen": "127.0.0.1:5000"}),
+        Host {
+            os: "Linux".to_owned(),
+        },
+    );
+    header.analyzer = Some("ANALYZER".to_owned());
+    let mut text = serde_json::to_string(&Event::Session(header)).expect("заголовок");
+    text.push('\n');
+    let mut times = Vec::with_capacity(events);
+    for index in 0..events {
+        let at = base + chrono::Duration::seconds(index as i64);
+        let event = Event::Data(Data::new(
+            at.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string(),
+            index as u64,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            &[b'A'; 50],
+        ));
+        text.push_str(&serde_json::to_string(&event).expect("событие"));
+        text.push('\n');
+        times.push(at.format("%H:%M:%S.%3f").to_string());
+    }
+    (text, times)
+}
+
 /// Готовая сводка журнала для снимков: индекс строится по синтетическому файлу.
 fn journal_view() -> JournalView {
     let dir = tempfile::tempdir().expect("временная папка");
     let path = dir.path().join("bytetap-20261019101500-tcp_server.jsonl");
     std::fs::write(&path, journal_text()).expect("журнал");
-    let cache = JournalCacheHandle::default();
+    let cache = JournalCache::default();
     let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
     let mut view = JournalView::new(
         opened.path.clone(),
@@ -146,7 +202,8 @@ fn journal_view() -> JournalView {
     let events = cache
         .read(&opened.path, 0, bytetap_app::journal::PAGE_SIZE)
         .expect("страница");
-    view.source.store_page(0, events);
+    let generation = view.source.request_page(0);
+    view.source.store_page(0, generation, events);
     // Временная папка удалится — путь в снимке показываем как настоящий.
     view.path = PathBuf::from(format!(
         r"{LOG_DIR}\bytetap-20261019101500-tcp_server.jsonl"
@@ -275,12 +332,10 @@ fn a_comment_is_appended_to_the_journal() {
     let dir = tempfile::tempdir().expect("временная папка");
     let path = dir.path().join("journal.jsonl");
     std::fs::write(&path, journal_text()).expect("журнал");
-    let cache = JournalCacheHandle::default();
+    let cache = JournalCache::default();
     let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
     let before = opened.summary.events;
-    cache
-        .append_note(&path, "перезалили пробу")
-        .expect("комментарий");
+    bytetap_app::journal::JournalOpen::append_note(&path, "перезалили пробу").expect("комментарий");
     let after = JournalOpen::open(&cache, &path).expect("журнал после комментария");
     assert_eq!(after.summary.events, before + 1, "событие note добавлено");
     let events = cache
@@ -303,7 +358,7 @@ fn the_comment_from_the_header_reaches_the_journal() {
     let mut harness = Harness::builder()
         .with_size(WINDOW)
         .build_eframe(move |cc| {
-            let cache = JournalCacheHandle::default();
+            let cache = JournalCache::default();
             let opened = JournalOpen::open(&cache, &journal).expect("журнал открывается");
             let mut view = JournalView::new(
                 opened.path.clone(),
@@ -314,7 +369,8 @@ fn the_comment_from_the_header_reaches_the_journal() {
             let events = cache
                 .read(&opened.path, 0, bytetap_app::journal::PAGE_SIZE)
                 .expect("страница");
-            view.source.store_page(0, events);
+            let generation = view.source.request_page(0);
+            view.source.store_page(0, generation, events);
             BytetapApp::new(&cc.egui_ctx, settings(false), None, None)
                 .with_fixtures(fixtures())
                 .with_journal_fixture(view)
@@ -330,11 +386,18 @@ fn the_comment_from_the_header_reaches_the_journal() {
         .type_text("перезалили пробу");
     harness.run_steps(2);
     harness.get_by_label("Дописать").click();
-    harness.run_steps(4);
-    assert!(
-        harness.query_by_label("Комментарий к журналу").is_none(),
-        "диалог закрылся"
+    // Диалог закрывается, когда комментарий лёг в файл: запись идёт в фоне.
+    step_until(
+        &mut harness,
+        "комментарий в журнале",
+        |h| h.query_by_label("Комментарий к журналу").is_none(),
     );
+    // Строка под шапкой видит дописанный комментарий: последнюю страницу лента
+    // перечитывает сама (U1-AC19).
+    step_until(&mut harness, "строка комментариев под шапкой", |h| {
+        h.query_by_label_contains("проба 1 · перезалили пробу")
+            .is_some()
+    });
     // Файл получил комментарий, а сводка — новое событие.
     let text = std::fs::read_to_string(&path).expect("журнал");
     assert!(text.contains("\"type\":\"note\""), "{text}");
@@ -347,7 +410,7 @@ fn a_file_that_is_not_a_journal_gives_an_error() {
     let dir = tempfile::tempdir().expect("временная папка");
     let path = dir.path().join("notes.txt");
     std::fs::write(&path, "просто текст\n").expect("файл");
-    let cache = JournalCacheHandle::default();
+    let cache = JournalCache::default();
     let error = JournalOpen::open(&cache, &path).expect_err("не журнал");
     assert!(error.message.contains("session"), "{}", error.message);
 }
@@ -391,7 +454,7 @@ fn a_million_events_do_not_grow_the_memory() {
     }
     file.flush().expect("сброс");
 
-    let cache = JournalCacheHandle::default();
+    let cache = JournalCache::default();
     let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
     assert_eq!(
         opened.summary.events, EVENTS as usize,
@@ -408,7 +471,8 @@ fn a_million_events_do_not_grow_the_memory() {
         opened.lengths.clone(),
         opened.first_event.clone(),
     );
-    view.source.store_page(0, page);
+    let generation = view.source.request_page(0);
+    view.source.store_page(0, generation, page);
     assert_eq!(
         view.rows(false),
         EVENTS as usize,
@@ -491,7 +555,7 @@ fn a_journal_of_a_session_opens_and_shows_the_same_events() {
         session.stop().await;
         path
     });
-    let cache = JournalCacheHandle::default();
+    let cache = JournalCache::default();
     let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
     assert!(opened.summary.events > 0, "в журнале есть события");
     // События журнала и ленты совпадают: заголовок и итоги в ленту не входят.
@@ -512,4 +576,320 @@ fn a_journal_of_a_session_opens_and_shows_the_same_events() {
     let _ = Duration::from_secs(1);
     let _ = Store::new(std::path::PathBuf::from("settings.json"));
     let _ = theme::palette(false);
+}
+
+/// Лента сама просит страницы: без заранее положенной страницы 0 строки появляются,
+/// когда фоновый пул прочитает файл (U1-AC18, U1-AC19).
+#[test]
+fn the_feed_loads_its_first_page_itself() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("journal.jsonl");
+    let (text, times) = long_journal(2000);
+    std::fs::write(&path, text).expect("журнал");
+    let journal = path.clone();
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            let cache = JournalCache::default();
+            let opened = JournalOpen::open(&cache, &journal).expect("журнал открывается");
+            // Страница 0 не положена: её должен прочитать пул страниц ленты.
+            let view = JournalView::new(
+                opened.path,
+                opened.summary,
+                opened.lengths,
+                opened.first_event,
+            );
+            BytetapApp::new(&cc.egui_ctx, settings(false), None, None)
+                .with_fixtures(fixtures())
+                .with_journal_fixture(view)
+        });
+    step_until(&mut harness, "первая страница", |h| {
+        h.state()
+            .viewing()
+            .is_some_and(|view| view.source.pages_in_memory() > 0)
+    });
+    harness.run_steps(2);
+    harness.get_by_label_contains(&times[0]);
+}
+
+/// HEX через карту сессии: переход просит страницы по номерам событий, а не строк HEX,
+/// и лента показывает событие из середины журнала (U1-AC19).
+#[test]
+fn the_hex_seek_reaches_events_past_the_first_page() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("journal.jsonl");
+    let (text, times) = long_journal(2000);
+    std::fs::write(&path, text).expect("журнал");
+    let journal = path.clone();
+    let mut setup = settings(false);
+    setup.feed.view = FeedView::Hex;
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            let cache = JournalCache::default();
+            let opened = JournalOpen::open(&cache, &journal).expect("журнал открывается");
+            let view = JournalView::new(
+                opened.path,
+                opened.summary,
+                opened.lengths,
+                opened.first_event,
+            );
+            BytetapApp::new(&cc.egui_ctx, setup, None, None)
+                .with_fixtures(fixtures())
+                .with_journal_fixture(view)
+        });
+    step_until(&mut harness, "первая страница", |h| {
+        h.state()
+            .viewing()
+            .is_some_and(|view| view.source.pages_in_memory() > 0)
+    });
+    // Середина карты: переход к событию примерно из середины журнала.
+    let map = harness.get_by_label("Перейти к месту ленты").rect();
+    click(&mut harness, map.center());
+    harness.run_steps(2);
+    let (event, time) = {
+        let view = harness.state_mut().viewing_mut().expect("журнал открыт");
+        let rows = view.rows(true);
+        let row = view.scroll.first_row(rows);
+        let (event, _) = view.event_of_row(row, true).expect("строка в журнале");
+        (event, times[event].clone())
+    };
+    assert!(
+        (700..=1300).contains(&event),
+        "переход в середину журнала: событие {event}"
+    );
+    // Строка события из середины появляется, когда пул прочитает её страницу.
+    step_until(
+        &mut harness,
+        "событие середины в ленте",
+        |h| shown(h, &time),
+    );
+}
+
+/// Строка, чья страница ещё едет, — заполнитель той же высоты: строки не сдвигаются,
+/// событие 500 остаётся на 500·h от первой видимой строки (U1-AC19).
+#[test]
+fn a_pending_row_keeps_its_height_until_the_page_arrives() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("journal.jsonl");
+    let (text, times) = long_journal(1000);
+    std::fs::write(&path, text).expect("журнал");
+    let cache = JournalCache::default();
+    let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
+    // Источник — файла нет: страница 0 не подгрузится сама и останется заполнителем.
+    let mut view = JournalView::new(
+        PathBuf::from("/нет/такого/журнала.jsonl"),
+        opened.summary,
+        opened.lengths,
+        opened.first_event,
+    );
+    // Загружена только вторая страница: события 500…999.
+    let events = cache
+        .read(&opened.path, PAGE_SIZE, PAGE_SIZE)
+        .expect("страница");
+    let generation = view.source.request_page(1);
+    assert_eq!(
+        view.source.store_page(1, generation, events),
+        bytetap_app::journal::PageLoad::Stored
+    );
+    view.scroll.set_top(480);
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings(false), None, None)
+                .with_fixtures(fixtures())
+                .with_journal_fixture(view)
+        });
+    harness.run_steps(3);
+    let real = harness
+        .get_by_label_contains(&times[PAGE_SIZE])
+        .rect()
+        .top();
+    let placeholder = harness
+        .query_all_by_label("…")
+        .filter_map(|node| {
+            let rect = node.rect();
+            rect.top().is_finite().then_some(rect.top())
+        })
+        .fold(f32::INFINITY, f32::min);
+    let shift = real - placeholder;
+    assert!(
+        (shift - 20.0 * TEXT_ROW_HEIGHT).abs() < 0.5,
+        "событие 500 через 20 строк заполнителей: {shift} px"
+    );
+}
+
+/// «Отмена» в комментарии к журналу не оставляет цель: следующий комментарий во время
+/// записи идёт в журнал сессии (U1-AC17, U1-AC19).
+#[test]
+fn a_cancelled_journal_comment_does_not_steal_the_recording_comment() {
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("свободный порт");
+        listener.local_addr().expect("адрес").port()
+    };
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("journal.jsonl");
+    std::fs::write(&path, journal_text()).expect("журнал");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let handle = runtime.handle().clone();
+    let log_dir = dir.path().to_string_lossy().into_owned();
+    let journal = path.clone();
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            let cache = JournalCache::default();
+            let opened = JournalOpen::open(&cache, &journal).expect("журнал открывается");
+            let mut view = JournalView::new(
+                opened.path.clone(),
+                opened.summary,
+                opened.lengths,
+                opened.first_event,
+            );
+            let events = cache
+                .read(&opened.path, 0, PAGE_SIZE)
+                .expect("первая страница");
+            let generation = view.source.request_page(0);
+            view.source.store_page(0, generation, events);
+            let mut settings = Settings::with_log_dir(&log_dir);
+            settings.config.listen_host = "127.0.0.1".into();
+            settings.config.listen_port = port;
+            BytetapApp::new(&cc.egui_ctx, settings, None, None)
+                .with_fixtures(fixtures())
+                .with_runtime(handle)
+                .with_journal_fixture(view)
+        });
+    harness.run_steps(3);
+    // Комментарий в просмотре: открыли и отменили.
+    harness
+        .get_by_role_and_label(Role::Button, "Комментарий")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("Комментарий к журналу");
+    harness.get_by_label("Отмена").click();
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("Комментарий к журналу").is_none(),
+        "диалог закрылся по «Отмене»"
+    );
+    // «×» — назад к сценариям и запись TCP-сервера на свободном порту.
+    harness
+        .get_by_role_and_label(Role::Button, "Закрыть журнал")
+        .click();
+    harness.run_steps(2);
+    assert_eq!(harness.state().screen, Screen::Scenarios);
+    harness.key_press(Key::Enter);
+    harness.run_steps(2);
+    harness.get_by_label("Старт").click();
+    step_until(&mut harness, "запись", |h| {
+        h.state().phase() == Phase::Recording
+    });
+    let recorded = harness
+        .state()
+        .recorded_path()
+        .cloned()
+        .expect("журнал записи");
+    harness
+        .get_by_role_and_label(Role::Button, "Меню записи")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("Комментарий…").click();
+    harness.run_steps(2);
+    harness.get_by_label("Комментарий к сессии");
+    harness
+        .get_by_role_and_label(Role::MultilineTextInput, "Комментарий")
+        .type_text("проба 9");
+    harness.run_steps(2);
+    harness.get_by_label("Добавить").click();
+    step_until(
+        &mut harness,
+        "диалог комментария закрылся",
+        |h| h.query_by_label("Комментарий к сессии").is_none(),
+    );
+    // Остановка сессии: журнал заканчивается штатно, и комментарий уже в файле.
+    harness.get_by_label_contains("Стоп 00:").click();
+    step_until(&mut harness, "остановка", |h| {
+        h.state().phase() == Phase::Idle
+    });
+    let text = std::fs::read_to_string(&recorded).expect("журнал записи");
+    assert!(
+        text.contains("\"type\":\"note\"") && text.contains("проба 9"),
+        "комментарий не попал в журнал сессии: {text}"
+    );
+    runtime.shutdown_background();
+}
+
+/// Ошибка дописывания: диалог не закрывается молча, причина — строкой в диалоге.
+#[cfg(unix)]
+#[test]
+fn a_comment_error_keeps_the_dialog_open() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("journal.jsonl");
+    std::fs::write(&path, journal_text()).expect("журнал");
+    // Только чтение: дописать комментарий нельзя.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("права");
+    let journal = path.clone();
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            let cache = JournalCache::default();
+            let opened = JournalOpen::open(&cache, &journal).expect("журнал открывается");
+            let mut view = JournalView::new(
+                opened.path.clone(),
+                opened.summary,
+                opened.lengths,
+                opened.first_event,
+            );
+            let events = cache
+                .read(&opened.path, 0, PAGE_SIZE)
+                .expect("первая страница");
+            let generation = view.source.request_page(0);
+            view.source.store_page(0, generation, events);
+            BytetapApp::new(&cc.egui_ctx, settings(false), None, None)
+                .with_fixtures(fixtures())
+                .with_journal_fixture(view)
+        });
+    harness.run_steps(3);
+    harness
+        .get_by_role_and_label(Role::Button, "Комментарий")
+        .click();
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(Role::MultilineTextInput, "Что дописать в конец журнала")
+        .type_text("не ляжет");
+    harness.run_steps(2);
+    harness.get_by_label("Дописать").click();
+    step_until(&mut harness, "ошибка комментария", |h| {
+        shown(h, "Комментарий не записан")
+    });
+    // Диалог на месте: строку ошибки видно в нём, а не только в журнале запуска.
+    harness.get_by_label("Комментарий к журналу");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("права");
+    let text = std::fs::read_to_string(&path).expect("журнал");
+    assert!(!text.contains("не ляжет"), "{text}");
+}
+
+/// Клик мышью по точке экрана: наведение, нажатие и отпускание.
+fn click(harness: &mut Harness<'static, BytetapApp>, at: egui::Pos2) {
+    harness.event(egui::Event::PointerMoved(at));
+    harness.run_steps(1);
+    harness.event(egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run_steps(1);
+    harness.event(egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run_steps(1);
 }
