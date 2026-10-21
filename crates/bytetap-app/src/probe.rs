@@ -40,6 +40,13 @@ pub const LATENCY_ENV: &str = "BYTETAP_TEST_PROBE_LATENCY";
 /// Размер окна для замера: `640x480`.
 pub const SIZE_ENV: &str = "BYTETAP_TEST_PROBE_SIZE";
 
+/// Период кадра для замера в миллисекундах: без него кадр просится сразу, как в
+/// непрерывной перерисовке, с ним — как в работе окна (`request_repaint_after`).
+pub const PERIOD_ENV: &str = "BYTETAP_TEST_PROBE_PERIOD";
+
+/// Ждать ли GPU в начале кадра: `0` — не ждать (ожидание добавляет синхронизацию).
+pub const POLL_ENV: &str = "BYTETAP_TEST_PROBE_POLL";
+
 /// Весь интерфейс: так окно работает на самом деле.
 pub const FULL: &str = "full";
 
@@ -69,8 +76,12 @@ pub fn start() {
     ON.store(true, Ordering::Relaxed);
     *PROBE.lock().unwrap_or_else(PoisonError::into_inner) = Some(Probe::new(seconds));
     diag::info(format!(
-        "проба кадра: {seconds} с, режим {}{}",
+        "проба кадра: {seconds} с, режим {}{}{}",
         mode(),
+        match period() {
+            Some(period) => format!(", период кадра {} мс", period.as_millis()),
+            None => String::new(),
+        },
         if crate::gpu::diagnostics() {
             format!(
                 ", диагностика: представление {}, MSAA {}, задержка {}",
@@ -118,6 +129,22 @@ fn parse_size(value: &str) -> Option<[f32; 2]> {
     Some([width.trim().parse().ok()?, height.trim().parse().ok()?])
 }
 
+/// Период кадра пробы из [`PERIOD_ENV`]: `None` — кадр просится сразу.
+#[must_use]
+pub fn period() -> Option<Duration> {
+    std::env::var(PERIOD_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|millis: &u64| *millis > 0)
+        .map(Duration::from_millis)
+}
+
+/// Ждать ли GPU в начале кадра: [`POLL_ENV`] `0` выключает ожидание.
+#[must_use]
+pub fn polling() -> bool {
+    std::env::var(POLL_ENV).is_ok_and(|value| value.trim() != "0")
+}
+
 /// Начало кадра пробы: `None`, когда проба выключена.
 #[must_use]
 pub fn frame_start() -> Option<Instant> {
@@ -140,8 +167,12 @@ pub fn frame_end(ctx: &egui::Context, frame: &mut eframe::Frame, started: Option
     if finished {
         std::process::exit(0);
     }
-    // Кадр за кадром без паузы: так проба видит наибольшую частоту кадров.
-    ctx.request_repaint();
+    // Кадр за кадром без паузы: так проба видит наибольшую частоту кадров; с периодом
+    // кадр просится реже, как его просит окно во время записи.
+    match period() {
+        Some(period) => ctx.request_repaint_after(period),
+        None => ctx.request_repaint(),
+    }
 }
 
 /// Замер одного кадра в секундах.
@@ -184,9 +215,11 @@ impl Probe {
         // работы растра осталось незавершённой, когда окно начало новый кадр.
         let waited = frame.wgpu_render_state().map_or(Duration::ZERO, |state| {
             let start = Instant::now();
-            let _ = state
-                .device
-                .poll(eframe::wgpu::PollType::wait_indefinitely());
+            if polling() {
+                let _ = state
+                    .device
+                    .poll(eframe::wgpu::PollType::wait_indefinitely());
+            }
             start.elapsed()
         });
         if let Some(last) = self.last_frame {

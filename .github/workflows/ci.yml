@@ -969,19 +969,23 @@ jobs:
             'BYTETAP_TEST_AUTOSTART', 'BYTETAP_TEST_HOOKS', 'BYTETAP_TEST_PROBE',
             'BYTETAP_TEST_PROBE_MODE', 'BYTETAP_TEST_PROBE_PRESENT',
             'BYTETAP_TEST_PROBE_MSAA', 'BYTETAP_TEST_PROBE_LATENCY',
-            'BYTETAP_TEST_PROBE_SIZE', 'WGPU_ADAPTER_NAME', 'WGPU_BACKEND'
+            'BYTETAP_TEST_PROBE_SIZE', 'BYTETAP_TEST_PROBE_PERIOD',
+            'BYTETAP_TEST_PROBE_POLL', 'WGPU_ADAPTER_NAME', 'WGPU_BACKEND'
           )
+          # Цена кадра не зависит от периода его запроса — так это или нет, видно по
+          # CPU: он либо падает вместе с числом кадров, либо остаётся.
           $variants = @(
-            @{ Name = 'как есть (Fifo, задержка 2)'; Env = @{} },
-            @{ Name = 'задержка кадров 1'; Env = @{ BYTETAP_TEST_PROBE_LATENCY = '1' } },
-            @{ Name = 'immediate'; Env = @{ BYTETAP_TEST_PROBE_PRESENT = 'immediate' } },
-            @{ Name = 'novsync'; Env = @{ BYTETAP_TEST_PROBE_PRESENT = 'novsync' } },
-            @{ Name = 'MSAA 4'; Env = @{ BYTETAP_TEST_PROBE_MSAA = '4' } },
-            @{ Name = 'без иконок'; Env = @{ BYTETAP_TEST_PROBE_MODE = 'no-icons' } },
-            @{ Name = 'только фон'; Env = @{ BYTETAP_TEST_PROBE_MODE = 'empty' } },
-            @{ Name = 'только фон, immediate'; Env = @{ BYTETAP_TEST_PROBE_MODE = 'empty'; BYTETAP_TEST_PROBE_PRESENT = 'immediate' } },
-            @{ Name = 'окно 640x480'; Env = @{ BYTETAP_TEST_PROBE_SIZE = '640x480' } },
-            @{ Name = 'запись 100 фрагментов/с'; Env = @{ BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0' } }
+            @{ Name = 'непрерывно'; Env = @{} },
+            @{ Name = 'непрерывно, без ожидания GPU'; Env = @{ BYTETAP_TEST_PROBE_POLL = '0' } },
+            @{ Name = 'период 100 мс'; Env = @{ BYTETAP_TEST_PROBE_PERIOD = '100'; BYTETAP_TEST_PROBE_POLL = '0' } },
+            @{ Name = 'период 100 мс, ожидание GPU'; Env = @{ BYTETAP_TEST_PROBE_PERIOD = '100' } },
+            @{ Name = 'период 33 мс'; Env = @{ BYTETAP_TEST_PROBE_PERIOD = '33'; BYTETAP_TEST_PROBE_POLL = '0' } },
+            @{ Name = 'период 33 мс, ожидание GPU'; Env = @{ BYTETAP_TEST_PROBE_PERIOD = '33' } },
+            @{ Name = 'запись, непрерывно'; Env = @{ BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0' } },
+            @{ Name = 'запись, период 100 мс'; Env = @{ BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0'; BYTETAP_TEST_PROBE_PERIOD = '100'; BYTETAP_TEST_PROBE_POLL = '0' } },
+            @{ Name = 'запись, период 33 мс'; Env = @{ BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0'; BYTETAP_TEST_PROBE_PERIOD = '33'; BYTETAP_TEST_PROBE_POLL = '0' } },
+            @{ Name = 'только фон, период 100 мс'; Env = @{ BYTETAP_TEST_PROBE_MODE = 'empty'; BYTETAP_TEST_PROBE_PERIOD = '100'; BYTETAP_TEST_PROBE_POLL = '0' } },
+            @{ Name = 'период 100 мс, immediate'; Env = @{ BYTETAP_TEST_PROBE_PERIOD = '100'; BYTETAP_TEST_PROBE_POLL = '0'; BYTETAP_TEST_PROBE_PRESENT = 'immediate' } }
           )
           $rows = @('| вариант | итог пробы | CPU % одного ядра |', '| --- | --- | --- |')
           $failed = $false
