@@ -4,7 +4,7 @@
 use bytetap_app::settings::{Settings, Store, WindowState};
 use bytetap_app::{
     AUTOSTART_ENV, BytetapApp, FORCED_EXIT, HOOKS_ENV, SCREEN_ENV, WINDOW_MIN_SIZE, WINDOW_SIZE,
-    diag, gpu, placement, t,
+    diag, gpu, placement, probe, t,
 };
 use eframe::egui;
 
@@ -70,10 +70,19 @@ fn main() {
     let screen = hooks_enabled()
         .then(|| std::env::var(SCREEN_ENV).ok())
         .flatten();
+    // Цена кадра на CI (U1-AC24): проба меряет живые кадры и сама завершает процесс.
+    let probe = hooks_enabled() && std::env::var_os(crate::probe::ENV).is_some();
+    if probe {
+        crate::probe::start();
+    }
     let options = eframe::NativeOptions {
-        viewport: viewport(settings.window.as_ref()),
+        viewport: viewport(
+            settings.window.as_ref(),
+            probe.then(crate::probe::size).flatten(),
+        ),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: gpu::configuration(),
+        multisampling: if probe { gpu::msaa() } else { 0 },
         centered: position.is_none(),
         // Размер и положение окна хранятся в settings.json, а не в хранилище eframe.
         persist_window: false,
@@ -162,12 +171,15 @@ fn relaunch_with_warp() {
 
 /// Окно без рамки: запомненный размер или 1200×800. Положение и разворот ставятся в
 /// первом кадре (`BytetapApp::with_window_restore`), когда известен масштаб монитора.
-fn viewport(saved: Option<&WindowState>) -> egui::ViewportBuilder {
-    let size = saved.map_or(WINDOW_SIZE, |w| {
-        [
-            w.size[0].max(WINDOW_MIN_SIZE[0]),
-            w.size[1].max(WINDOW_MIN_SIZE[1]),
-        ]
+/// `probe_size` — размер окна для замера цены кадра (`probe.rs`).
+fn viewport(saved: Option<&WindowState>, probe_size: Option<[f32; 2]>) -> egui::ViewportBuilder {
+    let size = probe_size.unwrap_or_else(|| {
+        saved.map_or(WINDOW_SIZE, |w| {
+            [
+                w.size[0].max(WINDOW_MIN_SIZE[0]),
+                w.size[1].max(WINDOW_MIN_SIZE[1]),
+            ]
+        })
     });
     egui::ViewportBuilder::default()
         .with_title("bytetap")

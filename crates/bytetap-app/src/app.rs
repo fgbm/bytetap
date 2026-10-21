@@ -1908,6 +1908,7 @@ impl eframe::App for BytetapApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let probe = crate::probe::frame_start();
         self.measure_frame_cost();
         if !self.ready
             && let Some(state) = frame.wgpu_render_state()
@@ -1935,7 +1936,15 @@ impl eframe::App for BytetapApp {
         // Рамка окна: скругление, расширение и цвет средствами DWM — на первом видимом
         // кадре, когда окно уже показано (иначе DWM теряет атрибуты).
         self.apply_window_frame(&ctx);
-        self.draw(ui);
+        // Проба цены кадра (`probe.rs`): в режиме `empty` рисуется только фон — столько
+        // стоит кадр без интерфейса.
+        if crate::probe::enabled() && crate::probe::mode() == crate::probe::EMPTY {
+            let p = self.pal();
+            let rect = ui.max_rect();
+            ui.painter().rect_filled(rect, 0, p.surface_0);
+        } else {
+            self.draw(ui);
+        }
         // Снимок меню (CI, `BYTETAP_TEST_SCREEN=menu-*`): кнопка уже нарисована,
         // меню открывается следующим кадром — его и снимает CI.
         if let Some(menu) = self.hook_menu.take() {
@@ -1950,6 +1959,7 @@ impl eframe::App for BytetapApp {
             self.ready = true;
             diag::info("интерфейс готов");
         }
+        crate::probe::frame_end(&ctx, frame, probe);
     }
 
     fn on_exit(&mut self) {

@@ -22,6 +22,61 @@ pub const ADAPTER_ENV: &str = "WGPU_ADAPTER_NAME";
 /// Часть имени WARP (`Microsoft Basic Render Driver`) для [`ADAPTER_ENV`].
 pub const WARP_ADAPTER: &str = "basic render";
 
+/// Диагностика цены кадра (`probe.rs`): режим представления, MSAA и задержка кадров.
+///
+/// Ключи читаются только вместе с `BYTETAP_TEST_PROBE`: без пробы окно берёт
+/// [`egui_wgpu::SurfaceConfig::LOW_LATENCY`] и MSAA 0, как и раньше.
+pub const PRESENT_ENV: &str = "BYTETAP_TEST_PROBE_PRESENT";
+pub const MSAA_ENV: &str = "BYTETAP_TEST_PROBE_MSAA";
+pub const LATENCY_ENV: &str = "BYTETAP_TEST_PROBE_LATENCY";
+
+/// Диагностика включена: задан хотя бы один ключ замера.
+#[must_use]
+pub fn diagnostics() -> bool {
+    [PRESENT_ENV, MSAA_ENV, LATENCY_ENV]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+}
+
+/// Режим представления из [`PRESENT_ENV`]: `fifo`, `immediate`, `novsync`, `mailbox`.
+#[must_use]
+pub fn present() -> Option<wgpu::PresentMode> {
+    let value = std::env::var(PRESENT_ENV).ok()?;
+    Some(match value.trim().to_lowercase().as_str() {
+        "fifo" | "vsync" => wgpu::PresentMode::Fifo,
+        "immediate" => wgpu::PresentMode::Immediate,
+        "novsync" | "auto-no-vsync" => wgpu::PresentMode::AutoNoVsync,
+        "mailbox" => wgpu::PresentMode::Mailbox,
+        _ => return None,
+    })
+}
+
+/// Имя режима представления для журнала запуска.
+#[must_use]
+pub fn present_name() -> String {
+    match present() {
+        Some(mode) => format!("{mode:?}"),
+        None => "LOW_LATENCY".into(),
+    }
+}
+
+/// Число сэмплов MSAA из [`MSAA_ENV`].
+#[must_use]
+pub fn msaa() -> u16 {
+    std::env::var(MSAA_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Желаемая задержка кадров из [`LATENCY_ENV`].
+#[must_use]
+pub fn latency() -> Option<u32> {
+    std::env::var(LATENCY_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+}
+
 /// Метка перезапуска с WARP: второй сбой графики уже не перезапускает процесс.
 pub const RETRY_ENV: &str = "BYTETAP_WARP_RETRY";
 
@@ -100,8 +155,23 @@ pub fn configuration() -> WgpuConfiguration {
     }));
     WgpuConfiguration {
         wgpu_setup: WgpuSetup::CreateNew(setup),
+        surface: surface_config(),
         ..Default::default()
     }
+}
+
+/// Настройка поверхности: как у `WgpuConfiguration` по умолчанию
+/// ([`egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT`]), а в диагностике пробы кадра —
+/// режим представления и задержка из ключей замера.
+fn surface_config() -> eframe::egui_wgpu::SurfaceConfig {
+    let mut config = eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT;
+    if let Some(mode) = present() {
+        config.present_mode = mode;
+    }
+    if let Some(latency) = latency() {
+        config.desired_maximum_frame_latency = Some(latency);
+    }
+    config
 }
 
 /// Адаптер в списке выбора.

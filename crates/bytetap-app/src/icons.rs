@@ -62,6 +62,10 @@ impl Icon {
 
 /// Рисует иконку `size`×`size` по центру `center`.
 pub fn paint(ui: &Ui, icon: Icon, center: egui::Pos2, size: f32, color: Color32) {
+    // Проба цены кадра (`probe.rs`): кадр без иконок — столько стоит их растр в кадре.
+    if crate::probe::enabled() && crate::probe::mode() == crate::probe::NO_ICONS {
+        return;
+    }
     // Целые физические пиксели: при дробном положении растр иконки размывается, а на
     // масштабе 125 и 150 % целая точка — это 1.25 и 1.5 физического пикселя (U1-AC26).
     let ppp = ui.pixels_per_point();

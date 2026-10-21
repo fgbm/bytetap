@@ -14,6 +14,7 @@ pub mod icons;
 pub mod journal;
 pub mod live;
 pub mod placement;
+pub mod probe;
 pub mod recording;
 pub mod scenarios;
 pub mod settings;
