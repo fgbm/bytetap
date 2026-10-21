@@ -13,3 +13,7 @@
 ## 2026-10-19 22:52 — deepseek-v4.1-flash
 
 Code Mode: `execute` не видит `shell` в каталоге, а прямой вызов инструмента работает → не искать `tools.shell` внутри `execute`, вызывать `shell` напрямую.
+
+## 2026-10-21 14:40 — claude-opus-5-5
+
+U1 шаг 1: `cargo test --workspace` и `gh run download` в `/tmp/opencode/...` падают с `Disk quota exceeded` (tmpfs `/tmp` занят чужими каталогами, квота пользователя исчерпана) → тесты ядра с tempfile ложно красные. Обход: `TMPDIR=<worktree>/target/tmp`, артефакты CI — в `target/`.
