@@ -394,10 +394,14 @@ fn the_comment_from_the_header_reaches_the_journal() {
     );
     // Строка под шапкой видит дописанный комментарий: последнюю страницу лента
     // перечитывает сама (U1-AC19).
-    step_until(&mut harness, "строка комментариев под шапкой", |h| {
-        h.query_by_label_contains("проба 1 · перезалили пробу")
-            .is_some()
-    });
+    step_until(
+        &mut harness,
+        "строка комментариев под шапкой",
+        |h| {
+            h.query_by_label_contains("проба 1 · перезалили пробу")
+                .is_some()
+        },
+    );
     // Файл получил комментарий, а сводка — новое событие.
     let text = std::fs::read_to_string(&path).expect("журнал");
     assert!(text.contains("\"type\":\"note\""), "{text}");
