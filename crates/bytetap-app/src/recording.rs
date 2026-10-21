@@ -1086,10 +1086,10 @@ fn feed_list(
 
     if !rec.follow && rec.pending > 0 {
         let text = t!("feed.newRows", count = rec.pending);
-        let galley =
-            ui.painter()
-                .layout_no_wrap(format!("↓ {text}"), theme::sans(TEXT_XS), p.rec_fg);
-        let size = vec2(12.0 + galley.size().x + 12.0, 28.0);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text.clone(), theme::sans(TEXT_XS), p.rec_fg);
+        let size = vec2(12.0 + 13.0 + 6.0 + galley.size().x + 12.0, 28.0);
         let pill = Rect::from_min_size(area.right_bottom() - size - vec2(SPACE_4, SPACE_4), size);
         let response = ui.interact(pill, Id::unique("bt-new-rows"), Sense::click());
         response.widget_info(|| WidgetInfo::labeled(Role::Button, true, &text));
@@ -1110,8 +1110,15 @@ fn feed_list(
                 p.rec_bg
             },
         );
+        icons::paint(
+            ui,
+            Icon::ArrowDown,
+            pos2(pill.left() + 12.0 + 6.5, pill.center().y),
+            13.0,
+            p.rec_fg,
+        );
         ui.painter().galley(
-            pos2(pill.left() + 12.0, pill.center().y - galley.size().y / 2.0),
+            pos2(pill.left() + 31.0, pill.center().y - galley.size().y / 2.0),
             galley,
             p.rec_fg,
         );
