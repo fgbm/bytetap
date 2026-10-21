@@ -149,6 +149,21 @@ jobs:
           path: target/release/bytetap.exe
           if-no-files-found: error
 
+      # NFR-3: окно не должно закрываться само. Процесс жив через 15 с, а журнал старта
+      # дошёл до «интерфейс готов»: живой процесс с системным окном об ошибке тоже «жив».
+      - name: Смоук — запуск exe
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
+          $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
+          $null = $p.Handle
+          Start-Sleep -Seconds 15
+          $alive = -not $p.HasExited
+          if ($alive) { Stop-Process -Id $p.Id -Force } else { Write-Host "bytetap.exe завершился, код $($p.ExitCode)" }
+          if (Test-Path $log) { Get-Content -Encoding utf8 $log } else { Write-Host "журнала $log нет" }
+          $ready = (Test-Path $log) -and (Select-String -Path $log -Pattern 'интерфейс готов' -Quiet -Encoding utf8)
+          if (-not $alive -or -not $ready) { exit 1 }
+
   actionlint:
     name: actionlint
     runs-on: ubuntu-latest
