@@ -34,11 +34,24 @@ pub const ENCODINGS: [Encoding; 5] = [
     Encoding::Latin1,
 ];
 
-/// Кусок текста фрагмента: печатный текст или глиф управляющего байта `‹CR›`.
+/// Кусок текста фрагмента: печатный текст, глиф управляющего байта `‹CR›` или
+/// экранированный символ данных.
+///
+/// Глиф хранится байтом, а не строкой: `String` на каждый управляющий байт — это
+/// столько же аллокаций, сколько управляющих байт в фрагменте. Имя глифа
+/// (`CR`, `x0B`) получается по байту при отрисовке и копировании.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Segment {
-    pub text: String,
-    pub ctrl: bool,
+pub enum Segment {
+    /// Печатный текст: подряд идущие обычные байты одним куском.
+    Text(String),
+    /// Глиф управляющего байта: сам байт, имя — по [`control_name`].
+    Ctrl(u8),
+    /// Символ данных, который выглядел бы глифом: `‹` или `›`.
+    ///
+    /// Показывается как `‹x2039›` / `‹x203A›` — код символа в шестнадцатерицине.
+    /// Такой вид не даёт глифу управления (у него `xHH` — ровно две цифры), поэтому
+    /// символ данных нельзя принять за управляющий (FR-22).
+    Escaped(char),
 }
 
 /// Фрагмент обмена: направление, автоответ и исходные байты.
@@ -67,6 +80,14 @@ impl DataPayload {
         Arc::clone(
             slot.get_or_init(|| text_segments(&self.bytes, encoding, TEXT_LIMIT_BYTES).into()),
         )
+    }
+
+    /// Полный текст фрагмента по кодировке — без предела [`TEXT_LIMIT_BYTES`].
+    ///
+    /// Считается только по клику «Скопировать текст»: строка ленты показывает первые
+    /// 2048 байт, а копировать инженеру нужно весь фрагмент (U1-AC16).
+    pub fn full_text(&self, encoding: Encoding) -> String {
+        plain_text(&text_segments(&self.bytes, encoding, usize::MAX))
     }
 }
 
@@ -318,23 +339,36 @@ pub fn control_name(byte: u8) -> String {
     name.to_owned()
 }
 
-fn glyph(name: &str) -> Segment {
-    Segment {
-        text: format!("‹{name}›"),
-        ctrl: true,
-    }
+/// Глиф управляющего байта: `‹CR›`.
+pub fn ctrl_glyph(byte: u8) -> String {
+    format!("‹{}›", control_name(byte))
 }
 
-/// Печатный текст с `<` глифом `‹x3C›`: иначе текст прибора притворился бы управляющим
-/// символом (FR-22).
+/// Символ данных, похожий на глиф управления, — как `‹x2039›`.
+///
+/// Глиф управления — `‹CR›` или `‹x0B›`: между стрелками имя, а не код символа.
+/// Поэтому заменяем оба символа на вид с шестнадцатеричным кодом: `‹x2039›`.
+pub fn escaped_glyph(ch: char) -> String {
+    format!("‹x{:04X}›", ch as u32)
+}
+
+/// Печатный текст с экранированием глифов: `<` — как `‹x3C›`, `‹` и `›` — как
+/// `‹x2039›` и `‹x203A›`.
+///
+/// Иначе текст прибора притворился бы управляющим символом (FR-22): `‹` в данных
+/// иначе выглядел бы как начало глифа `‹CR›`.
 fn push_text(out: &mut Vec<Segment>, text: &str) {
     let mut rest = text;
-    while let Some(at) = rest.find('<') {
+    while let Some(at) = rest.find(['<', '\u{2039}', '\u{203a}']) {
         if at > 0 {
             push_plain(out, &rest[..at]);
         }
-        out.push(glyph("x3C"));
-        rest = &rest[at + 1..];
+        let ch = rest[at..].chars().next().expect("a char is there");
+        match ch {
+            '<' => out.push(Segment::Ctrl(b'<')),
+            _ => out.push(Segment::Escaped(ch)),
+        }
+        rest = &rest[at + ch.len_utf8()..];
     }
     if !rest.is_empty() {
         push_plain(out, rest);
@@ -343,11 +377,8 @@ fn push_text(out: &mut Vec<Segment>, text: &str) {
 
 fn push_plain(out: &mut Vec<Segment>, text: &str) {
     match out.last_mut() {
-        Some(last) if !last.ctrl => last.text.push_str(text),
-        _ => out.push(Segment {
-            text: text.to_owned(),
-            ctrl: false,
-        }),
+        Some(Segment::Text(last)) => last.push_str(text),
+        _ => out.push(Segment::Text(text.to_owned())),
     }
 }
 
@@ -368,6 +399,9 @@ fn decode_run(run: &[u8], encoding: Encoding) -> String {
 /// `‹CR›`, печатные куски — декодированные выбранной кодировкой. Текст режется до
 /// декодирования, поэтому управляющий байт внутри многобайтовой последовательности
 /// никогда не попадёт в декодер. Длиннее `limit` байт — «…» в конце.
+///
+/// Подряд идущие обычные байты дают один сегмент: фрагмент из двух тысяч одинаковых
+/// байт — это один кусок текста, а не две тысячи сегментов (FR-22, FR-28).
 pub fn text_segments(bytes: &[u8], encoding: Encoding, limit: usize) -> Vec<Segment> {
     let end = bytes.len().min(limit);
     let mut out = Vec::new();
@@ -377,7 +411,7 @@ pub fn text_segments(bytes: &[u8], encoding: Encoding, limit: usize) -> Vec<Segm
             if start < index {
                 push_text(&mut out, &decode_run(&bytes[start..index], encoding));
             }
-            out.push(glyph(&control_name(byte)));
+            out.push(Segment::Ctrl(byte));
             start = index + 1;
         }
     }
@@ -390,9 +424,26 @@ pub fn text_segments(bytes: &[u8], encoding: Encoding, limit: usize) -> Vec<Segm
     out
 }
 
+/// Текст сегмента так, как он показывается в ленте: глиф — `‹CR›`.
+pub fn segment_text(segment: &Segment) -> String {
+    match segment {
+        Segment::Text(text) => text.clone(),
+        Segment::Ctrl(byte) => ctrl_glyph(*byte),
+        Segment::Escaped(ch) => escaped_glyph(*ch),
+    }
+}
+
 /// Строка текста целиком: для копирования из контекстного меню.
 pub fn plain_text(segments: &[Segment]) -> String {
-    segments.iter().map(|s| s.text.as_str()).collect()
+    let mut out = String::new();
+    for segment in segments {
+        match segment {
+            Segment::Text(text) => out.push_str(text),
+            Segment::Ctrl(byte) => out.push_str(&ctrl_glyph(*byte)),
+            Segment::Escaped(ch) => out.push_str(&escaped_glyph(*ch)),
+        }
+    }
+    out
 }
 
 /// Сколько строк дампа занимает фрагмент; пустой фрагмент — тоже строка.
@@ -503,8 +554,15 @@ mod tests {
 
     use super::*;
 
-    fn texts(segments: &[Segment]) -> Vec<(&str, bool)> {
-        segments.iter().map(|s| (s.text.as_str(), s.ctrl)).collect()
+    /// Тексты сегментов так, как они показываются в ленте.
+    fn shown(segments: &[Segment]) -> Vec<(String, bool)> {
+        segments
+            .iter()
+            .map(|segment| {
+                let ctrl = !matches!(segment, Segment::Text(_));
+                (segment_text(segment), ctrl)
+            })
+            .collect()
     }
 
     #[test]
@@ -513,14 +571,14 @@ mod tests {
         for encoding in ENCODINGS {
             let segments = text_segments(bytes, encoding, TEXT_LIMIT_BYTES);
             assert_eq!(
-                texts(&segments),
+                shown(&segments),
                 [
-                    ("‹VT›", true),
-                    ("MSH|A", false),
-                    ("‹CR›", true),
-                    ("B", false),
-                    ("‹FS›", true),
-                    ("‹CR›", true),
+                    ("‹VT›".to_owned(), true),
+                    ("MSH|A".to_owned(), false),
+                    ("‹CR›".to_owned(), true),
+                    ("B".to_owned(), false),
+                    ("‹FS›".to_owned(), true),
+                    ("‹CR›".to_owned(), true),
                 ],
                 "{encoding:?}"
             );
@@ -557,8 +615,12 @@ mod tests {
         );
         // ASCII: старшие байты — глифы, а не догадка о кодировке.
         assert_eq!(
-            texts(&text_segments(&[b'a', 0xc3, b'b'], Encoding::Ascii, 100)),
-            [("a", false), ("‹xC3›", true), ("b", false)]
+            shown(&text_segments(&[b'a', 0xc3, b'b'], Encoding::Ascii, 100)),
+            [
+                ("a".to_owned(), false),
+                ("‹xC3›".to_owned(), true),
+                ("b".to_owned(), false)
+            ]
         );
         // Битая последовательность UTF-8 — символ замены, а не паника.
         assert_eq!(
@@ -570,9 +632,32 @@ mod tests {
     #[test]
     fn a_less_than_sign_is_not_mistaken_for_a_control_glyph() {
         assert_eq!(
-            texts(&text_segments(b"a<CR>", Encoding::Cp1251, 100)),
-            [("a", false), ("‹x3C›", true), ("CR>", false)]
+            shown(&text_segments(b"a<CR>", Encoding::Cp1251, 100)),
+            [
+                ("a".to_owned(), false),
+                ("‹x3C›".to_owned(), true),
+                ("CR>".to_owned(), false)
+            ]
         );
+    }
+
+    /// Символы данных, похожие на глиф, не выглядят как глиф (FR-22).
+    #[test]
+    fn a_data_bracket_is_not_mistaken_for_a_glyph() {
+        let text = "a\u{2039}b\u{203a}c";
+        let segments = text_segments(text.as_bytes(), Encoding::Utf8, 100);
+        assert_eq!(
+            shown(&segments),
+            [
+                ("a".to_owned(), false),
+                ("‹x2039›".to_owned(), true),
+                ("b".to_owned(), false),
+                ("‹x203A›".to_owned(), true),
+                ("c".to_owned(), false),
+            ]
+        );
+        // В HEX-виде текст не считается: там байты показываются числами.
+        assert_eq!(hex_line(b"\x0b", 0).ascii, ".");
     }
 
     #[test]
@@ -591,6 +676,43 @@ mod tests {
         let again = data.segments(Encoding::Cp1251);
         assert!(Arc::ptr_eq(&first, &again), "кеш на событие и кодировку");
         assert!(!Arc::ptr_eq(&first, &data.segments(Encoding::Utf8)));
+    }
+
+    /// Фрагмент из одних управляющих байтов: сегмент на каждый байт, но без строк —
+    /// имя глифа получается по байту при отрисовке (FR-28).
+    #[test]
+    fn a_control_only_fragment_has_no_text_allocations() {
+        let bytes = vec![0x01u8; 2048];
+        let segments = text_segments(&bytes, Encoding::Ascii, TEXT_LIMIT_BYTES);
+        assert_eq!(segments.len(), 2048, "глиф на каждый байт");
+        assert!(
+            segments
+                .iter()
+                .all(|segment| matches!(segment, Segment::Ctrl(0x01))),
+            "глифы без строк"
+        );
+    }
+
+    /// Подряд идущие обычные байты — один сегмент: 2048 байт дают один кусок.
+    #[test]
+    fn a_plain_fragment_is_one_segment() {
+        let bytes = vec![b'x'; 2048];
+        let segments = text_segments(&bytes, Encoding::Ascii, TEXT_LIMIT_BYTES);
+        assert_eq!(segments.len(), 1, "подряд идущие байты — один сегмент");
+        assert_eq!(segments[0], Segment::Text("x".repeat(2048)));
+    }
+
+    /// Копирование отдаёт весь фрагмент, а не первые 2048 байт (U1-AC16).
+    #[test]
+    fn the_copied_text_is_the_whole_fragment() {
+        let data = DataPayload::new(Dir::AnalyzerToLis, false, vec![b'x'; 3000]);
+        assert_eq!(
+            data.segments(Encoding::Ascii).len(),
+            1,
+            "в строке ленты — один кусок"
+        );
+        let full = data.full_text(Encoding::Ascii);
+        assert_eq!(full.chars().count(), 3000, "весь фрагмент, без предела");
     }
 
     #[test]

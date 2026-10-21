@@ -137,12 +137,25 @@ fn data_job(p: &Palette, segments: &[Segment], synthetic: bool) -> LayoutJob {
     let mut job = LayoutJob::default();
     let ctrl = p.ctrl.gamma_multiply(0.55);
     for segment in segments {
-        let fmt = if segment.ctrl {
-            text_format(theme::mono(TEXT_2XS), ctrl)
-        } else {
-            text_format(theme::mono(TEXT_DATA), p.text)
-        };
-        job.append(&segment.text, 0.0, fmt);
+        match segment {
+            Segment::Text(text) => {
+                job.append(text, 0.0, text_format(theme::mono(TEXT_DATA), p.text));
+            }
+            Segment::Ctrl(byte) => {
+                job.append(
+                    &feed::ctrl_glyph(*byte),
+                    0.0,
+                    text_format(theme::mono(TEXT_2XS), ctrl),
+                );
+            }
+            Segment::Escaped(ch) => {
+                job.append(
+                    &feed::escaped_glyph(*ch),
+                    0.0,
+                    text_format(theme::mono(TEXT_2XS), ctrl),
+                );
+            }
+        }
     }
     if synthetic {
         job.append(
@@ -223,7 +236,7 @@ pub fn text_row(ui: &mut Ui, p: &Palette, event: &FeedEvent, multi: bool, encodi
             }
         }
     }
-    row_menu(&response, p, event, &body);
+    row_menu(&response, p, event, &body, encoding);
 }
 
 /// Строка HEX-дампа: время и стрелка только у первой строки события.
@@ -303,18 +316,29 @@ pub fn hex_row(
     job.append(&dump.ascii, SPACE_2, text_format(font, ascii_color));
     let galley = truncated(ui, job, rect.right() - SPACE_3 - x);
     painter.galley(pos2(x, y), galley, p.text);
-    let copy_text = event
-        .data()
-        .map_or(text, |data| feed::plain_text(&data.segments(encoding)));
-    row_menu(&response, p, event, &copy_text);
+    row_menu(&response, p, event, &text, encoding);
 }
 
 /// Контекстное меню строки: текст, HEX и Base64 фрагмента (U1-AC16).
-fn row_menu(response: &egui::Response, p: &Palette, event: &FeedEvent, text: &str) {
+///
+/// Текст фрагмента копируется целиком, без предела показа в строке: строка ленты
+/// показывает первые 2048 байт, а копировать инженеру нужно весь фрагмент. Строка
+/// строится по клику, а не на каждый кадр (U1-AC16).
+fn row_menu(
+    response: &egui::Response,
+    p: &Palette,
+    event: &FeedEvent,
+    text: &str,
+    encoding: Encoding,
+) {
     response.context_menu(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         if widgets::menu_item(ui, p, t!("feed.copyText"), true).clicked() {
-            ui.ctx().copy_text(text.to_owned());
+            let copied = match event.data() {
+                Some(data) => data.full_text(encoding),
+                None => text.to_owned(),
+            };
+            ui.ctx().copy_text(copied);
         }
         if let Some(data) = event.data() {
             if widgets::menu_item(ui, p, t!("feed.copyHex"), true).clicked() {
