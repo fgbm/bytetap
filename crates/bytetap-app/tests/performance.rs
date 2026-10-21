@@ -304,7 +304,12 @@ fn a_recording_session_asks_for_at_most_thirty_frames_per_second() {
         .collect();
     assert!(!periodic.is_empty(), "кадры ленты идут по таймеру");
     let fastest = periodic.iter().min().copied().expect("есть запросы");
-    assert_eq!(fastest, FRAME, "кадры ленты — по таймеру {FRAME:?}");
+    // Период считается по цене кадра: на медленной машине он больше [`FRAME`], но
+    // чаще, чем раз в [`FRAME`], окно кадр не просит.
+    assert!(
+        (FRAME..=FRAME_SLOWEST).contains(&fastest),
+        "кадры ленты — по таймеру от {FRAME:?} до {FRAME_SLOWEST:?}: {fastest:?}"
+    );
     let per_second = 1.0 / fastest.as_secs_f64();
     // Сколько кадров нарисует цикл событий за окно замера: мгновенные плюс таймер.
     let drawn = immediate as f64 + 2.0 / fastest.as_secs_f64();
