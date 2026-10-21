@@ -855,6 +855,118 @@ fn the_fonts_have_every_glyph_the_interface_uses() {
     harness.run();
 }
 
+/// Масштаб экрана Windows: 100, 125 и 150 % (U1-AC26).
+///
+/// В egui всё меряется точками, поэтому раскладка от масштаба не зависит; масштаб
+/// меняет растр: текст, иконки Lucide и свою рамку окна в 1 физический пиксель.
+/// Снимок в 1200×800 точек на 125 % — это 1500×1000 пикселей.
+fn scaled_with(
+    screen: Screen,
+    dark: bool,
+    pixels_per_point: f32,
+    prepare: impl FnOnce(BytetapApp) -> BytetapApp + 'static,
+) -> Harness<'static, BytetapApp> {
+    let settings = settings(dark);
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .with_pixels_per_point(pixels_per_point)
+        .with_theme(if dark { Theme::Dark } else { Theme::Light })
+        .wgpu()
+        .build_eframe(move |cc| {
+            prepare(
+                BytetapApp::new(&cc.egui_ctx, settings, None, None)
+                    .with_fixtures(fixtures())
+                    .with_screen(screen),
+            )
+        });
+    harness.run_steps(8);
+    harness
+}
+
+/// Снимок экрана на масштабе `ppp`.
+fn scaled_snapshot(
+    name: &str,
+    screen: Screen,
+    ppp: f32,
+    prepare: impl FnOnce(BytetapApp) -> BytetapApp + 'static,
+) {
+    scaled_with(screen, false, ppp, prepare).snapshot_options(name, &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn start_at_125_percent() {
+    let _gpu = gpu();
+    scaled_snapshot("start-125-light", Screen::Scenarios, 1.25, |app| app);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn start_at_150_percent() {
+    let _gpu = gpu();
+    scaled_snapshot("start-150-light", Screen::Scenarios, 1.5, |app| app);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_at_125_percent() {
+    let _gpu = gpu();
+    scaled_snapshot("recording-text-125-light", Screen::Scenarios, 1.25, |app| {
+        app.with_recording_fixture(recording_fixture(0))
+    });
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_at_150_percent() {
+    let _gpu = gpu();
+    scaled_snapshot("recording-text-150-light", Screen::Scenarios, 1.5, |app| {
+        app.with_recording_fixture(recording_fixture(0))
+    });
+}
+
+/// На 125 и 150 % у каждого своего виджета та же роль и подпись, что на 100 %,
+/// и ни один не вылезает за окно: масштаб не сдвигает раскладку (U1-AC26).
+#[test]
+fn the_layout_is_the_same_at_every_scale() {
+    for pixels_per_point in [1.0, 1.25, 1.5] {
+        for screen in [
+            Screen::Scenarios,
+            Screen::Step(SessionMode::TcpServer),
+            Screen::Step(SessionMode::Serial),
+        ] {
+            let harness = scaled_with(screen, false, pixels_per_point, |app| app);
+            let nodes = audit_nodes(&harness, &format!("{screen:?} на {pixels_per_point}"));
+            let rect = |label: &str| {
+                nodes
+                    .iter()
+                    .find(|(_, name, _)| name == label)
+                    .map(|(_, _, rect)| *rect)
+                    .unwrap_or_else(|| panic!("нет «{label}» на {pixels_per_point}"))
+            };
+            // Шапка и колонка формы стоят на местах в точках: масштаб их не двигает.
+            let close = rect("Закрыть");
+            assert!(
+                (close.right() - WINDOW.0).abs() <= 1.0,
+                "«Закрыть» на {pixels_per_point}: {close:?}"
+            );
+            if matches!(screen, Screen::Step(_)) {
+                let start = rect("Старт");
+                assert!(
+                    (start.right() - start.left() - 512.0).abs() <= 1.0,
+                    "«Старт» на {pixels_per_point}: {start:?}"
+                );
+            }
+            for (role, name, rect) in &nodes {
+                assert!(
+                    rect.left() >= -1.0 && rect.right() <= WINDOW.0 + 1.0,
+                    "{role:?} «{name}» за краем окна на {pixels_per_point}: {rect:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Синтетическая запись как на снимке UI v2: два соединения, сообщения HL7 с кириллицей
 /// в Windows-1251, автоответы, замечание и закрытия.
 fn recording_fixture(extra: usize) -> RecordingFixture {
@@ -1284,4 +1396,293 @@ fn ten_thousand_rows_draw_only_the_visible_ones() {
     let started = std::time::Instant::now();
     harness.run_steps(10);
     eprintln!("10 кадров с 10 000 строк: {:?}", started.elapsed());
+}
+
+/// Роли AccessKit, по которым человек действует: у каждой должна быть подпись.
+const INTERACTIVE: [Role; 9] = [
+    Role::Button,
+    Role::ComboBox,
+    Role::TextInput,
+    Role::MultilineTextInput,
+    Role::CheckBox,
+    Role::MenuItem,
+    Role::ListBoxOption,
+    Role::ScrollBar,
+    Role::Link,
+];
+
+/// Экран с раскрытым «Дополнительно»: поля профилей и папки журналов.
+fn plain_more(screen: Screen) -> Harness<'static, BytetapApp> {
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings(false), None, None)
+                .with_fixtures(fixtures())
+                .with_screen(screen)
+                .with_more()
+        });
+    harness.run_steps(2);
+    harness
+}
+
+/// Какие роли и подписи нашлись на экране: `(роль, подпись, прямоугольник)`.
+fn audit_nodes(
+    harness: &Harness<'static, BytetapApp>,
+    screen: &str,
+) -> Vec<(Role, String, egui::Rect)> {
+    use egui_kittest::kittest::NodeT as _;
+    harness.check_accessibility();
+    let mut found = Vec::new();
+    let (w, h) = WINDOW;
+    for node in harness.root().children_recursive() {
+        let accesskit = node.accesskit_node();
+        if accesskit.is_hidden() || !INTERACTIVE.contains(&accesskit.role()) {
+            continue;
+        }
+        // У строк ленты текст лежит в `value` (роль Label), у кнопок — в `label`.
+        let label = accesskit
+            .label()
+            .or_else(|| accesskit.value())
+            .unwrap_or_default();
+        // `Node::rect` переводит физические пиксели AccessKit в точки экрана.
+        let rect = node.rect();
+        assert!(
+            !label.trim().is_empty(),
+            "{screen}: у {:?} нет подписи ({rect:?})",
+            accesskit.role()
+        );
+        let inside = rect.left() >= -1.0
+            && rect.top() >= -1.0
+            && rect.right() <= w + 1.0
+            && rect.bottom() <= h + 1.0;
+        assert!(
+            inside,
+            "{screen}: {:?} «{label}» вне окна: {rect:?}",
+            accesskit.role()
+        );
+        found.push((accesskit.role(), label, rect));
+    }
+    assert!(
+        !found.is_empty(),
+        "{screen}: в дереве нет ни одного виджета"
+    );
+    found
+}
+
+/// Есть ли на экране виджет с такой ролью и подписью.
+fn has(nodes: &[(Role, String, egui::Rect)], role: Role, label: &str) -> bool {
+    nodes.iter().any(|(r, l, _)| *r == role && l == label)
+}
+
+/// Все экраны: у каждого своего виджета — роль и подпись, ничего не обрезано краем
+/// окна и не налезает на соседа по тому же месту (U1-AC25).
+#[test]
+fn every_screen_names_its_widgets() {
+    // Стартовый: карточки сценариев, последние записи, шапка окна.
+    let harness = plain(settings(false), None, Screen::Scenarios);
+    let nodes = audit_nodes(&harness, "сценарии");
+    assert!(has(&nodes, Role::Button, "Журналы"));
+    assert!(has(&nodes, Role::Button, "Закрыть"));
+    assert!(has(&nodes, Role::Button, "Свернуть"));
+    assert!(has(&nodes, Role::Button, "Развернуть"));
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|(role, _, _)| *role == Role::Button)
+            .count()
+            >= 6,
+        true,
+        "шапка, три карточки и записи"
+    );
+
+    // Шаг TCP-сервера с «Дополнительно»: поля, списки, кнопки.
+    let harness = plain(settings(false), None, Screen::Step(SessionMode::TcpServer));
+    let nodes = audit_nodes(&harness, "шаг сервера");
+    for (role, label) in [
+        (Role::TextInput, "Порт"),
+        (Role::ComboBox, "Автоответ"),
+        (Role::Button, "Скопировать"),
+        (Role::Button, "Старт"),
+        (Role::Button, "Дополнительно"),
+    ] {
+        assert!(has(&nodes, role, label), "нет {role:?} «{label}»");
+    }
+
+    // COM с раскрытым «Дополнительно»: списки, флажки, профили, папка журналов.
+    let harness = plain_more(Screen::Step(SessionMode::Serial));
+    let nodes = audit_nodes(&harness, "шаг COM");
+    for (role, label) in [
+        (Role::ComboBox, "Порт"),
+        (Role::ComboBox, "Скорость"),
+        (Role::ComboBox, "Формат"),
+        (Role::CheckBox, "DTR"),
+        (Role::CheckBox, "RTS"),
+        (Role::TextInput, "Анализатор"),
+        (Role::TextInput, "Комментарий"),
+        (Role::ComboBox, "Профиль"),
+        (Role::Button, "Выбрать"),
+    ] {
+        assert!(has(&nodes, role, label), "нет {role:?} «{label}»");
+    }
+
+    // Запись: «Стоп», меню «…», счётчики, вид и кодировка ленты, фильтр соединений.
+    let harness = plain_recording(FeedView::Text, 0);
+    let nodes = audit_nodes(&harness, "запись");
+    for (role, label) in [
+        (Role::Button, "Стоп 00:05"),
+        (Role::Button, "Меню записи"),
+        (Role::ComboBox, "Вид ленты"),
+        (Role::ComboBox, "Кодировка"),
+        (Role::Button, "все"),
+        (Role::Button, "#2"),
+    ] {
+        assert!(has(&nodes, role, label), "нет {role:?} «{label}»");
+    }
+}
+
+/// Tab обходит экран в порядке чтения: сверху вниз, внутри строки — слева направо
+/// (U1-AC25). Обход идёт до возврата к уже пройденному виджету.
+fn tab_walk(harness: &mut Harness<'static, BytetapApp>, steps: usize) -> Vec<(String, egui::Rect)> {
+    use egui_kittest::kittest::NodeT as _;
+    let mut order: Vec<(String, egui::Rect)> = Vec::new();
+    for _ in 0..steps {
+        harness.key_press(Key::Tab);
+        harness.run_steps(2);
+        let Some(node) = harness
+            .root()
+            .children_recursive()
+            .find(egui_kittest::Node::is_focused)
+        else {
+            continue;
+        };
+        let accesskit = node.accesskit_node();
+        let label = accesskit
+            .label()
+            .or_else(|| accesskit.value())
+            .unwrap_or_default();
+        assert!(
+            !label.trim().is_empty(),
+            "Tab попал на {:?} без подписи: {:?}",
+            accesskit.role(),
+            node.rect()
+        );
+        let rect = node.rect();
+        // Круг замкнулся: egui отдаёт фокус первому виджету.
+        if order
+            .iter()
+            .any(|(seen, seen_rect)| *seen == label && *seen_rect == rect)
+        {
+            break;
+        }
+        order.push((label, rect));
+    }
+    order
+}
+
+/// Допуск строки: кнопки окна начинаются от самого верха окна, иконка — на 8 px ниже,
+/// а поле с подписью — на 20 px ниже флажка рядом. Всё это одна строка экрана.
+const ROW_TOLERANCE: f32 = 22.0;
+
+/// Порядок Tab совпадает с тем, что видит глаз: сверху вниз и слева направо.
+fn assert_reading_order(screen: &str, order: &[(String, egui::Rect)]) {
+    for pair in order.windows(2) {
+        let (above, a) = &pair[0];
+        let (below, b) = &pair[1];
+        let dy = b.top() - a.top();
+        assert!(
+            dy >= -ROW_TOLERANCE,
+            "{screen}: Tab ушёл вверх: «{above}» {a:?} → «{below}» {b:?}\n{order:#?}"
+        );
+        if dy.abs() <= ROW_TOLERANCE {
+            assert!(
+                b.left() > a.left() - 0.5,
+                "{screen}: Tab ушёл влево в той же строке: «{above}» {a:?} → «{below}» {b:?}\n{order:#?}"
+            );
+        }
+    }
+}
+
+/// Tab идёт по экрану в порядке чтения на каждом экране (U1-AC25).
+#[test]
+fn tab_visits_every_screen_in_reading_order() {
+    let mut order = tab_walk(&mut plain(settings(false), None, Screen::Scenarios), 24);
+    assert_reading_order("сценарии", &order);
+    // Шапка, три карточки, записи — и ничего лишнего вроде полосы перетаскивания.
+    assert_eq!(
+        order.first().map(|(label, _)| label.as_str()),
+        Some("Журналы")
+    );
+    assert!(
+        order
+            .iter()
+            .any(|(label, _)| label.starts_with("Анализатор подключается ко мне")),
+        "карточки в обходе: {order:#?}"
+    );
+
+    let order = tab_walk(&mut plain_more(Screen::Step(SessionMode::Serial)), 24);
+    assert_reading_order("шаг COM", &order);
+    let labels: Vec<&str> = order.iter().map(|(label, _)| label.as_str()).collect();
+    // Поля формы идут сверху вниз, профили — в конце «Дополнительно».
+    let position = |want: &str| labels.iter().position(|label| *label == want);
+    let port = position("Порт").expect("порт в обходе");
+    let format = position("Формат").expect("формат в обходе");
+    let profile = position("Профиль").expect("профиль в обходе");
+    assert!(port < format && format < profile, "{labels:#?}");
+
+    let order = tab_walk(&mut plain_recording(FeedView::Text, 0), 24);
+    assert_reading_order("запись", &order);
+    let labels: Vec<&str> = order.iter().map(|(label, _)| label.as_str()).collect();
+    assert_eq!(labels.first(), Some(&"Стоп 00:05"), "{labels:#?}");
+    // Кнопки окна — после своих виджетов шапки и до панели ленты.
+    let close = position_of(&labels, "Закрыть").expect("«Закрыть» в обходе");
+    let view = position_of(&labels, "Вид ленты").expect("вид ленты в обходе");
+    assert!(close < view, "{labels:#?}");
+}
+
+fn position_of<'a>(labels: &[&'a str], want: &str) -> Option<usize> {
+    labels.iter().position(|label| *label == want)
+}
+
+/// Escape закрывает меню шапки и диалог комментария (U1-AC25).
+#[test]
+fn escape_closes_menus_and_dialogs() {
+    let mut harness = plain(settings(false), None, Screen::Scenarios);
+    harness.get_by_label("Журналы").click();
+    harness.run_steps(2);
+    harness.get_by_label("Открыть папку журналов");
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("Открыть папку журналов").is_none());
+
+    // Меню записи «…»: Escape закрывает его, не выбирая пункт.
+    let mut harness = plain_recording(FeedView::Text, 0);
+    harness.get_by_label("Меню записи").click();
+    harness.run_steps(2);
+    harness.get_by_label("Скопировать путь к журналу");
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label("Скопировать путь к журналу")
+            .is_none()
+    );
+
+    // Диалог имени профиля: Escape — отмена, профиля нет.
+    let mut harness = plain_more(Screen::Step(SessionMode::Serial));
+    harness
+        .get_all_by_label("Сохранить")
+        .next()
+        .unwrap()
+        .click();
+    harness.run_steps(3);
+    harness.get_by_role_and_label(Role::TextInput, "Имя профиля");
+    harness.key_press(Key::Escape);
+    harness.run_steps(3);
+    assert!(
+        harness
+            .query_by_role_and_label(Role::TextInput, "Имя профиля")
+            .is_none(),
+        "Escape не закрыл диалог"
+    );
+    assert!(harness.state().settings().profiles.is_empty());
 }

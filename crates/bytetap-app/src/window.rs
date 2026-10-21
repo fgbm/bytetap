@@ -29,8 +29,11 @@ use eframe::wgpu::rwh::RawWindowHandle;
 use crate::diag;
 use crate::theme::Palette;
 
-/// Толщина своей рамки окна: 1 px по периметру.
-pub const FRAME_WIDTH: f32 = 1.0;
+/// Толщина своей рамки окна в точках: ровно один физический пиксель на любом
+/// масштабе экрана (U1-AC26). Токен `--bt-border` — цвет, не толщина.
+pub fn frame_width(pixels_per_point: f32) -> f32 {
+    1.0 / pixels_per_point.max(1.0)
+}
 
 /// DWM уже настроил это окно: рамку рисует система, а не приложение.
 static DWM_BORDER: AtomicBool = AtomicBool::new(false);
@@ -246,7 +249,7 @@ pub fn draw_frame(ui: &mut egui::Ui, p: &Palette, system: bool) {
     ui.painter().rect_stroke(
         rect,
         0,
-        Stroke::new(FRAME_WIDTH, frame_color(p)),
+        Stroke::new(frame_width(ui.pixels_per_point()), frame_color(p)),
         egui::StrokeKind::Inside,
     );
 }
@@ -267,9 +270,17 @@ mod tests {
         assert!(!dwm_expected());
     }
 
+    /// Своя рамка — 1 физический пиксель: на 125 и 150 % это 0.8 и 0.67 точки.
     #[test]
-    fn the_frame_is_one_pixel_wide() {
-        assert_eq!(FRAME_WIDTH, 1.0);
+    fn the_frame_is_one_physical_pixel_wide() {
+        for ppp in [1.0, 1.25, 1.5] {
+            let width = frame_width(ppp);
+            assert!(
+                (width * ppp - 1.0).abs() < 1e-6,
+                "на {ppp} рамка {width} точки — {} физических пикселей",
+                width * ppp
+            );
+        }
     }
 
     /// Цвет рамки идёт в журнал запуска как `#RRGGBB`: по этой строке смоук CI видит,
