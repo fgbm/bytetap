@@ -801,7 +801,7 @@ jobs:
                     Start-Sleep -Milliseconds 200
                   }
                   $client.Close()
-                } catch { Write-Host "$name: клиент HL7: $_" }
+                } catch { Write-Host "${name}: клиент HL7: $_" }
               }
             }
             if (-not $p.HasExited) {
@@ -822,11 +822,11 @@ jobs:
                 $file = Join-Path $out ('{0:d2}-{1}.png' -f $index, $name)
                 $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
                 $g.Dispose(); $bmp.Dispose()
-                Write-Host "$name: ${width}x${height} → $file"
-              } catch { Write-Host "$name: снимок: $_"; $failed = $true }
+                Write-Host "${name}: ${width}x${height} → $file"
+              } catch { Write-Host "${name}: снимок: $_"; $failed = $true }
               Stop-Process -Id $p.Id -Force
             } else {
-              Write-Host "$name: bytetap.exe завершился, код $($p.HasExited)"
+              Write-Host "${name}: bytetap.exe завершился, код $($p.HasExited)"
               $failed = $true
             }
             Start-Sleep -Milliseconds 300
