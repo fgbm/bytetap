@@ -1,0 +1,174 @@
+name: Soak
+
+# U1-AC24 (NFR-5): память долгой записи. Ручной прогон настоящего release-exe:
+# запись на loopback с потоком фрагментов, раз в минуту снимаются WorkingSet и
+# PrivateBytes процесса. Буфер ленты ограничен 10 000 фрагментов (U1-AC13), поэтому
+# после прогрева память не должна расти: критерий — рост не больше 10 %.
+#
+# Отдельный workflow, а не job в CI: прогон идёт полчаса и запускается вручную
+# (`gh workflow run Soak --ref native-ui -f minutes=25 -f rate=200`), а concurrency
+# CI выдал бы его только после текущего прогона ветки.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Длительность записи, минут"
+        type: number
+        default: 25
+      rate:
+        description: "Фрагментов в секунду"
+        type: number
+        default: 200
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  memory:
+    name: память долгой записи (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Установить Rust из rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustc -V
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.2
+        with:
+          shared-key: native-windows
+          # Замер публикуется артефактом, поэтому кеш только читается (zizmor:
+          # cache-poisoning); наполняет его `native-windows` в CI.
+          lookup-only: true
+
+      - name: cargo build --release
+        run: cargo build --release -p bytetap-app --bin bytetap
+
+      - name: Запись потоком и замер памяти
+        shell: pwsh
+        env:
+          MINUTES: ${{ inputs.minutes }}
+          RATE: ${{ inputs.rate }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
+          $minutes = [int]$env:MINUTES
+          $rate = [int]$env:RATE
+          $out = New-Item -ItemType Directory -Force -Path soak
+          Write-Host "длительность записи: $minutes мин, поток $rate фрагментов/с"
+
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $env:BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0'
+          $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
+          $null = $p.Handle
+          $env:BYTETAP_TEST_AUTOSTART = ''
+
+          $addr = $null
+          $journal = $null
+          for ($i = 0; $i -lt 120 -and -not $addr; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Test-Path $log) {
+              $found = Select-String -Path $log -Pattern 'запись идёт: адрес ([^,\s]+), журнал (.+)$' -Encoding utf8 | Select-Object -First 1
+              if ($found) {
+                $addr = $found.Matches[0].Groups[1].Value
+                $journal = $found.Matches[0].Groups[2].Value.Trim()
+              }
+            }
+          }
+          if (-not $addr) { throw 'запись не началась: в журнале запуска нет адреса' }
+          Write-Host "адрес записи: $addr, журнал: $journal"
+
+          # Поток в отдельном процессе PowerShell: 200 фрагментов/с пачками по 20 раз в
+          # 100 мс. Живёт на минуту дольше замера, чтобы последняя точка снималась при
+          # идущем обмене.
+          $port = [int]($addr -split ':')[-1]
+          $sender = Start-Job -ScriptBlock {
+            param($port, $rate, $seconds)
+            $client = New-Object System.Net.Sockets.TcpClient
+            $client.Connect('127.0.0.1', $port)
+            $stream = $client.GetStream()
+            $stream.ReadTimeout = 200
+            $buffer = New-Object byte[] 8192
+            $batch = [Math]::Max(1, [int]($rate / 10))
+            $frame = 0
+            $deadline = (Get-Date).AddSeconds($seconds)
+            while ((Get-Date) -lt $deadline) {
+              for ($i = 0; $i -lt $batch; $i++) {
+                $text = "MSH|^~\&|ANALYZER|LAB|LIS||20261019101500||ORU^R01|MSG$frame|P|2.3.1`rPID|1||000001||PATIENT^TEST`rOBX|1|NM|GLU^Glucose||5.4|mmol/L`r"
+                [byte[]]$bytes = @(0x0b) + [System.Text.Encoding]::ASCII.GetBytes($text) + @(0x1c, 0x0d)
+                try { $stream.Write($bytes, 0, $bytes.Length) } catch { $client.Close(); return }
+                $frame++
+              }
+              # Автоответы: читаем, чтобы буфер сокета не переполнился.
+              try { $null = $stream.Read($buffer, 0, $buffer.Length) } catch { }
+              Start-Sleep -Milliseconds 100
+            }
+            $client.Close()
+            Write-Output "отправлено фрагментов: $frame"
+          } -ArgumentList $port, $rate, ($minutes * 60 + 60)
+
+          $warmup = 5
+          $rows = @('| минута | WorkingSet, МБ | PrivateBytes, МБ | журнал, МБ |', '| --- | --- | --- | --- |')
+          $ws = @()
+          $pv = @()
+          for ($m = 1; $m -le $minutes; $m++) {
+            Start-Sleep -Seconds 60
+            if ($p.HasExited) { throw "bytetap.exe завершился на $m-й минуте" }
+            $p.Refresh()
+            $w = $p.WorkingSet64 / 1MB
+            $v = $p.PrivateMemorySize64 / 1MB
+            $size = if ($journal -and (Test-Path $journal)) { (Get-Item $journal).Length / 1MB } else { 0 }
+            $ws += $w
+            $pv += $v
+            $rows += "| $m | {0:N1} | {1:N1} | {2:N1} |" -f $w, $v, $size
+            Write-Host ("{0} мин: WorkingSet {1:N1} МБ, PrivateBytes {2:N1} МБ, журнал {3:N1} МБ" -f $m, $w, $v, $size)
+          }
+
+          # Остановка штатная (WM_CLOSE): журнал получает session_end, а журнал запуска —
+          # итог кадров записи.
+          $null = $p.CloseMainWindow()
+          if (-not $p.WaitForExit(30000)) { Stop-Process -Id $p.Id -Force }
+          $sent = Receive-Job -Id $sender -Wait -AutoRemoveJob
+          Write-Host $sent
+
+          $ready = [Math]::Min($warmup, $ws.Count - 1)
+          $baseWs = ($ws[0..$ready] | Measure-Object -Maximum).Maximum
+          $basePv = ($pv[0..$ready] | Measure-Object -Maximum).Maximum
+          $peakWs = ($ws[($ready + 1)..($ws.Count - 1)] | Measure-Object -Maximum).Maximum
+          $peakPv = ($pv[($ready + 1)..($pv.Count - 1)] | Measure-Object -Maximum).Maximum
+          $endWs = $ws[-1]
+          $endPv = $pv[-1]
+          $growthWs = ($peakWs - $baseWs) / $baseWs * 100
+          $growthPv = ($peakPv - $basePv) / $basePv * 100
+          $line = "после прогрева ({0} мин): WorkingSet {1:N1} → {2:N1} МБ (пик {3:N1}), рост {4:N1} %; PrivateBytes {5:N1} → {6:N1} МБ (пик {7:N1}), рост {8:N1} %" -f $warmup, $baseWs, $endWs, $peakWs, $growthWs, $basePv, $endPv, $peakPv, $growthPv
+          Write-Host $line
+          $rows += ''
+          $rows += $line
+          if ($sent) { $rows += $sent }
+          $rows | Out-File -Encoding utf8 soak/memory.txt
+
+          $failed = $false
+          if ($growthWs -gt 10) { Write-Host "WorkingSet вырос на $growthWs % — больше 10 %"; $failed = $true }
+          if ($growthPv -gt 10) { Write-Host "PrivateBytes вырос на $growthPv % — больше 10 %"; $failed = $true }
+          if (Test-Path $log) {
+            $tail = Select-String -Path $log -Pattern 'кадров за запись|цена кадра записи|пропущено' -Encoding utf8
+            $tail | ForEach-Object { $_.Line } | Out-File -Encoding utf8 soak/memory-app-log.txt
+          }
+          if ($failed) { exit 1 }
+
+      - name: Замер памяти
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bytetap-soak-memory
+          path: soak/
+          if-no-files-found: warn

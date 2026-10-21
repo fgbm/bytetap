@@ -1,9 +1,19 @@
 name: Release
 
+# Релиз v0.2.0 — нативный bytetap.exe (crates/bytetap-app): Tauri и npm для сборки
+# больше не нужны. По тегу `v*` собирается exe, zip и SHA256SUMS, затем создаётся
+# черновик релиза. Ручной запуск собирает те же артефакты и ничего не публикует:
+# так workflow проверяется на ветке до тега (`gh workflow run Release --ref native-ui`).
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Только собрать артефакты: релиз создаётся по тегу, не по ручному запуску"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -15,6 +25,7 @@ jobs:
   build:
     name: build
     runs-on: windows-latest
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:
@@ -32,9 +43,35 @@ jobs:
           rustup toolchain install
           rustc -V
 
-      - run: npm ci
+      # Кеша нет намеренно: релиз собирается редко и публикует артефакты, а кеш cargo
+      # в публикующем workflow — путь подмены артефакта (zizmor: cache-poisoning).
+      - name: cargo build --release
+        run: cargo build --release -p bytetap-app --bin bytetap
+
+      # NFR-7 и U1-AC1: exe релиза — тот же, что в CI (`native-windows`), поэтому те же
+      # проверки перед упаковкой: размер и зависимости только из System32.
+      - name: Размер и DLL exe
+        shell: pwsh
+        run: |
+          $exe = Get-Item target\release\bytetap.exe
+          Write-Host ("bytetap.exe: {0:N2} МБ ({1} байт)" -f ($exe.Length / 1MB), $exe.Length)
+          if ($exe.Length -gt 25MB) { throw 'bytetap.exe больше 25 МБ (NFR-7)' }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          $deps = & $dumpbin /nologo /dependents $exe.FullName
+          $deps | Write-Host
+          $dlls = foreach ($line in $deps) { if ($line -match '^\s+(\S+\.dll)\s*$') { $Matches[1] } }
+          if (-not $dlls) { throw 'dumpbin не показал ни одной DLL' }
+          $system32 = Join-Path $env:SystemRoot 'System32'
+          $extra = $dlls | Where-Object { $_ -notmatch '^api-ms-win-' -and -not (Test-Path (Join-Path $system32 $_)) }
+          if ($extra) { throw "exe зависит от DLL не из System32: $($extra -join ', ')" }
+
+      # Лицензии встроенных шрифтов, иконок и сторонних crate едут в архиве рядом с exe.
+      - name: Сторонние лицензии актуальны
+        run: node scripts/licenses.mjs --check
 
       - name: Сверить тег с версией
+        if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           TAG: ${{ github.ref_name }}
@@ -44,18 +81,23 @@ jobs:
           $expected = "v" + $match.Matches[0].Groups[1].Value
           if ($env:TAG -ne $expected) { throw "тег $env:TAG не совпадает с версией $expected" }
 
-      - name: Сборка exe без установщика
-        run: npm run tauri build -- --no-bundle
-
+      # Имя архива ручного запуска — по версии из Cargo.toml: у ветки тега нет, а
+      # артефакт должен называться так же, как в релизе.
       - name: zip и SHA256SUMS
         shell: pwsh
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
         run: |
-          $name = "bytetap-$env:TAG-windows-x64"
+          $tag = $env:TAG
+          if (-not $tag) {
+            $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+            if (-not $match) { throw "в корневом Cargo.toml не найден [workspace.package] version" }
+            $tag = "v" + $match.Matches[0].Groups[1].Value
+          }
+          $name = "bytetap-$tag-windows-x64"
           New-Item -ItemType Directory -Path staging | Out-Null
           Copy-Item target/release/bytetap.exe staging/
-          Copy-Item README.md, LICENSE staging/
+          Copy-Item README.md, LICENSE, THIRD-PARTY-LICENSES.md staging/
           Compress-Archive -Path staging/* -DestinationPath "$name.zip"
           $hash = (Get-FileHash -Algorithm SHA256 "$name.zip").Hash.ToLower()
           "$hash  $name.zip" | Out-File -FilePath SHA256SUMS -Encoding ascii
@@ -72,6 +114,9 @@ jobs:
   publish:
     name: publish
     needs: build
+    # Черновик релиза — только по тегу. Ручной запуск (в том числе `dry_run: false`)
+    # публиковать нечего: тега нет, и проверка сборки остаётся проверкой.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
