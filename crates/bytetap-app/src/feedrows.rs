@@ -13,7 +13,7 @@ use eframe::egui::{
     text::LayoutJob, text::TextWrapping, vec2,
 };
 
-use crate::feed::{self, DataPayload, FeedEvent, FeedKind, HexLine, Segment};
+use crate::feed::{self, DataPayload, FeedEvent, FeedKind, HexLine, Segment, Segments};
 use crate::settings::Encoding;
 use crate::theme::tokens::{SPACE_2, SPACE_3, TEXT_2XS, TEXT_DATA, TEXT_XS};
 use crate::theme::{self, Palette};
@@ -133,24 +133,28 @@ fn row_frame(ui: &mut Ui, p: &Palette, height: f32, name: &str) -> (Rect, egui::
 }
 
 /// Текст фрагмента одной строкой с глифами `‹CR›` и «автоответ».
-fn data_job(p: &Palette, segments: &[Segment], synthetic: bool) -> LayoutJob {
+fn data_job(p: &Palette, segments: &Segments, synthetic: bool) -> LayoutJob {
     let mut job = LayoutJob::default();
     let ctrl = p.ctrl.gamma_multiply(0.55);
-    for segment in segments {
+    for segment in segments.iter() {
         match segment {
             Segment::Text(text) => {
                 job.append(text, 0.0, text_format(theme::mono(TEXT_DATA), p.text));
             }
             Segment::Ctrl(byte, count) => {
                 job.append(
-                    &feed::ctrl_glyph(*byte).repeat(*count as usize),
+                    &feed::ctrl_glyph(byte).repeat(count as usize),
                     0.0,
                     text_format(theme::mono(TEXT_2XS), ctrl),
                 );
             }
-            Segment::Escaped(ch) => {
+            Segment::Escaped(text) => {
                 job.append(
-                    &feed::escaped_glyph(*ch),
+                    &text
+                        .chars()
+                        .next()
+                        .map(feed::escaped_glyph)
+                        .unwrap_or_default(),
                     0.0,
                     text_format(theme::mono(TEXT_2XS), ctrl),
                 );
@@ -171,9 +175,11 @@ fn data_job(p: &Palette, segments: &[Segment], synthetic: bool) -> LayoutJob {
 pub fn text_row(ui: &mut Ui, p: &Palette, event: &FeedEvent, multi: bool, encoding: Encoding) {
     let (class, text) = row_text(event);
     let segments = event.data().map(|data| data.segments(encoding));
+    // Подпись строки для AccessKit — начало фрагмента: повторы глифов целиком не
+    // разворачиваются, подпись строится каждый кадр (U1-AC16).
     let body = segments
         .as_deref()
-        .map_or_else(|| text.clone(), feed::plain_text);
+        .map_or_else(|| text.clone(), |s| feed::preview(s, feed::LABEL_CHARS));
     let name = match (class, event.conn) {
         (RowClass::Data(dir), Some(conn)) if multi => {
             format!("{} {} #{conn} {body}", event.time, glyph(dir))
@@ -216,7 +222,11 @@ pub fn text_row(ui: &mut Ui, p: &Palette, event: &FeedEvent, multi: bool, encodi
                 );
                 x += CONN_WIDTH + SPACE_2;
             }
-            let job = data_job(p, segments.as_deref().unwrap_or_default(), data.synthetic);
+            let job = data_job(
+                p,
+                segments.as_deref().unwrap_or(&Segments::EMPTY),
+                data.synthetic,
+            );
             let galley = truncated(ui, job, right - x);
             painter.galley(pos2(x, cy - galley.size().y / 2.0), galley, p.text);
         }
@@ -357,9 +367,9 @@ pub fn error_row(ui: &mut Ui, p: &Palette, height: f32) {
 
 /// Контекстное меню строки: текст, HEX и Base64 фрагмента (U1-AC16).
 ///
-/// Текст фрагмента копируется целиком, без предела показа в строке: строка ленты
-/// показывает первые 2048 байт, а копировать инженеру нужно весь фрагмент. Строка
-/// строится по клику, а не на каждый кадр (U1-AC16).
+/// Текст для копирования строится по клику и целиком, без предела показа в строке:
+/// строка ленты и её подпись для AccessKit показывают начало фрагмента, а скопировать
+/// инженеру нужно весь фрагмент (U1-AC16).
 fn row_menu(
     response: &egui::Response,
     p: &Palette,

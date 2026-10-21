@@ -37,24 +37,172 @@ pub const ENCODINGS: [Encoding; 5] = [
 /// Кусок текста фрагмента: печатный текст, глиф управляющего байта `‹CR›` или
 /// экранированный символ данных.
 ///
-/// Глиф хранится байтом, а не строкой: `String` на каждый управляющий байт — это
-/// столько же аллокаций, сколько управляющих байт в фрагменте. Имя глифа
-/// (`CR`, `x0B`) получается по байту при отрисовке и копирования.
+/// Кусок текста — не строка, а место в общей строке фрагмента: смещение, длина и вид.
+/// Строка на кусок означала бы столько же аллокаций, сколько управляющих байт во
+/// фрагменте: чередование `01 61 02 61…` давало бы две тысячи строк и две тысячи
+/// аллокаций на кадр отрисовки. Имя глифа (`CR`, `x0B`) получается по байту при
+/// отрисовке и копировании.
 ///
-/// Подряд идущие одинаковые управляющие байты — один сегмент с повтором: фрагмент
-/// из двух тысяч одинаковых байт не должен давать две тысячи сегментов (FR-28).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Segment {
-    /// Печатный текст: подряд идущие обычные байты одним куском.
-    Text(String),
-    /// Глиф управляющего байта: сам байт и сколько раз он подряд повторился.
-    Ctrl(u8, u32),
+/// Подряд идущие одинаковые управляющие байты — один спан с повтором: фрагмент из
+/// двух тысяч одинаковых байт не должен давать две тысячи спанов (FR-28).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    /// Смещение в [`Segments::text`], байты.
+    start: u32,
+    /// Длина куска в [`Segments::text`], байты; у глифа — ноль.
+    len: u32,
+    /// Вид куска.
+    kind: SpanKind,
+}
+
+/// Вид куска текста фрагмента.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanKind {
+    /// Печатный текст: `start..start + len` общей строки.
+    Text,
     /// Символ данных, который выглядел бы глифом: `‹` или `›`.
     ///
     /// Показывается как `‹x2039›` / `‹x203A›` — код символа в шестнадцатерицине.
     /// Такой вид не даёт глифу управления (у него `xHH` — ровно две цифры), поэтому
     /// символ данных нельзя принять за управляющий (FR-22).
-    Escaped(char),
+    Escaped,
+    /// Глиф управляющего байта: сам байт и сколько раз он подряд повторился.
+    Ctrl(u8, u32),
+}
+
+/// Кусок текста фрагмента так, как он показывается в ленте.
+///
+/// Заимствованный вид [`Span`]: отрисовка берёт кусок из общей строки, ничего не
+/// копируя.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Segment<'a> {
+    /// Печатный текст.
+    Text(&'a str),
+    /// Глиф управляющего байта: сам байт и сколько раз он подряд повторился.
+    Ctrl(u8, u32),
+    /// Символ данных, который выглядел бы глифом: `‹` или `›`.
+    Escaped(&'a str),
+}
+
+/// Текст фрагмента по кодировке: одна строка на фрагмент и компактные спаны в неё.
+///
+/// Декодированный текст фрагмента лежит одной строкой, а спаны только указывают в неё:
+/// фрагмент на 2048 байт стоит одну строку и один `Vec` спанов, сколько бы кусков в
+/// нём ни было (FR-28).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Segments {
+    text: String,
+    spans: Vec<Span>,
+}
+
+impl Segments {
+    /// Пустой фрагмент: у события ленты нет текста (служебная строка, комментарий).
+    pub const EMPTY: Self = Self {
+        text: String::new(),
+        spans: Vec::new(),
+    };
+
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Декодированный текст фрагмента: общая строка всех текстовых спанов.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Спаны фрагмента в порядке показа.
+    pub fn spans(&self) -> &[Span] {
+        &self.spans
+    }
+
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// Куски фрагмента в порядке показа.
+    pub fn iter(&self) -> impl Iterator<Item = Segment<'_>> {
+        self.spans.iter().map(|span| self.view(span))
+    }
+
+    fn view(&self, span: &Span) -> Segment<'_> {
+        let start = usize::try_from(span.start).unwrap_or(usize::MAX);
+        let end = start + usize::try_from(span.len).unwrap_or(usize::MAX);
+        let piece = self.text.get(start..end).unwrap_or_default();
+        match span.kind {
+            SpanKind::Text => Segment::Text(piece),
+            SpanKind::Escaped => Segment::Escaped(piece),
+            SpanKind::Ctrl(byte, count) => Segment::Ctrl(byte, count),
+        }
+    }
+
+    /// Печатный кусок: дописывается в конец общей строки и удлиняет соседний текстовый
+    /// спан, если тот кончается там же.
+    fn push_plain(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let start = self.offset();
+        self.text.push_str(text);
+        let len = self.length(text.len());
+        if let Some(last) = self.spans.last_mut()
+            && last.kind == SpanKind::Text
+            && last.start + last.len == start
+        {
+            last.len += len;
+            return;
+        }
+        self.spans.push(Span {
+            start,
+            len,
+            kind: SpanKind::Text,
+        });
+    }
+
+    /// Глиф управляющего байта: подряд идущие одинаковые байты — один спан с повтором.
+    fn push_ctrl(&mut self, byte: u8) {
+        match self.spans.last_mut() {
+            Some(Span {
+                kind: SpanKind::Ctrl(last, count),
+                ..
+            }) if *last == byte => *count += 1,
+            _ => {
+                let start = self.offset();
+                self.spans.push(Span {
+                    start,
+                    len: 0,
+                    kind: SpanKind::Ctrl(byte, 1),
+                });
+            }
+        }
+    }
+
+    /// Символ данных, похожий на глиф: сам символ лежит в общей строке, спан только
+    /// указывает на него.
+    fn push_escaped(&mut self, ch: char) {
+        let start = self.offset();
+        self.text.push(ch);
+        let len = self.length(ch.len_utf8());
+        self.spans.push(Span {
+            start,
+            len,
+            kind: SpanKind::Escaped,
+        });
+    }
+
+    /// Смещение в общей строке; фрагмент длиннее 4 ГиБ в ленту не попадает (у приёма
+    /// свой предел буфера), но тип спана не должен от этого врать.
+    fn offset(&self) -> u32 {
+        u32::try_from(self.text.len()).unwrap_or(u32::MAX)
+    }
+
+    fn length(&self, len: usize) -> u32 {
+        u32::try_from(len).unwrap_or(u32::MAX)
+    }
 }
 
 /// Фрагмент обмена: направление, автоответ и исходные байты.
@@ -64,7 +212,7 @@ pub struct DataPayload {
     pub synthetic: bool,
     pub bytes: Vec<u8>,
     /// Текст по кодировке в порядке [`ENCODINGS`]: считается при первом показе.
-    text: [OnceLock<Arc<[Segment]>>; 5],
+    text: [OnceLock<Arc<Segments>>; 5],
 }
 
 impl DataPayload {
@@ -78,10 +226,10 @@ impl DataPayload {
     }
 
     /// Текст фрагмента по кодировке с кешем на событие.
-    pub fn segments(&self, encoding: Encoding) -> Arc<[Segment]> {
+    pub fn segments(&self, encoding: Encoding) -> Arc<Segments> {
         let slot = &self.text[encoding_index(encoding)];
         Arc::clone(
-            slot.get_or_init(|| text_segments(&self.bytes, encoding, TEXT_LIMIT_BYTES).into()),
+            slot.get_or_init(|| Arc::new(text_segments(&self.bytes, encoding, TEXT_LIMIT_BYTES))),
         )
     }
 
@@ -360,50 +508,54 @@ pub fn escaped_glyph(ch: char) -> String {
 ///
 /// Иначе текст прибора притворился бы управляющим символом (FR-22): `‹` в данных
 /// иначе выглядел бы как начало глифа `‹CR›`.
-fn push_text(out: &mut Vec<Segment>, text: &str) {
+fn push_text(out: &mut Segments, text: &str) {
     let mut rest = text;
     while let Some(at) = rest.find(['<', '\u{2039}', '\u{203a}']) {
         if at > 0 {
-            push_plain(out, &rest[..at]);
+            out.push_plain(&rest[..at]);
         }
         let ch = rest[at..].chars().next().expect("a char is there");
         match ch {
-            '<' => push_ctrl(out, b'<'),
-            _ => out.push(Segment::Escaped(ch)),
+            '<' => out.push_ctrl(b'<'),
+            _ => out.push_escaped(ch),
         }
         rest = &rest[at + ch.len_utf8()..];
     }
     if !rest.is_empty() {
-        push_plain(out, rest);
+        out.push_plain(rest);
     }
 }
 
-/// Глиф управляющего байта: подряд идущие одинаковые байты — один сегмент с повтором.
-fn push_ctrl(out: &mut Vec<Segment>, byte: u8) {
-    match out.last_mut() {
-        Some(Segment::Ctrl(last, count)) if *last == byte => *count += 1,
-        _ => out.push(Segment::Ctrl(byte, 1)),
-    }
-}
-
-fn push_plain(out: &mut Vec<Segment>, text: &str) {
-    match out.last_mut() {
-        Some(Segment::Text(last)) => last.push_str(text),
-        _ => out.push(Segment::Text(text.to_owned())),
-    }
-}
-
-fn decode_run(run: &[u8], encoding: Encoding) -> String {
+/// Декодирует печатный кусок в общий буфер: буфер один на фрагмент, и строка на
+/// каждый кусок не создаётся.
+fn decode_into(run: &[u8], encoding: Encoding, out: &mut String) {
     let table = match encoding {
         // ASCII печатный: управляющие и старшие байты сюда не попадают.
-        Encoding::Ascii => return run.iter().map(|&b| char::from(b)).collect(),
+        Encoding::Ascii => {
+            out.extend(run.iter().map(|&b| char::from(b)));
+            return;
+        }
         Encoding::Cp1251 => encoding_rs::WINDOWS_1251,
         Encoding::Utf8 => encoding_rs::UTF_8,
         Encoding::Gbk => encoding_rs::GBK,
         // `iso-8859-1` по WHATWG — Windows-1252, как у `TextDecoder` Vue-версии.
         Encoding::Latin1 => encoding_rs::WINDOWS_1252,
     };
-    table.decode_without_bom_handling(run).0.into_owned()
+    // `decode_to_string` пишет только в запас ёмкости: место резервируется заранее,
+    // и остаток куска дочитывается, если его не хватило.
+    let mut decoder = table.new_decoder_without_bom_handling();
+    let mut rest = run;
+    loop {
+        let needed = decoder
+            .max_utf8_buffer_length(rest.len())
+            .unwrap_or(rest.len() * 4 + 4);
+        out.reserve(needed);
+        let (result, read, _) = decoder.decode_to_string(rest, out, true);
+        rest = &rest[read..];
+        if result == encoding_rs::CoderResult::InputEmpty {
+            break;
+        }
+    }
 }
 
 /// Текст фрагмента: управляющие байты `<0x20` и `0x7F` (в ASCII ещё и `≥0x80`) — глифы
@@ -411,26 +563,32 @@ fn decode_run(run: &[u8], encoding: Encoding) -> String {
 /// декодирования, поэтому управляющий байт внутри многобайтовой последовательности
 /// никогда не попадёт в декодер. Длиннее `limit` байт — «…» в конце.
 ///
-/// Подряд идущие обычные байты дают один сегмент: фрагмент из двух тысяч одинаковых
-/// байт — это один кусок текста, а не две тысячи сегментов (FR-22, FR-28).
-pub fn text_segments(bytes: &[u8], encoding: Encoding, limit: usize) -> Vec<Segment> {
+/// Подряд идущие обычные байты дают один спан: фрагмент из двух тысяч одинаковых
+/// байт — это один кусок текста, а не две тысячи спанов (FR-22, FR-28).
+pub fn text_segments(bytes: &[u8], encoding: Encoding, limit: usize) -> Segments {
     let end = bytes.len().min(limit);
-    let mut out = Vec::new();
+    let mut out = Segments::new();
+    // Буфер декодера один на фрагмент: он только принимает очередной печатный кусок.
+    let mut decoded = String::new();
     let mut start = 0;
     for (index, &byte) in bytes[..end].iter().enumerate() {
         if is_control_byte(byte) || (encoding == Encoding::Ascii && byte >= 0x80) {
             if start < index {
-                push_text(&mut out, &decode_run(&bytes[start..index], encoding));
+                decoded.clear();
+                decode_into(&bytes[start..index], encoding, &mut decoded);
+                push_text(&mut out, &decoded);
             }
-            push_ctrl(&mut out, byte);
+            out.push_ctrl(byte);
             start = index + 1;
         }
     }
     if start < end {
-        push_text(&mut out, &decode_run(&bytes[start..end], encoding));
+        decoded.clear();
+        decode_into(&bytes[start..end], encoding, &mut decoded);
+        push_text(&mut out, &decoded);
     }
     if bytes.len() > end {
-        push_plain(&mut out, "…");
+        out.push_plain("…");
     }
     out
 }
@@ -438,24 +596,92 @@ pub fn text_segments(bytes: &[u8], encoding: Encoding, limit: usize) -> Vec<Segm
 /// Текст сегмента так, как он показывается в ленте: глиф — `‹CR›`.
 pub fn segment_text(segment: &Segment) -> String {
     match segment {
-        Segment::Text(text) => text.clone(),
+        Segment::Text(text) => (*text).to_owned(),
         Segment::Ctrl(byte, count) => ctrl_glyph(*byte).repeat(*count as usize),
-        Segment::Escaped(ch) => escaped_glyph(*ch),
+        Segment::Escaped(text) => text.chars().next().map(escaped_glyph).unwrap_or_default(),
     }
 }
 
-/// Строка текста целиком: для копирования из контекстного меню.
-pub fn plain_text(segments: &[Segment]) -> String {
+/// Сколько символов текста фрагмента уходит в подпись строки для AccessKit.
+pub const LABEL_CHARS: usize = 256;
+
+/// Начало текста фрагмента для подписи строки: до `chars` символов, с «…» в конце.
+///
+/// Подпись строится каждый кадр для каждой видимой строки, поэтому повторы глифов не
+/// разворачиваются целиком: у фрагмента из двух тысяч одинаковых управляющих байт в
+/// подпись попадает столько глифов, сколько влезает в предел, а не все две тысячи
+/// (U1-AC16).
+///
+/// Считаются символы показанного текста: у глифа их несколько (`‹x01›`), и глиф
+/// укладывается целиком или не попадает вовсе.
+pub fn preview(segments: &Segments, chars: usize) -> String {
     let mut out = String::new();
-    for segment in segments {
+    let mut left = chars;
+    'spans: for segment in segments.iter() {
+        match segment {
+            Segment::Text(text) => {
+                for ch in text.chars() {
+                    if left == 0 {
+                        out.push('…');
+                        break 'spans;
+                    }
+                    out.push(ch);
+                    left -= 1;
+                }
+            }
+            Segment::Escaped(text) => {
+                let glyph = text.chars().next().map(escaped_glyph).unwrap_or_default();
+                if !push_limited(&mut out, &glyph, &mut left) {
+                    out.push('…');
+                    break 'spans;
+                }
+            }
+            Segment::Ctrl(byte, count) => {
+                let glyph = ctrl_glyph(byte);
+                let width = glyph.chars().count().max(1);
+                let count = count as usize;
+                let fits = (left / width).min(count);
+                for _ in 0..fits {
+                    out.push_str(&glyph);
+                }
+                left -= fits * width;
+                if fits < count {
+                    out.push('…');
+                    break 'spans;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Дописывает кусок, если он влезает в остаток предела; `false` — не влез.
+fn push_limited(out: &mut String, piece: &str, left: &mut usize) -> bool {
+    let width = piece.chars().count();
+    if width > *left {
+        return false;
+    }
+    *left -= width;
+    out.push_str(piece);
+    true
+}
+
+/// Строка текста целиком: для копирования из контекстного меню.
+pub fn plain_text(segments: &Segments) -> String {
+    let mut out = String::new();
+    for segment in segments.iter() {
         match segment {
             Segment::Text(text) => out.push_str(text),
             Segment::Ctrl(byte, count) => {
-                for _ in 0..*count {
-                    out.push_str(&ctrl_glyph(*byte));
+                for _ in 0..count {
+                    out.push_str(&ctrl_glyph(byte));
                 }
             }
-            Segment::Escaped(ch) => out.push_str(&escaped_glyph(*ch)),
+            Segment::Escaped(text) => {
+                if let Some(ch) = text.chars().next() {
+                    out.push_str(&escaped_glyph(ch));
+                }
+            }
         }
     }
     out
@@ -569,13 +795,68 @@ mod tests {
 
     use super::*;
 
+    /// Счётчик аллокаций потока: сколько раз код просил у системы память.
+    ///
+    /// Нужен, чтобы проверить главное в представлении текста фрагмента: куски — это
+    /// спаны в одной строке, а не строки на каждый кусок. Счёт ведётся по потоку, и
+    /// соседние тесты ему не мешают; `System` остаётся настоящим аллокатором.
+    mod allocs {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            /// Сколько раз этот поток просил память.
+            static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+            /// Считать ли: только внутри [`count`].
+            static COUNTING: Cell<bool> = const { Cell::new(false) };
+        }
+
+        struct Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                COUNTING.with(|on| {
+                    if on.get() {
+                        ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                    }
+                });
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                COUNTING.with(|on| {
+                    if on.get() {
+                        ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                    }
+                });
+                unsafe { System.realloc(ptr, layout, size) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: Counting = Counting;
+
+        /// Сколько раз поток просил память, пока работал `f`.
+        pub fn count(f: impl FnOnce()) -> usize {
+            ALLOCATIONS.with(|count| count.set(0));
+            COUNTING.with(|on| on.set(true));
+            f();
+            COUNTING.with(|on| on.set(false));
+            ALLOCATIONS.with(Cell::get)
+        }
+    }
+
     /// Тексты сегментов так, как они показываются в ленте.
-    fn shown(segments: &[Segment]) -> Vec<(String, bool)> {
+    fn shown(segments: &Segments) -> Vec<(String, bool)> {
         segments
             .iter()
             .map(|segment| {
                 let ctrl = !matches!(segment, Segment::Text(_));
-                (segment_text(segment), ctrl)
+                (segment_text(&segment), ctrl)
             })
             .collect()
     }
@@ -693,14 +974,19 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &data.segments(Encoding::Utf8)));
     }
 
-    /// Фрагмент из одних управляющих байтов: один сегмент-повтор, без строк — имя
+    /// Фрагмент из одних управляющих байтов: один спан-повтор, без строк — имя
     /// глифа получается по байту при отрисовке (FR-28).
     #[test]
     fn a_control_only_fragment_has_no_text_allocations() {
         let bytes = vec![0x01u8; 2048];
         let segments = text_segments(&bytes, Encoding::Ascii, TEXT_LIMIT_BYTES);
-        assert_eq!(segments.len(), 1, "одинаковые байты — один сегмент");
-        assert_eq!(segments[0], Segment::Ctrl(0x01, 2048), "с повтором");
+        assert_eq!(segments.len(), 1, "одинаковые байты — один спан");
+        assert_eq!(
+            segments.spans()[0].kind,
+            SpanKind::Ctrl(0x01, 2048),
+            "с повтором"
+        );
+        assert!(segments.text().is_empty(), "у глифов нет текста");
         // Текст при этом полный: 2048 глифа.
         assert_eq!(
             plain_text(&segments).matches("‹x01›").count(),
@@ -709,13 +995,60 @@ mod tests {
         );
     }
 
-    /// Подряд идущие обычные байты — один сегмент: 2048 байт дают один кусок.
+    /// Подряд идущие обычные байты — один спан: 2048 байт дают один кусок.
     #[test]
     fn a_plain_fragment_is_one_segment() {
         let bytes = vec![b'x'; 2048];
         let segments = text_segments(&bytes, Encoding::Ascii, TEXT_LIMIT_BYTES);
-        assert_eq!(segments.len(), 1, "подряд идущие байты — один сегмент");
-        assert_eq!(segments[0], Segment::Text("x".repeat(2048)));
+        assert_eq!(segments.len(), 1, "подряд идущие байты — один спан");
+        assert_eq!(segments.text(), "x".repeat(2048));
+        assert_eq!(plain_text(&segments), "x".repeat(2048));
+    }
+
+    /// Смешанные данные: управляющий и печатный байт по очереди дают 2048 спанов, но
+    /// текст фрагмента — одна строка, а не строка на спан (FR-28).
+    ///
+    /// Считаются аллокации потока: у строки на кусок их было бы больше тысячи, здесь —
+    /// единицы на рост буфера строки и `Vec` спанов.
+    #[test]
+    fn a_mixed_fragment_keeps_one_string() {
+        let bytes: Vec<u8> = (0..2048)
+            .map(|index| if index % 2 == 0 { 0x01 } else { b'a' })
+            .collect();
+        let counting = allocs::count(|| {
+            let segments = text_segments(&bytes, Encoding::Ascii, TEXT_LIMIT_BYTES);
+            assert_eq!(segments.len(), 2048, "глиф и буква по очереди");
+            assert_eq!(segments.text(), "a".repeat(1024), "одна строка фрагмента");
+        });
+        assert!(
+            counting < 64,
+            "одна строка и Vec спанов, а не строка на спан: {counting} аллокаций"
+        );
+        let segments = text_segments(&bytes, Encoding::Ascii, TEXT_LIMIT_BYTES);
+        // Показ и копирование те же, что были у строк на каждый кусок.
+        assert_eq!(
+            plain_text(&segments),
+            "‹x01›a".repeat(1024),
+            "текст фрагмента"
+        );
+        assert_eq!(preview(&segments, 8), "‹x01›a…", "глиф не влез — «…»");
+    }
+
+    /// Подпись строки — начало фрагмента: повторы глифов не разворачиваются целиком.
+    #[test]
+    fn the_label_is_a_limited_prefix() {
+        let bytes = vec![0x01u8; 2048];
+        let segments = text_segments(&bytes, Encoding::Ascii, TEXT_LIMIT_BYTES);
+        let label = preview(&segments, LABEL_CHARS);
+        assert!(
+            label.chars().count() <= LABEL_CHARS + 1,
+            "не длиннее предела: {label}"
+        );
+        assert!(label.ends_with('…'), "сокращено: {label}");
+        assert_eq!(label.matches("‹x01›").count(), LABEL_CHARS / 5);
+        // Короткий фрагмент попадает в подпись целиком.
+        let short = text_segments(b"AB\r", Encoding::Ascii, TEXT_LIMIT_BYTES);
+        assert_eq!(preview(&short, LABEL_CHARS), "AB‹CR›");
     }
 
     /// Копирование отдаёт весь фрагмент, а не первые 2048 байт (U1-AC16).
