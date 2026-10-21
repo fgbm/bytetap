@@ -1668,10 +1668,11 @@ impl BytetapApp {
         // Края — раньше шапки: нажатие на краю не должно достаться кнопкам под ним.
         titlebar::resize_edges(ui.ctx());
         let p = self.pal();
-        // Фон окна не заливается: проход отрисовки уже очищает всё окно тем же цветом
-        // (`clear_color`), а вторая полная заливка кадра на программном растре — это
-        // лишний проход по 1024×768 пикселей (U1-AC24). Убрана заливка
-        // `ui.max_rect()` — снимки экранов остались те же, пиксель в пиксель.
+        let rect = ui.max_rect();
+        // Фон окна: проход отрисовки очищает окно цветом `clear_color`, но заливка
+        // нужна — цвет из очистки и из вершины egui переводится в sRGB по-разному, и
+        // без заливки снимки экранов расходятся на один разряд канала (U1-AC24).
+        ui.painter().rect_filled(rect, 0, p.surface_0);
         let recording = self.screen == Screen::Recording && self.rec.is_some();
         let viewing = self.screen == Screen::Viewing;
         if recording {
@@ -1941,7 +1942,9 @@ impl eframe::App for BytetapApp {
         // Проба цены кадра (`probe.rs`): в режиме `empty` рисуется только фон — столько
         // стоит кадр без интерфейса.
         if crate::probe::enabled() && crate::probe::mode() == crate::probe::EMPTY {
-            // Ничего: кадр — только очистка окна в `clear_color`.
+            let p = self.pal();
+            let rect = ui.max_rect();
+            ui.painter().rect_filled(rect, 0, p.surface_0);
         } else {
             self.draw(ui);
         }
