@@ -253,6 +253,13 @@ fn journal_hex_light() {
     journal_harness(false, FeedView::Hex).snapshot_options("journal-hex-light", &options());
 }
 
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn journal_hex_dark() {
+    let _gpu = gpu();
+    journal_harness(true, FeedView::Hex).snapshot_options("journal-hex-dark", &options());
+}
+
 /// Шапка просмотра: имя файла, анализатор, длительность, строка о персональных данных.
 #[test]
 fn the_journal_header_and_notice_have_names() {
