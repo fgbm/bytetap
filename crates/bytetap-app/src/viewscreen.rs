@@ -371,7 +371,9 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
         return;
     }
     let row_height = if hex { HEX_ROW_HEIGHT } else { TEXT_ROW_HEIGHT };
-    let multi = view.conns().len() > 1;
+    // Колонка номера соединения — когда соединений было больше одного: как в UI v2,
+    // где в просмотре берутся итоги сессии из сводки журнала.
+    let multi = view.summary.stats.connections > 1;
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut scroll = ScrollArea::vertical()
         .id_salt("bt-journal-feed")

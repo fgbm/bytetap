@@ -367,20 +367,13 @@ jobs:
               [void][FrameWin]::DwmGetWindowAttribute($hwnd, 9, [ref]$rect, [System.Runtime.InteropServices.Marshal]::SizeOf($rect))
               $w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
               Write-Host "окно ${w}x${h}"
-              # Скругление (33) и цвет рамки (34) — как их задало приложение.
+              # Скругление (33) — как его задало приложение. Цвет рамки (34) атрибут
+              # только для записи, его не прочитать: о нём пишет журнал запуска.
               $corner = 0
               [void][FrameWin]::DwmGetWindowAttribute($hwnd, 33, [ref]$corner, 4)
-              $border = 0
-              [void][FrameWin]::DwmGetWindowAttribute($hwnd, 34, [ref]$border, 4)
-              Write-Host ("скругление: {0}, цвет рамки: 0x{1:X6}" -f $corner, $border)
+              Write-Host ("скругление: {0}" -f $corner)
               if ($corner -ne 2) {
                 Write-Host "DWM не скруглил окно (ожидалось DWMWCP_ROUND=2)"
-                $failed = $true
-              }
-              # Цвет рамки — токен `--bt-border` в COLORREF (0x00BBGGRR): светлая тема
-              # #e2e5e9 и тёмная #252d36, тема на раннере системная.
-              if ($border -ne 0x00E9E5E2 -and $border -ne 0x00362D25) {
-                Write-Host ("DWM не принял цвет рамки: 0x{0:X6}" -f $border)
                 $failed = $true
               }
               # Снимок окна на белом фоне: рамка 1 px видна только на нём.
@@ -406,6 +399,14 @@ jobs:
           # Журнал запуска пишет результат вызовов DWM: рамка, скругление и тень.
           if (-not (Select-String -Path $log -Pattern 'рамка окна' -Quiet -Encoding utf8)) {
             Write-Host 'в журнале запуска нет записей о рамке окна'
+            $failed = $true
+          }
+          if (-not (Select-String -Path $log -Pattern 'DWM скругляет углы' -Quiet -Encoding utf8)) {
+            Write-Host 'DWM не скруглил окно'
+            $failed = $true
+          }
+          if (-not (Select-String -Path $log -Pattern 'DWM рисует рамку цветом border' -Quiet -Encoding utf8)) {
+            Write-Host 'DWM не принял цвет рамки'
             $failed = $true
           }
           if ($failed) { exit 1 }

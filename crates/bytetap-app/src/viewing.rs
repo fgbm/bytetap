@@ -152,37 +152,6 @@ impl JournalView {
     pub fn hex_row_of(&mut self, index: usize) -> usize {
         self.hex_prefix().get(index).copied().unwrap_or(0) as usize
     }
-
-    /// Номера соединений в загруженных страницах: по ним лента решает, показывать ли
-    /// колонку номера соединения.
-    ///
-    /// В журнале соединения видны только у загруженных страниц — как и в UI v2, где
-    /// фильтр строится по загруженным страницам.
-    pub fn conns(&self) -> Vec<u32> {
-        let mut conns: Vec<u32> = Vec::new();
-        for event in self.source.events() {
-            if let Some(conn) = event_conn(event)
-                && !conns.contains(&conn)
-            {
-                conns.push(conn);
-            }
-        }
-        conns.sort_unstable();
-        conns
-    }
-}
-
-/// Номер соединения события журнала; `None` — у события его нет.
-#[must_use]
-pub fn event_conn(event: &Event) -> Option<u32> {
-    match event {
-        Event::Data(data) => Some(data.conn),
-        Event::Open(open) => Some(open.conn),
-        Event::Close(close) => Some(close.conn),
-        Event::Error(error) => error.conn,
-        Event::Info(info) => info.conn,
-        Event::Note(_) | Event::Session(_) | Event::SessionEnd(_) => None,
-    }
 }
 
 /// Номер события для доли времени на карте журнала.

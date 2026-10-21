@@ -179,14 +179,6 @@ impl PageSource {
         events.get(index % PAGE_SIZE)
     }
 
-    /// Все загруженные события: по страницам в порядке обращения.
-    pub fn events(&self) -> impl Iterator<Item = &Event> {
-        self.order
-            .iter()
-            .filter_map(|page| self.pages.get(page))
-            .flat_map(|events| events.iter())
-    }
-
     /// Сколько страниц сейчас в памяти: для проверки LRU и диагностики.
     pub fn pages_in_memory(&self) -> usize {
         self.pages.len()
