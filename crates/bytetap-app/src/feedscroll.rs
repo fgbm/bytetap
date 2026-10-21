@@ -13,7 +13,13 @@
 
 use std::ops::Range;
 
-use eframe::egui::{self, Align, CursorIcon, Id, Layout, Rect, Sense, Ui, UiBuilder, pos2, vec2};
+use eframe::egui::{
+    self, Align, CursorIcon, Id, Layout, Rect, Role, Sense, Ui, UiBuilder, WidgetInfo, pos2, vec2,
+};
+
+use crate::t;
+use crate::theme::Palette;
+use crate::widgets;
 
 /// Ширина полосы прокрутки.
 const BAR_WIDTH: f32 = 10.0;
@@ -91,14 +97,16 @@ impl FeedScroll {
     pub fn show(
         &mut self,
         ui: &mut Ui,
+        p: &Palette,
         id: Id,
         rows: usize,
         row_height: f32,
         add: impl FnOnce(&mut Ui, Range<usize>),
     ) -> ScrollOut {
         let height = ui.available_height().max(row_height);
-        let (outer, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click_and_drag());
+        // Сама лента фокуса не берёт: Tab идёт к ползунку полосы, а клавиши ленты
+        // работают, когда фокус не в поле ввода (U1-AC25).
+        let (outer, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
         // Полоса нужна, когда строки не помещаются целиком: `rows·h > h_ленты`. Высота
         // последней страницы бывает больше высоты ленты на доли строки — это уже прокрутка.
         let fit = f64::from(outer.height()) / f64::from(row_height);
@@ -118,9 +126,11 @@ impl FeedScroll {
         if ui.rect_contains_pointer(outer) {
             self.wheel(ui, row_height, max_offset);
         }
-        // Клавиши — когда фокус не в поле ввода: в диалоге комментария Home и End
-        // принадлежат тексту, а не ленте.
-        if ui.memory(|m| m.focused().is_none()) {
+        // Клавиши — когда фокус не в поле ввода и не на другом виджете экрана: в
+        // диалоге комментария Home и End принадлежат тексту, а не ленте. На ползунке
+        // полосы они прокручивают ленту — иначе фокус на полосе отнял бы клавиши.
+        let thumb = id.with("thumb");
+        if ui.memory(|m| m.focused().is_none_or(|focused| focused == thumb)) {
             self.keys(ui, visible, max_offset);
         }
         self.offset = self.offset.clamp(0.0, max_offset);
@@ -141,7 +151,7 @@ impl FeedScroll {
         let range = first..(first + visible + 2).min(rows);
         add(&mut child, range.clone());
         if bar {
-            self.bar(ui, id, outer, visible, rows, max_offset);
+            self.bar(ui, p, id, outer, visible, rows, max_offset);
         }
         ScrollOut {
             range,
@@ -190,6 +200,7 @@ impl FeedScroll {
     fn bar(
         &mut self,
         ui: &mut Ui,
+        p: &Palette,
         id: Id,
         outer: Rect,
         visible: usize,
@@ -224,6 +235,15 @@ impl FeedScroll {
         );
         let pointer = ui.input(|i| i.pointer.interact_pos());
         let thumb_response = ui.interact(thumb, id.with("thumb"), Sense::drag());
+        thumb_response.widget_info(|| {
+            let mut info = WidgetInfo::labeled(Role::ScrollBar, true, t!("feed.scrollBar"));
+            info.value = Some(if max_offset > 0.0 {
+                (self.offset / max_offset).clamp(0.0, 1.0)
+            } else {
+                0.0
+            });
+            info
+        });
         if thumb_response.drag_started()
             && let Some(pos) = pointer
         {
@@ -242,6 +262,8 @@ impl FeedScroll {
         }
         // Клик по дорожке — страница вверх или вниз.
         let track_response = ui.interact(track, id.with("track"), Sense::click());
+        track_response
+            .widget_info(|| WidgetInfo::labeled(Role::ScrollBar, true, t!("feed.scrollTrack")));
         if track_response.clicked()
             && let Some(pos) = pointer
             && !thumb.contains(pos)
@@ -259,6 +281,14 @@ impl FeedScroll {
         ui.painter().rect_filled(track, 0, visuals.extreme_bg_color);
         ui.painter()
             .rect_filled(thumb, egui::CornerRadius::same(3), color);
+        // Фокус с клавиатуры: кольцо вокруг ползунка в цвете `ctrl`.
+        widgets::focus_ring(
+            ui,
+            p,
+            &thumb_response,
+            thumb.shrink(1.0),
+            egui::CornerRadius::same(3),
+        );
         if thumb_response.hovered() || thumb_response.dragged() {
             ui.ctx().set_cursor_icon(CursorIcon::Grab);
         }

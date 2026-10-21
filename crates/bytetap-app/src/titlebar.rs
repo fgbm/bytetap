@@ -2,8 +2,8 @@
 //! двойной клик, кнопки окна в стиле Windows 46×44 и края для изменения размера.
 
 use eframe::egui::{
-    self, Align, Color32, CursorIcon, Layout, PointerButton, Rect, ResizeDirection, Role, Sense,
-    Stroke, Ui, UiBuilder, ViewportCommand, WidgetInfo, pos2, text::LayoutJob, vec2,
+    self, Align, Color32, CornerRadius, CursorIcon, Layout, PointerButton, Rect, ResizeDirection,
+    Role, Sense, Stroke, Ui, UiBuilder, ViewportCommand, WidgetInfo, pos2, text::LayoutJob, vec2,
 };
 
 use crate::BytetapApp;
@@ -19,12 +19,31 @@ pub const WINDOW_BUTTON_WIDTH: f32 = 46.0;
 /// Полоса по периметру окна, за которую меняется размер.
 const RESIZE_EDGE: f32 = 5.0;
 
+/// Что делает кнопка окна.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowAction {
+    Minimize,
+    ToggleMaximized,
+    Close,
+}
+
+/// Ширина трёх кнопок окна: правую группу шапки ставят от правого края на неё.
+pub fn buttons_width() -> f32 {
+    3.0 * WINDOW_BUTTON_WIDTH
+}
+
 impl BytetapApp {
-    /// Шапка: `left` — слева направо после отступа 12px, `right` — справа налево
-    /// перед кнопками окна; пустое место между ними — область перетаскивания.
+    /// Шапка: `left` — слева направо после отступа 12px, `right` — группа справа от
+    /// кнопок окна; `right_width` — её ширина в точках (её же ставят по правому краю).
+    ///
+    /// Порядок создания виджетов — порядок Tab в egui: left, right, кнопки окна. Глаз
+    /// видит их так же слева направо, поэтому Tab идёт по экрану в порядке чтения
+    /// (U1-AC25). Ширину правой группы каждый экран считает сам: она зависит от чисел
+    /// в счётчиках записи и от подписи «Комментарий».
     pub(crate) fn title_bar(
         &mut self,
         ui: &mut Ui,
+        right_width: f32,
         left: impl FnOnce(&mut Self, &mut Ui),
         right: impl FnOnce(&mut Self, &mut Ui),
     ) {
@@ -47,25 +66,35 @@ impl BytetapApp {
         left(self, &mut left_ui);
         let left_end = left_ui.min_rect().right().max(bar.left() + SPACE_3);
 
+        // Правая группа — одной полосой слева направо: сначала свои виджеты экрана,
+        // затем кнопки окна. Ширина складывется из тех же величин, что и рисуются.
+        let width = right_width + SPACE_2 + buttons_width();
+        let right_start = (bar.right() - width).max(left_end);
+        let right_rect = Rect::from_min_max(
+            pos2(right_start, bar.top()),
+            pos2(bar.right(), bar.bottom()),
+        );
         let mut right_ui = ui.new_child(
             UiBuilder::new()
-                .max_rect(bar)
-                .layout(Layout::right_to_left(Align::Center)),
+                .max_rect(right_rect)
+                .layout(Layout::left_to_right(Align::Center)),
         );
-        right_ui.spacing_mut().item_spacing.x = 0.0;
-        self.window_buttons(&mut right_ui);
-        right_ui.add_space(SPACE_2);
         right_ui.spacing_mut().item_spacing.x = SPACE_2;
         right(self, &mut right_ui);
-        let right_start = right_ui.min_rect().left();
+        // Промежуток между своими виджетами и кнопками окна — ровно `SPACE_2`: его
+        // добавляет раскладка, а не `add_space`.
+        right_ui.spacing_mut().item_spacing.x = SPACE_2;
+        self.window_buttons(&mut right_ui);
 
         if right_start > left_end + 2.0 * SPACE_2 {
             let drag =
                 Rect::from_x_y_ranges(left_end + SPACE_2..=right_start - SPACE_2, bar.y_range());
+            // Без фокуса: это не виджет, а полоса перетаскивания — в Tab ей делать
+            // нечего (U1-AC25).
             let response = ui.interact(
                 drag,
                 ui.scope_id().with("title-drag"),
-                Sense::click_and_drag(),
+                Sense::CLICK | Sense::DRAG,
             );
             if response.double_clicked() {
                 toggle_maximized(ui.ctx());
@@ -75,24 +104,43 @@ impl BytetapApp {
         }
     }
 
-    /// Свернуть / развернуть-восстановить / закрыть (справа налево).
+    /// Свернуть / развернуть-восстановить / закрыть — слева направо, как их видит глаз.
     fn window_buttons(&mut self, ui: &mut Ui) {
         let p = self.pal();
         let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
         let buttons = [
-            (Icon::X, 16.0, t!("window.close"), true),
+            (
+                Icon::Minus,
+                16.0,
+                t!("window.minimize"),
+                WindowAction::Minimize,
+            ),
             if maximized {
-                (Icon::Copy, 14.0, t!("window.restore"), false)
+                (
+                    Icon::Copy,
+                    14.0,
+                    t!("window.restore"),
+                    WindowAction::ToggleMaximized,
+                )
             } else {
-                (Icon::Square, 13.0, t!("window.maximize"), false)
+                (
+                    Icon::Square,
+                    13.0,
+                    t!("window.maximize"),
+                    WindowAction::ToggleMaximized,
+                )
             },
-            (Icon::Minus, 16.0, t!("window.minimize"), false),
+            (Icon::X, 16.0, t!("window.close"), WindowAction::Close),
         ];
-        for (index, (icon, size, label, close)) in buttons.into_iter().enumerate() {
+        // Кнопки окна стоят вплотную, как системные: промежуток перед первой уже
+        // отсчитан раскладкой шапки.
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for (icon, size, label, action) in buttons {
             let (rect, response) =
                 ui.allocate_exact_size(vec2(WINDOW_BUTTON_WIDTH, TITLE_HEIGHT), Sense::click());
             response.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
             let hovered = response.hovered();
+            let close = action == WindowAction::Close;
             let (fill, color) = match (hovered, close) {
                 (true, true) => (WINDOW_CLOSE, Color32::WHITE),
                 (true, false) => (p.hover, p.text),
@@ -104,12 +152,16 @@ impl BytetapApp {
                 0,
                 fill,
             );
+            // Фокус с клавиатуры виден и здесь: кольцо внутри кнопки, у края окна.
+            widgets::focus_ring(ui, &p, &response, rect.shrink(1.0), CornerRadius::ZERO);
             icons::paint(ui, icon, rect.center(), size, color);
             if response.on_hover_text(label).clicked() {
-                match index {
-                    0 => ui.ctx().send_viewport_cmd(ViewportCommand::Close),
-                    1 => toggle_maximized(ui.ctx()),
-                    _ => ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true)),
+                match action {
+                    WindowAction::Minimize => {
+                        ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
+                    }
+                    WindowAction::ToggleMaximized => toggle_maximized(ui.ctx()),
+                    WindowAction::Close => ui.ctx().send_viewport_cmd(ViewportCommand::Close),
                 }
             }
         }
@@ -179,19 +231,20 @@ impl BytetapApp {
 
     /// Шапка экранов: бренд, «Журналы», переключатель темы, кнопки окна.
     pub(crate) fn home_title_bar(&mut self, ui: &mut Ui) {
+        let (icon, label) = if self.dark() {
+            (Icon::Sun, t!("theme.toLight"))
+        } else {
+            (Icon::Moon, t!("theme.toDark"))
+        };
         self.title_bar(
             ui,
+            widgets::ICON_BUTTON_WIDTH,
             |app, ui| {
                 app.brand(ui);
                 app.journals_menu(ui);
             },
             |app, ui| {
                 let p = app.pal();
-                let (icon, label) = if app.dark() {
-                    (Icon::Sun, t!("theme.toLight"))
-                } else {
-                    (Icon::Moon, t!("theme.toDark"))
-                };
                 if widgets::icon_button(ui, &p, icon, 16.0, label).clicked() {
                     app.toggle_theme(ui.ctx());
                 }
@@ -236,7 +289,8 @@ pub fn resize_edges(ctx: &egui::Context) {
             .fixed_pos(strip.min)
             .constrain(false)
             .show(ctx, |ui| {
-                ui.allocate_exact_size(strip.size(), Sense::drag()).1
+                // Полосы ресайза фокуса не берут: Tab обходит виджеты, а не края окна.
+                ui.allocate_exact_size(strip.size(), Sense::DRAG).1
             })
             .inner;
         on_strip |= response.hovered();

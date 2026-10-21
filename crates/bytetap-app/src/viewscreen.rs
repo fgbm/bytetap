@@ -50,8 +50,17 @@ pub fn title_bar(app: &mut BytetapApp, ui: &mut Ui) {
         }
         None => (String::new(), String::new()),
     };
+    let (icon, theme_label) = if app.dark() {
+        (Icon::Sun, t!("theme.toLight"))
+    } else {
+        (Icon::Moon, t!("theme.toDark"))
+    };
+    let right_width = widgets::ICON_BUTTON_WIDTH
+        + SPACE_2
+        + widgets::link_button_width(ui, 15.0, t!("journal.comment"));
     app.title_bar(
         ui,
+        right_width,
         |app, ui| {
             app.brand(ui);
             let p = app.pal();
@@ -77,17 +86,14 @@ pub fn title_bar(app: &mut BytetapApp, ui: &mut Ui) {
         },
         |app, ui| {
             let p = app.pal();
+            // Тема — левее «Комментария»: так эти кнопки стояли и раньше, и так их
+            // обходит Tab (U1-AC25).
+            if widgets::icon_button(ui, &p, icon, 16.0, theme_label).clicked() {
+                app.toggle_theme(ui.ctx());
+            }
             if widgets::link_button(ui, &p, Icon::Pen, 15.0, t!("journal.comment"), false).clicked()
             {
                 app.open_journal_note();
-            }
-            let (icon, label) = if app.dark() {
-                (Icon::Sun, t!("theme.toLight"))
-            } else {
-                (Icon::Moon, t!("theme.toDark"))
-            };
-            if widgets::icon_button(ui, &p, icon, 16.0, label).clicked() {
-                app.toggle_theme(ui.ctx());
             }
         },
     );
@@ -326,6 +332,7 @@ fn view_button(ui: &mut Ui, p: &Palette, text: &str, name: &str) -> egui::Respon
     if hovered {
         ui.painter().rect_filled(rect, radius(RADIUS_CHIP), p.hover);
     }
+    widgets::focus_ring(ui, p, &response, rect, radius(RADIUS_CHIP));
     let color = if hovered { p.text } else { p.text_muted };
     let x = rect.left() + 6.0;
     let width = galley.size().x;
@@ -383,6 +390,7 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     let mut scroll = view.scroll;
     let out = scroll.show(
         ui,
+        &p,
         Id::unique("bt-journal-feed"),
         total,
         row_height,

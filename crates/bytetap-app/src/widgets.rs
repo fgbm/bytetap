@@ -18,6 +18,8 @@ use crate::theme::{self, Palette, mix, radius};
 
 /// Высота поля ввода и списка.
 pub const FIELD_HEIGHT: f32 = 34.0;
+/// Сторона кнопки-иконки.
+pub const ICON_BUTTON_WIDTH: f32 = 28.0;
 /// Внутренний отступ поля слева и справа.
 const FIELD_PADDING: f32 = 9.0;
 /// Высота кнопки-пилюли второго уровня.
@@ -28,13 +30,14 @@ const START_HEIGHT: f32 = 42.0;
 /// Кнопка-иконка 28×28: muted, при наведении — фон `hover` и цвет текста. Подпись —
 /// подсказка и имя для AccessKit.
 pub fn icon_button(ui: &mut Ui, p: &Palette, icon: Icon, icon_size: f32, label: &str) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(ICON_BUTTON_WIDTH), Sense::click());
     response.widget_info(|| WidgetInfo::labeled(Role::Button, ui.is_enabled(), label));
     let hovered = response.hovered() || response.has_focus();
     if hovered {
         ui.painter()
             .rect_filled(rect, radius(RADIUS_CONTROL), p.hover);
     }
+    focus_ring(ui, p, &response, rect, radius(RADIUS_CONTROL));
     icons::paint(
         ui,
         icon,
@@ -46,7 +49,7 @@ pub fn icon_button(ui: &mut Ui, p: &Palette, icon: Icon, icon_size: f32, label: 
 }
 
 /// Рамка фокуса с клавиатуры: 1px `ctrl` вокруг элемента.
-fn focus_ring(ui: &Ui, p: &Palette, response: &Response, rect: Rect, corner: CornerRadius) {
+pub fn focus_ring(ui: &Ui, p: &Palette, response: &Response, rect: Rect, corner: CornerRadius) {
     if response.has_focus() {
         ui.painter().rect_stroke(
             rect.expand(2.0),
@@ -265,6 +268,7 @@ pub fn menu_item(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -> Respons
     if enabled && (response.hovered() || response.has_focus()) {
         ui.painter().rect_filled(rect, radius(RADIUS_CHIP), p.hover);
     }
+    focus_ring(ui, p, &response, rect, radius(RADIUS_CHIP));
     ui.painter().galley(
         pos2(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0),
         galley,
@@ -415,6 +419,16 @@ pub fn link_button(
         color,
     );
     response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Ширина [`link_button`]: чтобы правую группу шапки ставить от её края.
+pub fn link_button_width(ui: &Ui, icon_size: f32, text: &str) -> f32 {
+    2.0 * 6.0
+        + icon_size
+        + 6.0
+        + label_galley(ui, text, TEXT_XS, Color32::PLACEHOLDER)
+            .size()
+            .x
 }
 
 /// Флажок: квадрат 14px (отмеченный — заливка `ctrl` и галочка) и подпись 12px.

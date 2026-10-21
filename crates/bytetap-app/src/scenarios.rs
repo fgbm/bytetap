@@ -356,6 +356,7 @@ fn recent_row(ui: &mut Ui, p: &Palette, journal: &RecentJournal, meta: &str) -> 
         ui.painter()
             .rect_filled(rect, radius(RADIUS_CONTROL), p.hover);
     }
+    widgets::focus_ring(ui, p, &response, rect, radius(RADIUS_CONTROL));
     let name_height = name_galley.size().y;
     ui.painter().galley(
         pos2(rect.left() + 10.0, rect.top() + 8.0),

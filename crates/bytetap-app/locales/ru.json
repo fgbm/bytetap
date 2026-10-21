@@ -168,6 +168,8 @@
     "connAll": "все",
     "dropped": "пропущено в ленте: {count}",
     "newRows": "{count} новых",
+    "scrollBar": "Прокрутка ленты",
+    "scrollTrack": "Полоса прокрутки ленты",
     "synthetic": "автоответ",
     "copyText": "Скопировать текст",
     "copyHex": "Скопировать HEX",

@@ -436,8 +436,11 @@ impl BytetapApp {
         let stats = rec.stats();
         let summary = rec.summary(&stats);
         let elapsed = rec.elapsed().as_secs();
+        let p = self.pal();
+        let counters_width = counters_width(ui, &p, &stats);
         self.title_bar(
             ui,
+            counters_width + SPACE_2 + widgets::ICON_BUTTON_WIDTH,
             |app, ui| {
                 app.brand(ui);
                 let p = app.pal();
@@ -457,8 +460,8 @@ impl BytetapApp {
             },
             |app, ui| {
                 let p = app.pal();
-                app.recording_menu(ui, &p);
                 counters(ui, &p, &stats);
+                app.recording_menu(ui, &p);
             },
         );
     }
@@ -736,6 +739,7 @@ fn text_action(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -> egui::Res
     response.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, text));
     let hovered = enabled && response.hovered();
     let text_rect = Rect::from_center_size(rect.center(), galley.size());
+    widgets::focus_ring(ui, p, &response, rect, radius(RADIUS_CHIP));
     ui.painter().galley(text_rect.min, galley, color);
     if hovered {
         ui.painter().hline(
@@ -809,6 +813,19 @@ fn stop_pill(ui: &mut Ui, p: &Palette, timer: &str) -> egui::Response {
 
 /// Счётчики «→ 629 Б ← 195 Б 2 соед.»: стрелки цветом направления, моно 12px.
 fn counters(ui: &mut Ui, p: &Palette, stats: &Stats) {
+    let (galley, text) = counters_galley(ui, p, stats);
+    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(Role::Label, true, &text));
+    ui.painter().galley(rect.min, galley, p.text);
+}
+
+/// Ширина счётчиков: правую группу шапки ставят от правого края на неё.
+fn counters_width(ui: &Ui, p: &Palette, stats: &Stats) -> f32 {
+    counters_galley(ui, p, stats).0.size().x
+}
+
+/// Готовый текст и галлея счётчиков — одна и та же раскладка для меры и рисунка.
+fn counters_galley(ui: &Ui, p: &Palette, stats: &Stats) -> (std::sync::Arc<egui::Galley>, String) {
     let font = theme::mono(TEXT_XS);
     let mut job = LayoutJob::default();
     job.append("→ ", 0.0, text_format(font.clone(), p.dir_a2l));
@@ -835,10 +852,7 @@ fn counters(ui: &mut Ui, p: &Palette, stats: &Stats) {
         stats.connections,
         t!("record.connShort")
     );
-    let galley = ui.painter().layout_job(job);
-    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
-    response.widget_info(|| WidgetInfo::labeled(Role::Label, true, &text));
-    ui.painter().galley(rect.min, galley, p.text);
+    (ui.painter().layout_job(job), text)
 }
 
 /// Кнопка панели ленты: текст 12px `text-muted` и шеврон, 24px.
@@ -859,6 +873,7 @@ fn bar_button(ui: &mut Ui, p: &Palette, text: &str, name: &str) -> egui::Respons
     if hovered {
         ui.painter().rect_filled(rect, radius(RADIUS_CHIP), p.hover);
     }
+    widgets::focus_ring(ui, p, &response, rect, radius(RADIUS_CHIP));
     let color = if hovered { p.text } else { p.text_muted };
     let x = rect.left() + 6.0;
     ui.painter().galley(
@@ -928,20 +943,50 @@ fn feed_bar(
             });
     }
 
-    let mut right = ui.new_child(
-        UiBuilder::new()
-            .max_rect(inner)
-            .layout(Layout::right_to_left(Align::Center)),
-    );
-    right.spacing_mut().item_spacing.x = SPACE_1;
+    // Правая часть панели — одной полосой слева направо от правого края: Tab идёт по
+    // таблеткам соединений в том же порядке, что их видит глаз (U1-AC25).
     let conns = rec.conns();
+    let mut chips: Vec<(Option<u32>, String)> = Vec::new();
     if conns.len() > 1 {
         let shown = &conns[conns.len().saturating_sub(feed::CONN_CHIPS)..];
-        let mut chips: Vec<(Option<u32>, String)> =
-            shown.iter().map(|&c| (Some(c), format!("#{c}"))).collect();
+        chips = shown.iter().map(|&c| (Some(c), format!("#{c}"))).collect();
         chips.insert(0, (None, t!("feed.connAll").to_owned()));
+    }
+    let dropped = (rec.dropped > 0).then(|| t!("feed.dropped", count = rec.dropped));
+    let chips_width: f32 = chips
+        .iter()
+        .map(|(_, text)| conn_chip_width(ui, text))
+        .sum::<f32>()
+        + SPACE_1 * chips.len().saturating_sub(1) as f32;
+    let dropped_width = dropped.as_ref().map_or(0.0, |text| {
+        ui.painter()
+            .layout_no_wrap(text.clone(), theme::sans(TEXT_2XS), p.text_faint)
+            .size()
+            .x
+    });
+    let width = chips_width
+        + if dropped.is_some() {
+            SPACE_2 + dropped_width
+        } else {
+            0.0
+        };
+    let mut right = ui.new_child(
+        UiBuilder::new()
+            .max_rect(Rect::from_min_max(
+                pos2(inner.right() - width, inner.top()),
+                inner.max,
+            ))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    right.spacing_mut().item_spacing.x = SPACE_1;
+    if let Some(text) = dropped {
+        right.label(RichText::new(text).size(TEXT_2XS).color(p.text_faint));
+        // Промежуток до таблеток — `SPACE_2`: `item_spacing` уже отсчитал `SPACE_1`.
+        right.add_space(SPACE_2 - SPACE_1);
+    }
+    if !chips.is_empty() {
         let mut chosen = None;
-        for (value, text) in chips.into_iter().rev() {
+        for (value, text) in chips {
             if conn_chip(&mut right, p, &text, rec.filter == value).clicked() {
                 chosen = Some(value);
             }
@@ -950,14 +995,15 @@ fn feed_bar(
             rec.set_filter(value);
         }
     }
-    if rec.dropped > 0 {
-        right.add_space(SPACE_2);
-        right.label(
-            RichText::new(t!("feed.dropped", count = rec.dropped))
-                .size(TEXT_2XS)
-                .color(p.text_faint),
-        );
-    }
+}
+
+/// Ширина таблетки соединения: правую часть панели ставят от правого края на неё.
+fn conn_chip_width(ui: &Ui, text: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), theme::mono(TEXT_2XS), Color32::PLACEHOLDER)
+        .size()
+        .x
+        + 16.0
 }
 
 /// Таблетка соединения: моно 11px, выбранная — фон цвета текста.
@@ -975,8 +1021,9 @@ fn conn_chip(ui: &mut Ui, p: &Palette, text: &str, on: bool) -> egui::Response {
         (false, true) => (p.hover, p.text),
         _ => (Color32::TRANSPARENT, p.text_muted),
     };
-    ui.painter()
-        .rect_filled(rect, radius(RADIUS_RECORD.min(127.0)), fill);
+    let corner = radius(RADIUS_RECORD.min(127.0));
+    ui.painter().rect_filled(rect, corner, fill);
+    widgets::focus_ring(ui, p, &response, rect, corner);
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, color);
     response.on_hover_cursor(CursorIcon::PointingHand)
@@ -1078,6 +1125,7 @@ fn feed_list(
                 p.rec_bg
             },
         );
+        widgets::focus_ring(ui, p, &response, pill, corner);
         icons::paint(
             ui,
             Icon::ArrowDown,
