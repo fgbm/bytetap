@@ -51,6 +51,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+base64.workspace = true
 bytetap-core = { workspace = true, features = ["test-hooks"] }
 bytetap-testkit.workspace = true
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu", "snapshot"] }

@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use bytetap_app::errors::ErrorCode;
 use bytetap_app::feed::{FEED_CAPACITY, FeedKind};
 use bytetap_app::live::{self, Phase};
@@ -45,6 +46,33 @@ fn journal_types(path: &Path) -> Vec<String> {
             value["type"].as_str().unwrap_or_default().to_owned()
         })
         .collect()
+}
+
+/// Сумма длин `b64` строк `data` журнала по направлениям: сколько байт ушло в каждую
+/// сторону — по самим данным журнала, а не по счётчикам сессии.
+fn journal_bytes_by_dir(path: &Path) -> (u64, u64) {
+    let mut to_lis = 0u64;
+    let mut to_analyzer = 0u64;
+    for line in std::fs::read_to_string(path)
+        .expect("журнал читается")
+        .lines()
+    {
+        let value: serde_json::Value = serde_json::from_str(line).expect("строка журнала — JSON");
+        if value["type"].as_str() != Some("data") {
+            continue;
+        }
+        let b64 = value["b64"].as_str().expect("у data есть b64");
+        let len = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("b64 разбирается")
+            .len() as u64;
+        match value["dir"].as_str() {
+            Some("analyzer_to_lis") => to_lis += len,
+            Some("lis_to_analyzer") => to_analyzer += len,
+            other => panic!("неизвестное направление {other:?}"),
+        }
+    }
+    (to_lis, to_analyzer)
 }
 
 fn server(dir: &Path) -> SessionConfig {
@@ -149,12 +177,19 @@ fn fifty_thousand_fragments_keep_the_feed_bounded() {
         let ring = live::lock(&feed);
         assert!(ring.len() <= FEED_CAPACITY, "буфер {}", ring.len());
         assert_eq!(ring.len(), FEED_CAPACITY);
-        assert_eq!(
-            ring.next_seq() + ring.dropped(),
-            feed_lines,
-            "дошедшее и пропущенное = журнал"
+        // `Lagged` считает все события подписки, а лента без заголовка и итогов: число
+        // пропущенных может отличаться на эти два события (U1-AC13).
+        let skipped = ring.next_seq() + ring.dropped();
+        assert!(
+            (feed_lines..=feed_lines + 2).contains(&skipped),
+            "дошедшее и пропущенное = журнал: {skipped} против {feed_lines}"
         );
         assert_eq!(counters.snapshot(), stats, "счётчики шапки = итоги журнала");
+        // Итоги совпадают с самими данными журнала: сумма длин `b64` по направлениям
+        // равна счётчикам сессии (U1-AC13).
+        let (to_lis, to_analyzer) = journal_bytes_by_dir(&path);
+        assert_eq!(to_lis, stats.bytes_analyzer_to_lis, "байты к ЛИС");
+        assert_eq!(to_analyzer, stats.bytes_lis_to_analyzer, "байты от ЛИС");
     });
 }
 
