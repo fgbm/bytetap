@@ -71,6 +71,10 @@ export default defineConfig({
                   text: "M3 — TCP-клиент, ASTM, «Авто», COM-порт",
                   link: "/dev/stages/M3",
                 },
+                {
+                  text: "U1 — нативный интерфейс (egui)",
+                  link: "/dev/stages/U1",
+                },
               ],
             },
             { text: "Архитектура", link: "/dev/architecture" },

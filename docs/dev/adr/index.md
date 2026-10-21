@@ -4,3 +4,4 @@
 
 - [0001. Писатель журнала: неограниченный канал и групповая фиксация](/dev/adr/0001-journal-writer) — FR-20, NFR-5, NFR-6.
 - [0002. COM-порт: `serialport` в отдельном потоке](/dev/adr/0002-serial-port) — FR-9, FR-11, FR-12, T-3.
+- [0003. Нативный интерфейс на egui вместо Tauri и WebView2](/dev/adr/0003-native-ui) — NFR-2, NFR-3, NFR-7, FR-25…FR-31, этап U1.
