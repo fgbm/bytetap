@@ -1,0 +1,36 @@
+[package]
+name = "bytetap-app"
+description = "Настольное приложение bytetap на egui: запись «сырого» обмена анализатора с ЛИС без WebView2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[lib]
+name = "bytetap_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bytetap"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+dirs.workspace = true
+# Окно без WebView2 (ADR 0003): wgpu (DX12, без GPU — WARP), AccessKit, буфер обмена.
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "accesskit", "clipboard", "default_fonts", "x11", "wayland"] }
+# SVG-иконки Lucide растеризует resvg.
+egui_extras = { version = "0.37", features = ["svg"] }
+os_info.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Системное окно сообщения о фатальной ошибке и панике (NFR-3).
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["eframe", "wgpu", "snapshot"] }
+tempfile.workspace = true

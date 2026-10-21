@@ -4,6 +4,7 @@ members = [
     "crates/bytetap-core",
     "crates/bytetap-cli",
     "crates/bytetap-testkit",
+    "crates/bytetap-app",
     "app/src-tauri",
 ]
 
