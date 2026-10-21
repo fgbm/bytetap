@@ -779,6 +779,18 @@ fn a_cancelled_journal_comment_does_not_steal_the_recording_comment() {
         harness.query_by_label("Комментарий к журналу").is_none(),
         "диалог закрылся по «Отмене»"
     );
+    // Escape закрывает диалог так же, как «Отмена» (U1-AC25).
+    harness
+        .get_by_role_and_label(Role::Button, "Комментарий")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("Комментарий к журналу");
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("Комментарий к журналу").is_none(),
+        "Escape не закрыл диалог комментария"
+    );
     // «×» — назад к сценариям и запись TCP-сервера на свободном порту.
     harness
         .get_by_role_and_label(Role::Button, "Закрыть журнал")
@@ -1110,4 +1122,93 @@ fn click(harness: &mut Harness<'static, BytetapApp>, at: egui::Pos2) {
         modifiers: egui::Modifiers::NONE,
     });
     harness.run_steps(1);
+}
+
+/// Просмотр журнала: у каждой кнопки и у полосы прокрутки есть роль и подпись, а Tab
+/// идёт по шапке слева направо (U1-AC25).
+#[test]
+fn the_journal_screen_names_its_widgets_and_tabs_in_order() {
+    use egui_kittest::kittest::NodeT as _;
+
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("journal.jsonl");
+    // Журнал длиннее ленты: у полосы прокрутки появляется ползунок.
+    let (text, _) = long_journal(2000);
+    std::fs::write(&path, text).expect("журнал");
+    let mut harness = harness_with_journal(&path);
+    harness.run_steps(3);
+    harness.check_accessibility();
+
+    let mut names = Vec::new();
+    for node in harness.root().children_recursive() {
+        let node = node.accesskit_node();
+        if node.is_hidden() {
+            continue;
+        }
+        if matches!(node.role(), Role::Button | Role::ScrollBar | Role::ComboBox) {
+            let name = node.label().or_else(|| node.value()).unwrap_or_default();
+            assert!(!name.trim().is_empty(), "у {:?} нет подписи", node.role());
+            names.push((node.role(), name));
+        }
+    }
+    for want in [Role::Button, Role::ScrollBar] {
+        assert!(
+            names.iter().any(|(role, _)| *role == want),
+            "нет {want:?}: {names:?}"
+        );
+    }
+    // «Комментарий» — в шапке, «Закрыть журнал» — левее её, обе до кнопок окна.
+    let labels: Vec<String> = names.into_iter().map(|(_, name)| name).collect();
+    let close = labels
+        .iter()
+        .position(|name| name == "Закрыть журнал")
+        .expect("«×» просмотра");
+    let comment = labels
+        .iter()
+        .position(|name| name == "Комментарий")
+        .expect("комментарий");
+    assert!(close < comment, "{labels:?}");
+
+    let mut order = Vec::new();
+    for _ in 0..12 {
+        harness.key_press(Key::Tab);
+        harness.run_steps(2);
+        let Some(node) = harness
+            .root()
+            .children_recursive()
+            .find(egui_kittest::Node::is_focused)
+        else {
+            continue;
+        };
+        let label = node
+            .accesskit_node()
+            .label()
+            .or_else(|| node.accesskit_node().value())
+            .unwrap_or_default();
+        assert!(!label.is_empty(), "Tab попал на виджет без подписи");
+        let rect = node.rect();
+        if order
+            .iter()
+            .any(|(seen, seen_rect): &(String, egui::Rect)| *seen == label && *seen_rect == rect)
+        {
+            break;
+        }
+        order.push((label, rect));
+    }
+    assert!(!order.is_empty(), "Tab не нашёл ни одного виджета");
+    for pair in order.windows(2) {
+        let (above, a) = &pair[0];
+        let (below, b) = &pair[1];
+        let dy = b.top() - a.top();
+        assert!(
+            dy >= -22.0,
+            "Tab ушёл вверх: «{above}» {a:?} → «{below}» {b:?}"
+        );
+        if dy.abs() <= 22.0 {
+            assert!(
+                b.left() > a.left() - 0.5,
+                "Tab ушёл влево: «{above}» → «{below}»"
+            );
+        }
+    }
 }

@@ -151,7 +151,7 @@ impl FeedScroll {
         let range = first..(first + visible + 2).min(rows);
         add(&mut child, range.clone());
         if bar {
-            self.bar(ui, p, id, outer, visible, rows, max_offset);
+            self.bar(ui, p, id, outer, rows, max_offset);
         }
         ScrollOut {
             range,
@@ -197,16 +197,7 @@ impl FeedScroll {
     }
 
     /// Полоса прокрутки справа: ползунок и дорожка.
-    fn bar(
-        &mut self,
-        ui: &mut Ui,
-        p: &Palette,
-        id: Id,
-        outer: Rect,
-        visible: usize,
-        rows: usize,
-        max_offset: f64,
-    ) {
+    fn bar(&mut self, ui: &mut Ui, p: &Palette, id: Id, outer: Rect, rows: usize, max_offset: f64) {
         let track = Rect::from_min_max(
             pos2(outer.right() - BAR_WIDTH, outer.top()),
             pos2(outer.right(), outer.bottom()),
@@ -268,7 +259,9 @@ impl FeedScroll {
             && let Some(pos) = pointer
             && !thumb.contains(pos)
         {
-            let page = visible.saturating_sub(1).max(1) as f64;
+            // Страницей хода считается экран без строки перекрытия.
+            let fit = (rows as f64 - max_offset).clamp(0.0, rows as f64);
+            let page = (fit.ceil() as usize).saturating_sub(1).max(1) as f64;
             self.offset += if pos.y < thumb.top() { -page } else { page };
             self.offset = self.offset.clamp(0.0, max_offset);
         }

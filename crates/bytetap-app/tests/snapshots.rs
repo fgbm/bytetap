@@ -1120,6 +1120,13 @@ fn recording_hex_light() {
     recording(false, FeedView::Hex, 0).snapshot_options("recording-hex-light", &options());
 }
 
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_hex_dark() {
+    let _gpu = gpu();
+    recording(true, FeedView::Hex, 0).snapshot_options("recording-hex-dark", &options());
+}
+
 /// Прокрутка вверх останавливает догон; пришедшие строки — «↓ N новых» (U1-AC16).
 fn scrolled_up(harness: &mut Harness<'static, BytetapApp>) {
     harness.event(egui::Event::PointerMoved(egui::pos2(600.0, 400.0)));
@@ -1158,14 +1165,36 @@ fn recording_new_rows_light() {
 
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_new_rows_dark() {
+    let _gpu = gpu();
+    let mut harness = recording(true, FeedView::Text, 40);
+    scrolled_up(&mut harness);
+    harness.get_by_label("5 новых");
+    harness.snapshot_options("recording-new-rows-dark", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn journal_failure_light() {
     let _gpu = gpu();
+    journal_failure(false).snapshot_options("journal-failure-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn journal_failure_dark() {
+    let _gpu = gpu();
+    journal_failure(true).snapshot_options("journal-failure-dark", &options());
+}
+
+/// Стартовый экран после отказа журнала: строка причины и «Открыть записанное».
+fn journal_failure(dark: bool) -> Harness<'static, BytetapApp> {
     let failure = JournalFailure {
         code: JournalFailureCode::DiskFull,
         message: "No space left on device (os error 28)".into(),
     };
     let mut harness = harness_with(
-        settings(false),
+        settings(dark),
         None,
         Screen::Scenarios,
         WINDOW,
@@ -1178,7 +1207,7 @@ fn journal_failure_light() {
     );
     harness.get_by_label("Запись в журнал прервана: на диске нет места");
     harness.run_steps(2);
-    harness.snapshot_options("journal-failure-light", &options());
+    harness
 }
 
 fn plain_recording(view: FeedView, extra: usize) -> Harness<'static, BytetapApp> {
@@ -1485,13 +1514,12 @@ fn every_screen_names_its_widgets() {
     assert!(has(&nodes, Role::Button, "Закрыть"));
     assert!(has(&nodes, Role::Button, "Свернуть"));
     assert!(has(&nodes, Role::Button, "Развернуть"));
-    assert_eq!(
+    assert!(
         nodes
             .iter()
             .filter(|(role, _, _)| *role == Role::Button)
             .count()
             >= 6,
-        true,
         "шапка, три карточки и записи"
     );
 
@@ -1605,7 +1633,7 @@ fn assert_reading_order(screen: &str, order: &[(String, egui::Rect)]) {
 /// Tab идёт по экрану в порядке чтения на каждом экране (U1-AC25).
 #[test]
 fn tab_visits_every_screen_in_reading_order() {
-    let mut order = tab_walk(&mut plain(settings(false), None, Screen::Scenarios), 24);
+    let order = tab_walk(&mut plain(settings(false), None, Screen::Scenarios), 24);
     assert_reading_order("сценарии", &order);
     // Шапка, три карточки, записи — и ничего лишнего вроде полосы перетаскивания.
     assert_eq!(
@@ -1639,7 +1667,7 @@ fn tab_visits_every_screen_in_reading_order() {
     assert!(close < view, "{labels:#?}");
 }
 
-fn position_of<'a>(labels: &[&'a str], want: &str) -> Option<usize> {
+fn position_of(labels: &[&str], want: &str) -> Option<usize> {
     labels.iter().position(|label| *label == want)
 }
 

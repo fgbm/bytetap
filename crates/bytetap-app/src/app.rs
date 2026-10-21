@@ -59,6 +59,18 @@ pub fn take_close_notice() -> Option<String> {
 /// Тестовый хук смоука записи (CI): `tcp_server:127.0.0.1:0` — запись стартует сразу.
 pub const AUTOSTART_ENV: &str = "BYTETAP_TEST_AUTOSTART";
 
+/// Тестовый хук снимков для согласования (CI, U1-AC21): экран и тема снимка,
+/// `BYTETAP_TEST_SCREEN=recording-hex-dark`. Читается только вместе с
+/// [`HOOKS_ENV`]: случайная переменная окружения в чужой оболочке не переключит
+/// приложение на синтетический экран и не запишет журнал в чужую папку.
+pub const SCREEN_ENV: &str = "BYTETAP_TEST_SCREEN";
+
+/// Второй ключ тестовых хуков: без него [`SCREEN_ENV`] не читается вовсе.
+pub const HOOKS_ENV: &str = "BYTETAP_TEST_HOOKS";
+
+/// Журнал для снимка просмотра: файл, который откроется на экране просмотра.
+pub const JOURNAL_ENV: &str = "BYTETAP_TEST_JOURNAL";
+
 /// Данные окружения для снимков и тестов вместо фонового опроса системы.
 #[derive(Clone, Debug)]
 pub struct Fixtures {
@@ -67,6 +79,57 @@ pub struct Fixtures {
     pub recents: Vec<RecentJournal>,
     /// «Сейчас» для «сегодня 10:15».
     pub now: DateTime<FixedOffset>,
+}
+
+/// Окружение снимков для согласования (U1-AC21): те же порты, адреса и последние
+/// записи, что у эталонов `egui_kittest`, чтобы снимок в exe сравнивался с эталоном.
+#[must_use]
+pub fn review_fixtures() -> Fixtures {
+    let journal = |name: &str, started_at: &str, analyzer: &str, minutes: u64| RecentJournal {
+        path: format!(r"C:\Users\operator\Documents\bytetap\{name}").into(),
+        started_at: started_at.to_owned(),
+        analyzer: analyzer.to_owned(),
+        duration_us: minutes * 60 * 1_000_000,
+        mode: "tcp_server".to_owned(),
+    };
+    Fixtures {
+        interfaces: vec![
+            Interface {
+                name: "Ethernet".into(),
+                addr: "192.168.1.10".into(),
+            },
+            Interface {
+                name: "Wi-Fi".into(),
+                addr: "10.0.0.5".into(),
+            },
+        ],
+        ports: vec![PortInfo {
+            name: "COM3".into(),
+            description: "USB-SERIAL CH340".into(),
+        }],
+        recents: vec![
+            journal(
+                "bytetap-20261019101500-tcp_server.jsonl",
+                "2026-10-19T10:15:00+03:00",
+                "ANALYZER",
+                42,
+            ),
+            journal(
+                "bytetap-20261018180200-tcp_client.jsonl",
+                "2026-10-18T18:02:00+03:00",
+                "ANALYZER-2",
+                21,
+            ),
+            journal(
+                "bytetap-20261017094000-serial.jsonl",
+                "2026-10-17T09:40:00+03:00",
+                "",
+                8,
+            ),
+        ],
+        now: chrono::DateTime::parse_from_rfc3339("2026-10-19T12:00:00+03:00")
+            .expect("review fixtures time"),
+    }
 }
 
 /// Экран приложения.
@@ -190,6 +253,8 @@ pub struct BytetapApp {
     /// Настройку DWM повторить на следующем кадре: развёрнутое окно приходит из
     /// `DWMWA_CLOAK`, и часть атрибутов окна сбрасывается.
     frame_reapply: bool,
+    /// Тестовый хук снимков: меню, которое надо открыть на следующем кадре.
+    hook_menu: Option<&'static str>,
 }
 
 impl BytetapApp {
@@ -265,6 +330,7 @@ impl BytetapApp {
             frame_applied: false,
             restored_maximized: false,
             frame_reapply: false,
+            hook_menu: None,
         };
         app.preselect_last_card();
         app.interfaces = Loaded::Loading(Task::spawn(ctx, background::list_interfaces));
@@ -342,6 +408,108 @@ impl BytetapApp {
             .with_log_dir(cfg.log_dir.clone());
         self.launch(ctx, config, cfg);
         self
+    }
+
+    /// Экран по имени тестового хука (CI, [`SCREEN_ENV`]): `<экран>-<тема>`, например
+    /// `start-light`, `serial-more-dark`, `recording-hex-light`, `viewing-text-dark`.
+    ///
+    /// Окружение синтетическое (те же данные, что у снимков `egui_kittest`), чтобы
+    /// снимок в exe совпадал с эталоном на любой машине. Запись на экране
+    /// `recording-*` — пустая лента: строки приходят, если CI запускает сессию хуком
+    /// [`AUTOSTART_ENV`] и шлёт в неё сообщения.
+    #[must_use]
+    pub fn with_test_screen(mut self, ctx: &egui::Context, spec: &str) -> Self {
+        let (name, dark) = match spec.rsplit_once('-') {
+            Some((name, "dark")) => (name, true),
+            Some((name, "light")) => (name, false),
+            _ => (spec, false),
+        };
+        diag::info(format!("{SCREEN_ENV}: экран {name}, тёмная тема {dark}"));
+        if dark {
+            self.set_dark(ctx, true);
+        }
+        self = self.with_fixtures(review_fixtures());
+        match name {
+            "start" => self.screen = Screen::Scenarios,
+            "server" => self.show_step(SessionMode::TcpServer, false),
+            "client" => self.show_step(SessionMode::TcpClient, false),
+            "serial" => self.show_step(SessionMode::Serial, false),
+            "serial-more" => self.show_step(SessionMode::Serial, true),
+            "errors" => {
+                // Ошибка старта по коду: адреса прослушивания нет на машине.
+                self.show_step(SessionMode::TcpServer, true);
+                self.settings.config.listen_host = "eth0".into();
+                self.start_error = Some(
+                    crate::errors::StartError::new(
+                        crate::errors::ErrorCode::AddressUnavailable,
+                        "Cannot assign requested address (os error 99)",
+                    )
+                    .with_param("addr", "eth0"),
+                );
+            }
+            "recording-text" | "recording-hex" => {
+                self.settings.feed.view = if name == "recording-hex" {
+                    crate::settings::FeedView::Hex
+                } else {
+                    crate::settings::FeedView::Text
+                };
+                self.rec = Some(RecordingView::detached(self.settings.config.clone()));
+                self.phase = Phase::Recording;
+                self.screen = Screen::Recording;
+            }
+            "failure" => {
+                self.journal_failure = Some(JournalFailure {
+                    code: crate::live::JournalFailureCode::DiskFull,
+                    message: "No space left on device (os error 28)".into(),
+                });
+                self.recorded_path =
+                    Some(format!(r"{}\bytetap-review.jsonl", self.settings.config.log_dir).into());
+                self.phase = Phase::Failed;
+            }
+            "viewing-text" | "viewing-hex" => {
+                self.settings.feed.view = if name == "viewing-hex" {
+                    crate::settings::FeedView::Hex
+                } else {
+                    crate::settings::FeedView::Text
+                };
+                match std::env::var(JOURNAL_ENV) {
+                    Ok(path) if !path.is_empty() => self.open_journal(ctx, path.into()),
+                    _ => diag::error(format!(
+                        "{SCREEN_ENV}: для {name} нужен {JOURNAL_ENV}=<путь к журналу>"
+                    )),
+                }
+            }
+            "menu-journals" => self.hook_menu = Some("bt-journals-menu"),
+            "menu-record" => {
+                self.rec = Some(RecordingView::detached(self.settings.config.clone()));
+                self.phase = Phase::Recording;
+                self.screen = Screen::Recording;
+                self.hook_menu = Some("bt-recording-menu");
+            }
+            "note" => {
+                self.rec = Some(RecordingView::detached(self.settings.config.clone()));
+                self.phase = Phase::Recording;
+                self.screen = Screen::Recording;
+                self.open_note(NoteTarget::Session);
+                if let Some(note) = &mut self.note {
+                    note.text = t!("review.noteText").to_owned();
+                }
+            }
+            "profile" => {
+                self.show_step(SessionMode::Serial, true);
+                self.profile_prompt = Some(t!("review.profileName").to_owned());
+            }
+            _ => diag::error(format!("{SCREEN_ENV}: неизвестный экран `{spec}`")),
+        }
+        self
+    }
+
+    /// Шаг режима с полями из настроек; `more` раскрывает «Дополнительно».
+    fn show_step(&mut self, mode: SessionMode, more: bool) {
+        self.settings.config.mode = mode;
+        self.form = FormState::new(&self.settings.config);
+        self.form.more = more;
+        self.screen = Screen::Step(mode);
     }
 
     /// Сейчас идёт запись (или её старт, или остановка).
@@ -1627,6 +1795,12 @@ impl eframe::App for BytetapApp {
         // кадре, когда окно уже показано (иначе DWM теряет атрибуты).
         self.apply_window_frame(&ctx);
         self.draw(ui);
+        // Снимок меню (CI, `BYTETAP_TEST_SCREEN=menu-*`): кнопка уже нарисована,
+        // меню открывается следующим кадром — его и снимает CI.
+        if let Some(menu) = self.hook_menu.take() {
+            egui::Popup::open_id(&ctx, egui::Id::unique(menu));
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
         if self.dirty && self.screen != Screen::Step(self.settings.config.mode) {
             self.save_settings();
         }
@@ -1679,6 +1853,52 @@ mod tests {
             ThemeMode::Dark
         };
         assert_eq!(saved.theme, expected);
+    }
+
+    /// Тестовый хук снимков показывает тот экран, который назван в переменной, и ту
+    /// тему, которой кончается имя (U1-AC21).
+    #[test]
+    fn the_review_hook_shows_the_named_screen_and_theme() {
+        let ctx = egui::Context::default();
+        for (spec, screen, dark) in [
+            ("start-light", Screen::Scenarios, false),
+            ("start-dark", Screen::Scenarios, true),
+            ("server-light", Screen::Step(SessionMode::TcpServer), false),
+            ("client-dark", Screen::Step(SessionMode::TcpClient), true),
+            (
+                "serial-more-light",
+                Screen::Step(SessionMode::Serial),
+                false,
+            ),
+            ("errors-dark", Screen::Step(SessionMode::TcpServer), true),
+            ("recording-text-light", Screen::Recording, false),
+            ("recording-hex-dark", Screen::Recording, true),
+            ("menu-record-light", Screen::Recording, false),
+            ("note-dark", Screen::Recording, true),
+            ("profile-light", Screen::Step(SessionMode::Serial), false),
+            ("failure-dark", Screen::Scenarios, true),
+        ] {
+            let app =
+                BytetapApp::new(&ctx, Settings::default(), None, None).with_test_screen(&ctx, spec);
+            assert_eq!(app.screen, screen, "{spec}");
+            assert_eq!(app.dark(), dark, "{spec}");
+        }
+        // Просмотр без журнала и неизвестное имя экран не меняют.
+        for spec in ["viewing-text-light", "no-such-screen-light"] {
+            let app =
+                BytetapApp::new(&ctx, Settings::default(), None, None).with_test_screen(&ctx, spec);
+            assert_eq!(app.screen, Screen::Scenarios, "{spec}");
+        }
+        // «Дополнительно» и диалоги раскрыты, «…» открывается на следующем кадре.
+        let app = BytetapApp::new(&ctx, Settings::default(), None, None)
+            .with_test_screen(&ctx, "serial-more-light");
+        assert!(app.form.more, "«Дополнительно» раскрыто");
+        let app = BytetapApp::new(&ctx, Settings::default(), None, None)
+            .with_test_screen(&ctx, "note-light");
+        assert!(app.note.is_some(), "диалог комментария открыт");
+        let app = BytetapApp::new(&ctx, Settings::default(), None, None)
+            .with_test_screen(&ctx, "menu-journals-dark");
+        assert_eq!(app.hook_menu, Some("bt-journals-menu"));
     }
 
     /// Журнал на диске: заголовок сессии и один фрагмент. Путь и сводка — то, что

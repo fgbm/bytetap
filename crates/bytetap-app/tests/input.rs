@@ -85,7 +85,6 @@ fn an_ime_composition_fills_the_field_and_publishes_its_candidate_area() {
         .output()
         .platform_output
         .ime
-        .clone()
         .expect("поле в фокусе отдаёт область кандидатов IME");
     assert!(
         field.contains_rect(ime.cursor_rect),

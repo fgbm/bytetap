@@ -3,7 +3,8 @@
 
 use bytetap_app::settings::{Settings, Store, WindowState};
 use bytetap_app::{
-    AUTOSTART_ENV, BytetapApp, FORCED_EXIT, WINDOW_MIN_SIZE, WINDOW_SIZE, diag, gpu, placement, t,
+    AUTOSTART_ENV, BytetapApp, FORCED_EXIT, HOOKS_ENV, SCREEN_ENV, WINDOW_MIN_SIZE, WINDOW_SIZE,
+    diag, gpu, placement, t,
 };
 use eframe::egui;
 
@@ -64,6 +65,11 @@ fn main() {
     };
     let handle = runtime.handle().clone();
     let autostart = std::env::var(AUTOSTART_ENV).ok();
+    // Снимки для согласования (CI, U1-AC21): экран по имени, только вместе с ключом
+    // хуков. Переменная окружения сама по себе приложение не переключает.
+    let screen = hooks_enabled()
+        .then(|| std::env::var(SCREEN_ENV).ok())
+        .flatten();
     let options = eframe::NativeOptions {
         viewport: viewport(settings.window.as_ref()),
         renderer: eframe::Renderer::Wgpu,
@@ -81,6 +87,9 @@ fn main() {
             let mut app = BytetapApp::new(&cc.egui_ctx, settings, warning, store)
                 .with_window_restore(position, maximized)
                 .with_runtime(handle);
+            if let Some(spec) = &screen {
+                app = app.with_test_screen(&cc.egui_ctx, spec);
+            }
             if let Some(spec) = autostart {
                 app = app.with_test_autostart(&cc.egui_ctx, &spec);
             }
@@ -114,6 +123,13 @@ fn main() {
         }
         diag::fatal(&t!("diag.startFailed", reason = err));
     }
+}
+
+/// Тестовые хуки включены: `BYTETAP_TEST_HOOKS=1`. Без этого ключа
+/// `BYTETAP_TEST_SCREEN` не читается: снимок экрана в чужой оболочке не должен
+/// менять поведение приложения.
+fn hooks_enabled() -> bool {
+    std::env::var(HOOKS_ENV).is_ok_and(|value| value == "1")
 }
 
 /// Перезапуск себя с WARP: тот же exe и аргументы, `WGPU_ADAPTER_NAME=basic render` и
