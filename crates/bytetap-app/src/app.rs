@@ -429,9 +429,15 @@ impl BytetapApp {
             _ => (spec, false),
         };
         diag::info(format!("{SCREEN_ENV}: экран {name}, тёмная тема {dark}"));
-        if dark {
-            self.set_dark(ctx, true);
-        }
+        // Тема задана явно: иначе системная тема машины перебила бы её в первом кадре.
+        self.settings.theme = if dark {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        };
+        self.set_dark(ctx, dark);
+        // Хук ничего не пишет на диск: ни настроек, ни выбранной темы.
+        self.store = None;
         self = self.with_fixtures(review_fixtures());
         match name {
             "start" => self.screen = Screen::Scenarios,
