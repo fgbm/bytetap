@@ -743,6 +743,15 @@ jobs:
           }
           if ($addr -and (Test-Path $log)) {
             $frames = Select-String -Path $log -Pattern 'кадров за запись: (\d+), ([\d.]+) в секунду' -Encoding utf8 | Select-Object -Last 1
+            $cost = Select-String -Path $log -Pattern 'цена кадра записи: (\d+) мс, период запроса кадра (\d+) мс' -Encoding utf8 | Select-Object -Last 1
+            if ($cost) {
+              $line = "цена кадра {0} мс, период запроса кадра {1} мс" -f $cost.Matches[0].Groups[1].Value, $cost.Matches[0].Groups[2].Value
+              Write-Host $line
+              $line | Out-File -Encoding utf8 smoke/cpu-recording.txt -Append
+            } else {
+              Write-Host 'в журнале запуска нет цены кадра записи'
+              $failed = $true
+            }
             if ($frames) {
               $count = [int]$frames.Matches[0].Groups[1].Value
               $fps = [double]$frames.Matches[0].Groups[2].Value

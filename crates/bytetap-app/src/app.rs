@@ -1839,12 +1839,13 @@ impl BytetapApp {
             return;
         }
         let cost = live::frame_cost(now.saturating_duration_since(last), delay);
-        // Среднее с весом 1/4: одна медленная загрузка шрифтов режим не задаёт, а
-        // устойчиво медленный кадр задаёт.
-        self.frame_cost = if self.frame_cost.is_zero() {
+        // Вверх — сразу, вниз — медленно: медленный кадр виден по первому же замеру, и
+        // окно не тратит секунды, догоняя среднее; быстрый кадр после одного медленного
+        // (загрузка шрифтов, первый показ) режим не переключает.
+        self.frame_cost = if cost >= self.frame_cost {
             cost
         } else {
-            self.frame_cost.mul_f32(0.75) + cost.mul_f32(0.25)
+            self.frame_cost.mul_f32(0.875) + cost.mul_f32(0.125)
         };
     }
 }
