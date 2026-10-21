@@ -130,16 +130,15 @@ pub fn frame_end(ctx: &egui::Context, frame: &mut eframe::Frame, started: Option
     let Some(started) = started else {
         return;
     };
-    {
+    let finished = {
         let mut guard = PROBE.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(probe) = guard.as_mut() else {
             return;
         };
-        if let Some(finished) = probe.record(ctx, frame, started) {
-            diag::info(finished);
-            drop(guard);
-            std::process::exit(0);
-        }
+        probe.record(ctx, frame, started)
+    };
+    if finished {
+        std::process::exit(0);
     }
     // Кадр за кадром без паузы: так проба видит наибольшую частоту кадров.
     ctx.request_repaint();
@@ -178,13 +177,8 @@ impl Probe {
         }
     }
 
-    /// Записать кадр. Итоговая строка — когда время пробы вышло.
-    fn record(
-        &mut self,
-        ctx: &egui::Context,
-        frame: &mut eframe::Frame,
-        started: Instant,
-    ) -> Option<String> {
+    /// Записать кадр; `true` — время пробы вышло и итог уже в журнале.
+    fn record(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame, started: Instant) -> bool {
         let ended = Instant::now();
         // Кадр предыдущей пробы уже отправлен в очередь: ожидание показывает, сколько
         // работы растра осталось незавершённой, когда окно начало новый кадр.
@@ -234,39 +228,37 @@ impl Probe {
         // и растут ли текстуры (атлас шрифтов, иконки) от кадра к кадру.
         if self.report.elapsed() >= Duration::from_secs(1) {
             self.report = Instant::now();
-            let frames = std::mem::take(&mut self.report_frames);
-            let report = self.report_line(ctx, frames);
-            diag::info(report);
+            let frames = self.report_frames;
+            self.report_frames = 0;
+            let (textures, bytes) = textures(ctx);
+            self.textures = textures;
+            self.texture_bytes = bytes;
+            let (spacing, from, to) = spread(&self.spacings, frames);
+            let (draw, draw_from, draw_to) = spread(&self.draws, frames);
+            diag::info(format!(
+                "проба кадра: {:.1} с, кадров {frames}, текстур {textures} ({:.1} МБ), \
+                 промежуток {} ({}…{}), отрисовка {} ({}…{})",
+                self.started.elapsed().as_secs_f32(),
+                bytes as f64 / (1024.0 * 1024.0),
+                as_ms(spacing),
+                as_ms(from),
+                as_ms(to),
+                as_ms(draw),
+                as_ms(draw_from),
+                as_ms(draw_to),
+            ));
         }
 
-        if self.started.elapsed() >= self.duration {
-            return Some(self.summary(ctx));
+        if self.started.elapsed() < self.duration {
+            return false;
         }
-        None
-    }
-
-    /// Строка секунды замера: кадры, промежуток и отрисовка за неё, число текстур.
-    fn report_line(&mut self, ctx: &egui::Context, frames: usize) -> String {
-        let (textures, bytes) = textures(ctx);
-        self.textures = textures;
-        self.texture_bytes = bytes;
-        format!(
-            "проба кадра: {:.1} с, кадров {frames}, промежуток {}, отрисовка {}",
-            self.started.elapsed().as_secs_f32(),
-            durations(&self.spacings, self.spacings.len().saturating_sub(frames)),
-            durations(&self.draws, self.draws.len().saturating_sub(frames)),
-        )
-    }
-
-    /// Итог пробы: медиана и размах промежутка, отрисовки и ожидания GPU.
-    fn summary(&self, ctx: &egui::Context) -> String {
-        let spacing = median(&self.spacings);
         // Цена кадра — промежуток, только когда он больше отрисовки: остальное —
         // растр, отправка и представление кадра.
+        let spacing = median(&self.spacings);
         let paint = spacing.saturating_sub(median(&self.draws));
-        format!(
-            "проба кадра: итог {}, кадров {} за {:.1} с, промежуток {:.1} мс (мин {:.1}, макс {:.1}), \
-             отрисовка {:.2} мс, цена кадра {:.1} мс, ожидание GPU {:.2} мс, текстур {}",
+        diag::info(format!(
+            "проба кадра: итог {}, кадров {} за {:.1} с, промежуток {} ({}…{}), \
+             отрисовка {}, цена кадра {}, ожидание GPU {}, текстур {}",
             mode(),
             self.spacings.len(),
             self.started.elapsed().as_secs_f32(),
@@ -277,7 +269,8 @@ impl Probe {
             as_ms(paint),
             as_ms(median(&self.waits)),
             textures(ctx).0,
-        )
+        ));
+        true
     }
 }
 
@@ -309,15 +302,10 @@ fn max(values: &[Duration]) -> Duration {
     values.iter().copied().max().unwrap_or(Duration::ZERO)
 }
 
-/// Последние `take` замеров строкой «медиана (мин…макс)».
-fn durations(values: &[Duration], from: usize) -> String {
-    let tail = &values[from.min(values.len())..];
-    format!(
-        "{:.1} мс ({:.1}…{:.1})",
-        as_ms(median(tail)),
-        as_ms(min(tail)),
-        as_ms(max(tail))
-    )
+/// Последние `take` замеров: медиана, минимум и максимум, в секундах.
+fn spread(values: &[Duration], take: usize) -> (Duration, Duration, Duration) {
+    let tail = &values[values.len().saturating_sub(take)..];
+    (median(tail), min(tail), max(tail))
 }
 
 fn as_ms(duration: Duration) -> f64 {
