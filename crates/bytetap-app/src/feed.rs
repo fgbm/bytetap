@@ -39,13 +39,16 @@ pub const ENCODINGS: [Encoding; 5] = [
 ///
 /// Глиф хранится байтом, а не строкой: `String` на каждый управляющий байт — это
 /// столько же аллокаций, сколько управляющих байт в фрагменте. Имя глифа
-/// (`CR`, `x0B`) получается по байту при отрисовке и копировании.
+/// (`CR`, `x0B`) получается по байту при отрисовке и копирования.
+///
+/// Подряд идущие одинаковые управляющие байты — один сегмент с повтором: фрагмент
+/// из двух тысяч одинаковых байт не должен давать две тысячи сегментов (FR-28).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Segment {
     /// Печатный текст: подряд идущие обычные байты одним куском.
     Text(String),
-    /// Глиф управляющего байта: сам байт, имя — по [`control_name`].
-    Ctrl(u8),
+    /// Глиф управляющего байта: сам байт и сколько раз он подряд повторился.
+    Ctrl(u8, u32),
     /// Символ данных, который выглядел бы глифом: `‹` или `›`.
     ///
     /// Показывается как `‹x2039›` / `‹x203A›` — код символа в шестнадцатерицине.
@@ -365,13 +368,21 @@ fn push_text(out: &mut Vec<Segment>, text: &str) {
         }
         let ch = rest[at..].chars().next().expect("a char is there");
         match ch {
-            '<' => out.push(Segment::Ctrl(b'<')),
+            '<' => push_ctrl(out, b'<'),
             _ => out.push(Segment::Escaped(ch)),
         }
         rest = &rest[at + ch.len_utf8()..];
     }
     if !rest.is_empty() {
         push_plain(out, rest);
+    }
+}
+
+/// Глиф управляющего байта: подряд идущие одинаковые байты — один сегмент с повтором.
+fn push_ctrl(out: &mut Vec<Segment>, byte: u8) {
+    match out.last_mut() {
+        Some(Segment::Ctrl(last, count)) if *last == byte => *count += 1,
+        _ => out.push(Segment::Ctrl(byte, 1)),
     }
 }
 
@@ -411,7 +422,7 @@ pub fn text_segments(bytes: &[u8], encoding: Encoding, limit: usize) -> Vec<Segm
             if start < index {
                 push_text(&mut out, &decode_run(&bytes[start..index], encoding));
             }
-            out.push(Segment::Ctrl(byte));
+            push_ctrl(&mut out, byte);
             start = index + 1;
         }
     }
@@ -428,7 +439,7 @@ pub fn text_segments(bytes: &[u8], encoding: Encoding, limit: usize) -> Vec<Segm
 pub fn segment_text(segment: &Segment) -> String {
     match segment {
         Segment::Text(text) => text.clone(),
-        Segment::Ctrl(byte) => ctrl_glyph(*byte),
+        Segment::Ctrl(byte, count) => ctrl_glyph(*byte).repeat(*count as usize),
         Segment::Escaped(ch) => escaped_glyph(*ch),
     }
 }
@@ -439,7 +450,11 @@ pub fn plain_text(segments: &[Segment]) -> String {
     for segment in segments {
         match segment {
             Segment::Text(text) => out.push_str(text),
-            Segment::Ctrl(byte) => out.push_str(&ctrl_glyph(*byte)),
+            Segment::Ctrl(byte, count) => {
+                for _ in 0..*count {
+                    out.push_str(&ctrl_glyph(*byte));
+                }
+            }
             Segment::Escaped(ch) => out.push_str(&escaped_glyph(*ch)),
         }
     }
@@ -678,18 +693,19 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &data.segments(Encoding::Utf8)));
     }
 
-    /// Фрагмент из одних управляющих байтов: сегмент на каждый байт, но без строк —
-    /// имя глифа получается по байту при отрисовке (FR-28).
+    /// Фрагмент из одних управляющих байтов: один сегмент-повтор, без строк — имя
+    /// глифа получается по байту при отрисовке (FR-28).
     #[test]
     fn a_control_only_fragment_has_no_text_allocations() {
         let bytes = vec![0x01u8; 2048];
         let segments = text_segments(&bytes, Encoding::Ascii, TEXT_LIMIT_BYTES);
-        assert_eq!(segments.len(), 2048, "глиф на каждый байт");
-        assert!(
-            segments
-                .iter()
-                .all(|segment| matches!(segment, Segment::Ctrl(0x01))),
-            "глифы без строк"
+        assert_eq!(segments.len(), 1, "одинаковые байты — один сегмент");
+        assert_eq!(segments[0], Segment::Ctrl(0x01, 2048), "с повтором");
+        // Текст при этом полный: 2048 глифа.
+        assert_eq!(
+            plain_text(&segments).matches("‹x01›").count(),
+            2048,
+            "глиф на каждый байт"
         );
     }
 

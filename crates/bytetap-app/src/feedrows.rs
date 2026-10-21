@@ -141,9 +141,9 @@ fn data_job(p: &Palette, segments: &[Segment], synthetic: bool) -> LayoutJob {
             Segment::Text(text) => {
                 job.append(text, 0.0, text_format(theme::mono(TEXT_DATA), p.text));
             }
-            Segment::Ctrl(byte) => {
+            Segment::Ctrl(byte, count) => {
                 job.append(
-                    &feed::ctrl_glyph(*byte),
+                    &feed::ctrl_glyph(*byte).repeat(*count as usize),
                     0.0,
                     text_format(theme::mono(TEXT_2XS), ctrl),
                 );
