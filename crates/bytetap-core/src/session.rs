@@ -101,6 +101,21 @@ pub static TEST_PANIC_AFTER_EVENTS: AtomicU64 = AtomicU64::new(u64::MAX);
 #[cfg(feature = "test-hooks")]
 static PUBLISHED_EVENTS: AtomicU64 = AtomicU64::new(0);
 
+/// Сколько событий дошло до публикации за всё время процесса.
+///
+/// Тест ставит предел хука от этого значения («ещё N событий»): счётчик общий на
+/// процесс, и предел, отсчитанный от нуля, сработал бы сразу после соседнего теста.
+#[cfg(feature = "test-hooks")]
+pub fn test_published_events() -> u64 {
+    PUBLISHED_EVENTS.load(Ordering::Relaxed)
+}
+
+/// Сбрасывает счётчик хуков: его возвращает в исходное состояние гард теста.
+#[cfg(feature = "test-hooks")]
+pub fn reset_test_published_events() {
+    PUBLISHED_EVENTS.store(0, Ordering::Relaxed);
+}
+
 /// Пора закончить сессию самой: хук [`TEST_END_AFTER_EVENTS`] сработал.
 #[cfg(feature = "test-hooks")]
 fn test_hook_end() -> bool {

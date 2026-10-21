@@ -68,6 +68,21 @@ pub static TEST_FAIL_AFTER_EVENTS: AtomicU64 = AtomicU64::new(u64::MAX);
 #[cfg(feature = "test-hooks")]
 static TEST_EVENTS_IN_BATCHES: AtomicU64 = AtomicU64::new(0);
 
+/// Сколько событий прошло через хук [`TEST_FAIL_AFTER_EVENTS`] за всё время процесса.
+///
+/// Тест ставит предел от этого значения («ещё N событий»): счётчик общий на процесс,
+/// и предел, отсчитанный от нуля, сработал бы сразу после соседнего теста.
+#[cfg(feature = "test-hooks")]
+pub fn test_events_in_batches() -> u64 {
+    TEST_EVENTS_IN_BATCHES.load(Ordering::Relaxed)
+}
+
+/// Сбрасывает счётчик хука: его возвращает в исходное состояние гард теста.
+#[cfg(feature = "test-hooks")]
+pub fn reset_test_events_in_batches() {
+    TEST_EVENTS_IN_BATCHES.store(0, Ordering::Relaxed);
+}
+
 /// Задержка перед фиксацией пачки, если тест её запросил.
 #[cfg(feature = "test-hooks")]
 fn test_hook_delay() {
