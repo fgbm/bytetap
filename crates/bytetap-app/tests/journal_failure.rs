@@ -6,8 +6,10 @@
 //! сессии — тоже видны: окно замечает их и освобождает слот.
 //!
 //! Хуки `TEST_FAIL_AFTER_EVENTS`, `TEST_END_AFTER_EVENTS` и `TEST_PANIC_AFTER_EVENTS`
-//! глобальны для процесса, поэтому тесты живут отдельным бинаром: соседние
-//! интеграционные тесты сессии они не задевают. Данные — только синтетические.
+//! глобальны для процесса, поэтому тесты живут отдельным бинаром и берут их через
+//! [`Hooks`]: очередь на время теста и сброс хуков со счётчиками в `Drop`, даже если
+//! тест упал. Предел хука считается от текущего счётчика («ещё N событий»), иначе
+//! события соседнего теста сработали бы сразу. Данные — только синтетические.
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -16,8 +18,13 @@ use std::time::{Duration, Instant};
 use bytetap_app::live::Phase;
 use bytetap_app::settings::Settings;
 use bytetap_app::{BytetapApp, Screen};
-use bytetap_core::journal::writer::TEST_FAIL_AFTER_EVENTS;
-use bytetap_core::session::{TEST_END_AFTER_EVENTS, TEST_PANIC_AFTER_EVENTS};
+use bytetap_core::journal::writer::{
+    TEST_FAIL_AFTER_EVENTS, reset_test_events_in_batches, test_events_in_batches,
+};
+use bytetap_core::session::{
+    TEST_END_AFTER_EVENTS, TEST_PANIC_AFTER_EVENTS, reset_test_published_events,
+    test_published_events,
+};
 use bytetap_testkit::emulator::{AnalyzerEmulator, frame};
 use egui_kittest::Harness;
 
@@ -58,11 +65,65 @@ fn step_until(
 /// Хуки ядра глобальны для процесса, поэтому тесты этой группы идут по очереди.
 static HOOKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Занимает хуки ядра на время теста: тесты этой группы не идут одновременно.
-fn hooks() -> std::sync::MutexGuard<'static, ()> {
-    HOOKS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Хуки ядра на время теста.
+///
+/// Держит очередь тестов группы и возвращает все хуки со счётчиками в исходное
+/// состояние в [`Drop`] — в том числе когда тест упал: иначе следующий тест получил бы
+/// чужой предел и падение задачи сессии там, где его не ждут.
+struct Hooks {
+    _queue: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Hooks {
+    /// Занимает хуки и начинает счёт событий с нуля.
+    fn take() -> Self {
+        let hooks = Self {
+            _queue: HOOKS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        };
+        Self::reset();
+        hooks
+    }
+
+    /// Писатель журнала отказывает после `events` событий.
+    fn fail_after(&self, events: u64) {
+        TEST_FAIL_AFTER_EVENTS.store(
+            test_events_in_batches().saturating_add(events),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Сессия заканчивается сама после `events` событий.
+    fn end_after(&self, events: u64) {
+        TEST_END_AFTER_EVENTS.store(
+            test_published_events().saturating_add(events),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Задача сессии падает после `events` событий.
+    fn panic_after(&self, events: u64) {
+        TEST_PANIC_AFTER_EVENTS.store(
+            test_published_events().saturating_add(events),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Все хуки выключены, счётчики обнулены.
+    fn reset() {
+        TEST_FAIL_AFTER_EVENTS.store(u64::MAX, Ordering::Relaxed);
+        TEST_END_AFTER_EVENTS.store(u64::MAX, Ordering::Relaxed);
+        TEST_PANIC_AFTER_EVENTS.store(u64::MAX, Ordering::Relaxed);
+        reset_test_events_in_batches();
+        reset_test_published_events();
+    }
+}
+
+impl Drop for Hooks {
+    fn drop(&mut self) {
+        Self::reset();
+    }
 }
 
 /// Окно с записью TCP-сервера на loopback: пишет журнал в свою папку.
@@ -80,11 +141,24 @@ fn recording_harness(
         })
 }
 
+/// Запрос закрытия окна: одно событие вьюпорта, как от системной кнопки.
+fn close_window(harness: &mut Harness<'static, BytetapApp>) {
+    use eframe::egui::{ViewportEvent, ViewportId};
+    harness
+        .input_mut()
+        .viewports
+        .get_mut(&ViewportId::ROOT)
+        .unwrap()
+        .events
+        .push(ViewportEvent::Close);
+    harness.step();
+}
+
 /// Отказ журнала во время записи: окно показывает строку причины и уходит на стартовый
 /// экран, записанный журнал остаётся доступным (U1-AC17).
 #[test]
 fn a_journal_failure_shows_the_reason_on_the_start_screen() {
-    let _hooks = hooks();
+    let hooks = Hooks::take();
     let dir = tempfile::tempdir().unwrap();
     let rt = runtime();
     let log_dir = dir.path().to_string_lossy().into_owned();
@@ -102,7 +176,7 @@ fn a_journal_failure_shows_the_reason_on_the_start_screen() {
         .unwrap();
 
     // Писатель ломается на первом же событии после старта: обмен в журнал не попадёт.
-    TEST_FAIL_AFTER_EVENTS.store(0, Ordering::Relaxed);
+    hooks.fail_after(0);
     // ACK не придёт: сессия остановится на отказе журнала. Это и есть ожидаемое.
     let _ = rt.block_on(AnalyzerEmulator::new(addr).with_messages([hl7(1)]).run());
 
@@ -133,15 +207,13 @@ fn a_journal_failure_shows_the_reason_on_the_start_screen() {
         !text.contains("\"type\":\"session_end\""),
         "без журнала итогов сессии нет: {text}"
     );
-
-    TEST_FAIL_AFTER_EVENTS.store(u64::MAX, Ordering::Relaxed);
 }
 
 /// Закрытие окна во время записи, когда журнал отказывает при остановке: окно
 /// показывает системное сообщение о неполном журнале, а не закрывается молча (U1-AC17).
 #[test]
 fn closing_after_a_journal_failure_tells_the_user_about_the_journal() {
-    let _hooks = hooks();
+    let hooks = Hooks::take();
     let dir = tempfile::tempdir().unwrap();
     let rt = runtime();
     let log_dir = dir.path().to_string_lossy().into_owned();
@@ -161,7 +233,7 @@ fn closing_after_a_journal_failure_tells_the_user_about_the_journal() {
         .expect("эмулятор");
 
     // Писатель ломается на следующей пачке: отказ придёт при остановке записи.
-    TEST_FAIL_AFTER_EVENTS.store(0, Ordering::Relaxed);
+    hooks.fail_after(0);
     use eframe::egui::{ViewportCommand, ViewportEvent, ViewportId};
     assert!(
         bytetap_app::take_close_notice().is_none(),
@@ -199,15 +271,100 @@ fn closing_after_a_journal_failure_tells_the_user_about_the_journal() {
         notice.contains("Журнал мог быть дописан не полностью"),
         "{notice}"
     );
+}
 
-    TEST_FAIL_AFTER_EVENTS.store(u64::MAX, Ordering::Relaxed);
+/// Закрытие окна после ошибки остановки: сессия могла не дописать `session_end`, и
+/// строка ошибки на стартовом экране уходит в системное сообщение, а не пропадает
+/// вместе с окном (U1-AC17).
+#[test]
+fn closing_after_a_failed_stop_tells_the_user_about_the_journal() {
+    let hooks = Hooks::take();
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let log_dir = dir.path().to_string_lossy().into_owned();
+    let mut harness = recording_harness(&rt, log_dir);
+    step_until(&mut harness, "запись", |h| {
+        h.state().phase() == Phase::Recording
+    });
+    let addr: SocketAddr = harness
+        .state()
+        .recording()
+        .unwrap()
+        .local_addr()
+        .parse()
+        .unwrap();
+
+    // Задача сессии падает: остановка вернёт ошибку, журнал останется без итогов.
+    hooks.panic_after(0);
+    let _ = rt.block_on(AnalyzerEmulator::new(addr).with_messages([hl7(1)]).run());
+    step_until(&mut harness, "ошибка остановки", |h| {
+        h.state().stop_error().is_some()
+    });
+    harness.run_steps(2);
+    assert!(
+        bytetap_app::take_close_notice().is_none(),
+        "до закрытия сообщения не было"
+    );
+
+    close_window(&mut harness);
+    let notice = bytetap_app::take_close_notice().expect("сообщение о неполном журнале");
+    assert!(
+        notice.contains("Журнал мог быть дописан не полностью"),
+        "{notice}"
+    );
+    // Закрывать нечего: сессия уже остановлена, окно не отменяет закрытие.
+    assert!(!harness.state().session_busy());
+}
+
+/// Закрытие окна, когда отказ журнала случился раньше и остался строкой под шапкой:
+/// человек строку не видел или не закрыл её, и о неполном журнале узнаёт системным
+/// сообщением после выхода (U1-AC17).
+#[test]
+fn closing_after_an_earlier_journal_failure_tells_the_user() {
+    let hooks = Hooks::take();
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let log_dir = dir.path().to_string_lossy().into_owned();
+    let mut harness = recording_harness(&rt, log_dir);
+    step_until(&mut harness, "запись", |h| {
+        h.state().phase() == Phase::Recording
+    });
+    let addr: SocketAddr = harness
+        .state()
+        .recording()
+        .unwrap()
+        .local_addr()
+        .parse()
+        .unwrap();
+
+    // Писатель ломается на первом событии: сессия останавливается сама, строка отказа
+    // остаётся на экране.
+    hooks.fail_after(0);
+    let _ = rt.block_on(AnalyzerEmulator::new(addr).with_messages([hl7(1)]).run());
+    step_until(&mut harness, "строка отказа", |h| {
+        h.state().journal_failure().is_some()
+    });
+    harness.run_steps(2);
+    assert_eq!(harness.state().screen, Screen::Scenarios);
+    assert!(!harness.state().session_busy(), "слот освобождён");
+    assert!(
+        bytetap_app::take_close_notice().is_none(),
+        "до закрытия сообщения не было"
+    );
+
+    close_window(&mut harness);
+    let notice = bytetap_app::take_close_notice().expect("сообщение о неполном журнале");
+    assert!(
+        notice.contains("Журнал мог быть дописан не полностью"),
+        "{notice}"
+    );
 }
 
 /// Сессия ядра падает сама: слот освобождается, окно это замечает и показывает ошибку
 /// остановки на стартовом экране (как `stop_failed` в UI v2, U1-AC17).
 #[test]
 fn a_stop_error_is_visible_on_the_start_screen() {
-    let _hooks = hooks();
+    let hooks = Hooks::take();
     let dir = tempfile::tempdir().unwrap();
     let rt = runtime();
     let log_dir = dir.path().to_string_lossy().into_owned();
@@ -224,7 +381,7 @@ fn a_stop_error_is_visible_on_the_start_screen() {
         .unwrap();
 
     // Задача сессии падает: остановка вернёт ошибку без причины журнала.
-    TEST_PANIC_AFTER_EVENTS.store(0, Ordering::Relaxed);
+    hooks.panic_after(0);
     let _ = rt.block_on(AnalyzerEmulator::new(addr).with_messages([hl7(1)]).run());
 
     step_until(&mut harness, "ошибка остановки", |h| {
@@ -235,15 +392,13 @@ fn a_stop_error_is_visible_on_the_start_screen() {
     assert!(!harness.state().session_busy(), "слот освобождён");
     use egui_kittest::kittest::Queryable as _;
     harness.get_by_label_contains("Запись остановлена с ошибкой");
-
-    TEST_PANIC_AFTER_EVENTS.store(u64::MAX, Ordering::Relaxed);
 }
 
 /// Сессия ядра закончилась сама без отказа журнала: окно замечает это, останавливает
 /// таймер и возвращает стартовый экран (U1-AC17).
 #[test]
 fn a_session_that_finished_by_itself_is_noticed() {
-    let _hooks = hooks();
+    let hooks = Hooks::take();
     let dir = tempfile::tempdir().unwrap();
     let rt = runtime();
     let log_dir = dir.path().to_string_lossy().into_owned();
@@ -261,7 +416,7 @@ fn a_session_that_finished_by_itself_is_noticed() {
         .unwrap();
 
     // Сессия заканчивается сама после первого обмена: ядро пишет `session_end`.
-    TEST_END_AFTER_EVENTS.store(1, Ordering::Relaxed);
+    hooks.end_after(1);
     let _ = rt.block_on(AnalyzerEmulator::new(addr).with_messages([hl7(1)]).run());
 
     step_until(&mut harness, "остановка", |h| {
@@ -288,6 +443,4 @@ fn a_session_that_finished_by_itself_is_noticed() {
         text.contains("\"type\":\"session_end\""),
         "журнал закончен итогами: {text}"
     );
-
-    TEST_END_AFTER_EVENTS.store(u64::MAX, Ordering::Relaxed);
 }

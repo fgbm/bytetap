@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -12,6 +13,7 @@ use bytetap_app::feed::{FEED_CAPACITY, FeedKind};
 use bytetap_app::live::{self, Phase};
 use bytetap_app::settings::Settings;
 use bytetap_app::{BytetapApp, Screen};
+use bytetap_core::journal::writer::{TEST_SYNC_DELAY_MS, TEST_SYNC_DELAYS};
 use bytetap_core::journal::{Autoresponder, Dir};
 use bytetap_core::session::SessionConfig;
 use bytetap_testkit::emulator::{AnalyzerEmulator, frame};
@@ -244,6 +246,25 @@ fn step_until(
     }
 }
 
+/// Хук писателя журнала на время теста: фиксация пачки идёт медленнее, и остановка
+/// сессии не успевает закончиться между двумя шагами харнесса.
+///
+/// Возврат в [`Drop`] — даже если тест упал: хук глобальный для процесса.
+struct SlowSync;
+
+fn slow_sync(millis: u64) -> SlowSync {
+    TEST_SYNC_DELAY_MS.store(millis, Ordering::Relaxed);
+    TEST_SYNC_DELAYS.store(0, Ordering::Relaxed);
+    SlowSync
+}
+
+impl Drop for SlowSync {
+    fn drop(&mut self) {
+        TEST_SYNC_DELAY_MS.store(0, Ordering::Relaxed);
+        TEST_SYNC_DELAYS.store(0, Ordering::Relaxed);
+    }
+}
+
 fn commands(harness: &Harness<'static, BytetapApp>) -> Vec<ViewportCommand> {
     harness
         .output()
@@ -310,10 +331,12 @@ fn closing_the_window_stops_the_recording_first() {
     assert!(types.iter().any(|t| t == "data"));
 }
 
-/// Закрытие окна во время записи отменяется один раз, а не по каждому кадру: иначе
-/// окно гоняло бы `CancelClose` и не дошло бы до закрытия (U1-AC17).
+/// Закрытие окна во время записи отменяется в каждом проходе, где пришёл запрос:
+/// событие закрытия живёт один проход (eframe очищает события вьюпорта перед кадром),
+/// поэтому второй `Close` — новый запрос. Без `CancelClose` во втором проходе окно
+/// закрылось бы посреди остановки, и журнал остался бы без `session_end` (U1-AC17).
 #[test]
-fn the_close_is_canceled_once_and_not_in_a_loop() {
+fn every_close_request_is_canceled_until_the_session_stops() {
     let dir = tempfile::tempdir().unwrap();
     let rt = runtime();
     let handle = rt.handle().clone();
@@ -328,40 +351,55 @@ fn the_close_is_canceled_once_and_not_in_a_loop() {
     step_until(&mut harness, "запись", |h| {
         h.state().phase() == Phase::Recording
     });
-
-    harness
-        .input_mut()
-        .viewports
-        .get_mut(&ViewportId::ROOT)
+    let path = harness.state().recorded_path().cloned().expect("журнал");
+    let addr: SocketAddr = harness
+        .state()
+        .recording()
         .unwrap()
-        .events
-        .push(ViewportEvent::Close);
-    harness.step();
-    assert!(
-        commands(&harness).contains(&ViewportCommand::CancelClose),
-        "закрытие отменено до остановки"
-    );
+        .local_addr()
+        .parse()
+        .unwrap();
+    rt.block_on(AnalyzerEmulator::new(addr).with_messages([hl7(1)]).run())
+        .expect("эмулятор");
 
-    // Пока идёт остановка, отменять закрытие снова нельзя: событие закрытия может
-    // висеть в кадре дольше одного прохода (у свёрнутого окна кадр рисует логика).
-    let mut canceled = 0;
-    let mut closed = false;
-    for _ in 0..200 {
+    // Фиксация журнала замедлена хуком писателя: окно остаётся занятым остановкой,
+    // пока тест делает два шага подряд.
+    let _slow = slow_sync(1_000);
+    for step in 1..=2 {
+        assert!(
+            harness.state().session_busy(),
+            "шаг {step}: запись ещё останавливается"
+        );
+        harness
+            .input_mut()
+            .viewports
+            .get_mut(&ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(ViewportEvent::Close);
         harness.step();
         let commands = commands(&harness);
-        canceled += commands
-            .iter()
-            .filter(|command| **command == ViewportCommand::CancelClose)
-            .count();
-        closed |= commands.contains(&ViewportCommand::Close);
-        if closed {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            commands.contains(&ViewportCommand::CancelClose),
+            "шаг {step}: закрытие отменено до остановки"
+        );
+        assert!(
+            !commands.contains(&ViewportCommand::Close),
+            "шаг {step}: окно ждёт остановку записи"
+        );
     }
-    assert_eq!(canceled, 0, "повторной отмены закрытия нет");
-    assert!(closed, "окно закрылось после остановки записи");
+
+    // Остановка закончилась: окно закрывается само, журнал закончен `session_end`.
+    step_until(&mut harness, "закрытие окна", |h| {
+        commands(h).contains(&ViewportCommand::Close)
+    });
     assert!(!harness.state().session_busy());
+    let types = journal_types(&path);
+    assert_eq!(
+        types.last().map(String::as_str),
+        Some("session_end"),
+        "{types:?}"
+    );
 }
 
 /// «Старт» на занятом порту из формы: ошибка у поля порта, экран формы, журнала нет.

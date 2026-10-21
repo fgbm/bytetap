@@ -1,8 +1,9 @@
 //! Состояние приложения и каркас экранов.
 //!
 //! Экраны — сценарии, шаг режима, запись, просмотр журнала. Сценарии и шаг — шаг 2
-//! этапа U1 (`scenarios.rs`, `step.rs`), запись — шаг 3 (`recording.rs`, `live.rs`);
-//! просмотр пока заглушка с заголовком.
+//! этапа U1 (`scenarios.rs`, `step.rs`), запись — шаг 3 (`recording.rs`, `live.rs`),
+//! просмотр — шаг 4 (`viewscreen.rs` с индексом `journal.rs` и переводом доли времени
+//! в событие `viewing.rs`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -168,13 +169,6 @@ pub struct BytetapApp {
     closing: Option<Instant>,
     /// Остановка не уложилась в предел: следующее закрытие не отменяется.
     force_close: bool,
-    /// Закрытие уже отменено один раз: повторно `CancelClose` не шлём.
-    ///
-    /// Пока идёт остановка, событие закрытия может висеть в кадре дольше одного
-    /// прохода (особенно у свёрнутого окна, где кадр рисует логика). Без этого флага
-    /// окно гоняло бы `CancelClose` по каждому кадру и никогда не дошло бы до
-    /// закрытия (U1-AC17).
-    close_canceled: bool,
     /// Ошибка остановки записи: строка на стартовом экране (как `stop_failed` в UI v2).
     pub(crate) stop_error: Option<String>,
     /// Итоги последней записи: строка на стартовом экране (U1-AC17).
@@ -256,7 +250,6 @@ impl BytetapApp {
             note: None,
             closing: None,
             force_close: false,
-            close_canceled: false,
             stop_error: None,
             stop_stats: None,
             fixtures: false,
@@ -1079,27 +1072,27 @@ impl BytetapApp {
     /// Закрытие окна во время записи: сначала штатная остановка (журнал заканчивается
     /// `session_end`), потом окно. Дольше [`live::STOP_WAIT`] окно не ждёт.
     ///
-    /// Закрытие отменяется один раз: пока идёт остановка, событие закрытия может
-    /// висеть в кадре дольше одного прохода (у свёрнутого окна кадр рисует логика), и
-    /// без флага окно гоняло бы `CancelClose` по каждому кадру, не доходя до закрытия
-    /// (U1-AC17).
+    /// Пока запись идёт, каждый пришедший запрос закрытия отменяется: окно ждёт
+    /// остановку, а не закрывается посреди неё. Событие закрытия живёт один проход
+    /// (eframe очищает события вьюпорта перед кадром), занятого цикла нет, поэтому
+    /// запрос во втором проходе — новый: без `CancelClose` в нём окно закрылось бы,
+    /// не дописав `session_end` (U1-AC17).
     fn handle_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
         if requested && self.session_busy() && !self.force_close {
-            if !self.close_canceled {
-                self.close_canceled = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                if self.closing.is_none() {
-                    diag::info("закрытие окна во время записи: сначала остановка сессии");
-                    self.closing = Some(Instant::now());
-                    self.stop_recording(ctx);
-                }
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.closing.is_none() {
+                diag::info("закрытие окна во время записи: сначала остановка сессии");
+                self.closing = Some(Instant::now());
+                self.stop_recording(ctx);
             }
-        } else if !requested {
-            // Событие закрытия ушло: следующий раз закрыть можно будет снова.
-            self.close_canceled = false;
         }
         let Some(since) = self.closing else {
+            // Записи нет: закрытие не отменено, но отказ журнала или ошибка остановки,
+            // оставшиеся на экране, уходят в системное сообщение до выхода из окна.
+            if requested {
+                self.show_close_notice();
+            }
             return;
         };
         if !self.session_busy() {
@@ -1124,16 +1117,20 @@ impl BytetapApp {
 
     /// Журнал мог быть дописан не полностью: причина уходит в системное сообщение.
     ///
+    /// Причина — отказ журнала, пришедший при остановке или раньше (сессия могла
+    /// остановиться сама, пока окно было свёрнуто, а строку причины человек не видел
+    /// и не закрыл), или ошибка остановки: и в том и в другом случае `session_end` мог
+    /// не дойти до журнала.
+    ///
     /// Сообщение показывает `main` уже после выхода из окна: системное окно модально,
     /// и из окна оно заблокировало бы поток окна до нажатия «ОК» (U1-AC17).
     fn show_close_notice(&mut self) {
-        let Some(failure) = self.journal_failure.take() else {
-            return;
+        let reason = match (self.journal_failure.take(), self.stop_error.take()) {
+            (Some(failure), _) => crate::recording::failure_reason(failure.code).to_owned(),
+            (None, Some(error)) => error,
+            (None, None) => return,
         };
-        let text = t!(
-            "record.journalIncomplete",
-            reason = crate::recording::failure_reason(failure.code)
-        );
+        let text = t!("record.journalIncomplete", reason = reason);
         diag::error(format!("окно закрывается: {text}"));
         *CLOSE_NOTICE.lock().unwrap_or_else(PoisonError::into_inner) = Some(text);
     }
