@@ -1,12 +1,16 @@
 //! Состояние приложения и каркас экранов.
 //!
 //! Экраны — сценарии, шаг режима, запись, просмотр журнала. Сценарии и шаг — шаг 2
-//! этапа U1 (`scenarios.rs`, `step.rs`); запись и просмотр пока заглушки с заголовком.
+//! этапа U1 (`scenarios.rs`, `step.rs`), запись — шаг 3 (`recording.rs`, `live.rs`);
+//! просмотр пока заглушка с заголовком.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use bytetap_core::journal::{LogDirWarningKind, RecentJournal};
 use bytetap_core::session::SessionConfig;
+use bytetap_core::transport::Source;
 use bytetap_core::transport::serial::PortInfo;
 use chrono::{DateTime, FixedOffset};
 use eframe::egui::{self, Align, Layout, RichText, Sense, Stroke, Theme, Ui, vec2};
@@ -15,6 +19,8 @@ use crate::background::{self, Interface, Loaded, Task};
 use crate::errors::StartError;
 use crate::form::FormState;
 use crate::icons::Icon;
+use crate::live::{self, Action, JournalFailure, LiveSession, Phase, StopOutcome};
+use crate::recording::{RecordingFixture, RecordingView};
 use crate::settings::{LoadWarning, SessionMode, Settings, Store, ThemeMode, WindowState};
 use crate::theme::tokens::{SPACE_2, SPACE_3, SPACE_4, SPACE_5, TEXT_XS};
 use crate::theme::{self, Palette, mix};
@@ -22,6 +28,13 @@ use crate::{diag, t, titlebar, widgets};
 
 /// Сколько последних записей показывает стартовый экран.
 pub const RECENT_SHOWN: usize = 3;
+
+/// Окно закрыто принудительно, не дождавшись остановки записи: `main` после выхода
+/// показывает системное сообщение — журнал мог быть дописан не полностью.
+pub static FORCED_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Тестовый хук смоука записи (CI): `tcp_server:127.0.0.1:0` — запись стартует сразу.
+pub const AUTOSTART_ENV: &str = "BYTETAP_TEST_AUTOSTART";
 
 /// Данные окружения для снимков и тестов вместо фонового опроса системы.
 #[derive(Clone, Debug)]
@@ -75,8 +88,26 @@ pub struct BytetapApp {
     pub(crate) profile_prompt: Option<String>,
     /// Журнал, открытый на просмотр.
     pub(crate) viewing: Option<PathBuf>,
-    /// Конфигурация, собранная «Старт»; запускает её шаг 3.
+    /// Конфигурация, собранная последним «Старт».
     pending: Option<SessionConfig>,
+    /// Runtime записи; `None` — тесты без сессий: «Старт» только собирает конфигурацию.
+    runtime: Option<tokio::runtime::Handle>,
+    pub(crate) phase: Phase,
+    start_task: Option<Task<Result<LiveSession, StartError>>>,
+    pub(crate) live: Option<LiveSession>,
+    stop_task: Option<Task<StopOutcome>>,
+    /// Экран записи: зеркало ленты, прокрутка, сводка.
+    pub(crate) rec: Option<RecordingView>,
+    /// Отказ журнала: строка под шапкой до «Выбрать другую папку» или «Открыть записанное».
+    pub(crate) journal_failure: Option<JournalFailure>,
+    /// Журнал последней записи.
+    pub(crate) recorded_path: Option<PathBuf>,
+    /// Открыт диалог комментария: набранный текст.
+    pub(crate) note_prompt: Option<String>,
+    /// Закрытие окна ждёт остановки записи с этого момента.
+    closing: Option<Instant>,
+    /// Остановка не уложилась в предел: следующее закрытие не отменяется.
+    force_close: bool,
     /// Снимки и тесты: данные окружения даны заранее, фоновых опросов нет.
     fixtures: bool,
     pub(crate) now: Option<DateTime<FixedOffset>>,
@@ -134,6 +165,17 @@ impl BytetapApp {
             profile_prompt: None,
             viewing: None,
             pending: None,
+            runtime: None,
+            phase: Phase::Idle,
+            start_task: None,
+            live: None,
+            stop_task: None,
+            rec: None,
+            journal_failure: None,
+            recorded_path: None,
+            note_prompt: None,
+            closing: None,
+            force_close: false,
             fixtures: false,
             now: None,
             dirty: false,
@@ -152,8 +194,94 @@ impl BytetapApp {
             self.settings.config.mode = mode;
             self.form = FormState::new(&self.settings.config);
         }
+        if screen == Screen::Recording && self.rec.is_none() {
+            self.rec = Some(RecordingView::detached(self.settings.config.clone()));
+        }
         self.screen = screen;
         self
+    }
+
+    /// Runtime записи: «Старт» запускает сессию ядра в нём.
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// Экран записи на синтетических данных: снимки и тесты без сессии.
+    #[must_use]
+    pub fn with_recording_fixture(mut self, fixture: RecordingFixture) -> Self {
+        self.recorded_path.clone_from(&fixture.journal_path);
+        self.rec = Some(RecordingView::fixture(
+            fixture,
+            self.settings.config.clone(),
+        ));
+        self.phase = Phase::Recording;
+        self.screen = Screen::Recording;
+        self
+    }
+
+    /// Строка отказа журнала под шапкой: снимки и тесты.
+    #[must_use]
+    pub fn with_journal_failure(
+        mut self,
+        failure: JournalFailure,
+        recorded: Option<PathBuf>,
+    ) -> Self {
+        self.journal_failure = Some(failure);
+        self.recorded_path = recorded;
+        self.phase = Phase::Failed;
+        self
+    }
+
+    /// Тестовый хук смоука (CI, [`AUTOSTART_ENV`]): `tcp_server:<адрес>` — запись
+    /// TCP-сервера с автоответом «Авто» в папку журналов из настроек сразу после запуска.
+    #[must_use]
+    pub fn with_test_autostart(mut self, ctx: &egui::Context, spec: &str) -> Self {
+        let listen = spec
+            .strip_prefix("tcp_server:")
+            .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok());
+        let Some(listen) = listen else {
+            diag::error(format!(
+                "{AUTOSTART_ENV}: не понят `{spec}`, нужен tcp_server:<адрес:порт>"
+            ));
+            return self;
+        };
+        diag::info(format!("{AUTOSTART_ENV}: запись TCP-сервера на {listen}"));
+        let mut cfg = self.settings.config.clone();
+        cfg.mode = SessionMode::TcpServer;
+        cfg.listen_host = listen.ip().to_string();
+        cfg.listen_port = listen.port();
+        let config = SessionConfig::new(listen)
+            .with_responder(bytetap_core::journal::Autoresponder::Auto)
+            .with_log_dir(cfg.log_dir.clone());
+        self.launch(ctx, config, cfg);
+        self
+    }
+
+    /// Сейчас идёт запись (или её старт, или остановка).
+    pub fn session_busy(&self) -> bool {
+        self.start_task.is_some() || self.live.is_some() || self.stop_task.is_some()
+    }
+
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    pub fn recording(&self) -> Option<&RecordingView> {
+        self.rec.as_ref()
+    }
+
+    pub fn recording_mut(&mut self) -> Option<&mut RecordingView> {
+        self.rec.as_mut()
+    }
+
+    pub fn journal_failure(&self) -> Option<&JournalFailure> {
+        self.journal_failure.as_ref()
+    }
+
+    pub fn recorded_path(&self) -> Option<&PathBuf> {
+        self.recorded_path.as_ref()
     }
 
     /// Данные окружения вместо опроса системы: снимки и тесты не зависят от машины.
@@ -283,6 +411,9 @@ impl BytetapApp {
             self.folder_pick = None;
             if let Some(dir) = picked {
                 self.settings_mut().config.log_dir = dir.to_string_lossy().into_owned();
+                if self.journal_failure.is_some() {
+                    self.dismiss_failure();
+                }
                 if self.start_error.as_ref().is_some_and(|e| {
                     e.field(self.settings.config.mode) == crate::errors::ErrorField::LogDir
                 }) {
@@ -375,7 +506,7 @@ impl BytetapApp {
 
     /// «Старт»: поля проверены — набранное уходит в настройки, из них собирается
     /// конфигурация ядра. Ошибка — текст под своим полем; файл журнала не создаётся.
-    pub(crate) fn start(&mut self) {
+    pub(crate) fn start(&mut self, ctx: &egui::Context) {
         self.form.attempted = true;
         self.start_error = None;
         let cfg = &self.settings.config;
@@ -391,25 +522,198 @@ impl BytetapApp {
         ) {
             Ok(config) => {
                 self.settings.last_run = Some(crate::form::last_run_of(&self.settings.config));
-                self.pending = Some(config);
-                self.screen = Screen::Recording;
+                let cfg = self.settings.config.clone();
+                self.launch(ctx, config, cfg);
             }
-            Err(error) => {
-                diag::info(format!(
-                    "старт отклонён: {:?}: {}",
-                    error.code, error.message
-                ));
-                if error.field(self.settings.config.mode) == crate::errors::ErrorField::LogDir
-                    || (error.field(self.settings.config.mode)
-                        == crate::errors::ErrorField::Address
-                        && self.settings.config.mode == SessionMode::TcpServer)
-                {
-                    self.form.more = true;
-                }
-                self.start_error = Some(error);
-            }
+            Err(error) => self.start_failed(error),
         }
         self.save_settings();
+    }
+
+    /// Ошибка старта — под своим полем; поле в «Дополнительно» раскрывает его.
+    fn start_failed(&mut self, error: StartError) {
+        diag::info(format!(
+            "старт отклонён: {:?}: {}",
+            error.code, error.message
+        ));
+        let mode = self.settings.config.mode;
+        let field = error.field(mode);
+        if field == crate::errors::ErrorField::LogDir
+            || (field == crate::errors::ErrorField::Address && mode == SessionMode::TcpServer)
+        {
+            self.form.more = true;
+        }
+        self.start_error = Some(error);
+    }
+
+    /// Запускает сессию ядра в runtime; без runtime (тесты) — сразу экран записи без
+    /// сессии.
+    fn launch(
+        &mut self,
+        ctx: &egui::Context,
+        config: SessionConfig,
+        cfg: crate::settings::AppConfig,
+    ) {
+        self.pending = Some(config.clone());
+        let Some(runtime) = self.runtime.clone() else {
+            self.rec = Some(RecordingView::detached(cfg));
+            self.screen = Screen::Recording;
+            return;
+        };
+        if self.session_busy() {
+            return;
+        }
+        self.phase = live::reduce(self.phase, Action::StartRequested);
+        self.journal_failure = None;
+        diag::info(format!("старт записи: {}", describe(&config.source)));
+        let repaint = ctx.clone();
+        self.start_task = Some(Task::spawn_async(&runtime, ctx, async move {
+            live::start(config, repaint).await
+        }));
+        // Сводка шапки берёт режим из настроек старта.
+        self.rec = Some(RecordingView::detached(cfg));
+    }
+
+    /// «Стоп» и закрытие окна: штатная остановка в runtime, итоги — в следующем кадре.
+    pub(crate) fn stop_recording(&mut self, ctx: &egui::Context) {
+        self.note_prompt = None;
+        match (self.live.take(), self.runtime.clone()) {
+            (Some(session), Some(runtime)) => {
+                self.phase = live::reduce(self.phase, Action::StopRequested);
+                diag::info("остановка записи");
+                self.stop_task = Some(Task::spawn_async(&runtime, ctx, session.stop()));
+            }
+            (Some(session), None) => self.live = Some(session),
+            (None, _) => {
+                if self.stop_task.is_none() && self.start_task.is_none() {
+                    // Экран без сессии (тесты, снимки): назад к сценариям.
+                    self.rec = None;
+                    self.phase = Phase::Idle;
+                    self.screen = Screen::Scenarios;
+                }
+            }
+        }
+    }
+
+    /// Комментарий в идущую сессию (FR-23).
+    pub(crate) fn add_note(&mut self, text: &str) {
+        let Some(session) = &self.live else {
+            return;
+        };
+        match session.note(text) {
+            Ok(()) => diag::info("комментарий добавлен в журнал"),
+            Err(err) => diag::error(format!("комментарий не записан: {err}")),
+        }
+    }
+
+    pub(crate) fn dismiss_failure(&mut self) {
+        self.journal_failure = None;
+        self.phase = live::reduce(self.phase, Action::FailureDismissed);
+    }
+
+    /// Старт, отказ журнала и остановка: результаты задач runtime к этому кадру.
+    fn poll_session(&mut self, ctx: &egui::Context) {
+        if let Some(task) = &mut self.start_task
+            && let Some(result) = task.poll()
+        {
+            self.start_task = None;
+            match result {
+                Ok(session) => {
+                    self.phase = live::reduce(self.phase, Action::Started);
+                    diag::info(format!(
+                        "запись идёт: адрес {}, журнал {}",
+                        session.local_addr(),
+                        session.journal_path().display()
+                    ));
+                    let cfg = self
+                        .rec
+                        .take()
+                        .map_or_else(|| self.settings.config.clone(), |rec| rec.config);
+                    self.rec = Some(RecordingView::live(&session, cfg));
+                    self.recorded_path = Some(session.journal_path().to_path_buf());
+                    self.live = Some(session);
+                    self.start_error = None;
+                    self.screen = Screen::Recording;
+                    if self.closing.is_some() {
+                        self.stop_recording(ctx);
+                    }
+                }
+                Err(error) => {
+                    self.phase = live::reduce(self.phase, Action::StartFailed);
+                    self.rec = None;
+                    self.start_failed(error);
+                }
+            }
+        }
+        // Отказ журнала: ядро уже остановило запись, слот освобождается без «Стоп».
+        if self.live.is_some()
+            && let Some(failure) = self.rec.as_ref().and_then(RecordingView::failure)
+        {
+            diag::error(format!(
+                "отказ журнала: {:?}: {}",
+                failure.code, failure.message
+            ));
+            self.stop_recording(ctx);
+            self.phase = live::reduce(self.phase, Action::JournalFailed);
+            self.journal_failure = Some(failure);
+        }
+        if let Some(task) = &mut self.stop_task
+            && let Some(outcome) = task.poll()
+        {
+            self.stop_task = None;
+            crate::recording::log_outcome(&outcome);
+            self.recorded_path = Some(outcome.journal_path.clone());
+            if let Some(failure) = outcome.failure {
+                self.phase = live::reduce(self.phase, Action::JournalFailed);
+                self.journal_failure = Some(failure);
+            } else {
+                self.phase = live::reduce(self.phase, Action::Stopped);
+            }
+            self.rec = None;
+            if self.screen == Screen::Recording {
+                self.screen = Screen::Scenarios;
+                self.preselect_last_card();
+            }
+            self.refresh_recents(ctx);
+        }
+        if self.journal_failure.is_some() && self.screen == Screen::Recording && self.live.is_none()
+        {
+            // Как в UI v2: после отказа — стартовый экран со строкой причины.
+            self.screen = Screen::Scenarios;
+        }
+    }
+
+    /// Закрытие окна во время записи: сначала штатная остановка (журнал заканчивается
+    /// `session_end`), потом окно. Дольше [`live::STOP_WAIT`] окно не ждёт.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        let requested = ctx.input(|i| i.viewport().close_requested());
+        if requested && self.session_busy() && !self.force_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.closing.is_none() {
+                diag::info("закрытие окна во время записи: сначала остановка сессии");
+                self.closing = Some(Instant::now());
+                self.stop_recording(ctx);
+            }
+        }
+        let Some(since) = self.closing else {
+            return;
+        };
+        if !self.session_busy() {
+            diag::info("запись остановлена, окно закрывается");
+            self.closing = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if since.elapsed() >= live::STOP_WAIT {
+            diag::error(format!(
+                "запись не остановилась за {} с: окно закрывается принудительно",
+                live::STOP_WAIT.as_secs()
+            ));
+            self.closing = None;
+            self.force_close = true;
+            FORCED_EXIT.store(true, Ordering::Relaxed);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     pub fn settings(&self) -> &Settings {
@@ -528,19 +832,37 @@ impl BytetapApp {
 
     /// Весь интерфейс: шапка-заголовок окна, предупреждение о настройках и экран.
     pub fn draw(&mut self, ui: &mut Ui) {
-        self.poll_background(&ui.ctx().clone());
+        let ctx = ui.ctx().clone();
+        self.poll_background(&ctx);
         // Края — раньше шапки: нажатие на краю не должно достаться кнопкам под ним.
         titlebar::resize_edges(ui.ctx());
         let p = self.pal();
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0, p.surface_0);
-        self.home_title_bar(ui);
+        let recording = self.screen == Screen::Recording && self.rec.is_some();
+        if recording {
+            // Шапка, трасса, панель и лента стоят вплотную, как в UI v2.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            self.recording_title_bar(ui);
+        } else {
+            self.home_title_bar(ui);
+        }
+        self.failure_notice(ui);
         self.settings_warning(ui);
-        egui::ScrollArea::vertical()
-            .id_salt("screen")
-            .auto_shrink(false)
-            .show(ui, |ui| self.screen_body(ui));
-        self.profile_prompt(ui.ctx());
+        if recording {
+            self.recording_screen(ui);
+            if self.live.is_some() {
+                // Пульс точки «Стоп» и таймер: ~30 кадров в секунду только во время записи.
+                ctx.request_repaint_after(live::FRAME);
+            }
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("screen")
+                .auto_shrink(false)
+                .show(ui, |ui| self.screen_body(ui));
+        }
+        self.profile_prompt(&ctx);
+        self.note_prompt(&ctx);
     }
 
     /// Строка под шапкой о сброшенных настройках, как в Tauri-версии.
@@ -584,23 +906,16 @@ impl BytetapApp {
         match self.screen {
             Screen::Scenarios => self.scenarios(ui),
             Screen::Step(mode) => self.step(ui, mode),
+            // Запись без экрана записи не бывает: запись идёт со своей шапкой.
             Screen::Recording | Screen::Viewing => self.placeholder(ui),
         }
     }
 
-    /// Запись и просмотр — шаги 3 и 4 этапа: пока заголовок, путь журнала и «← Сценарии».
+    /// Просмотр — шаг 4 этапа: пока заголовок, путь журнала и «← Сценарии».
     fn placeholder(&mut self, ui: &mut Ui) {
         let p = self.pal();
-        let title = if self.screen == Screen::Recording {
-            t!("screen.recording")
-        } else {
-            t!("screen.viewing")
-        };
-        let path = self
-            .viewing
-            .as_ref()
-            .filter(|_| self.screen == Screen::Viewing)
-            .map(|path| path.display().to_string());
+        let title = t!("screen.viewing");
+        let path = self.viewing.as_ref().map(|path| path.display().to_string());
         let ctx = ui.ctx().clone();
         centered(ui, 512.0, |ui| {
             ui.add_space(SPACE_4);
@@ -649,7 +964,22 @@ pub fn resolve_dark(mode: ThemeMode, system: Option<Theme>) -> bool {
     }
 }
 
+/// Источник сессии для журнала запуска.
+fn describe(source: &Source) -> String {
+    match source {
+        Source::TcpServer { listen } => format!("tcp_server {listen}"),
+        Source::TcpClient { addr, .. } => format!("tcp_client {addr}"),
+        Source::Serial { settings, .. } => format!("serial {} {}", settings.port, settings.baud),
+    }
+}
+
 impl eframe::App for BytetapApp {
+    /// Каждый кадр, и когда окно свёрнуто: итоги задач записи и закрытие окна.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_session(ctx);
+        self.handle_close(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.ready

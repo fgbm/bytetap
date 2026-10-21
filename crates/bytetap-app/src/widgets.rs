@@ -273,6 +273,16 @@ pub fn menu_item(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -> Respons
     response
 }
 
+/// Разделитель пунктов меню: линия `border-faint` с отступами 4px.
+pub fn menu_separator(ui: &mut Ui, p: &Palette) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 9.0), Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        Stroke::new(1.0, p.border_faint),
+    );
+}
+
 /// Размер текста кнопки с иконкой: ширина содержимого и галерея текста.
 fn label_galley(ui: &Ui, text: &str, size: f32, color: Color32) -> std::sync::Arc<egui::Galley> {
     ui.painter()

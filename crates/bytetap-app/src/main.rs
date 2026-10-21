@@ -2,7 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use bytetap_app::settings::{Settings, Store, WindowState};
-use bytetap_app::{BytetapApp, WINDOW_MIN_SIZE, WINDOW_SIZE, diag, gpu, placement, t};
+use bytetap_app::{
+    AUTOSTART_ENV, BytetapApp, FORCED_EXIT, WINDOW_MIN_SIZE, WINDOW_SIZE, diag, gpu, placement, t,
+};
 use eframe::egui;
 
 fn main() {
@@ -49,6 +51,19 @@ fn main() {
         ));
     }
     let maximized = settings.window.is_some_and(|w| w.maximized);
+    // Один runtime на приложение: сессия записи и приёмник ленты живут в нём, окно не
+    // ждёт ввод-вывод.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("bytetap-session")
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => diag::fatal(&t!("diag.startFailed", reason = err)),
+    };
+    let handle = runtime.handle().clone();
+    let autostart = std::env::var(AUTOSTART_ENV).ok();
     let options = eframe::NativeOptions {
         viewport: viewport(settings.window.as_ref()),
         renderer: eframe::Renderer::Wgpu,
@@ -63,12 +78,21 @@ fn main() {
         "bytetap",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(
-                BytetapApp::new(&cc.egui_ctx, settings, warning, store)
-                    .with_window_restore(position, maximized),
-            ))
+            let mut app = BytetapApp::new(&cc.egui_ctx, settings, warning, store)
+                .with_window_restore(position, maximized)
+                .with_runtime(handle);
+            if let Some(spec) = autostart {
+                app = app.with_test_autostart(&cc.egui_ctx, &spec);
+            }
+            Ok(Box::new(app))
         }),
     );
+    // Сессия, которую окно не дождалось, получает сигнал остановки; ждать её дольше
+    // нельзя — пользователь уже закрыл окно.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    if FORCED_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
+        diag::show_error(t!("record.closeTimeout"));
+    }
     if let Err(err) = result {
         let wgpu_failed = matches!(err, eframe::Error::Wgpu(_));
         if gpu::retry_with_warp(

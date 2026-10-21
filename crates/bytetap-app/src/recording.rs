@@ -1,0 +1,1518 @@
+//! Экран записи (M3-UI-AC4…AC8, U1-AC14…AC17): шапка с «Стоп», сводкой и счётчиками,
+//! строка отказа журнала, трасса, панель ленты и виртуализированная лента.
+//!
+//! Лента — зеркало общего буфера [`live::SharedFeed`]: каждый кадр окно забирает только
+//! новые события (без копирования всей ленты) и дописывает их в свой индекс строк. Кадр
+//! рисует только видимые строки (`show_rows`); высота строки фиксирована, в HEX-виде
+//! событие занимает по строке на 16 байт.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bytetap_core::journal::{ClosedBy, Dir, JournalFailureReason, Stats};
+use bytetap_core::session::SessionCounters;
+use eframe::egui::{
+    self, Align, Align2, Color32, CursorIcon, Frame, Id, Key, Layout, Popup, Rect, RectAlign,
+    RichText, Role, ScrollArea, Sense, Stroke, TextEdit, TextFormat, Ui, UiBuilder, WidgetInfo,
+    epaint::Shadow, pos2, text::LayoutJob, text::TextWrapping, vec2,
+};
+use tokio::sync::watch;
+
+use crate::app::BytetapApp;
+use crate::feed::{self, Detected, ENCODINGS, FeedEvent, FeedKind, FeedRing, HexLine, Segment};
+use crate::icons::{self, Icon};
+use crate::live::{self, JournalFailure, JournalFailureCode, SharedFeed};
+use crate::settings::{AppConfig, Encoding, FeedView, Responder, SessionMode};
+use crate::theme::tokens::{
+    RADIUS_CHIP, RADIUS_PANEL, RADIUS_RECORD, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_2XS,
+    TEXT_BASE, TEXT_DATA, TEXT_XS,
+};
+use crate::theme::{self, Palette, mix, radius};
+use crate::{diag, t, trace, widgets};
+
+/// Высота строки ленты в виде «Текст».
+pub const TEXT_ROW_HEIGHT: f32 = 28.0;
+/// Высота строки HEX-дампа.
+pub const HEX_ROW_HEIGHT: f32 = 25.0;
+/// Высота панели над лентой.
+const BAR_HEIGHT: f32 = 32.0;
+/// Колонка времени.
+const TIME_WIDTH: f32 = 94.0;
+/// Колонка глифа направления.
+const ARROW_WIDTH: f32 = 12.0;
+/// Колонка номера соединения.
+const CONN_WIDTH: f32 = 24.0;
+/// Период пульса точки «Стоп» (`--bt-pulse-duration`).
+const PULSE_PERIOD: f64 = 1.6;
+
+/// Индекс строк ленты: номер события и номер его первой строки.
+///
+/// Номера строк сквозные с начала индекса: вытеснение старых событий снимает записи
+/// спереди, новые дописываются сзади. Строка экрана — смещение от первой записи.
+#[derive(Debug, Default)]
+pub struct RowIndex {
+    entries: VecDeque<(u64, u64)>,
+    end: u64,
+    hex: bool,
+    filter: Option<u32>,
+}
+
+impl RowIndex {
+    pub fn new(hex: bool, filter: Option<u32>) -> Self {
+        Self {
+            hex,
+            filter,
+            ..Self::default()
+        }
+    }
+
+    /// Дописывает событие, если оно проходит фильтр соединения.
+    pub fn push(&mut self, seq: u64, event: &FeedEvent) {
+        if !feed::passes(event, self.filter) {
+            return;
+        }
+        let lines = if self.hex { event.hex_lines() } else { 1 };
+        self.entries.push_back((seq, self.end));
+        self.end += lines as u64;
+    }
+
+    /// Снимает события старше `first_seq`: их уже нет в буфере.
+    pub fn evict_before(&mut self, first_seq: u64) {
+        while self
+            .entries
+            .front()
+            .is_some_and(|(seq, _)| *seq < first_seq)
+        {
+            self.entries.pop_front();
+        }
+    }
+
+    /// Сколько строк в ленте.
+    pub fn rows(&self) -> usize {
+        self.entries
+            .front()
+            .map_or(0, |(_, start)| (self.end - start) as usize)
+    }
+
+    /// Событие и номер строки внутри него для строки экрана `row`.
+    pub fn locate(&self, row: usize) -> Option<(u64, usize)> {
+        let base = self.entries.front()?.1;
+        let line = base + row as u64;
+        if line >= self.end {
+            return None;
+        }
+        let index = self.entries.partition_point(|(_, start)| *start <= line) - 1;
+        let (seq, start) = self.entries[index];
+        Some((seq, (line - start) as usize))
+    }
+
+    /// Индекс заново: другой вид или фильтр.
+    pub fn rebuild(ring: &FeedRing, hex: bool, filter: Option<u32>) -> Self {
+        let mut index = Self::new(hex, filter);
+        for (seq, event) in ring.since(0) {
+            index.push(seq, event);
+        }
+        index
+    }
+}
+
+/// Что показывает экран записи: зеркало ленты, индекс строк, прокрутка и сводка.
+pub struct RecordingView {
+    shared: SharedFeed,
+    feed: FeedRing,
+    /// Сколько событий каждого соединения в буфере: фильтр и колонка номера.
+    conns: BTreeMap<u32, usize>,
+    detected: Option<Detected>,
+    rows: RowIndex,
+    dropped: u64,
+    /// Догон новых строк; прокрутка вверх выключает.
+    follow: bool,
+    /// Сколько событий пришло после прокрутки вверх — «↓ N новых».
+    pending: u64,
+    filter: Option<u32>,
+    jump_bottom: bool,
+    counters: Option<SessionCounters>,
+    fixed_stats: Stats,
+    started: Instant,
+    fixed_elapsed: Option<Duration>,
+    /// Настройки, с которыми запись запущена: сводка режима в шапке.
+    pub(crate) config: AppConfig,
+    /// Фактический адрес слушателя TCP-сервера или адрес анализатора.
+    pub(crate) local_addr: String,
+    pub(crate) journal_path: Option<PathBuf>,
+    failure: Option<watch::Receiver<Option<JournalFailureReason>>>,
+}
+
+/// Синтетическая запись для снимков и тестов: события, счётчики и время без сессии.
+#[derive(Clone, Debug, Default)]
+pub struct RecordingFixture {
+    pub events: Vec<bytetap_core::journal::Event>,
+    pub stats: Stats,
+    pub elapsed: Duration,
+    pub local_addr: String,
+    pub journal_path: Option<PathBuf>,
+    pub dropped: u64,
+}
+
+impl RecordingView {
+    fn new(shared: SharedFeed, config: AppConfig, local_addr: String) -> Self {
+        Self {
+            shared,
+            feed: FeedRing::default(),
+            conns: BTreeMap::new(),
+            detected: None,
+            rows: RowIndex::default(),
+            dropped: 0,
+            follow: true,
+            pending: 0,
+            filter: None,
+            jump_bottom: false,
+            counters: None,
+            fixed_stats: Stats::default(),
+            started: Instant::now(),
+            fixed_elapsed: None,
+            config,
+            local_addr,
+            journal_path: None,
+            failure: None,
+        }
+    }
+
+    /// Экран идущей сессии.
+    pub fn live(session: &live::LiveSession, config: AppConfig) -> Self {
+        let mut view = Self::new(session.feed(), config, session.local_addr().to_owned());
+        view.counters = Some(session.counters());
+        view.journal_path = Some(session.journal_path().to_path_buf());
+        view.failure = Some(session.failure_watch());
+        view
+    }
+
+    /// Экран без сессии: старт без runtime (тесты) — пустая лента.
+    pub fn detached(config: AppConfig) -> Self {
+        Self::new(SharedFeed::default(), config, String::new())
+    }
+
+    pub fn fixture(fixture: RecordingFixture, config: AppConfig) -> Self {
+        let shared = SharedFeed::default();
+        {
+            let mut ring = live::lock(&shared);
+            for event in &fixture.events {
+                if let Some(event) = FeedEvent::from_session(event) {
+                    ring.push(Arc::new(event));
+                }
+            }
+            ring.lagged(fixture.dropped);
+        }
+        let mut view = Self::new(shared, config, fixture.local_addr);
+        view.fixed_stats = fixture.stats;
+        view.fixed_elapsed = Some(fixture.elapsed);
+        view.journal_path = fixture.journal_path;
+        view
+    }
+
+    /// Общий буфер ленты: тесты дописывают в него события.
+    pub fn shared(&self) -> SharedFeed {
+        Arc::clone(&self.shared)
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.counters
+            .as_ref()
+            .map_or_else(|| self.fixed_stats.clone(), SessionCounters::snapshot)
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.fixed_elapsed.unwrap_or_else(|| self.started.elapsed())
+    }
+
+    /// Отказ журнала, о котором сообщило ядро.
+    pub fn failure(&self) -> Option<JournalFailure> {
+        let watch = self.failure.as_ref()?;
+        watch.borrow().as_ref().map(JournalFailure::new)
+    }
+
+    /// Фактический адрес слушателя TCP-сервера или адрес анализатора.
+    pub fn local_addr(&self) -> &str {
+        &self.local_addr
+    }
+
+    pub fn follow(&self) -> bool {
+        self.follow
+    }
+
+    pub fn pending(&self) -> u64 {
+        self.pending
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows.rows()
+    }
+
+    pub fn len(&self) -> usize {
+        self.feed.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.feed.is_empty()
+    }
+
+    /// Номера соединений в буфере по возрастанию.
+    pub fn conns(&self) -> Vec<u32> {
+        self.conns.keys().copied().collect()
+    }
+
+    pub fn set_filter(&mut self, filter: Option<u32>) {
+        if self.filter != filter {
+            self.filter = filter;
+            self.rows = RowIndex::rebuild(&self.feed, self.rows.hex, filter);
+        }
+    }
+
+    /// Забирает из общего буфера только новые события; возвращает, сколько пришло.
+    pub fn sync(&mut self, hex: bool) -> u64 {
+        if self.rows.hex != hex {
+            self.rows = RowIndex::rebuild(&self.feed, hex, self.filter);
+        }
+        let shared = live::lock(&self.shared);
+        self.dropped = shared.dropped();
+        if self.feed.next_seq() < shared.first_seq() {
+            // Окно отстало больше чем на буфер: зеркало начинается заново с общего.
+            self.feed = FeedRing::starting_at(shared.first_seq());
+            self.conns.clear();
+            self.rows = RowIndex::new(hex, self.filter);
+        }
+        let mut added = 0;
+        let new: Vec<(u64, Arc<FeedEvent>)> = shared
+            .since(self.feed.next_seq())
+            .map(|(seq, event)| (seq, Arc::clone(event)))
+            .collect();
+        drop(shared);
+        for (seq, event) in new {
+            if self.detected.is_none() {
+                self.detected = feed::detect(&event);
+            }
+            if let Some(conn) = event.conn {
+                *self.conns.entry(conn).or_default() += 1;
+            }
+            self.rows.push(seq, &event);
+            if let Some(evicted) = self.feed.push(event)
+                && let Some(conn) = evicted.conn
+                && let Some(count) = self.conns.get_mut(&conn)
+            {
+                *count -= 1;
+                if *count == 0 {
+                    self.conns.remove(&conn);
+                }
+            }
+            added += 1;
+        }
+        self.rows.evict_before(self.feed.first_seq());
+        if self
+            .filter
+            .is_some_and(|conn| !self.conns.contains_key(&conn))
+        {
+            // Выбранное соединение ушло из буфера — фильтр снимается.
+            self.set_filter(None);
+        }
+        if !self.follow {
+            self.pending += added;
+        }
+        added
+    }
+
+    /// Сводка режима в шапке: «жду на :5000 · HL7 (авто)», «COM5 · 9600 8N1».
+    pub fn summary(&self, stats: &Stats) -> String {
+        let cfg = &self.config;
+        match cfg.mode {
+            SessionMode::TcpClient => t!(
+                "record.connectedTo",
+                addr = format!("{}:{}", cfg.connect_host, cfg.connect_port),
+                responder = self.responder_name()
+            ),
+            SessionMode::Serial => format!(
+                "{} · {} {}",
+                cfg.serial.port,
+                cfg.serial.baud,
+                crate::form::serial_format(&cfg.serial)
+            ),
+            SessionMode::TcpServer => {
+                // Порт 0 выбирает система: в сводке — тот, что занят на самом деле.
+                let port = self
+                    .local_addr
+                    .rsplit_once(':')
+                    .map_or_else(|| cfg.listen_port.to_string(), |(_, port)| port.to_owned());
+                let port = format!(":{port}");
+                if stats.connections > 0 {
+                    t!(
+                        "record.onPort",
+                        port = port,
+                        responder = self.responder_name()
+                    )
+                } else {
+                    t!(
+                        "record.waitingOn",
+                        port = port,
+                        responder = self.responder_name()
+                    )
+                }
+            }
+        }
+    }
+
+    fn responder_name(&self) -> &'static str {
+        match self.config.responder {
+            Responder::Hl7 => t!("record.responderHl7"),
+            Responder::Astm => t!("record.responderAstm"),
+            Responder::None => t!("record.responderNone"),
+            Responder::Auto => match self.detected {
+                Some(Detected::Hl7) => t!("record.responderAutoHl7"),
+                Some(Detected::Astm) => t!("record.responderAutoAstm"),
+                _ => t!("record.responderAuto"),
+            },
+        }
+    }
+}
+
+/// Байты: «512 Б», «10,2 КБ», «1,2 МБ» (FR-25, счётчики в шапке записи).
+pub fn format_bytes(bytes: u64) -> String {
+    const NBSP: char = '\u{a0}';
+    let size = |value: f64, unit: &str| {
+        let rounded = (value * 10.0).round() / 10.0;
+        let number = if rounded.fract() == 0.0 {
+            format!("{rounded:.0}")
+        } else {
+            format!("{rounded:.1}").replace('.', ",")
+        };
+        format!("{number}{NBSP}{unit}")
+    };
+    let value = bytes as f64;
+    if value >= 1024f64.powi(3) {
+        size(value / 1024f64.powi(3), t!("units.gigabytes"))
+    } else if value >= 1024f64.powi(2) {
+        size(value / 1024f64.powi(2), t!("units.megabytes"))
+    } else if value >= 1024.0 {
+        size(value / 1024.0, t!("units.kilobytes"))
+    } else {
+        format!("{bytes}{NBSP}{}", t!("units.bytes"))
+    }
+}
+
+/// Причина отказа журнала человеческой фразой.
+pub fn failure_reason(code: JournalFailureCode) -> &'static str {
+    match code {
+        JournalFailureCode::DiskFull => t!("banner.journalFailureReasons.disk_full"),
+        JournalFailureCode::PermissionDenied => {
+            t!("banner.journalFailureReasons.permission_denied")
+        }
+        JournalFailureCode::NotFound => t!("banner.journalFailureReasons.not_found"),
+        JournalFailureCode::Network => t!("banner.journalFailureReasons.network"),
+        JournalFailureCode::Busy => t!("banner.journalFailureReasons.busy"),
+        JournalFailureCode::Timeout => t!("banner.journalFailureReasons.timeout"),
+        JournalFailureCode::Io => t!("banner.journalFailureReasons.io"),
+    }
+}
+
+/// Текст события `error`/`info` по коду; неизвестный код — английский `message` журнала.
+pub fn event_text(code: Option<&str>, message: &str) -> String {
+    let text = match code {
+        Some("accept_failed") => t!("events.accept_failed"),
+        Some("connect_failed") => t!("events.connect_failed"),
+        Some("serial_open_failed") => t!("events.serial_open_failed"),
+        Some("connection_read_failed") => t!("events.connection_read_failed"),
+        Some("connection_write_failed") => t!("events.connection_write_failed"),
+        Some("answer_timeout") => t!("events.answer_timeout"),
+        Some("journal_failure") => t!("events.journal_failure"),
+        Some("protocol_undetected") => t!("events.protocol_undetected"),
+        _ => message,
+    };
+    text.to_owned()
+}
+
+fn closed_by(by: ClosedBy) -> &'static str {
+    match by {
+        ClosedBy::Analyzer => t!("feed.byAnalyzer"),
+        ClosedBy::Lis => t!("feed.byLis"),
+        ClosedBy::Bytetap => t!("feed.byApp"),
+    }
+}
+
+/// Вид строки: цвет текста и шрифт служебных строк — как классы `svc`, `ev`, `err`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowClass {
+    Data(Dir),
+    Service,
+    Event,
+    Error,
+}
+
+/// Текст служебной строки (у фрагмента текст идёт сегментами).
+fn row_text(event: &FeedEvent) -> (RowClass, String) {
+    let conn = event.conn.unwrap_or_default();
+    match &event.kind {
+        FeedKind::Data(data) => (RowClass::Data(data.dir), String::new()),
+        FeedKind::Open { peer } => (
+            RowClass::Service,
+            t!("feed.opened", conn = conn, peer = peer),
+        ),
+        FeedKind::Close { by } => (
+            RowClass::Service,
+            t!("feed.closedSimple", conn = conn, by = closed_by(*by)),
+        ),
+        FeedKind::Error { code, message } => {
+            (RowClass::Error, event_text(code.as_deref(), message))
+        }
+        FeedKind::Info { code, message } => (RowClass::Event, event_text(code.as_deref(), message)),
+        FeedKind::Note { text } => (RowClass::Event, text.clone()),
+    }
+}
+
+fn encoding_label(encoding: Encoding) -> &'static str {
+    match encoding {
+        Encoding::Ascii => t!("feed.encAscii"),
+        Encoding::Cp1251 => t!("feed.encCp1251"),
+        Encoding::Utf8 => t!("feed.encUtf8"),
+        Encoding::Gbk => t!("feed.encGbk"),
+        Encoding::Latin1 => t!("feed.encLatin1"),
+    }
+}
+
+fn view_label(view: FeedView) -> &'static str {
+    match view {
+        FeedView::Text => t!("feed.viewText"),
+        FeedView::Hex => t!("feed.viewHex"),
+    }
+}
+
+fn glyph(dir: Dir) -> &'static str {
+    match dir {
+        Dir::AnalyzerToLis => "→",
+        Dir::LisToAnalyzer => "←",
+    }
+}
+
+fn dir_color(p: &Palette, dir: Dir) -> Color32 {
+    match dir {
+        Dir::AnalyzerToLis => p.dir_a2l,
+        Dir::LisToAnalyzer => p.dir_l2a,
+    }
+}
+
+fn format(font: egui::FontId, color: Color32) -> TextFormat {
+    TextFormat {
+        font_id: font,
+        color,
+        valign: Align::Center,
+        ..Default::default()
+    }
+}
+
+/// Текст в одну строку, обрезанный «…» по ширине.
+fn truncated(ui: &Ui, mut job: LayoutJob, width: f32) -> Arc<egui::Galley> {
+    job.wrap = TextWrapping::truncate_at_width(width.max(0.0));
+    ui.painter().layout_job(job)
+}
+
+impl BytetapApp {
+    /// Шапка записи: бренд, «Стоп» с таймером, сводка; справа счётчики и меню «…».
+    pub(crate) fn recording_title_bar(&mut self, ui: &mut Ui) {
+        let Some(rec) = &self.rec else {
+            return;
+        };
+        let stats = rec.stats();
+        let summary = rec.summary(&stats);
+        let elapsed = rec.elapsed().as_secs();
+        self.title_bar(
+            ui,
+            |app, ui| {
+                app.brand(ui);
+                let p = app.pal();
+                if stop_pill(ui, &p, &feed::format_duration(elapsed)).clicked() {
+                    let ctx = ui.ctx().clone();
+                    app.stop_recording(&ctx);
+                }
+                let width = (ui.ctx().content_rect().width() * 0.42).min(ui.available_width());
+                let job = LayoutJob::single_section(
+                    summary.clone(),
+                    format(theme::sans(TEXT_DATA), p.text_muted),
+                );
+                let galley = truncated(ui, job, width);
+                let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+                response.widget_info(|| WidgetInfo::labeled(Role::Label, true, &summary));
+                ui.painter().galley(rect.min, galley, p.text_muted);
+            },
+            |app, ui| {
+                let p = app.pal();
+                app.recording_menu(ui, &p);
+                counters(ui, &p, &stats);
+            },
+        );
+    }
+
+    /// Меню «…» записи: комментарий, папка журналов, путь к журналу, тема.
+    fn recording_menu(&mut self, ui: &mut Ui, p: &Palette) {
+        let button = widgets::icon_button(ui, p, Icon::Ellipsis, 16.0, t!("record.menu"));
+        let mut note = false;
+        let mut folder = false;
+        let mut copy = false;
+        let mut theme = false;
+        let journal = self.rec.as_ref().and_then(|rec| rec.journal_path.clone());
+        let theme_text = if self.dark() {
+            t!("theme.toLight")
+        } else {
+            t!("theme.toDark")
+        };
+        Popup::menu(&button)
+            .id(Id::unique("bt-recording-menu"))
+            .align(RectAlign::BOTTOM_END)
+            .width(232.0)
+            .gap(4.0)
+            .show(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                note =
+                    widgets::menu_item(ui, p, t!("record.addNote"), self.live.is_some()).clicked();
+                folder = widgets::menu_item(ui, p, t!("header.openFolder"), true).clicked();
+                copy =
+                    widgets::menu_item(ui, p, t!("record.copyPath"), journal.is_some()).clicked();
+                widgets::menu_separator(ui, p);
+                theme = widgets::menu_item(ui, p, theme_text, true).clicked();
+            });
+        let ctx = ui.ctx().clone();
+        if note {
+            self.note_prompt = Some(String::new());
+        }
+        if folder {
+            self.open_log_dir(&ctx);
+        }
+        if copy && let Some(path) = journal {
+            ctx.copy_text(path.display().to_string());
+        }
+        if theme {
+            self.toggle_theme(&ctx);
+        }
+    }
+
+    /// Отказ журнала: строка причины цветом `danger` и два текстовых действия.
+    pub(crate) fn failure_notice(&mut self, ui: &mut Ui) {
+        let Some(failure) = &self.journal_failure else {
+            return;
+        };
+        let p = self.pal();
+        let text = t!(
+            "banner.journalFailureTitleWith",
+            reason = failure_reason(failure.code)
+        );
+        let recorded = self.recorded_path.clone();
+        let mut choose = false;
+        let mut open = false;
+        Frame::new()
+            .inner_margin(egui::Margin::symmetric(SPACE_3 as i8, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = SPACE_2;
+                    let (rect, _) = ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
+                    icons::paint(ui, Icon::CircleAlert, rect.center(), 15.0, p.danger);
+                    let label = ui.label(RichText::new(&text).size(TEXT_XS).color(p.danger));
+                    label.widget_info(|| WidgetInfo::labeled(Role::Alert, true, &text));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = SPACE_2;
+                        // Справа налево: «Открыть записанное» крайняя справа.
+                        open = text_action(ui, &p, t!("banner.openRecorded"), recorded.is_some())
+                            .clicked();
+                        choose = text_action(ui, &p, t!("banner.chooseOtherDir"), true).clicked();
+                    });
+                });
+            });
+        let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().hline(
+            line.x_range(),
+            line.center().y,
+            Stroke::new(1.0, p.border_faint),
+        );
+        let ctx = ui.ctx().clone();
+        if choose {
+            self.pick_log_dir(&ctx);
+        }
+        if open && let Some(path) = recorded {
+            self.dismiss_failure();
+            self.open_journal(path);
+        }
+    }
+
+    /// Тело экрана записи под шапкой: трасса, панель ленты, лента.
+    pub(crate) fn recording_screen(&mut self, ui: &mut Ui) {
+        let p = self.pal();
+        let hex = self.settings.feed.view == FeedView::Hex;
+        let encoding = self.settings.feed.encoding;
+        let Some(rec) = &mut self.rec else {
+            return;
+        };
+        let added = rec.sync(hex);
+        let now_us = u64::try_from(rec.elapsed().as_micros()).unwrap_or(u64::MAX);
+        trace::show(ui, &p, &rec.feed, now_us);
+        let mut view = self.settings.feed.view;
+        let mut chosen_encoding = encoding;
+        feed_bar(ui, &p, rec, &mut view, &mut chosen_encoding);
+        feed_list(ui, &p, rec, hex, encoding, added);
+        if view != self.settings.feed.view || chosen_encoding != encoding {
+            let feed = &mut self.settings_mut().feed;
+            feed.view = view;
+            feed.encoding = chosen_encoding;
+            self.save_settings();
+        }
+    }
+
+    /// Комментарий во время записи (FR-23): Ctrl+Enter или «Добавить», Escape — отмена.
+    pub(crate) fn note_prompt(&mut self, ctx: &egui::Context) {
+        let Some(mut text) = self.note_prompt.take() else {
+            return;
+        };
+        let p = self.pal();
+        let mut confirm = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(Id::unique("bt-note-prompt"))
+            .frame(
+                Frame::new()
+                    .fill(p.surface_0)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(radius(RADIUS_PANEL))
+                    .inner_margin(SPACE_4),
+            )
+            .backdrop_color(p.text.gamma_multiply(0.35))
+            .show(ctx, |ui| {
+                ui.set_width(388.0);
+                ui.spacing_mut().item_spacing.y = SPACE_3;
+                ui.label(
+                    RichText::new(t!("actions.noteTitle"))
+                        .font(theme::sans_semibold(TEXT_BASE))
+                        .color(p.text),
+                );
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = SPACE_1;
+                    let label = widgets::field_label(ui, &p, t!("actions.note"));
+                    let id = Id::unique("bt-note-text");
+                    let focused = ui.memory(|m| m.has_focus(id));
+                    let response = ui
+                        .add(
+                            TextEdit::multiline(&mut text)
+                                .id(id)
+                                .font(theme::sans(TEXT_XS + 1.0))
+                                .text_color(p.text)
+                                .hint_text(
+                                    RichText::new(t!("actions.notePlaceholder"))
+                                        .color(p.text_faint),
+                                )
+                                .frame(
+                                    Frame::new()
+                                        .fill(p.surface_0)
+                                        .stroke(Stroke::new(
+                                            1.0,
+                                            if focused { p.ctrl } else { p.border },
+                                        ))
+                                        .corner_radius(radius(crate::theme::tokens::RADIUS_CONTROL))
+                                        .inner_margin(egui::Margin::symmetric(9, 8)),
+                                )
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(4),
+                        )
+                        .labelled_by(label.id);
+                    if ui.memory(|m| m.focused().is_none()) {
+                        response.request_focus();
+                    }
+                    if ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter)) {
+                        confirm = true;
+                    }
+                });
+                let filled = !text.trim().is_empty();
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = SPACE_2;
+                    let buttons = widgets::confirm_button_width(ui, t!("actions.noteAdd"))
+                        + SPACE_2
+                        + widgets::chip_button_width(ui, false, t!("actions.cancel"));
+                    ui.add_space((ui.available_width() - buttons - SPACE_2).max(0.0));
+                    confirm |=
+                        widgets::confirm_button(ui, &p, t!("actions.noteAdd"), filled).clicked();
+                    cancel =
+                        widgets::chip_button(ui, &p, None, t!("actions.cancel"), true).clicked();
+                });
+            });
+        if modal.should_close() {
+            cancel = true;
+        }
+        if confirm && !text.trim().is_empty() {
+            self.add_note(&text);
+        } else if !cancel {
+            self.note_prompt = Some(text);
+        }
+    }
+}
+
+/// Текстовое действие строки отказа: `danger`, подчёркивание при наведении.
+fn text_action(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -> egui::Response {
+    let color = if enabled {
+        p.danger
+    } else {
+        mix(p.surface_0, p.danger, 0.45)
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), theme::sans_medium(TEXT_XS), color);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(galley.size() + vec2(8.0, 6.0), sense);
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, text));
+    let hovered = enabled && response.hovered();
+    let text_rect = Rect::from_center_size(rect.center(), galley.size());
+    ui.painter().galley(text_rect.min, galley, color);
+    if hovered {
+        ui.painter().hline(
+            text_rect.x_range(),
+            text_rect.bottom(),
+            Stroke::new(1.0, color),
+        );
+    }
+    if enabled {
+        response.on_hover_cursor(CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// Пилюля «Стоп»: пульсирующая точка, слово и таймер, 28px.
+fn stop_pill(ui: &mut Ui, p: &Palette, timer: &str) -> egui::Response {
+    let label = ui.painter().layout_no_wrap(
+        t!("record.stop").to_owned(),
+        theme::sans_semibold(TEXT_XS),
+        p.rec_fg,
+    );
+    let time = ui
+        .painter()
+        .layout_no_wrap(timer.to_owned(), theme::mono_medium(TEXT_XS), p.rec_fg);
+    let width = 8.0 + 9.0 + 7.0 + label.size().x + 7.0 + time.size().x + 10.0;
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+    let name = format!("{} {timer}", t!("record.stop"));
+    response.widget_info(|| WidgetInfo::labeled(Role::Button, true, &name));
+    let corner = radius(RADIUS_RECORD.min(127.0));
+    let fill = if response.hovered() {
+        mix(p.rec_bg, p.rec_fg, 0.12)
+    } else {
+        p.rec_bg
+    };
+    ui.painter().rect_filled(rect, corner, fill);
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            corner,
+            Stroke::new(1.0, p.ctrl),
+            egui::StrokeKind::Outside,
+        );
+    }
+    let center = pos2(rect.left() + 8.0 + 4.5, rect.center().y);
+    // Пульс как `bt-pulse`: кольцо растёт до 7px и гаснет за 70% периода.
+    let phase = (ui.input(|i| i.time) % PULSE_PERIOD / PULSE_PERIOD) as f32;
+    let grow = (phase / 0.7).min(1.0);
+    if grow < 1.0 {
+        ui.painter().circle_filled(
+            center,
+            4.5 + 7.0 * grow,
+            p.rec.gamma_multiply(0.6 * (1.0 - grow)),
+        );
+    }
+    ui.painter().circle_filled(center, 4.5, p.rec);
+    let x = rect.left() + 8.0 + 9.0 + 7.0;
+    let lw = label.size().x;
+    ui.painter().galley(
+        pos2(x, rect.center().y - label.size().y / 2.0),
+        label,
+        p.rec_fg,
+    );
+    ui.painter().galley(
+        pos2(x + lw + 7.0, rect.center().y - time.size().y / 2.0),
+        time,
+        p.rec_fg,
+    );
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Счётчики «→ 629 Б ← 195 Б 2 соед.»: стрелки цветом направления, моно 12px.
+fn counters(ui: &mut Ui, p: &Palette, stats: &Stats) {
+    let font = theme::mono(TEXT_XS);
+    let mut job = LayoutJob::default();
+    job.append("→ ", 0.0, format(font.clone(), p.dir_a2l));
+    job.append(
+        &format_bytes(stats.bytes_analyzer_to_lis),
+        0.0,
+        format(font.clone(), p.text),
+    );
+    job.append("← ", SPACE_3, format(font.clone(), p.dir_l2a));
+    job.append(
+        &format_bytes(stats.bytes_lis_to_analyzer),
+        0.0,
+        format(font.clone(), p.text),
+    );
+    job.append(
+        &format!("{} {}", stats.connections, t!("record.connShort")),
+        SPACE_3,
+        format(font, p.text_faint),
+    );
+    let text = format!(
+        "→ {} ← {} {} {}",
+        format_bytes(stats.bytes_analyzer_to_lis),
+        format_bytes(stats.bytes_lis_to_analyzer),
+        stats.connections,
+        t!("record.connShort")
+    );
+    let galley = ui.painter().layout_job(job);
+    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+    response.widget_info(|| WidgetInfo::labeled(Role::Label, true, &text));
+    ui.painter().galley(rect.min, galley, p.text);
+}
+
+/// Кнопка панели ленты: текст 12px `text-muted` и шеврон, 24px.
+fn bar_button(ui: &mut Ui, p: &Palette, text: &str, name: &str) -> egui::Response {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), theme::sans(TEXT_XS), p.text_muted);
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(6.0 + galley.size().x + 4.0 + 12.0 + 6.0, 24.0),
+        Sense::click(),
+    );
+    response.widget_info(|| {
+        let mut info = WidgetInfo::labeled(Role::ComboBox, true, name);
+        info.current_text_value = Some(text.to_owned());
+        info
+    });
+    let hovered = response.hovered() || response.has_focus();
+    if hovered {
+        ui.painter().rect_filled(rect, radius(RADIUS_CHIP), p.hover);
+    }
+    let color = if hovered { p.text } else { p.text_muted };
+    let x = rect.left() + 6.0;
+    ui.painter().galley(
+        pos2(x, rect.center().y - galley.size().y / 2.0),
+        galley.clone(),
+        color,
+    );
+    icons::paint(
+        ui,
+        Icon::ChevronDown,
+        pos2(x + galley.size().x + 4.0 + 6.0, rect.center().y),
+        12.0,
+        color,
+    );
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Панель 32px над лентой: вид, кодировка (только текст), пропущенное и фильтр.
+fn feed_bar(
+    ui: &mut Ui,
+    p: &Palette,
+    rec: &mut RecordingView,
+    view: &mut FeedView,
+    encoding: &mut Encoding,
+) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), BAR_HEIGHT), Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        Stroke::new(1.0, p.border_faint),
+    );
+    let inner = rect.shrink2(vec2(SPACE_3, 0.0));
+    let mut left = ui.new_child(
+        UiBuilder::new()
+            .max_rect(inner)
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    left.spacing_mut().item_spacing.x = SPACE_2;
+    let button = bar_button(&mut left, p, view_label(*view), t!("feed.viewGroup"));
+    Popup::menu(&button)
+        .id(Id::unique("bt-feed-view"))
+        .align(RectAlign::BOTTOM_START)
+        .gap(4.0)
+        .width(160.0)
+        .show(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for option in [FeedView::Text, FeedView::Hex] {
+                if widgets::menu_item(ui, p, view_label(option), true).clicked() {
+                    *view = option;
+                }
+            }
+        });
+    if *view == FeedView::Text {
+        let button = bar_button(&mut left, p, encoding_label(*encoding), t!("feed.encoding"));
+        Popup::menu(&button)
+            .id(Id::unique("bt-feed-encoding"))
+            .align(RectAlign::BOTTOM_START)
+            .gap(4.0)
+            .width(160.0)
+            .show(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for option in ENCODINGS {
+                    if widgets::menu_item(ui, p, encoding_label(option), true).clicked() {
+                        *encoding = option;
+                    }
+                }
+            });
+    }
+
+    let mut right = ui.new_child(
+        UiBuilder::new()
+            .max_rect(inner)
+            .layout(Layout::right_to_left(Align::Center)),
+    );
+    right.spacing_mut().item_spacing.x = SPACE_1;
+    let conns = rec.conns();
+    if conns.len() > 1 {
+        let shown = &conns[conns.len().saturating_sub(feed::CONN_CHIPS)..];
+        let mut chips: Vec<(Option<u32>, String)> =
+            shown.iter().map(|&c| (Some(c), format!("#{c}"))).collect();
+        chips.insert(0, (None, t!("feed.connAll").to_owned()));
+        let mut chosen = None;
+        for (value, text) in chips.into_iter().rev() {
+            if conn_chip(&mut right, p, &text, rec.filter == value).clicked() {
+                chosen = Some(value);
+            }
+        }
+        if let Some(value) = chosen {
+            rec.set_filter(value);
+        }
+    }
+    if rec.dropped > 0 {
+        right.add_space(SPACE_2);
+        right.label(
+            RichText::new(t!("feed.dropped", count = rec.dropped))
+                .size(TEXT_2XS)
+                .color(p.text_faint),
+        );
+    }
+}
+
+/// Таблетка соединения: моно 11px, выбранная — фон цвета текста.
+fn conn_chip(ui: &mut Ui, p: &Palette, text: &str, on: bool) -> egui::Response {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), theme::mono(TEXT_2XS), Color32::PLACEHOLDER);
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(galley.size().x + 16.0, galley.size().y + 4.0),
+        Sense::click(),
+    );
+    response.widget_info(|| WidgetInfo::selected(Role::Button, true, on, text));
+    let (fill, color) = match (on, response.hovered()) {
+        (true, _) => (p.text, p.surface_0),
+        (false, true) => (p.hover, p.text),
+        _ => (Color32::TRANSPARENT, p.text_muted),
+    };
+    ui.painter()
+        .rect_filled(rect, radius(RADIUS_RECORD.min(127.0)), fill);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, color);
+    response.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Лента: видимые строки через `show_rows`, догон и таблетка «↓ N новых».
+fn feed_list(
+    ui: &mut Ui,
+    p: &Palette,
+    rec: &mut RecordingView,
+    hex: bool,
+    encoding: Encoding,
+    added: u64,
+) {
+    let total = rec.rows.rows();
+    let area = ui.available_rect_before_wrap();
+    if total == 0 {
+        ui.add_space(28.0);
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.label(
+                RichText::new(t!("feed.emptyTitle"))
+                    .font(theme::sans_semibold(TEXT_XS))
+                    .color(p.text_muted),
+            );
+            ui.label(
+                RichText::new(t!("feed.emptyText"))
+                    .size(TEXT_XS)
+                    .color(p.text_muted),
+            );
+        });
+        return;
+    }
+    let row_height = if hex { HEX_ROW_HEIGHT } else { TEXT_ROW_HEIGHT };
+    let multi = rec.conns.len() > 1;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let mut scroll = ScrollArea::vertical()
+        .id_salt("bt-feed")
+        .auto_shrink(false)
+        .stick_to_bottom(true);
+    if rec.jump_bottom {
+        // Ниже конца содержимого: область прижмёт прокрутку к последней строке.
+        scroll = scroll.vertical_scroll_offset(total as f32 * row_height + area.height());
+        rec.jump_bottom = false;
+    }
+    let output = scroll.show_rows(ui, row_height, total, |ui, range| {
+        for row in range {
+            let Some((seq, line)) = rec.rows.locate(row) else {
+                break;
+            };
+            let Some(event) = rec.feed.get(seq).cloned() else {
+                continue;
+            };
+            if hex {
+                hex_row(ui, p, &event, line, multi, encoding);
+            } else {
+                text_row(ui, p, &event, multi, encoding);
+            }
+        }
+    });
+
+    // Догон: внизу — следим; прокрутка вверх выключает догон и копит «новые».
+    let max = (output.content_size.y - output.inner_rect.height()).max(0.0);
+    let slack = if rec.follow {
+        4.0 + added as f32 * row_height
+    } else {
+        4.0
+    };
+    if output.state.clamped_offset().y >= max - slack {
+        rec.follow = true;
+        rec.pending = 0;
+    } else {
+        rec.follow = false;
+    }
+
+    if !rec.follow && rec.pending > 0 {
+        let text = t!("feed.newRows", count = rec.pending);
+        let galley =
+            ui.painter()
+                .layout_no_wrap(format!("↓ {text}"), theme::sans(TEXT_XS), p.rec_fg);
+        let size = vec2(12.0 + galley.size().x + 12.0, 28.0);
+        let pill = Rect::from_min_size(area.right_bottom() - size - vec2(SPACE_4, SPACE_4), size);
+        let response = ui.interact(pill, Id::unique("bt-new-rows"), Sense::click());
+        response.widget_info(|| WidgetInfo::labeled(Role::Button, true, &text));
+        let corner = radius(RADIUS_RECORD.min(127.0));
+        let shadow = Shadow {
+            offset: [0, 4],
+            blur: 14,
+            spread: 0,
+            color: p.text.gamma_multiply(0.18),
+        };
+        ui.painter().add(shadow.as_shape(pill, corner));
+        ui.painter().rect_filled(
+            pill,
+            corner,
+            if response.hovered() {
+                mix(p.rec_bg, p.rec_fg, 0.12)
+            } else {
+                p.rec_bg
+            },
+        );
+        ui.painter().galley(
+            pos2(pill.left() + 12.0, pill.center().y - galley.size().y / 2.0),
+            galley,
+            p.rec_fg,
+        );
+        if response.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+            rec.jump_bottom = true;
+            rec.follow = true;
+            rec.pending = 0;
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// Строка ленты во всю ширину: наведение — фоном, роль `label` с текстом строки.
+fn row_frame(ui: &mut Ui, p: &Palette, height: f32, name: &str) -> (Rect, egui::Response) {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
+    response.widget_info(|| WidgetInfo::labeled(Role::Label, true, name));
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 0, p.hover);
+    }
+    (rect, response)
+}
+
+/// Текст фрагмента одной строкой с глифами `‹CR›` и «автоответ».
+fn data_job(p: &Palette, segments: &[Segment], synthetic: bool) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let ctrl = p.ctrl.gamma_multiply(0.55);
+    for segment in segments {
+        let fmt = if segment.ctrl {
+            format(theme::mono(TEXT_2XS), ctrl)
+        } else {
+            format(theme::mono(TEXT_DATA), p.text)
+        };
+        job.append(&segment.text, 0.0, fmt);
+    }
+    if synthetic {
+        job.append(
+            t!("feed.synthetic"),
+            6.0,
+            format(theme::sans(TEXT_2XS), p.dir_l2a),
+        );
+    }
+    job
+}
+
+/// Строка «Текст»: время · стрелка · №соединения · данные · «автоответ».
+fn text_row(ui: &mut Ui, p: &Palette, event: &FeedEvent, multi: bool, encoding: Encoding) {
+    let (class, text) = row_text(event);
+    let segments = event.data().map(|data| data.segments(encoding));
+    let body = segments
+        .as_deref()
+        .map_or_else(|| text.clone(), feed::plain_text);
+    let name = match (class, event.conn) {
+        (RowClass::Data(dir), Some(conn)) if multi => {
+            format!("{} {} #{conn} {body}", event.time, glyph(dir))
+        }
+        (RowClass::Data(dir), _) => format!("{} {} {body}", event.time, glyph(dir)),
+        _ => format!("{} {body}", event.time),
+    };
+    let (rect, response) = row_frame(ui, p, TEXT_ROW_HEIGHT, &name);
+    let painter = ui.painter().clone();
+    let cy = rect.center().y;
+    let x0 = rect.left() + SPACE_3;
+    let right = rect.right() - SPACE_3;
+    let service = class == RowClass::Service;
+    let size = if service { TEXT_XS } else { TEXT_DATA };
+    painter.text(
+        pos2(x0, cy),
+        Align2::LEFT_CENTER,
+        &event.time,
+        theme::mono(size),
+        p.text_faint,
+    );
+    let mut x = x0 + TIME_WIDTH + SPACE_2;
+    match (class, event.data()) {
+        (RowClass::Data(dir), Some(data)) => {
+            painter.text(
+                pos2(x, cy),
+                Align2::LEFT_CENTER,
+                glyph(dir),
+                theme::mono_medium(TEXT_DATA),
+                dir_color(p, dir),
+            );
+            x += ARROW_WIDTH + SPACE_2;
+            if multi {
+                painter.text(
+                    pos2(x, cy),
+                    Align2::LEFT_CENTER,
+                    format!("#{}", event.conn.unwrap_or_default()),
+                    theme::mono(TEXT_2XS),
+                    p.text_faint,
+                );
+                x += CONN_WIDTH + SPACE_2;
+            }
+            let job = data_job(p, segments.as_deref().unwrap_or_default(), data.synthetic);
+            let galley = truncated(ui, job, right - x);
+            painter.galley(pos2(x, cy - galley.size().y / 2.0), galley, p.text);
+        }
+        _ => {
+            let color = match class {
+                RowClass::Error => p.danger,
+                _ => p.text_muted,
+            };
+            let job = LayoutJob::single_section(text.clone(), format(theme::mono(size), color));
+            let galley = truncated(ui, job, right - x);
+            let end = x + galley.size().x;
+            painter.galley(pos2(x, cy - galley.size().y / 2.0), galley, color);
+            // Служебная строка: линия начинается за текстом и уходит до края.
+            if service && end + SPACE_2 + 12.0 <= right {
+                painter.hline(end + SPACE_2..=right, cy, Stroke::new(1.0, p.border_faint));
+            }
+        }
+    }
+    row_menu(&response, p, event, &body);
+}
+
+/// Строка HEX-дампа: время и стрелка только у первой строки события.
+fn hex_row(
+    ui: &mut Ui,
+    p: &Palette,
+    event: &FeedEvent,
+    line: usize,
+    multi: bool,
+    encoding: Encoding,
+) {
+    let (class, text) = row_text(event);
+    let bytes = event.data().map_or(&[][..], |data| data.bytes.as_slice());
+    let dump: HexLine = feed::hex_line(bytes, line);
+    let hex: Vec<&str> = dump.bytes.iter().map(|(value, _)| value.as_str()).collect();
+    let name = format!(
+        "{} {} {} {}",
+        if line == 0 { event.time.as_str() } else { "" },
+        dump.offset,
+        hex.join(" "),
+        dump.ascii
+    );
+    let (rect, response) = row_frame(ui, p, HEX_ROW_HEIGHT, name.trim());
+    let painter = ui.painter().clone();
+    let font = theme::mono(TEXT_XS);
+    let y = rect.top() + 3.0;
+    let x0 = rect.left() + SPACE_3;
+    let first = line == 0;
+    if first {
+        painter.text(
+            pos2(x0, y),
+            Align2::LEFT_TOP,
+            &event.time,
+            font.clone(),
+            p.text_faint,
+        );
+    }
+    let mut x = x0 + TIME_WIDTH + SPACE_2;
+    if first && let RowClass::Data(dir) = class {
+        painter.text(
+            pos2(x, y),
+            Align2::LEFT_TOP,
+            glyph(dir),
+            theme::mono_medium(TEXT_XS),
+            dir_color(p, dir),
+        );
+    }
+    x += ARROW_WIDTH + SPACE_2;
+    if multi {
+        if first && let Some(conn) = event.conn {
+            painter.text(
+                pos2(x, y),
+                Align2::LEFT_TOP,
+                format!("#{conn}"),
+                font.clone(),
+                p.text_faint,
+            );
+        }
+        x += CONN_WIDTH + SPACE_2;
+    }
+    let (byte_color, ascii_color) = match class {
+        RowClass::Data(_) => (p.text, p.text_muted),
+        RowClass::Error => (p.danger, p.danger),
+        RowClass::Event | RowClass::Service => (p.text_muted, p.text_muted),
+    };
+    let mut job = LayoutJob::default();
+    job.append(&dump.offset, 0.0, format(font.clone(), p.text_faint));
+    for (index, (value, control)) in dump.bytes.iter().enumerate() {
+        let fmt = if *control && matches!(class, RowClass::Data(_)) {
+            format(theme::mono_medium(TEXT_XS), p.ctrl)
+        } else {
+            format(font.clone(), byte_color)
+        };
+        job.append(value, if index == 0 { SPACE_2 } else { 2.0 }, fmt.clone());
+        job.append(" ", 0.0, fmt);
+    }
+    job.append(&dump.ascii, SPACE_2, format(font, ascii_color));
+    let galley = truncated(ui, job, rect.right() - SPACE_3 - x);
+    painter.galley(pos2(x, y), galley, p.text);
+    let copy_text = event
+        .data()
+        .map_or(text, |data| feed::plain_text(&data.segments(encoding)));
+    row_menu(&response, p, event, &copy_text);
+}
+
+/// Контекстное меню строки: текст, HEX и Base64 фрагмента (U1-AC16).
+fn row_menu(response: &egui::Response, p: &Palette, event: &FeedEvent, text: &str) {
+    response.context_menu(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        if widgets::menu_item(ui, p, t!("feed.copyText"), true).clicked() {
+            ui.ctx().copy_text(text.to_owned());
+        }
+        if let Some(data) = event.data() {
+            if widgets::menu_item(ui, p, t!("feed.copyHex"), true).clicked() {
+                ui.ctx().copy_text(feed::hex_string(&data.bytes));
+            }
+            if widgets::menu_item(ui, p, t!("feed.copyBase64"), true).clicked() {
+                ui.ctx().copy_text(feed::base64_string(&data.bytes));
+            }
+        }
+    });
+}
+
+/// Итоги остановки в журнал запуска.
+pub(crate) fn log_outcome(outcome: &live::StopOutcome) {
+    match (&outcome.stats, &outcome.failure, &outcome.error) {
+        (Some(stats), _, _) => diag::info(format!(
+            "запись остановлена: {}, соединений {}, байт → {} ← {}",
+            outcome.journal_path.display(),
+            stats.connections,
+            stats.bytes_analyzer_to_lis,
+            stats.bytes_lis_to_analyzer
+        )),
+        (_, Some(failure), _) => diag::error(format!(
+            "запись прервана отказом журнала {}: {:?}: {}",
+            outcome.journal_path.display(),
+            failure.code,
+            failure.message
+        )),
+        (_, _, Some(error)) => diag::error(format!(
+            "остановка записи {}: {error}",
+            outcome.journal_path.display()
+        )),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feed::DataPayload;
+
+    fn data(conn: u32, len: usize) -> Arc<FeedEvent> {
+        Arc::new(FeedEvent {
+            time: String::new(),
+            mono_us: Some(0),
+            conn: Some(conn),
+            kind: FeedKind::Data(DataPayload::new(Dir::AnalyzerToLis, false, vec![b'x'; len])),
+        })
+    }
+
+    fn note() -> Arc<FeedEvent> {
+        Arc::new(FeedEvent {
+            time: String::new(),
+            mono_us: None,
+            conn: None,
+            kind: FeedKind::Note {
+                text: String::new(),
+            },
+        })
+    }
+
+    #[test]
+    fn the_hex_index_maps_rows_to_lines_of_events() {
+        let mut ring = FeedRing::new(3);
+        let mut index = RowIndex::new(true, None);
+        for (seq, event) in [data(1, 20), data(1, 0), data(1, 40)]
+            .into_iter()
+            .enumerate()
+        {
+            index.push(seq as u64, &event);
+            ring.push(event);
+        }
+        assert_eq!(index.rows(), 2 + 1 + 3);
+        assert_eq!(index.locate(0), Some((0, 0)));
+        assert_eq!(index.locate(1), Some((0, 1)));
+        assert_eq!(index.locate(2), Some((1, 0)));
+        assert_eq!(index.locate(5), Some((2, 2)));
+        assert_eq!(index.locate(6), None);
+        // Вытеснение первого события снимает его строки спереди.
+        let event = data(1, 1);
+        index.push(3, &event);
+        ring.push(event);
+        index.evict_before(ring.first_seq());
+        assert_eq!(index.rows(), 1 + 3 + 1);
+        assert_eq!(index.locate(0), Some((1, 0)));
+        let text = RowIndex::rebuild(&ring, false, None);
+        assert_eq!(text.rows(), 3);
+        assert_eq!(text.locate(2), Some((3, 0)));
+    }
+
+    #[test]
+    fn the_filter_keeps_one_connection_and_the_session_events() {
+        let mut ring = FeedRing::default();
+        for event in [data(1, 1), data(2, 1), note(), data(1, 1)] {
+            ring.push(event);
+        }
+        let index = RowIndex::rebuild(&ring, false, Some(1));
+        assert_eq!(index.rows(), 3);
+        let seqs: Vec<u64> = (0..3).map(|row| index.locate(row).unwrap().0).collect();
+        assert_eq!(seqs, [0, 2, 3]);
+    }
+
+    #[test]
+    fn the_view_takes_only_new_events_from_the_shared_feed() {
+        let shared = SharedFeed::default();
+        let mut view = RecordingView::new(
+            Arc::clone(&shared),
+            AppConfig::with_log_dir(""),
+            String::new(),
+        );
+        live::lock(&shared).push(data(1, 1));
+        assert_eq!(view.sync(false), 1);
+        assert_eq!(view.sync(false), 0, "второй раз нового нет");
+        {
+            let mut ring = live::lock(&shared);
+            ring.push(data(2, 1));
+            ring.lagged(3);
+        }
+        assert_eq!(view.sync(false), 1);
+        assert_eq!(view.dropped, 3);
+        assert_eq!(view.conns(), [1, 2]);
+        view.set_filter(Some(2));
+        assert_eq!(view.rows(), 1);
+        // Прокрутка вверх: новые события копятся для «↓ N новых».
+        view.follow = false;
+        live::lock(&shared).push(data(2, 1));
+        view.sync(false);
+        assert_eq!(view.pending(), 1);
+    }
+
+    #[test]
+    fn a_view_far_behind_restarts_from_the_shared_feed() {
+        let shared = Arc::new(std::sync::Mutex::new(FeedRing::new(4)));
+        let mut view = RecordingView::new(
+            Arc::clone(&shared),
+            AppConfig::with_log_dir(""),
+            String::new(),
+        );
+        for _ in 0..10 {
+            live::lock(&shared).push(data(1, 1));
+        }
+        assert_eq!(view.sync(false), 4);
+        assert_eq!(view.rows(), 4);
+        assert_eq!(view.feed.first_seq(), 6);
+    }
+
+    #[test]
+    fn bytes_are_shown_with_units() {
+        assert_eq!(format_bytes(0), "0\u{a0}Б");
+        assert_eq!(format_bytes(629), "629\u{a0}Б");
+        assert_eq!(format_bytes(10_445), "10,2\u{a0}КБ");
+        assert_eq!(format_bytes(2048), "2\u{a0}КБ");
+        assert_eq!(format_bytes(1_258_291), "1,2\u{a0}МБ");
+        assert_eq!(format_bytes(3_650_722_202), "3,4\u{a0}ГБ");
+    }
+
+    #[test]
+    fn the_summary_follows_the_mode() {
+        let mut cfg = AppConfig::with_log_dir("");
+        cfg.listen_port = 0;
+        let mut view = RecordingView::detached(cfg.clone());
+        view.local_addr = "127.0.0.1:50123".into();
+        let stats = Stats::default();
+        assert_eq!(view.summary(&stats), "жду на :50123 · авто");
+        live::lock(&view.shared).push(data(1, 0));
+        view.detected = Some(Detected::Hl7);
+        let connected = Stats {
+            connections: 1,
+            ..Stats::default()
+        };
+        assert_eq!(view.summary(&connected), "подключено · :50123 · HL7 (авто)");
+        cfg.mode = SessionMode::Serial;
+        cfg.serial.port = "COM5".into();
+        assert_eq!(
+            RecordingView::detached(cfg.clone()).summary(&stats),
+            "COM5 · 9600 8N1"
+        );
+        cfg.mode = SessionMode::TcpClient;
+        cfg.responder = Responder::Astm;
+        assert_eq!(
+            RecordingView::detached(cfg).summary(&stats),
+            "подключено к 192.168.1.50:5000 · ASTM"
+        );
+    }
+
+    #[test]
+    fn codes_have_texts() {
+        assert_eq!(
+            event_text(Some("connect_failed"), "x"),
+            "Не удалось подключиться к анализатору — повторяю."
+        );
+        assert_eq!(event_text(Some("unknown"), "raw"), "raw");
+        assert_eq!(event_text(None, "raw"), "raw");
+        assert_eq!(
+            failure_reason(JournalFailureCode::DiskFull),
+            "на диске нет места"
+        );
+    }
+}

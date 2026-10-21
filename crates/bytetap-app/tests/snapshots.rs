@@ -8,13 +8,25 @@
 //! последние записи, «сейчас») — синтетическое, через `Fixtures`.
 
 use bytetap_app::background::Interface;
-use bytetap_app::settings::{LastRun, LoadWarning, SessionMode, Settings, Store, ThemeMode};
+use bytetap_app::live::{JournalFailure, JournalFailureCode};
+use bytetap_app::recording::RecordingFixture;
+use bytetap_app::settings::{
+    FeedView, LastRun, LoadWarning, SessionMode, Settings, Store, ThemeMode,
+};
 use bytetap_app::{BytetapApp, Fixtures, Screen, theme};
 use bytetap_core::journal::RecentJournal;
 use bytetap_core::transport::Source;
 use bytetap_core::transport::serial::PortInfo;
 use eframe::egui::{self, Key, Theme, accesskit::Role};
 use egui_kittest::{Harness, SnapshotOptions, kittest::Queryable as _};
+
+/// Рендер-тесты по одному: загрузчик Vulkan (lavapipe) изредка падает с SIGSEGV, когда
+/// несколько харнессов wgpu создают и закрывают устройства одновременно.
+fn gpu() -> std::sync::MutexGuard<'static, ()> {
+    static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GPU.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Допуск сравнения: версии lavapipe на машине разработчика и в CI сглаживают немного
 /// по-разному, но не больше чем в 20 пикселях и на 0.6 по цветовой разнице.
@@ -131,18 +143,21 @@ const WINDOW: (f32, f32) = (1200.0, 800.0);
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn title_bar_light() {
+    let _gpu = gpu();
     snapshot("titlebar-light", Screen::Scenarios, false, TITLE_BAR);
 }
 
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn title_bar_dark() {
+    let _gpu = gpu();
     snapshot("titlebar-dark", Screen::Scenarios, true, TITLE_BAR);
 }
 
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn close_button_turns_red_on_hover() {
+    let _gpu = gpu();
     let mut harness = harness(Screen::Scenarios, false, TITLE_BAR);
     harness.get_by_label("Закрыть").hover();
     harness.run_steps(2);
@@ -152,18 +167,21 @@ fn close_button_turns_red_on_hover() {
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn scenarios_light() {
+    let _gpu = gpu();
     snapshot("scenarios-light", Screen::Scenarios, false, WINDOW);
 }
 
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn scenarios_dark() {
+    let _gpu = gpu();
     snapshot("scenarios-dark", Screen::Scenarios, true, WINDOW);
 }
 
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn journals_menu() {
+    let _gpu = gpu();
     let mut harness = harness(Screen::Scenarios, false, WINDOW);
     harness.get_by_label("Журналы").click();
     harness.run_steps(4);
@@ -175,6 +193,7 @@ fn journals_menu() {
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_server_light() {
+    let _gpu = gpu();
     snapshot(
         "step-server-light",
         Screen::Step(SessionMode::TcpServer),
@@ -186,6 +205,7 @@ fn step_server_light() {
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_server_dark() {
+    let _gpu = gpu();
     snapshot(
         "step-server-dark",
         Screen::Step(SessionMode::TcpServer),
@@ -197,6 +217,7 @@ fn step_server_dark() {
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_client_light() {
+    let _gpu = gpu();
     snapshot(
         "step-client-light",
         Screen::Step(SessionMode::TcpClient),
@@ -208,6 +229,7 @@ fn step_client_light() {
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_client_dark() {
+    let _gpu = gpu();
     snapshot(
         "step-client-dark",
         Screen::Step(SessionMode::TcpClient),
@@ -229,12 +251,14 @@ fn serial_more(dark: bool) -> Harness<'static, BytetapApp> {
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_serial_more_light() {
+    let _gpu = gpu();
     serial_more(false).snapshot_options("step-serial-more-light", &options());
 }
 
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_serial_more_dark() {
+    let _gpu = gpu();
     serial_more(true).snapshot_options("step-serial-more-dark", &options());
 }
 
@@ -282,12 +306,14 @@ fn field_errors(dark: bool) -> Harness<'static, BytetapApp> {
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_errors_light() {
+    let _gpu = gpu();
     field_errors(false).snapshot_options("step-errors-light", &options());
 }
 
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_errors_dark() {
+    let _gpu = gpu();
     field_errors(true).snapshot_options("step-errors-dark", &options());
 }
 
@@ -561,7 +587,7 @@ fn every_screen_has_its_heading() {
             "Я подключаюсь к анализатору",
         ),
         (Screen::Step(SessionMode::Serial), "Кабель COM-порта"),
-        (Screen::Recording, "Запись"),
+        (Screen::Recording, "Стоп 00:00"),
         (Screen::Viewing, "Просмотр журнала"),
     ] {
         let mut harness = Harness::builder()
@@ -571,10 +597,14 @@ fn every_screen_has_its_heading() {
             });
         harness.run_steps(2);
         harness.get_by_label(heading);
-        for button in ["Свернуть", "Развернуть", "Закрыть", "Журналы"]
-        {
+        for button in ["Свернуть", "Развернуть", "Закрыть"] {
             harness.get_by_label(button);
         }
+        // Во время записи «Журналы» нет: открыть журнал нельзя, папка — в меню «…».
+        assert_eq!(
+            harness.query_by_label("Журналы").is_some(),
+            screen != Screen::Recording
+        );
     }
 }
 
@@ -771,4 +801,379 @@ fn the_fonts_have_every_glyph_the_interface_uses() {
             ui.label(egui::RichText::new(sample).font(theme::sans_medium(13.0)));
         });
     harness.run();
+}
+
+/// Синтетическая запись как на снимке UI v2: два соединения, сообщения HL7 с кириллицей
+/// в Windows-1251, автоответы, замечание и закрытия.
+fn recording_fixture(extra: usize) -> RecordingFixture {
+    use bytetap_core::journal::{Close, ClosedBy, Data, Dir, Event, InfoEvent, Open, Stats};
+
+    let cp1251 = |text: &str| -> Vec<u8> {
+        let (bytes, _, _) = encoding_rs::WINDOWS_1251.encode(text);
+        bytes.into_owned()
+    };
+    let at = |ms: u64| {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-10-19T23:27:10.046+03:00").unwrap();
+        (base + chrono::Duration::milliseconds(ms as i64))
+            .format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+            .to_string()
+    };
+    let msg = |id: &str, body: &str| {
+        cp1251(&format!(
+            "\x0bMSH|^~\\&|ANALYZER|LAB|LIS||20261019232710||ORU^R01|{id}|P|2.3.1\r{body}\x1c\r"
+        ))
+    };
+    let ack = |id: &str| {
+        cp1251(&format!(
+            "\x0bMSH|^~\\&|LIS||ANALYZER|LAB|20261019232711||ACK^R01|BT{id}|P|2.3.1\rMSA|AA|{id}\r\x1c\r"
+        ))
+    };
+    let data = |ms: u64, conn: u32, dir: Dir, synthetic: bool, bytes: &[u8]| {
+        Event::Data(Data::new(at(ms), ms * 1000, conn, dir, synthetic, bytes))
+    };
+    let mut events = vec![
+        Event::Open(Open {
+            t: at(0),
+            mono_us: 0,
+            conn: 1,
+            peer: "192.168.1.51:49152".into(),
+            local: "0.0.0.0:5000".into(),
+        }),
+        Event::Open(Open {
+            t: at(0),
+            mono_us: 0,
+            conn: 2,
+            peer: "192.168.1.52:49152".into(),
+            local: "0.0.0.0:5000".into(),
+        }),
+        data(
+            500,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            &msg(
+                "MSG0002",
+                "PID|1||000001||PATIENT^TEST\rOBX|1|NM|GLU^Glucose||5.4|mmol/L\r",
+            ),
+        ),
+        data(
+            1000,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            &msg(
+                "MSG0003",
+                "PID|1||000001||ПАЦИЕНТ^ТЕСТ\rOBX|1|NM|GLU^Глюкоза||5.1|ммоль/л\r",
+            ),
+        ),
+        data(1500, 1, Dir::LisToAnalyzer, true, &ack("MSG0004")),
+        data(
+            2000,
+            2,
+            Dir::AnalyzerToLis,
+            false,
+            &msg(
+                "MSG0005B",
+                "PID|1||000002||PATIENT^TEST\rOBX|1|NM|GLU^Glucose||6.0|mmol/L\r",
+            ),
+        ),
+        data(
+            2500,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            &msg("MSG0006", "QRD|20261019|R|I|MSG0002|||10^RD\r"),
+        ),
+        data(3000, 2, Dir::LisToAnalyzer, true, &ack("MSG0007B")),
+        Event::Info(InfoEvent {
+            t: at(3500),
+            mono_us: 3_500_000,
+            conn: None,
+            code: None,
+            message: "Autoresponder: ACK sent".into(),
+        }),
+    ];
+    for index in 0..extra {
+        let ms = 3600 + index as u64 * 100;
+        events.push(data(
+            ms,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            &msg(&format!("MSG1{index:03}"), "PID|1||000001||PATIENT^TEST\r"),
+        ));
+    }
+    let end = 4000 + extra as u64 * 100;
+    for conn in [1, 2] {
+        events.push(Event::Close(Close {
+            t: at(end),
+            mono_us: end * 1000,
+            conn,
+            by: ClosedBy::Analyzer,
+            reason: "eof".into(),
+        }));
+    }
+    RecordingFixture {
+        events,
+        stats: Stats {
+            connections: 2,
+            bytes_analyzer_to_lis: 629,
+            bytes_lis_to_analyzer: 195,
+        },
+        elapsed: std::time::Duration::from_secs(5),
+        local_addr: "0.0.0.0:5000".into(),
+        journal_path: Some(format!(r"{LOG_DIR}\bytetap-20261019232710-tcp_server.jsonl").into()),
+        dropped: 0,
+    }
+}
+
+fn recording(dark: bool, view: FeedView, extra: usize) -> Harness<'static, BytetapApp> {
+    let mut settings = settings(dark);
+    settings.feed.view = view;
+    harness_with(settings, None, Screen::Scenarios, WINDOW, move |app| {
+        app.with_recording_fixture(recording_fixture(extra))
+    })
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_text_light() {
+    let _gpu = gpu();
+    recording(false, FeedView::Text, 0).snapshot_options("recording-text-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_text_dark() {
+    let _gpu = gpu();
+    recording(true, FeedView::Text, 0).snapshot_options("recording-text-dark", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_hex_light() {
+    let _gpu = gpu();
+    recording(false, FeedView::Hex, 0).snapshot_options("recording-hex-light", &options());
+}
+
+/// Прокрутка вверх останавливает догон; пришедшие строки — «↓ N новых» (U1-AC16).
+fn scrolled_up(harness: &mut Harness<'static, BytetapApp>) {
+    harness.event(egui::Event::PointerMoved(egui::pos2(600.0, 400.0)));
+    harness.run_steps(2);
+    harness.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, 600.0),
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Wheel,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run_steps(4);
+    assert!(
+        !harness.state().recording().unwrap().follow(),
+        "догон выключен"
+    );
+    let shared = harness.state().recording().unwrap().shared();
+    for event in recording_fixture(5).events.into_iter().skip(9).take(5) {
+        if let Some(event) = bytetap_app::feed::FeedEvent::from_session(&event) {
+            bytetap_app::live::lock(&shared).push(std::sync::Arc::new(event));
+        }
+    }
+    harness.run_steps(3);
+    assert_eq!(harness.state().recording().unwrap().pending(), 5);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_new_rows_light() {
+    let _gpu = gpu();
+    let mut harness = recording(false, FeedView::Text, 40);
+    scrolled_up(&mut harness);
+    harness.get_by_label("5 новых");
+    harness.snapshot_options("recording-new-rows-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn journal_failure_light() {
+    let _gpu = gpu();
+    let failure = JournalFailure {
+        code: JournalFailureCode::DiskFull,
+        message: "No space left on device (os error 28)".into(),
+    };
+    let mut harness = harness_with(
+        settings(false),
+        None,
+        Screen::Scenarios,
+        WINDOW,
+        move |app| {
+            app.with_journal_failure(
+                failure,
+                Some(format!(r"{LOG_DIR}\bytetap-20261019232710-tcp_server.jsonl").into()),
+            )
+        },
+    );
+    harness.get_by_label("Запись в журнал прервана: на диске нет места");
+    harness.run_steps(2);
+    harness.snapshot_options("journal-failure-light", &options());
+}
+
+fn plain_recording(view: FeedView, extra: usize) -> Harness<'static, BytetapApp> {
+    let mut settings = settings(false);
+    settings.feed.view = view;
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings, None, None)
+                .with_fixtures(fixtures())
+                .with_recording_fixture(recording_fixture(extra))
+        });
+    harness.run_steps(3);
+    harness
+}
+
+/// Шапка записи и строки ленты — с ролями и подписями для AccessKit (U1-AC14, AC15).
+#[test]
+fn the_recording_header_and_rows_have_names() {
+    let harness = plain_recording(FeedView::Text, 0);
+    harness.get_by_role_and_label(Role::Button, "Стоп 00:05");
+    harness.get_by_role_and_label(Role::Button, "Меню записи");
+    harness.get_by_label("подключено · :5000 · HL7 (авто)");
+    harness.get_by_label("→ 629\u{a0}Б ← 195\u{a0}Б 2 соед.");
+    harness.get_by_role_and_label(Role::ComboBox, "Вид ленты");
+    harness.get_by_role_and_label(Role::ComboBox, "Кодировка");
+    harness.get_by_role_and_label(Role::Button, "все");
+    harness.get_by_role_and_label(Role::Button, "#2");
+    harness.get_by_label("23:27:10.046 #1 подключился 192.168.1.51:49152");
+    harness.get_by_label_contains("23:27:11.046 → #1 ‹VT›MSH|^~\\&|ANALYZER");
+    harness.get_by_label_contains("PID|1||000001||ПАЦИЕНТ^ТЕСТ‹CR›");
+    harness.get_by_label("23:27:13.546 Autoresponder: ACK sent");
+    harness.get_by_label("23:27:14.046 #1 отключился · анализатор");
+}
+
+/// Вид и кодировка ленты меняются в панели и сохраняются в настройках (FR-30).
+#[test]
+fn the_feed_view_and_encoding_are_saved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::new(dir.path().join("settings.json"));
+    let mut harness = harness_plain_store(store.clone());
+    harness
+        .get_by_role_and_label(Role::ComboBox, "Кодировка")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("UTF-8").click();
+    harness.run_steps(2);
+    harness
+        .get_by_role_and_label(Role::ComboBox, "Вид ленты")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("HEX").click();
+    harness.run_steps(3);
+    let (saved, _) = store.load("");
+    assert_eq!(saved.feed.view, FeedView::Hex);
+    assert_eq!(saved.feed.encoding, bytetap_app::settings::Encoding::Utf8);
+    // HEX: кодировки нет, строки дампа с полями смещения.
+    assert!(
+        harness
+            .query_by_role_and_label(Role::ComboBox, "Кодировка")
+            .is_none()
+    );
+    assert!(
+        harness
+            .get_all_by_label_contains("0000 0B 4D 53 48")
+            .count()
+            >= 1,
+        "первая строка дампа фрагмента"
+    );
+}
+
+fn harness_plain_store(store: Store) -> Harness<'static, BytetapApp> {
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings(false), None, Some(store))
+                .with_fixtures(fixtures())
+                .with_recording_fixture(recording_fixture(0))
+        });
+    harness.run_steps(3);
+    harness
+}
+
+/// Фильтр соединения оставляет его строки и события без соединения (FR-26).
+#[test]
+fn the_connection_filter_keeps_one_connection() {
+    let mut harness = plain_recording(FeedView::Text, 0);
+    let all = harness.state().recording().unwrap().rows();
+    harness.get_by_role_and_label(Role::Button, "#2").click();
+    harness.run_steps(2);
+    let rows = harness.state().recording().unwrap().rows();
+    // Второе соединение: open, два фрагмента, close — и замечание без соединения.
+    assert_eq!((all, rows), (11, 5));
+    assert!(harness.query_by_label_contains("ПАЦИЕНТ").is_none());
+    harness.get_by_role_and_label(Role::Button, "все").click();
+    harness.run_steps(2);
+    assert_eq!(harness.state().recording().unwrap().rows(), all);
+}
+
+/// Контекстное меню строки: копирование текста, HEX и Base64 (U1-AC16).
+#[test]
+fn a_row_has_a_copy_menu() {
+    let mut harness = plain_recording(FeedView::Text, 0);
+    harness
+        .get_by_label_contains("23:27:11.546 ← #1")
+        .click_secondary();
+    harness.run_steps(2);
+    harness.get_by_label("Скопировать текст");
+    harness.get_by_label("Скопировать HEX").click();
+    harness.step();
+    let copied = harness
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        });
+    assert!(copied.is_some_and(|text| text.starts_with("0B 4D 53 48")));
+}
+
+/// «↓ N новых» возвращает ленту вниз и включает догон.
+#[test]
+fn the_new_rows_pill_returns_to_the_bottom() {
+    let mut harness = plain_recording(FeedView::Text, 40);
+    scrolled_up(&mut harness);
+    harness.get_by_label("5 новых").click();
+    harness.run_steps(4);
+    let rec = harness.state().recording().unwrap();
+    assert!(rec.follow());
+    assert_eq!(rec.pending(), 0);
+    assert!(harness.query_by_label("5 новых").is_none());
+}
+
+/// «Стоп» без сессии (снимки, тесты) возвращает к сценариям.
+#[test]
+fn stop_returns_to_the_scenarios() {
+    let mut harness = plain_recording(FeedView::Text, 0);
+    harness
+        .get_by_role_and_label(Role::Button, "Стоп 00:05")
+        .click();
+    harness.run_steps(2);
+    assert_eq!(harness.state().screen, Screen::Scenarios);
+}
+
+/// 10 000 строк в ленте: кадр рисует только видимые (`show_rows`), буфер не растёт
+/// сверх предела (U1-AC16).
+#[test]
+fn ten_thousand_rows_draw_only_the_visible_ones() {
+    let mut harness = plain_recording(FeedView::Text, 10_200);
+    harness.run_steps(2);
+    let rec = harness.state().recording().unwrap();
+    assert_eq!(rec.len(), bytetap_app::feed::FEED_CAPACITY);
+    assert_eq!(rec.rows(), bytetap_app::feed::FEED_CAPACITY);
+    // Подпись каждой строки ленты начинается со времени «23:…».
+    let rows = harness.get_all_by_label_contains("23:").count();
+    assert!((20..60).contains(&rows), "видимых строк {rows}");
+    let started = std::time::Instant::now();
+    harness.run_steps(10);
+    eprintln!("10 кадров с 10 000 строк: {:?}", started.elapsed());
 }

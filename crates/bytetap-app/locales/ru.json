@@ -12,7 +12,6 @@
     "openFolder": "Открыть папку журналов"
   },
   "screen": {
-    "recording": "Запись",
     "viewing": "Просмотр журнала"
   },
   "scenarios": {
@@ -95,12 +94,20 @@
     "io": "Ошибка ввода-вывода: {message}"
   },
   "actions": {
+    "note": "Комментарий",
+    "noteTitle": "Комментарий к сессии",
+    "notePlaceholder": "что прогоняете",
+    "noteAdd": "Добавить",
     "profileName": "Имя профиля",
     "profileNamePlaceholder": "например, «Анализатор X, :5000»",
     "save": "Сохранить",
     "cancel": "Отмена"
   },
   "units": {
+    "bytes": "Б",
+    "kilobytes": "КБ",
+    "megabytes": "МБ",
+    "gigabytes": "ГБ",
     "minutes": "мин",
     "hours": "ч",
     "today": "сегодня",
@@ -121,5 +128,71 @@
     "maximize": "Развернуть",
     "restore": "Восстановить",
     "close": "Закрыть"
+  },
+  "record": {
+    "stop": "Стоп",
+    "connShort": "соед.",
+    "menu": "Меню записи",
+    "addNote": "Комментарий…",
+    "copyPath": "Скопировать путь к журналу",
+    "connectedTo": "подключено к {addr} · {responder}",
+    "onPort": "подключено · {port} · {responder}",
+    "waitingOn": "жду на {port} · {responder}",
+    "responderHl7": "HL7",
+    "responderAstm": "ASTM",
+    "responderNone": "без ответов",
+    "responderAuto": "авто",
+    "responderAutoHl7": "HL7 (авто)",
+    "responderAutoAstm": "ASTM (авто)",
+    "closeTimeout": "Запись не остановилась за 15 секунд, окно закрыто принудительно: журнал мог быть дописан не полностью."
+  },
+  "feed": {
+    "emptyTitle": "Здесь появится обмен",
+    "emptyText": "Нажмите «Старт», затем запустите передачу на анализаторе.",
+    "opened": "#{conn} подключился {peer}",
+    "closedSimple": "#{conn} отключился · {by}",
+    "byAnalyzer": "анализатор",
+    "byLis": "ЛИС",
+    "byApp": "bytetap",
+    "viewGroup": "Вид ленты",
+    "viewText": "Текст",
+    "viewHex": "HEX",
+    "encoding": "Кодировка",
+    "encAscii": "ASCII",
+    "encCp1251": "CP1251",
+    "encUtf8": "UTF-8",
+    "encGbk": "GBK",
+    "encLatin1": "Latin-1",
+    "connAll": "все",
+    "dropped": "пропущено в ленте: {count}",
+    "newRows": "{count} новых",
+    "synthetic": "автоответ",
+    "copyText": "Скопировать текст",
+    "copyHex": "Скопировать HEX",
+    "copyBase64": "Скопировать Base64"
+  },
+  "events": {
+    "accept_failed": "Не удалось принять соединение — повторяю.",
+    "connect_failed": "Не удалось подключиться к анализатору — повторяю.",
+    "serial_open_failed": "Не удалось открыть COM-порт — повторяю.",
+    "connection_read_failed": "Ошибка чтения соединения — соединение закрыто.",
+    "connection_write_failed": "Ошибка записи ответа — соединение закрыто.",
+    "answer_timeout": "Ответ не записался за отведённое время — соединение закрыто.",
+    "journal_failure": "Запись в журнал прервана.",
+    "protocol_undetected": "Протокол не определён — ответы отключены для этого соединения. Запись идёт."
+  },
+  "banner": {
+    "journalFailureTitleWith": "Запись в журнал прервана: {reason}",
+    "chooseOtherDir": "Выбрать другую папку",
+    "openRecorded": "Открыть записанное",
+    "journalFailureReasons": {
+      "disk_full": "на диске нет места",
+      "permission_denied": "нет прав на запись",
+      "not_found": "папка или файл журнала исчезли",
+      "network": "сетевой диск стал недоступен",
+      "busy": "файл журнала занят другой программой",
+      "timeout": "запись не завершилась за отведённое время",
+      "io": "ошибка записи на диск"
+    }
   }
 }

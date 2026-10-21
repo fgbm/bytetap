@@ -158,7 +158,8 @@ impl BytetapApp {
             }
             self.more(ui, &p, mode);
             ui.add_space(SPACE_4);
-            start = widgets::start_button(ui, &p, t!("form.start"), true).clicked();
+            let idle = self.phase != crate::live::Phase::Starting;
+            start = widgets::start_button(ui, &p, t!("form.start"), idle).clicked() && idle;
             if let Some(error) = self.error_text(ErrorField::Start) {
                 ui.add_space(SPACE_2);
                 ui.vertical_centered(|ui| widgets::field_error(ui, p.danger, &error));
@@ -168,7 +169,7 @@ impl BytetapApp {
         if back {
             self.back_to_scenarios(&ctx);
         } else if start {
-            self.start();
+            self.start(&ctx);
         }
     }
 

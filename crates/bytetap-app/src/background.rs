@@ -25,6 +25,21 @@ impl<T: Send + 'static> Task<T> {
         Self { receiver }
     }
 
+    /// Запускает `future` в runtime приложения; по готовности окно перерисовывается.
+    pub fn spawn_async(
+        runtime: &tokio::runtime::Handle,
+        ctx: &egui::Context,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        runtime.spawn(async move {
+            let _ = sender.send(future.await);
+            ctx.request_repaint();
+        });
+        Self { receiver }
+    }
+
     /// Готовое значение; `None` — задача ещё идёт или уже отдала результат.
     pub fn poll(&mut self) -> Option<T> {
         self.receiver.try_recv().ok()

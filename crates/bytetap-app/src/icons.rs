@@ -7,11 +7,14 @@ use eframe::egui::{self, Color32, ImageSource, Rect, Ui, Vec2};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
+    ArrowDown,
     ArrowLeft,
     Check,
     ChevronDown,
     ChevronRight,
+    CircleAlert,
     Copy,
+    Ellipsis,
     FolderOpen,
     Info,
     Minus,
@@ -28,11 +31,14 @@ pub enum Icon {
 impl Icon {
     pub fn source(self) -> ImageSource<'static> {
         match self {
+            Self::ArrowDown => egui::include_image!("../assets/icons/arrow-down.svg"),
             Self::ArrowLeft => egui::include_image!("../assets/icons/arrow-left.svg"),
             Self::Check => egui::include_image!("../assets/icons/check.svg"),
             Self::ChevronDown => egui::include_image!("../assets/icons/chevron-down.svg"),
             Self::ChevronRight => egui::include_image!("../assets/icons/chevron-right.svg"),
+            Self::CircleAlert => egui::include_image!("../assets/icons/circle-alert.svg"),
             Self::Copy => egui::include_image!("../assets/icons/copy.svg"),
+            Self::Ellipsis => egui::include_image!("../assets/icons/ellipsis.svg"),
             Self::FolderOpen => egui::include_image!("../assets/icons/folder-open.svg"),
             Self::Info => egui::include_image!("../assets/icons/info.svg"),
             Self::Minus => egui::include_image!("../assets/icons/minus.svg"),

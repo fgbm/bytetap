@@ -4,19 +4,23 @@ mod app;
 pub mod background;
 pub mod diag;
 pub mod errors;
+pub mod feed;
 pub mod form;
 pub mod gpu;
 pub mod i18n;
 pub mod icons;
+pub mod live;
 pub mod placement;
+pub mod recording;
 pub mod scenarios;
 pub mod settings;
 mod step;
 pub mod theme;
 mod titlebar;
+pub mod trace;
 pub mod widgets;
 
-pub use app::{BytetapApp, Fixtures, Screen, resolve_dark};
+pub use app::{AUTOSTART_ENV, BytetapApp, FORCED_EXIT, Fixtures, Screen, resolve_dark};
 
 /// Размер окна при первом запуске (U1-AC3).
 pub const WINDOW_SIZE: [f32; 2] = [1200.0, 800.0];
