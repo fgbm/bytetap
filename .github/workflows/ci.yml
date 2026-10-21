@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # native-ui — ветка этапа U1 (нативный интерфейс) до слияния в main.
+    branches: [main, native-ui]
   pull_request:
 
 concurrency:
@@ -33,11 +34,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Системные пакеты Tauri (Linux)
+      # mesa-vulkan-drivers — программный Vulkan (lavapipe) для снимков egui_kittest.
+      - name: Системные пакеты Tauri и Vulkan (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            mesa-vulkan-drivers \
             libwebkit2gtk-4.1-dev \
             libjavascriptcoregtk-4.1-dev \
             libgtk-3-dev \
@@ -69,6 +72,15 @@ jobs:
         env:
           BYTETAP_REQUIRE_SOCAT: "1"
         run: cargo test -p bytetap-core --test serial -- --ignored
+
+      # Эталоны снимков и, при расхождении, *.new.png и *.diff.png egui_kittest.
+      - name: Снимки интерфейса
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bytetap-app-snapshots
+          path: crates/bytetap-app/tests/snapshots/
+          if-no-files-found: error
 
   frontend:
     name: frontend
@@ -163,6 +175,116 @@ jobs:
           if (Test-Path $log) { Get-Content -Encoding utf8 $log } else { Write-Host "журнала $log нет" }
           $ready = (Test-Path $log) -and (Select-String -Path $log -Pattern 'интерфейс готов' -Quiet -Encoding utf8)
           if (-not $alive -or -not $ready) { exit 1 }
+
+  # U1: нативный bytetap.exe на egui (crates/bytetap-app). Проверяются размер (NFR-7),
+  # зависимости от DLL (только системные, U1-AC1) и запуск: процесс жив через 15 с и
+  # журнал старта дошёл до «интерфейс готов» — с выбранным адаптером и с WARP (U1-AC2).
+  native-windows:
+    name: native-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Установить Rust из rust-toolchain.toml
+        run: |
+          rustup toolchain install
+          rustc -V
+
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.2
+        with:
+          shared-key: native-windows
+
+      - name: cargo build --release
+        run: cargo build --release -p bytetap-app --bin bytetap
+
+      - name: Размер и DLL exe
+        shell: pwsh
+        run: |
+          $exe = Get-Item target\release\bytetap.exe
+          Write-Host ("bytetap.exe: {0:N2} МБ ({1} байт)" -f ($exe.Length / 1MB), $exe.Length)
+          if ($exe.Length -gt 25MB) { throw 'bytetap.exe больше 25 МБ (NFR-7)' }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          $deps = & $dumpbin /nologo /dependents $exe.FullName
+          $deps | Write-Host
+          $extra = $deps | Select-String -Pattern 'vcruntime|msvcp|WebView2Loader|mscoree'
+          if ($extra) { throw "exe зависит от несистемных DLL: $extra" }
+
+      - name: Смоук — запуск exe
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Win {
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+            [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+            [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT rect, int size);
+          }
+          '@
+          [void][Win]::SetProcessDPIAware()
+          $out = New-Item -ItemType Directory -Force -Path smoke
+          $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
+          $failed = $false
+          foreach ($run in @(@{ Name = 'default'; Adapter = '' }, @{ Name = 'warp'; Adapter = 'basic render' })) {
+            Remove-Item $log -ErrorAction SilentlyContinue
+            $env:WGPU_ADAPTER_NAME = $run.Adapter
+            $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
+            $null = $p.Handle
+            Start-Sleep -Seconds 15
+            $alive = -not $p.HasExited
+            if ($alive) {
+              try {
+                $p.Refresh()
+                $hwnd = $p.MainWindowHandle
+                [void][Win]::SetForegroundWindow($hwnd)
+                Start-Sleep -Milliseconds 700
+                $rect = New-Object Win+RECT
+                # DWMWA_EXTENDED_FRAME_BOUNDS = 9: границы окна без невидимой тени.
+                [void][Win]::DwmGetWindowAttribute($hwnd, 9, [ref]$rect, [System.Runtime.InteropServices.Marshal]::SizeOf($rect))
+                $w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
+                Write-Host "$($run.Name): окно ${w}x${h}"
+                $bmp = New-Object System.Drawing.Bitmap $w, $h
+                $g = [System.Drawing.Graphics]::FromImage($bmp)
+                $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
+                $bmp.Save((Join-Path $out "window-$($run.Name).png"), [System.Drawing.Imaging.ImageFormat]::Png)
+                $g.Dispose(); $bmp.Dispose()
+              } catch { Write-Host "снимок окна: $_" }
+              Stop-Process -Id $p.Id -Force
+            } else {
+              Write-Host "$($run.Name): bytetap.exe завершился, код $($p.ExitCode)"
+            }
+            if (Test-Path $log) {
+              Copy-Item $log (Join-Path $out "bytetap-$($run.Name).log")
+              Get-Content -Encoding utf8 $log
+            } else { Write-Host "журнала $log нет" }
+            $ready = (Test-Path $log) -and (Select-String -Path $log -Pattern 'интерфейс готов' -Quiet -Encoding utf8)
+            if (-not $alive -or -not $ready) { $failed = $true }
+            if ($run.Name -eq 'warp' -and -not (Select-String -Path $log -Pattern 'выбран адаптер wgpu: Microsoft Basic Render Driver' -Quiet -Encoding utf8)) {
+              Write-Host 'WARP не выбран'
+              $failed = $true
+            }
+            Start-Sleep -Seconds 1
+          }
+          if ($failed) { exit 1 }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bytetap-native-windows-x64
+          path: target/release/bytetap.exe
+          if-no-files-found: error
+
+      - name: Снимки и журналы смоука
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bytetap-native-smoke
+          path: smoke/
+          if-no-files-found: ignore
 
   actionlint:
     name: actionlint
