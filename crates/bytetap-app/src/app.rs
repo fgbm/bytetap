@@ -46,6 +46,18 @@ pub static FORCED_EXIT: AtomicBool = AtomicBool::new(false);
 /// пользователь видит окно с той же причиной (U1-AC17).
 pub static CLOSE_NOTICE: Mutex<Option<String>> = Mutex::new(None);
 
+/// Сообщение о неполном журнале при закрытии окна: `main` показывает его системным
+/// окном уже после выхода из окна приложения.
+///
+/// Показывать его из окна нельзя: системное окно модально, и на Windows оно
+/// заблокирует поток окна до нажатия «ОК» (U1-AC17).
+pub fn take_close_notice() -> Option<String> {
+    CLOSE_NOTICE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+}
+
 /// Тестовый хук смоука записи (CI): `tcp_server:127.0.0.1:0` — запись стартует сразу.
 pub const AUTOSTART_ENV: &str = "BYTETAP_TEST_AUTOSTART";
 
@@ -1020,11 +1032,10 @@ impl BytetapApp {
         }
     }
 
-    /// Журнал мог быть дописан не полностью: системное окно с причиной, как при
-    /// принудительном выходе (U1-AC17).
+    /// Журнал мог быть дописан не полностью: причина уходит в системное сообщение.
     ///
-    /// Показывается один раз и только если отказ журнала действительно был: без
-    /// него окно закрывается молча, как при обычной остановке.
+    /// Сообщение показывает `main` уже после выхода из окна: системное окно модально,
+    /// и из окна оно заблокировало бы поток окна до нажатия «ОК» (U1-AC17).
     fn show_close_notice(&mut self) {
         let Some(failure) = self.journal_failure.take() else {
             return;
@@ -1034,8 +1045,7 @@ impl BytetapApp {
             reason = crate::recording::failure_reason(failure.code)
         );
         diag::error(format!("окно закрывается: {text}"));
-        *CLOSE_NOTICE.lock().unwrap_or_else(PoisonError::into_inner) = Some(text.clone());
-        crate::diag::show_error(&text);
+        *CLOSE_NOTICE.lock().unwrap_or_else(PoisonError::into_inner) = Some(text);
     }
 
     pub fn settings(&self) -> &Settings {

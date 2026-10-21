@@ -27,6 +27,7 @@ pub mod window;
 
 pub use app::{
     AUTOSTART_ENV, BytetapApp, CLOSE_NOTICE, FORCED_EXIT, Fixtures, Screen, resolve_dark,
+    take_close_notice,
 };
 
 /// Размер окна при первом запуске (U1-AC3).

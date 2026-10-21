@@ -93,6 +93,11 @@ fn main() {
     if FORCED_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
         diag::show_error(t!("record.closeTimeout"));
     }
+    // Журнал мог быть дописан не полностью: окно уходит молча, а система говорит об
+    // этом после его закрытия (U1-AC17).
+    if let Some(notice) = bytetap_app::take_close_notice() {
+        diag::show_error(&notice);
+    }
     if let Err(err) = result {
         let wgpu_failed = matches!(err, eframe::Error::Wgpu(_));
         if gpu::retry_with_warp(

@@ -163,16 +163,8 @@ fn closing_after_a_journal_failure_tells_the_user_about_the_journal() {
     // Писатель ломается на следующей пачке: отказ придёт при остановке записи.
     TEST_FAIL_AFTER_EVENTS.store(0, Ordering::Relaxed);
     use eframe::egui::{ViewportCommand, ViewportEvent, ViewportId};
-    let mut notice = bytetap_app::CLOSE_NOTICE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *notice = None;
-    drop(notice);
     assert!(
-        bytetap_app::CLOSE_NOTICE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none(),
+        bytetap_app::take_close_notice().is_none(),
         "до закрытия сообщения не было"
     );
 
@@ -201,11 +193,8 @@ fn closing_after_a_journal_failure_tells_the_user_about_the_journal() {
             .flat_map(|viewport| viewport.commands.clone())
             .any(|command| command == ViewportCommand::Close)
     });
-    let notice = bytetap_app::CLOSE_NOTICE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-        .expect("окно показало сообщение о неполном журнале");
+    // Сообщение о неполном журнале система покажет после выхода из окна (U1-AC17).
+    let notice = bytetap_app::take_close_notice().expect("сообщение о неполном журнале");
     assert!(
         notice.contains("Журнал мог быть дописан не полностью"),
         "{notice}"
