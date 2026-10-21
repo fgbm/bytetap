@@ -19,12 +19,20 @@ use crate::background::{self, Interface, Loaded, Task};
 use crate::errors::StartError;
 use crate::form::FormState;
 use crate::icons::Icon;
+use crate::journal::{JournalOpen, PageError, SharedJournalCache};
 use crate::live::{self, Action, JournalFailure, LiveSession, Phase, StopOutcome};
 use crate::recording::{RecordingFixture, RecordingView};
 use crate::settings::{LoadWarning, SessionMode, Settings, Store, ThemeMode, WindowState};
-use crate::theme::tokens::{SPACE_2, SPACE_3, SPACE_4, SPACE_5, TEXT_XS};
+use crate::theme::tokens::{SPACE_2, SPACE_3, SPACE_5, TEXT_XS};
 use crate::theme::{self, Palette, mix};
+use crate::viewing::JournalView;
 use crate::{diag, t, titlebar, widgets};
+
+/// Страница журнала, которая читается в фоне: номер страницы и задача.
+type PageTask = (
+    usize,
+    Task<Result<Vec<bytetap_core::journal::Event>, PageError>>,
+);
 
 /// Сколько последних записей показывает стартовый экран.
 pub const RECENT_SHOWN: usize = 3;
@@ -87,7 +95,15 @@ pub struct BytetapApp {
     /// Открыт диалог имени профиля: набранный текст.
     pub(crate) profile_prompt: Option<String>,
     /// Журнал, открытый на просмотр.
-    pub(crate) viewing: Option<PathBuf>,
+    pub(crate) viewing: Option<JournalView>,
+    /// Ошибка открытия журнала: строка `danger` под шапкой.
+    pub(crate) view_error: Option<String>,
+    /// Открытие журнала в фоне: индекс большого файла строится не в потоке окна.
+    view_open: Option<Task<Result<JournalOpen, PageError>>>,
+    /// Страницы журнала, которые читаются в фоне.
+    view_pages: Vec<PageTask>,
+    /// Кеш индексов журналов: общий на приложение, индекс переживает просмотр.
+    pub(crate) journal_cache: std::sync::Arc<SharedJournalCache>,
     /// Конфигурация, собранная последним «Старт».
     pending: Option<SessionConfig>,
     /// Runtime записи; `None` — тесты без сессий: «Старт» только собирает конфигурацию.
@@ -104,6 +120,8 @@ pub struct BytetapApp {
     pub(crate) recorded_path: Option<PathBuf>,
     /// Открыт диалог комментария: набранный текст.
     pub(crate) note_prompt: Option<String>,
+    /// Комментарий относится к журналу на просмотре, а не к идущей сессии.
+    pub(crate) journal_note: bool,
     /// Закрытие окна ждёт остановки записи с этого момента.
     closing: Option<Instant>,
     /// Остановка не уложилась в предел: следующее закрытие не отменяется.
@@ -118,6 +136,8 @@ pub struct BytetapApp {
     restore: Option<(Option<[i32; 2]>, bool)>,
     /// Окно приложения: нужно, чтобы поменять цвет рамки DWM при смене темы.
     window_handle: Option<eframe::wgpu::rwh::RawWindowHandle>,
+    /// Контекст egui: нужен фоновым задачам просмотра журнала.
+    context: Option<egui::Context>,
 }
 
 impl BytetapApp {
@@ -166,6 +186,10 @@ impl BytetapApp {
             copied_until: None,
             profile_prompt: None,
             viewing: None,
+            view_error: None,
+            view_open: None,
+            view_pages: Vec::new(),
+            journal_cache: std::sync::Arc::new(SharedJournalCache::default()),
             pending: None,
             runtime: None,
             phase: Phase::Idle,
@@ -176,6 +200,7 @@ impl BytetapApp {
             journal_failure: None,
             recorded_path: None,
             note_prompt: None,
+            journal_note: false,
             closing: None,
             force_close: false,
             fixtures: false,
@@ -183,6 +208,7 @@ impl BytetapApp {
             dirty: false,
             restore: None,
             window_handle: None,
+            context: Some(ctx.clone()),
         };
         app.preselect_last_card();
         app.interfaces = Loaded::Loading(Task::spawn(ctx, background::list_interfaces));
@@ -298,6 +324,14 @@ impl BytetapApp {
         self
     }
 
+    /// Просмотр журнала на синтетических данных: снимки и тесты без файла.
+    #[must_use]
+    pub fn with_journal_fixture(mut self, view: JournalView) -> Self {
+        self.viewing = Some(view);
+        self.screen = Screen::Viewing;
+        self
+    }
+
     /// Положение окна в физических пикселях (уже проверенное на видимость) и разворот,
     /// которые окно получит в первом кадре.
     #[must_use]
@@ -325,10 +359,6 @@ impl BytetapApp {
 
     pub fn start_error(&self) -> Option<&StartError> {
         self.start_error.as_ref()
-    }
-
-    pub fn viewing(&self) -> Option<&PathBuf> {
-        self.viewing.as_ref()
     }
 
     pub fn selected_card(&self) -> usize {
@@ -430,7 +460,7 @@ impl BytetapApp {
         {
             self.journal_pick = None;
             if let Some(path) = picked {
-                self.open_journal(path);
+                self.open_journal(ctx, path);
             }
         }
         if let Some(task) = &mut self.folder_open
@@ -471,10 +501,209 @@ impl BytetapApp {
         }));
     }
 
-    /// Просмотр журнала (шаг 4 этапа): пока экран с путём.
-    pub(crate) fn open_journal(&mut self, path: PathBuf) {
-        self.viewing = Some(path);
+    /// Просмотр журнала (шаг 4 этапа): индекс журнала строится в фоне, окно не ждёт
+    /// ввод-вывод (U1-AC18).
+    pub(crate) fn open_journal(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.viewing = None;
+        self.view_error = None;
+        self.view_pages.clear();
         self.screen = Screen::Viewing;
+        let cache = std::sync::Arc::clone(&self.journal_cache);
+        self.view_open = Some(Task::spawn(ctx, move || {
+            let cache = cache.handle();
+            JournalOpen::open(&cache, &path)
+        }));
+    }
+
+    /// Закрыть просмотр журнала: возвращает стартовый экран.
+    pub(crate) fn close_journal(&mut self) {
+        self.viewing = None;
+        self.view_error = None;
+        self.view_open = None;
+        self.view_pages.clear();
+        self.screen = Screen::Scenarios;
+    }
+
+    /// Открытый на просмотр журнал.
+    pub fn viewing(&self) -> Option<&JournalView> {
+        self.viewing.as_ref()
+    }
+
+    /// Путь открытого на просмотр журнала.
+    pub fn viewing_path(&self) -> Option<&PathBuf> {
+        self.viewing.as_ref().map(|view| &view.path)
+    }
+
+    /// Ошибка открытия журнала.
+    pub fn view_error(&self) -> Option<&str> {
+        self.view_error.as_deref()
+    }
+
+    /// Открыть диалог комментария к журналу.
+    pub(crate) fn open_journal_note(&mut self) {
+        self.note_prompt = Some(String::new());
+        self.journal_note = true;
+    }
+
+    /// Дописать комментарий в журнал (FR-23): файл растёт, сводка и лента обновляются.
+    pub(crate) fn append_journal_note(&mut self, text: &str) {
+        let Some(view) = &self.viewing else {
+            return;
+        };
+        let path = view.path.clone();
+        let result = {
+            let cache = self.journal_cache.handle();
+            cache.append_note(&path, text)
+        };
+        match result {
+            Ok(()) => {
+                diag::info("комментарий добавлен в журнал");
+                self.reload_journal();
+            }
+            Err(err) => diag::error(format!("комментарий не записан: {err}")),
+        }
+    }
+
+    /// Перечитать журнал после комментария: сводка и лента видят новое событие.
+    ///
+    /// Экран не пересоздаётся: прокрутка и загруженные страницы остаются на месте.
+    fn reload_journal(&mut self) {
+        let Some(view) = &self.viewing else {
+            return;
+        };
+        let path = view.path.clone();
+        let cache = std::sync::Arc::clone(&self.journal_cache);
+        let ctx = self.pending_context();
+        self.view_open = Some(Task::spawn(&ctx, move || {
+            let cache = cache.handle();
+            JournalOpen::open(&cache, &path)
+        }));
+    }
+
+    /// Контекст egui для фоновой задачи: окно уже создано, контекст доступен.
+    fn pending_context(&self) -> egui::Context {
+        self.context.clone().unwrap_or_default()
+    }
+
+    /// Переход к событию по доле времени на карте сессии.
+    pub(crate) fn seek_journal(&mut self, fraction: f32) {
+        let Some(view) = &mut self.viewing else {
+            return;
+        };
+        view.seek = Some(view.event_at_fraction(fraction));
+    }
+
+    /// Рамка видимой области ленты на карте сессии.
+    pub(crate) fn set_visible(&mut self, visible: Option<(f32, f32)>) {
+        if let Some(view) = &mut self.viewing {
+            view.visible = visible;
+        }
+    }
+
+    /// Попросить страницы журнала, покрывающие видимые строки.
+    pub(crate) fn request_pages(&mut self, ctx: &egui::Context, from: usize, to: usize) {
+        let Some(view) = &mut self.viewing else {
+            return;
+        };
+        let missing = view.source.missing_pages(from, to);
+        if missing.is_empty() {
+            return;
+        }
+        let cache = std::sync::Arc::clone(&self.journal_cache);
+        let path = view.path.clone();
+        for (page, start) in missing {
+            view.source.mark_pending(page);
+            let cache = std::sync::Arc::clone(&cache);
+            let path = path.clone();
+            let task = Task::spawn(ctx, move || {
+                let cache = cache.handle();
+                cache.read(&path, start, crate::journal::PAGE_SIZE)
+            });
+            self.view_pages.push((page, task));
+        }
+    }
+
+    /// Итоги фоновых задач просмотра: открытый журнал и прочитанные страницы.
+    fn poll_view(&mut self, ctx: &egui::Context) {
+        if let Some(task) = &mut self.view_open
+            && let Some(result) = task.poll()
+        {
+            self.view_open = None;
+            match result {
+                Ok(opened) => {
+                    let total = opened.summary.events;
+                    match &mut self.viewing {
+                        // Журнал уже открыт: обновляем сводку и длины, экран остаётся.
+                        Some(view) => {
+                            view.summary = opened.summary.clone();
+                            view.first_event = opened.first_event.clone();
+                            view.source.set_lengths(opened.lengths.clone());
+                            view.source.extend(total);
+                            view.invalidate();
+                        }
+                        None => {
+                            self.viewing = Some(JournalView::new(
+                                opened.path.clone(),
+                                opened.summary.clone(),
+                                opened.lengths.clone(),
+                                opened.first_event.clone(),
+                            ));
+                        }
+                    }
+                    diag::info(format!(
+                        "журнал открыт: {} событий, {}",
+                        total,
+                        opened.path.display()
+                    ));
+                    // Первая страница нужна сразу: лента иначе пустая.
+                    self.request_pages(ctx, 0, 1);
+                }
+                Err(err) => {
+                    diag::error(format!("журнал не открылся: {err}"));
+                    self.view_error = Some(t!("journal.openFailed", reason = err.message));
+                }
+            }
+        }
+        let mut done: Vec<(usize, Result<Vec<bytetap_core::journal::Event>, PageError>)> =
+            Vec::new();
+        self.view_pages.retain_mut(|(page, task)| {
+            if let Some(result) = task.poll() {
+                done.push((*page, result));
+                return false;
+            }
+            true
+        });
+        for (page, result) in done {
+            let Some(view) = &mut self.viewing else {
+                continue;
+            };
+            match result {
+                Ok(events) => {
+                    view.source.store_page(page, events);
+                    view.collect_conns();
+                }
+                Err(err) => {
+                    diag::error(format!("страница журнала не прочитана: {err}"));
+                    view.source.mark_failed(page);
+                }
+            }
+        }
+    }
+
+    /// Вид ленты: «Текст» или «HEX»; выбор сохраняется в настройках.
+    pub(crate) fn set_feed_view(&mut self, view: crate::settings::FeedView) {
+        if self.settings.feed.view != view {
+            self.settings.feed.view = view;
+            self.save_settings();
+        }
+    }
+
+    /// Кодировка ленты; выбор сохраняется в настройках.
+    pub(crate) fn set_feed_encoding(&mut self, encoding: crate::settings::Encoding) {
+        if self.settings.feed.encoding != encoding {
+            self.settings.feed.encoding = encoding;
+            self.save_settings();
+        }
     }
 
     /// Карточка последнего сценария выбрана заранее.
@@ -856,16 +1085,21 @@ impl BytetapApp {
     pub fn draw(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.poll_background(&ctx);
+        self.poll_view(&ctx);
         // Края — раньше шапки: нажатие на краю не должно достаться кнопкам под ним.
         titlebar::resize_edges(ui.ctx());
         let p = self.pal();
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0, p.surface_0);
         let recording = self.screen == Screen::Recording && self.rec.is_some();
+        let viewing = self.screen == Screen::Viewing;
         if recording {
             // Шапка, трасса, панель и лента стоят вплотную, как в UI v2.
             ui.spacing_mut().item_spacing.y = 0.0;
             self.recording_title_bar(ui);
+        } else if viewing {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            crate::viewscreen::title_bar(self, ui);
         } else {
             self.home_title_bar(ui);
         }
@@ -876,6 +1110,14 @@ impl BytetapApp {
             if self.live.is_some() {
                 // Пульс точки «Стоп» и таймер: ~30 кадров в секунду только во время записи.
                 ctx.request_repaint_after(live::FRAME);
+            }
+        } else if viewing {
+            crate::viewscreen::error(self, ui);
+            if self.viewing.is_some() {
+                crate::viewscreen::notice(self, ui);
+                crate::viewscreen::map(self, ui);
+                crate::viewscreen::bar(self, ui);
+                crate::viewscreen::feed(self, ui);
             }
         } else {
             egui::ScrollArea::vertical()
@@ -932,33 +1174,9 @@ impl BytetapApp {
             Screen::Scenarios => self.scenarios(ui),
             Screen::Step(mode) => self.step(ui, mode),
             // Запись без экрана записи не бывает: запись идёт со своей шапкой.
-            Screen::Recording | Screen::Viewing => self.placeholder(ui),
+            // Просмотр журнала — тоже: у него своя шапка и своя лента.
+            Screen::Recording | Screen::Viewing => {}
         }
-    }
-
-    /// Просмотр — шаг 4 этапа: пока заголовок, путь журнала и «← Сценарии».
-    fn placeholder(&mut self, ui: &mut Ui) {
-        let p = self.pal();
-        let title = t!("screen.viewing");
-        let path = self.viewing.as_ref().map(|path| path.display().to_string());
-        let ctx = ui.ctx().clone();
-        centered(ui, 512.0, |ui| {
-            ui.add_space(SPACE_4);
-            if widgets::link_button(ui, &p, Icon::ArrowLeft, 15.0, t!("form.back"), false).clicked()
-            {
-                self.back_to_scenarios(&ctx);
-            }
-            ui.add_space(SPACE_3);
-            ui.heading(title);
-            if let Some(path) = path {
-                ui.add_space(SPACE_2);
-                ui.label(
-                    RichText::new(path)
-                        .font(theme::mono(TEXT_XS))
-                        .color(p.text_muted),
-                );
-            }
-        });
     }
 }
 

@@ -405,8 +405,9 @@ fn a_recent_journal_opens_the_viewer() {
         .click();
     harness.run_steps(2);
     assert_eq!(harness.state().screen, Screen::Viewing);
-    let viewing = harness.state().viewing().unwrap().to_string_lossy();
-    assert!(viewing.ends_with("bytetap-20261018180200-tcp_client.jsonl"));
+    // Файла записи нет — журнал не открылся, и под шапкой строка с причиной.
+    assert!(harness.state().viewing().is_none(), "журнал не открылся");
+    harness.get_by_label_contains("Не удалось открыть журнал");
 }
 
 #[test]
@@ -608,7 +609,6 @@ fn every_screen_has_its_heading() {
         ),
         (Screen::Step(SessionMode::Serial), "Кабель COM-порта"),
         (Screen::Recording, "Стоп 00:00"),
-        (Screen::Viewing, "Просмотр журнала"),
     ] {
         let mut harness = Harness::builder()
             .with_size((1200.0, 800.0))
@@ -625,6 +625,23 @@ fn every_screen_has_its_heading() {
             harness.query_by_label("Журналы").is_some(),
             screen != Screen::Recording
         );
+    }
+}
+
+/// Просмотр журнала: своя шапка с «×», именем файла и кнопкой комментария.
+#[test]
+fn the_journal_screen_has_its_own_header() {
+    let mut harness = Harness::builder()
+        .with_size((1200.0, 800.0))
+        .build_eframe(|cc| {
+            BytetapApp::new(&cc.egui_ctx, Settings::default(), None, None)
+                .with_screen(Screen::Viewing)
+        });
+    harness.run_steps(2);
+    harness.get_by_role_and_label(Role::Button, "Закрыть журнал");
+    harness.get_by_role_and_label(Role::Button, "Комментарий");
+    for button in ["Свернуть", "Развернуть", "Закрыть"] {
+        harness.get_by_label(button);
     }
 }
 

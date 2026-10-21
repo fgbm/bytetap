@@ -11,17 +11,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytetap_core::journal::{ClosedBy, Dir, JournalFailureReason, Stats};
+use bytetap_core::journal::{JournalFailureReason, Stats};
 use bytetap_core::session::SessionCounters;
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, Frame, Id, Key, Layout, Popup, Rect, RectAlign,
-    RichText, Role, ScrollArea, Sense, Stroke, TextEdit, TextFormat, Ui, UiBuilder, WidgetInfo,
-    epaint::Shadow, pos2, text::LayoutJob, text::TextWrapping, vec2,
+    self, Align, Color32, CursorIcon, Frame, Id, Key, Layout, Popup, Rect, RectAlign, RichText,
+    Role, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, WidgetInfo, epaint::Shadow, pos2,
+    text::LayoutJob, vec2,
 };
 use tokio::sync::watch;
 
 use crate::app::BytetapApp;
-use crate::feed::{self, Detected, ENCODINGS, FeedEvent, FeedKind, FeedRing, HexLine, Segment};
+use crate::feed::{self, Detected, ENCODINGS, FeedEvent, FeedRing};
+use crate::feedrows::{HEX_ROW_HEIGHT, TEXT_ROW_HEIGHT, hex_row, text_format, text_row, truncated};
 use crate::icons::{self, Icon};
 use crate::live::{self, JournalFailure, JournalFailureCode, SharedFeed};
 use crate::settings::{AppConfig, Encoding, FeedView, Responder, SessionMode};
@@ -30,20 +31,10 @@ use crate::theme::tokens::{
     TEXT_BASE, TEXT_DATA, TEXT_XS,
 };
 use crate::theme::{self, Palette, mix, radius};
-use crate::{diag, t, trace, widgets};
+use crate::{diag, feedrows, t, trace, widgets};
 
-/// Высота строки ленты в виде «Текст».
-pub const TEXT_ROW_HEIGHT: f32 = 28.0;
-/// Высота строки HEX-дампа.
-pub const HEX_ROW_HEIGHT: f32 = 25.0;
 /// Высота панели над лентой.
 const BAR_HEIGHT: f32 = 32.0;
-/// Колонка времени.
-const TIME_WIDTH: f32 = 94.0;
-/// Колонка глифа направления.
-const ARROW_WIDTH: f32 = 12.0;
-/// Колонка номера соединения.
-const CONN_WIDTH: f32 = 24.0;
 /// Период пульса точки «Стоп» (`--bt-pulse-duration`).
 const PULSE_PERIOD: f64 = 1.6;
 
@@ -416,56 +407,7 @@ pub fn failure_reason(code: JournalFailureCode) -> &'static str {
 
 /// Текст события `error`/`info` по коду; неизвестный код — английский `message` журнала.
 pub fn event_text(code: Option<&str>, message: &str) -> String {
-    let text = match code {
-        Some("accept_failed") => t!("events.accept_failed"),
-        Some("connect_failed") => t!("events.connect_failed"),
-        Some("serial_open_failed") => t!("events.serial_open_failed"),
-        Some("connection_read_failed") => t!("events.connection_read_failed"),
-        Some("connection_write_failed") => t!("events.connection_write_failed"),
-        Some("answer_timeout") => t!("events.answer_timeout"),
-        Some("journal_failure") => t!("events.journal_failure"),
-        Some("protocol_undetected") => t!("events.protocol_undetected"),
-        _ => message,
-    };
-    text.to_owned()
-}
-
-fn closed_by(by: ClosedBy) -> &'static str {
-    match by {
-        ClosedBy::Analyzer => t!("feed.byAnalyzer"),
-        ClosedBy::Lis => t!("feed.byLis"),
-        ClosedBy::Bytetap => t!("feed.byApp"),
-    }
-}
-
-/// Вид строки: цвет текста и шрифт служебных строк — как классы `svc`, `ev`, `err`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RowClass {
-    Data(Dir),
-    Service,
-    Event,
-    Error,
-}
-
-/// Текст служебной строки (у фрагмента текст идёт сегментами).
-fn row_text(event: &FeedEvent) -> (RowClass, String) {
-    let conn = event.conn.unwrap_or_default();
-    match &event.kind {
-        FeedKind::Data(data) => (RowClass::Data(data.dir), String::new()),
-        FeedKind::Open { peer } => (
-            RowClass::Service,
-            t!("feed.opened", conn = conn, peer = peer),
-        ),
-        FeedKind::Close { by } => (
-            RowClass::Service,
-            t!("feed.closedSimple", conn = conn, by = closed_by(*by)),
-        ),
-        FeedKind::Error { code, message } => {
-            (RowClass::Error, event_text(code.as_deref(), message))
-        }
-        FeedKind::Info { code, message } => (RowClass::Event, event_text(code.as_deref(), message)),
-        FeedKind::Note { text } => (RowClass::Event, text.clone()),
-    }
+    feedrows::event_text(code, message)
 }
 
 fn encoding_label(encoding: Encoding) -> &'static str {
@@ -483,35 +425,6 @@ fn view_label(view: FeedView) -> &'static str {
         FeedView::Text => t!("feed.viewText"),
         FeedView::Hex => t!("feed.viewHex"),
     }
-}
-
-fn glyph(dir: Dir) -> &'static str {
-    match dir {
-        Dir::AnalyzerToLis => "→",
-        Dir::LisToAnalyzer => "←",
-    }
-}
-
-fn dir_color(p: &Palette, dir: Dir) -> Color32 {
-    match dir {
-        Dir::AnalyzerToLis => p.dir_a2l,
-        Dir::LisToAnalyzer => p.dir_l2a,
-    }
-}
-
-fn format(font: egui::FontId, color: Color32) -> TextFormat {
-    TextFormat {
-        font_id: font,
-        color,
-        valign: Align::Center,
-        ..Default::default()
-    }
-}
-
-/// Текст в одну строку, обрезанный «…» по ширине.
-fn truncated(ui: &Ui, mut job: LayoutJob, width: f32) -> Arc<egui::Galley> {
-    job.wrap = TextWrapping::truncate_at_width(width.max(0.0));
-    ui.painter().layout_job(job)
 }
 
 impl BytetapApp {
@@ -535,7 +448,7 @@ impl BytetapApp {
                 let width = (ui.ctx().content_rect().width() * 0.42).min(ui.available_width());
                 let job = LayoutJob::single_section(
                     summary.clone(),
-                    format(theme::sans(TEXT_DATA), p.text_muted),
+                    text_format(theme::sans(TEXT_DATA), p.text_muted),
                 );
                 let galley = truncated(ui, job, width);
                 let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
@@ -637,7 +550,7 @@ impl BytetapApp {
         }
         if open && let Some(path) = recorded {
             self.dismiss_failure();
-            self.open_journal(path);
+            self.open_journal(&ctx, path);
         }
     }
 
@@ -670,6 +583,7 @@ impl BytetapApp {
             return;
         };
         let p = self.pal();
+        let journal = self.journal_note;
         let mut confirm = false;
         let mut cancel = false;
         let modal = egui::Modal::new(Id::unique("bt-note-prompt"))
@@ -685,13 +599,25 @@ impl BytetapApp {
                 ui.set_width(388.0);
                 ui.spacing_mut().item_spacing.y = SPACE_3;
                 ui.label(
-                    RichText::new(t!("actions.noteTitle"))
-                        .font(theme::sans_semibold(TEXT_BASE))
-                        .color(p.text),
+                    RichText::new(if journal {
+                        t!("journal.noteTitle")
+                    } else {
+                        t!("actions.noteTitle")
+                    })
+                    .font(theme::sans_semibold(TEXT_BASE))
+                    .color(p.text),
                 );
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = SPACE_1;
-                    let label = widgets::field_label(ui, &p, t!("actions.note"));
+                    let label = widgets::field_label(
+                        ui,
+                        &p,
+                        if journal {
+                            t!("journal.noteLabel")
+                        } else {
+                            t!("actions.note")
+                        },
+                    );
                     let id = Id::unique("bt-note-text");
                     let focused = ui.memory(|m| m.has_focus(id));
                     let response = ui
@@ -701,8 +627,12 @@ impl BytetapApp {
                                 .font(theme::sans(TEXT_XS + 1.0))
                                 .text_color(p.text)
                                 .hint_text(
-                                    RichText::new(t!("actions.notePlaceholder"))
-                                        .color(p.text_faint),
+                                    RichText::new(if journal {
+                                        t!("journal.notePlaceholder")
+                                    } else {
+                                        t!("actions.notePlaceholder")
+                                    })
+                                    .color(p.text_faint),
                                 )
                                 .frame(
                                     Frame::new()
@@ -726,14 +656,18 @@ impl BytetapApp {
                     }
                 });
                 let filled = !text.trim().is_empty();
+                let add_label = if journal {
+                    t!("journal.noteAdd")
+                } else {
+                    t!("actions.noteAdd")
+                };
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = SPACE_2;
-                    let buttons = widgets::confirm_button_width(ui, t!("actions.noteAdd"))
+                    let buttons = widgets::confirm_button_width(ui, add_label)
                         + SPACE_2
                         + widgets::chip_button_width(ui, false, t!("actions.cancel"));
                     ui.add_space((ui.available_width() - buttons - SPACE_2).max(0.0));
-                    confirm |=
-                        widgets::confirm_button(ui, &p, t!("actions.noteAdd"), filled).clicked();
+                    confirm |= widgets::confirm_button(ui, &p, add_label, filled).clicked();
                     cancel =
                         widgets::chip_button(ui, &p, None, t!("actions.cancel"), true).clicked();
                 });
@@ -742,7 +676,11 @@ impl BytetapApp {
             cancel = true;
         }
         if confirm && !text.trim().is_empty() {
-            self.add_note(&text);
+            if journal {
+                self.append_journal_note(&text);
+            } else {
+                self.add_note(&text);
+            }
         } else if !cancel {
             self.note_prompt = Some(text);
         }
@@ -843,22 +781,22 @@ fn stop_pill(ui: &mut Ui, p: &Palette, timer: &str) -> egui::Response {
 fn counters(ui: &mut Ui, p: &Palette, stats: &Stats) {
     let font = theme::mono(TEXT_XS);
     let mut job = LayoutJob::default();
-    job.append("→ ", 0.0, format(font.clone(), p.dir_a2l));
+    job.append("→ ", 0.0, text_format(font.clone(), p.dir_a2l));
     job.append(
         &format_bytes(stats.bytes_analyzer_to_lis),
         0.0,
-        format(font.clone(), p.text),
+        text_format(font.clone(), p.text),
     );
-    job.append("← ", SPACE_3, format(font.clone(), p.dir_l2a));
+    job.append("← ", SPACE_3, text_format(font.clone(), p.dir_l2a));
     job.append(
         &format_bytes(stats.bytes_lis_to_analyzer),
         0.0,
-        format(font.clone(), p.text),
+        text_format(font.clone(), p.text),
     );
     job.append(
         &format!("{} {}", stats.connections, t!("record.connShort")),
         SPACE_3,
-        format(font, p.text_faint),
+        text_format(font, p.text_faint),
     );
     let text = format!(
         "→ {} ← {} {} {}",
@@ -1131,211 +1069,6 @@ fn feed_list(
     }
 }
 
-/// Строка ленты во всю ширину: наведение — фоном, роль `label` с текстом строки.
-fn row_frame(ui: &mut Ui, p: &Palette, height: f32, name: &str) -> (Rect, egui::Response) {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
-    response.widget_info(|| WidgetInfo::labeled(Role::Label, true, name));
-    if response.hovered() {
-        ui.painter().rect_filled(rect, 0, p.hover);
-    }
-    (rect, response)
-}
-
-/// Текст фрагмента одной строкой с глифами `‹CR›` и «автоответ».
-fn data_job(p: &Palette, segments: &[Segment], synthetic: bool) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    let ctrl = p.ctrl.gamma_multiply(0.55);
-    for segment in segments {
-        let fmt = if segment.ctrl {
-            format(theme::mono(TEXT_2XS), ctrl)
-        } else {
-            format(theme::mono(TEXT_DATA), p.text)
-        };
-        job.append(&segment.text, 0.0, fmt);
-    }
-    if synthetic {
-        job.append(
-            t!("feed.synthetic"),
-            6.0,
-            format(theme::sans(TEXT_2XS), p.dir_l2a),
-        );
-    }
-    job
-}
-
-/// Строка «Текст»: время · стрелка · №соединения · данные · «автоответ».
-fn text_row(ui: &mut Ui, p: &Palette, event: &FeedEvent, multi: bool, encoding: Encoding) {
-    let (class, text) = row_text(event);
-    let segments = event.data().map(|data| data.segments(encoding));
-    let body = segments
-        .as_deref()
-        .map_or_else(|| text.clone(), feed::plain_text);
-    let name = match (class, event.conn) {
-        (RowClass::Data(dir), Some(conn)) if multi => {
-            format!("{} {} #{conn} {body}", event.time, glyph(dir))
-        }
-        (RowClass::Data(dir), _) => format!("{} {} {body}", event.time, glyph(dir)),
-        _ => format!("{} {body}", event.time),
-    };
-    let (rect, response) = row_frame(ui, p, TEXT_ROW_HEIGHT, &name);
-    let painter = ui.painter().clone();
-    let cy = rect.center().y;
-    let x0 = rect.left() + SPACE_3;
-    let right = rect.right() - SPACE_3;
-    let service = class == RowClass::Service;
-    let size = if service { TEXT_XS } else { TEXT_DATA };
-    painter.text(
-        pos2(x0, cy),
-        Align2::LEFT_CENTER,
-        &event.time,
-        theme::mono(size),
-        p.text_faint,
-    );
-    let mut x = x0 + TIME_WIDTH + SPACE_2;
-    match (class, event.data()) {
-        (RowClass::Data(dir), Some(data)) => {
-            painter.text(
-                pos2(x, cy),
-                Align2::LEFT_CENTER,
-                glyph(dir),
-                theme::mono_medium(TEXT_DATA),
-                dir_color(p, dir),
-            );
-            x += ARROW_WIDTH + SPACE_2;
-            if multi {
-                painter.text(
-                    pos2(x, cy),
-                    Align2::LEFT_CENTER,
-                    format!("#{}", event.conn.unwrap_or_default()),
-                    theme::mono(TEXT_2XS),
-                    p.text_faint,
-                );
-                x += CONN_WIDTH + SPACE_2;
-            }
-            let job = data_job(p, segments.as_deref().unwrap_or_default(), data.synthetic);
-            let galley = truncated(ui, job, right - x);
-            painter.galley(pos2(x, cy - galley.size().y / 2.0), galley, p.text);
-        }
-        _ => {
-            let color = match class {
-                RowClass::Error => p.danger,
-                _ => p.text_muted,
-            };
-            let job = LayoutJob::single_section(text.clone(), format(theme::mono(size), color));
-            let galley = truncated(ui, job, right - x);
-            let end = x + galley.size().x;
-            painter.galley(pos2(x, cy - galley.size().y / 2.0), galley, color);
-            // Служебная строка: линия начинается за текстом и уходит до края.
-            if service && end + SPACE_2 + 12.0 <= right {
-                painter.hline(end + SPACE_2..=right, cy, Stroke::new(1.0, p.border_faint));
-            }
-        }
-    }
-    row_menu(&response, p, event, &body);
-}
-
-/// Строка HEX-дампа: время и стрелка только у первой строки события.
-fn hex_row(
-    ui: &mut Ui,
-    p: &Palette,
-    event: &FeedEvent,
-    line: usize,
-    multi: bool,
-    encoding: Encoding,
-) {
-    let (class, text) = row_text(event);
-    let bytes = event.data().map_or(&[][..], |data| data.bytes.as_slice());
-    let dump: HexLine = feed::hex_line(bytes, line);
-    let hex: Vec<&str> = dump.bytes.iter().map(|(value, _)| value.as_str()).collect();
-    let name = format!(
-        "{} {} {} {}",
-        if line == 0 { event.time.as_str() } else { "" },
-        dump.offset,
-        hex.join(" "),
-        dump.ascii
-    );
-    let (rect, response) = row_frame(ui, p, HEX_ROW_HEIGHT, name.trim());
-    let painter = ui.painter().clone();
-    let font = theme::mono(TEXT_XS);
-    let y = rect.top() + 3.0;
-    let x0 = rect.left() + SPACE_3;
-    let first = line == 0;
-    if first {
-        painter.text(
-            pos2(x0, y),
-            Align2::LEFT_TOP,
-            &event.time,
-            font.clone(),
-            p.text_faint,
-        );
-    }
-    let mut x = x0 + TIME_WIDTH + SPACE_2;
-    if first && let RowClass::Data(dir) = class {
-        painter.text(
-            pos2(x, y),
-            Align2::LEFT_TOP,
-            glyph(dir),
-            theme::mono_medium(TEXT_XS),
-            dir_color(p, dir),
-        );
-    }
-    x += ARROW_WIDTH + SPACE_2;
-    if multi {
-        if first && let Some(conn) = event.conn {
-            painter.text(
-                pos2(x, y),
-                Align2::LEFT_TOP,
-                format!("#{conn}"),
-                font.clone(),
-                p.text_faint,
-            );
-        }
-        x += CONN_WIDTH + SPACE_2;
-    }
-    let (byte_color, ascii_color) = match class {
-        RowClass::Data(_) => (p.text, p.text_muted),
-        RowClass::Error => (p.danger, p.danger),
-        RowClass::Event | RowClass::Service => (p.text_muted, p.text_muted),
-    };
-    let mut job = LayoutJob::default();
-    job.append(&dump.offset, 0.0, format(font.clone(), p.text_faint));
-    for (index, (value, control)) in dump.bytes.iter().enumerate() {
-        let fmt = if *control && matches!(class, RowClass::Data(_)) {
-            format(theme::mono_medium(TEXT_XS), p.ctrl)
-        } else {
-            format(font.clone(), byte_color)
-        };
-        job.append(value, if index == 0 { SPACE_2 } else { 2.0 }, fmt.clone());
-        job.append(" ", 0.0, fmt);
-    }
-    job.append(&dump.ascii, SPACE_2, format(font, ascii_color));
-    let galley = truncated(ui, job, rect.right() - SPACE_3 - x);
-    painter.galley(pos2(x, y), galley, p.text);
-    let copy_text = event
-        .data()
-        .map_or(text, |data| feed::plain_text(&data.segments(encoding)));
-    row_menu(&response, p, event, &copy_text);
-}
-
-/// Контекстное меню строки: текст, HEX и Base64 фрагмента (U1-AC16).
-fn row_menu(response: &egui::Response, p: &Palette, event: &FeedEvent, text: &str) {
-    response.context_menu(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        if widgets::menu_item(ui, p, t!("feed.copyText"), true).clicked() {
-            ui.ctx().copy_text(text.to_owned());
-        }
-        if let Some(data) = event.data() {
-            if widgets::menu_item(ui, p, t!("feed.copyHex"), true).clicked() {
-                ui.ctx().copy_text(feed::hex_string(&data.bytes));
-            }
-            if widgets::menu_item(ui, p, t!("feed.copyBase64"), true).clicked() {
-                ui.ctx().copy_text(feed::base64_string(&data.bytes));
-            }
-        }
-    });
-}
-
 /// Итоги остановки в журнал запуска.
 pub(crate) fn log_outcome(outcome: &live::StopOutcome) {
     match (&outcome.stats, &outcome.failure, &outcome.error) {
@@ -1362,8 +1095,10 @@ pub(crate) fn log_outcome(outcome: &live::StopOutcome) {
 
 #[cfg(test)]
 mod tests {
+    use bytetap_core::journal::Dir;
+
     use super::*;
-    use crate::feed::DataPayload;
+    use crate::feed::{DataPayload, FeedKind};
 
     fn data(conn: u32, len: usize) -> Arc<FeedEvent> {
         Arc::new(FeedEvent {

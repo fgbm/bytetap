@@ -104,7 +104,7 @@ pub fn setup_dwm(handle: RawWindowHandle, border: Color32) -> DwmSetup {
     // Скругление: DWM рисует углы и рамку сам, иначе своя рамка дала бы квадратные
     // углы поверх скругления.
     if dwm_round_supported() {
-        let corner = DWMWCP_ROUND as i32;
+        let corner = DWMWCP_ROUND;
         // SAFETY: атрибут — целое число, размер совпадает с типом.
         let ok = unsafe {
             DwmSetWindowAttribute(

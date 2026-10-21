@@ -145,11 +145,14 @@ impl BytetapApp {
     }
 
     /// «Журналы»: открыть журнал на просмотр или папку журналов в проводнике.
+    ///
+    /// Во время записи журнал не открыть: лента занята сессией. Пункт остаётся
+    /// видимым, но неактивным, и подсказывает почему.
     fn journals_menu(&mut self, ui: &mut Ui) {
         let p = self.pal();
         let button =
             widgets::link_button(ui, &p, Icon::FolderOpen, 15.0, t!("header.journals"), false);
-        let recording = self.screen == crate::Screen::Recording;
+        let busy = self.session_busy();
         let mut open_journal = false;
         let mut open_folder = false;
         egui::Popup::menu(&button)
@@ -158,8 +161,11 @@ impl BytetapApp {
             .gap(4.0)
             .show(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                open_journal =
-                    widgets::menu_item(ui, &p, t!("header.openJournal"), !recording).clicked();
+                let item = widgets::menu_item(ui, &p, t!("header.openJournal"), !busy);
+                if busy {
+                    item.clone().on_hover_text(t!("header.openJournalBusy"));
+                }
+                open_journal = item.clicked();
                 open_folder = widgets::menu_item(ui, &p, t!("header.openFolder"), true).clicked();
             });
         let ctx = ui.ctx().clone();

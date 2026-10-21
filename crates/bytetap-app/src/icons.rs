@@ -21,9 +21,11 @@ pub enum Icon {
     MonitorDown,
     Moon,
     Network,
+    Pen,
     RefreshCw,
     Square,
     Sun,
+    TriangleAlert,
     Usb,
     X,
 }
@@ -45,9 +47,11 @@ impl Icon {
             Self::MonitorDown => egui::include_image!("../assets/icons/monitor-down.svg"),
             Self::Moon => egui::include_image!("../assets/icons/moon.svg"),
             Self::Network => egui::include_image!("../assets/icons/network.svg"),
+            Self::Pen => egui::include_image!("../assets/icons/pen.svg"),
             Self::RefreshCw => egui::include_image!("../assets/icons/refresh-cw.svg"),
             Self::Square => egui::include_image!("../assets/icons/square.svg"),
             Self::Sun => egui::include_image!("../assets/icons/sun.svg"),
+            Self::TriangleAlert => egui::include_image!("../assets/icons/triangle-alert.svg"),
             Self::Usb => egui::include_image!("../assets/icons/usb.svg"),
             Self::X => egui::include_image!("../assets/icons/x.svg"),
         }

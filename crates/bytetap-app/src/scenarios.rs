@@ -205,9 +205,14 @@ impl BytetapApp {
                 );
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.add_space(SPACE_2);
+                // Во время записи журнал не открыть: лента занята сессией.
+                let busy = self.session_busy();
                 for journal in &recents {
                     let meta = self.recent_meta_now(journal);
-                    if recent_row(ui, &p, journal, &meta).clicked() {
+                    let response = recent_row(ui, &p, journal, &meta);
+                    if busy {
+                        response.on_hover_text(t!("header.openJournalBusy"));
+                    } else if response.clicked() {
                         open_recent = Some(journal.path.clone());
                     }
                 }
@@ -215,7 +220,7 @@ impl BytetapApp {
             ui.add_space(SPACE_6);
         });
         if let Some(path) = open_recent {
-            self.open_journal(path);
+            self.open_journal(&ctx, path);
         } else if let Some(mode) = open {
             self.open_step(mode);
         }
