@@ -437,9 +437,17 @@ fn a_comment_and_stop_from_the_recording_header() {
         .type_text("проба 3");
     harness.run_steps(2);
     harness.get_by_label("Добавить").click();
-    harness.run_steps(2);
-    assert!(harness.query_by_label("Комментарий к сессии").is_none());
-    harness.get_by_label_contains("проба 3");
+    step_until(
+        &mut harness,
+        "диалог комментария закрылся",
+        |h| h.query_by_label("Комментарий к сессии").is_none(),
+    );
+    // Комментарий идёт в журнал сессии и возвращается лентой через broadcast.
+    step_until(
+        &mut harness,
+        "строка комментария в ленте",
+        |h| h.query_by_label_contains("проба 3").is_some(),
+    );
     harness.get_by_label_contains("Стоп 00:").click();
     step_until(&mut harness, "остановка", |h| {
         h.state().phase() == Phase::Idle
