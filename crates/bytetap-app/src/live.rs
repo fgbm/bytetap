@@ -47,12 +47,14 @@ pub const FRAME_SLOWEST: Duration = Duration::from_secs(1);
 /// Период кадров записи: потолок по адаптеру и по цене прошлых кадров.
 ///
 /// `cost` — скользящее среднее цены кадра (см. [`frame_cost`]). Кадр стоит столько,
-/// сколько он рисуется, поэтому ждать между кадрами надо не меньше, чем он рисуется:
-/// два бюджета кадра на кадр не дают окну занять все ядра, а лента всё равно догоняет.
+/// сколько он рисуется, поэтому ждать между кадрами надо заметно больше: три бюджета
+/// кадра на кадр оставляют окну четверть ядра, а лента всё равно догоняет буфером.
+/// Замер на WARP: кадр 206 мс при ожидании 620 мс — это 97 % одного ядра вместо 306 %
+/// при 30 запросах кадра в секунду.
 #[must_use]
 pub fn next_period(software: bool, cost: Duration) -> Duration {
     let floor = if software { FRAME_SOFTWARE } else { FRAME };
-    cost.saturating_mul(2).clamp(floor, FRAME_SLOWEST)
+    cost.saturating_mul(3).clamp(floor, FRAME_SLOWEST)
 }
 
 /// Цена кадра по промежутку между кадрами: пока окно ждёт по таймеру, кадр стоит
@@ -462,10 +464,10 @@ mod tests {
         // Быстрый кадр: на аппаратном растре 30 кадров в секунду, на WARP — 10.
         assert_eq!(next_period(false, Duration::from_millis(4)), FRAME);
         assert_eq!(next_period(true, Duration::from_millis(4)), FRAME_SOFTWARE);
-        // Кадр 160 мс на WARP: ждать вдвое дольше, чем он рисуется.
+        // Кадр 160 мс на WARP: ждать втрое дольше, чем он рисуется.
         assert_eq!(
             next_period(true, Duration::from_millis(160)),
-            Duration::from_millis(320)
+            Duration::from_millis(480)
         );
         // Медленнее предела — ждать не дольше секунды: лента должна идти.
         assert_eq!(next_period(true, Duration::from_secs(1)), FRAME_SLOWEST);
