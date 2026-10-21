@@ -322,6 +322,104 @@ jobs:
           if (-not $dialog -or -not $panicked) { $failed = $true }
           if ($failed) { exit 1 }
 
+      # U1-AC17, NFR-5: запись HL7 и закрытие окна во время записи. Тестовый хук
+      # BYTETAP_TEST_AUTOSTART запускает запись TCP-сервера на свободном порту loopback;
+      # адрес и журнал сессии exe пишет в журнал запуска. Клиент шлёт синтетическое
+      # сообщение HL7 в рамке MLLP и ждёт ACK, затем окно получает WM_CLOSE: журнал
+      # сессии должен закончиться session_end, а процесс — выйти сам.
+      - name: Смоук — запись HL7 и закрытие окна
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Force -Path smoke
+          $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $env:BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0'
+          $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
+          $null = $p.Handle
+          $env:BYTETAP_TEST_AUTOSTART = ''
+          $failed = $false
+          $addr = $null
+          $journal = $null
+          for ($i = 0; $i -lt 60 -and -not $addr -and -not $p.HasExited; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Test-Path $log) {
+              $found = Select-String -Path $log -Pattern 'запись идёт: адрес ([^,\s]+), журнал (.+)$' -Encoding utf8 | Select-Object -First 1
+              if ($found) {
+                $addr = $found.Matches[0].Groups[1].Value
+                $journal = $found.Matches[0].Groups[2].Value.Trim()
+              }
+            }
+          }
+          if (-not $addr) {
+            Write-Host 'запись не началась'
+            $failed = $true
+          } else {
+            Write-Host "запись: $addr, журнал $journal"
+            try {
+              $port = [int]($addr -split ':')[-1]
+              $client = New-Object System.Net.Sockets.TcpClient
+              $client.Connect('127.0.0.1', $port)
+              $stream = $client.GetStream()
+              $stream.ReadTimeout = 10000
+              $text = "MSH|^~\&|ANALYZER|LAB|LIS||20261019101500||ORU^R01|MSG00001|P|2.3.1`rPID|1||000001||PATIENT^TEST`r"
+              [byte[]]$frame = @(0x0b) + [System.Text.Encoding]::ASCII.GetBytes($text) + @(0x1c, 0x0d)
+              $stream.Write($frame, 0, $frame.Length)
+              $buffer = New-Object byte[] 4096
+              $ack = New-Object System.Collections.Generic.List[byte]
+              while (-not ($ack.Count -ge 2 -and $ack[$ack.Count - 2] -eq 0x1c -and $ack[$ack.Count - 1] -eq 0x0d)) {
+                $n = $stream.Read($buffer, 0, $buffer.Length)
+                if ($n -le 0) { break }
+                $ack.AddRange([byte[]]$buffer[0..($n - 1)])
+              }
+              $ackText = [System.Text.Encoding]::ASCII.GetString($ack.ToArray())
+              Write-Host "ACK: $($ackText -replace "`r", '<CR>')"
+              if ($ackText -notmatch 'MSA\|AA\|MSG00001') { Write-Host 'ACK не тот'; $failed = $true }
+              $client.Close()
+            } catch {
+              Write-Host "клиент HL7: $_"
+              $failed = $true
+            }
+          }
+          if (-not $p.HasExited) {
+            Start-Sleep -Seconds 1
+            $p.Refresh()
+            # WM_CLOSE главному окну: так же, как «Закрыть» в шапке или Alt+F4.
+            [void]$p.CloseMainWindow()
+            if (-not $p.WaitForExit(30000)) {
+              Write-Host 'bytetap.exe не закрылся за 30 с'
+              Stop-Process -Id $p.Id -Force
+              $failed = $true
+            } else {
+              Write-Host "bytetap.exe закрылся, код $($p.ExitCode)"
+              if ($p.ExitCode -ne 0) { $failed = $true }
+            }
+          } else {
+            Write-Host "bytetap.exe завершился сам, код $($p.ExitCode)"
+            $failed = $true
+          }
+          if (Test-Path $log) {
+            Copy-Item $log (Join-Path $out 'bytetap-recording.log')
+            Get-Content -Encoding utf8 $log
+          }
+          if ($journal -and (Test-Path $journal)) {
+            # Журнал синтетический: сообщение выше, данных приборов в нём нет.
+            Copy-Item $journal (Join-Path $out 'recording-session.jsonl')
+            $last = Get-Content -Encoding utf8 $journal | Select-Object -Last 1
+            Write-Host "последняя строка журнала: $last"
+            if ($last -notmatch '"type":"session_end"') { $failed = $true }
+            $data = (Select-String -Path $journal -Pattern '"type":"data"' -Encoding utf8).Count
+            Write-Host "фрагментов в журнале: $data"
+            if ($data -lt 2) { $failed = $true }
+          } else {
+            Write-Host "журнала сессии $journal нет"
+            $failed = $true
+          }
+          if (-not (Select-String -Path $log -Pattern 'запись остановлена, окно закрывается' -Quiet -Encoding utf8)) {
+            Write-Host 'окно закрылось без штатной остановки записи'
+            $failed = $true
+          }
+          if ($failed) { exit 1 }
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: bytetap-native-windows-x64
