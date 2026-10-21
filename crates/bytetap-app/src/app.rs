@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use bytetap_core::journal::{LogDirWarningKind, RecentJournal};
+use bytetap_core::journal::{LogDirWarningKind, RecentJournal, Stats};
 use bytetap_core::session::SessionConfig;
 use bytetap_core::transport::Source;
 use bytetap_core::transport::serial::PortInfo;
@@ -140,6 +140,8 @@ pub struct BytetapApp {
     close_canceled: bool,
     /// Ошибка остановки записи: строка на стартовом экране (как `stop_failed` в UI v2).
     pub(crate) stop_error: Option<String>,
+    /// Итоги последней записи: строка на стартовом экране (U1-AC17).
+    pub(crate) stop_stats: Option<Stats>,
     /// Снимки и тесты: данные окружения даны заранее, фоновых опросов нет.
     fixtures: bool,
     pub(crate) now: Option<DateTime<FixedOffset>>,
@@ -219,6 +221,7 @@ impl BytetapApp {
             force_close: false,
             close_canceled: false,
             stop_error: None,
+            stop_stats: None,
             fixtures: false,
             now: None,
             dirty: false,
@@ -328,6 +331,11 @@ impl BytetapApp {
     /// Ошибка остановки записи: видна на стартовом экране (U1-AC17).
     pub fn stop_error(&self) -> Option<&str> {
         self.stop_error.as_deref()
+    }
+
+    /// Итоги последней записи: видны на стартовом экране (U1-AC17).
+    pub fn stop_stats(&self) -> Option<&Stats> {
+        self.stop_stats.as_ref()
     }
 
     pub fn recorded_path(&self) -> Option<&PathBuf> {
@@ -745,6 +753,8 @@ impl BytetapApp {
         self.settings_mut().config.mode = mode;
         self.form = FormState::new(&self.settings.config);
         self.start_error = None;
+        self.stop_error = None;
+        self.stop_stats = None;
         self.copied_until = None;
         self.screen = Screen::Step(mode);
         self.save_settings();
@@ -893,6 +903,7 @@ impl BytetapApp {
                     self.live = Some(session);
                     self.start_error = None;
                     self.stop_error = None;
+                    self.stop_stats = None;
                     self.screen = Screen::Recording;
                     if self.closing.is_some() {
                         self.stop_recording(ctx);
@@ -946,6 +957,8 @@ impl BytetapApp {
                 self.stop_error = Some(error);
             } else {
                 self.phase = live::reduce(self.phase, Action::Stopped);
+                // Итоги записи — на стартовом экране: сколько соединений и байт (U1-AC17).
+                self.stop_stats = outcome.stats.clone();
             }
             self.rec = None;
             if self.screen == Screen::Recording {
@@ -1210,31 +1223,52 @@ impl BytetapApp {
         crate::window::draw_frame(ui, &p, maximized);
     }
 
-    /// Ошибка остановки записи: строка под шапкой на стартовом экране (U1-AC17).
+    /// Итоги или ошибка остановки записи: строка под шапкой на стартовом экране
+    /// (U1-AC17).
     ///
     /// Как `stop_failed` в UI v2: запись не началась заново, но человек видит, что
-    /// остановка сорвалась, и почему.
+    /// остановка сорвалась и почему; при удачной остановке — итоги записи.
     fn stop_error_notice(&mut self, ui: &mut Ui) {
-        let Some(error) = self.stop_error.clone() else {
-            return;
-        };
         if self.screen == Screen::Recording {
             return;
         }
+        let error = self.stop_error.clone();
+        let stats = self.stop_stats.clone();
+        if error.is_none() && stats.is_none() {
+            return;
+        }
         let p = self.pal();
-        let text = t!("record.stopFailed", reason = error);
+        let (text, danger) = match (&error, &stats) {
+            (Some(error), _) => (t!("record.stopFailed", reason = error), true),
+            (None, Some(stats)) => {
+                let text = t!(
+                    "record.stopped",
+                    connections = stats.connections,
+                    to_lis = crate::recording::format_bytes(stats.bytes_analyzer_to_lis),
+                    to_analyzer = crate::recording::format_bytes(stats.bytes_lis_to_analyzer)
+                );
+                (text, false)
+            }
+            (None, None) => return,
+        };
         egui::Frame::new()
-            .fill(mix(p.surface_0, p.danger, 0.12))
+            .fill(mix(
+                p.surface_0,
+                if danger { p.danger } else { p.text_muted },
+                0.12,
+            ))
             .inner_margin(egui::Margin::symmetric(SPACE_3 as i8, SPACE_2 as i8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(text).size(TEXT_XS).color(p.danger));
+                    let color = if danger { p.danger } else { p.text_muted };
+                    ui.label(RichText::new(text).size(TEXT_XS).color(color));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if widgets::icon_button(ui, &p, Icon::X, 14.0, t!("settings.dismiss"))
                             .clicked()
                         {
                             self.stop_error = None;
+                            self.stop_stats = None;
                         }
                     });
                 });

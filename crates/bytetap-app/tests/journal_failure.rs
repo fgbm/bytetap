@@ -281,6 +281,12 @@ fn a_session_that_finished_by_itself_is_noticed() {
         harness.state().stop_error().is_none(),
         "ошибки остановки нет: сессия закончилась сама"
     );
+    // Итоги записи видны на стартовом экране.
+    let stats = harness.state().stop_stats().expect("итоги записи");
+    assert_eq!(stats.connections, 1, "одно соединение");
+    assert!(stats.bytes_analyzer_to_lis > 0, "байты от анализатора");
+    use egui_kittest::kittest::Queryable as _;
+    harness.get_by_label_contains("Запись закончена");
     let text = std::fs::read_to_string(&path).expect("журнал читается");
     assert!(
         text.contains("\"type\":\"session_end\""),
