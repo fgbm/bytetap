@@ -82,6 +82,49 @@ const JOURNAL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(feature = "test-hooks")]
 pub static TEST_JOURNAL_SHUTDOWN_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Тестовый хук: сессия заканчивается сама после стольких событий.
+///
+/// `u64::MAX` — хук выключен. Нужен тесту интерфейса: сессия, закончившаяся сама без
+/// отказа журнала, должна освобождать слот и останавливать таймер (U1-AC17).
+#[cfg(feature = "test-hooks")]
+pub static TEST_END_AFTER_EVENTS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Тестовый хук: задача сессии падает после стольких событий.
+///
+/// `u64::MAX` — хук выключен. Падение задачи — не отказ журнала: остановка вернёт
+/// ошибку без причины журнала, и интерфейс покажет её как ошибку остановки (U1-AC17).
+#[cfg(feature = "test-hooks")]
+pub static TEST_PANIC_AFTER_EVENTS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// События, дошедшие до публикации: счётчик хуков [`TEST_END_AFTER_EVENTS`] и
+/// [`TEST_PANIC_AFTER_EVENTS`].
+#[cfg(feature = "test-hooks")]
+static PUBLISHED_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Пора закончить сессию самой: хук [`TEST_END_AFTER_EVENTS`] сработал.
+#[cfg(feature = "test-hooks")]
+fn test_hook_end() -> bool {
+    let limit = TEST_END_AFTER_EVENTS.load(Ordering::Relaxed);
+    limit != u64::MAX && PUBLISHED_EVENTS.load(Ordering::Relaxed) > limit
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn test_hook_end() -> bool {
+    false
+}
+
+/// Задача сессии должна упасть: хук [`TEST_PANIC_AFTER_EVENTS`] сработал.
+#[cfg(feature = "test-hooks")]
+fn test_hook_panic() -> bool {
+    let limit = TEST_PANIC_AFTER_EVENTS.load(Ordering::Relaxed);
+    limit != u64::MAX && PUBLISHED_EVENTS.load(Ordering::Relaxed) > limit
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn test_hook_panic() -> bool {
+    false
+}
+
 /// Настройки сессии: источник соединений, автоответчик, папка журналов, поля заголовка (FR-21).
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -537,6 +580,8 @@ impl Shared {
         if !recorded {
             self.fail_journal();
         }
+        #[cfg(feature = "test-hooks")]
+        PUBLISHED_EVENTS.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Ошибка и замечание уровня сессии или соединения (NFR-5).
@@ -798,6 +843,14 @@ async fn run(
     let (prefix, code) = source_failure(mode);
     let mut wait_before_next = false;
     loop {
+        // Тестовый хук: сессия заканчивается сама. Обычной сборки здесь нет — хук
+        // живёт только в сборке с `test-hooks`.
+        if test_hook_end() {
+            break;
+        }
+        if test_hook_panic() {
+            panic!("test hook: the session task failed");
+        }
         // TCP-клиент и COM-порт не открывают второе соединение, пока живо первое,
         // и выдерживают интервал после разрыва (M3-AC1, M3-AC2).
         if wait_before_next {
