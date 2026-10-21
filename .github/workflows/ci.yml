@@ -422,16 +422,23 @@ jobs:
                   [Convert]::ToInt32($hex.Substring(4, 2), 16))
               })
               # Углы не трогаем: там скругление и сглаживание. По середине каждой стороны
-              # берём 21 точку через 2 px и ищем цвет рамки в полосе ±6 px от края окна:
-              # рамка DWM ложится на край или на пиксель внутрь, а точное место зависит от
-              # масштаба экрана раннера.
-              $band = 6
+              # берём 21 точку через 2 px и ищем цвет рамки в полосе ±2 px от края окна:
+              # своя рамка — ровно 1 физический пиксель по краю, DWM рисует её по краю же.
+              # Допуск на канал — 8: рамка не сглаживается, но снимок проходит через
+              # масштаб экрана раннера.
+              $band = 2
+              $tolerance = 8
+              # Контраст: в 3 px внутрь окна лежит фон (`--bt-surface-0`), и рамка обязана
+              # от него отличаться. Иначе белая рамка на белом фоне прошла бы по цвету,
+              # но её не было бы видно — а рамка нужна именно на белом.
+              $contrast = 12
+              $inner = 3
               $samples = @()
               for ($i = -10; $i -le 10; $i++) {
-                $samples += @{ X = [int]($pad + $w / 2 + $i * 2); Y = [int]$pad; Vert = $true }
-                $samples += @{ X = [int]($pad + $w / 2 + $i * 2); Y = [int]($pad + $h - 1); Vert = $true }
-                $samples += @{ X = [int]$pad; Y = [int]($pad + $h / 2 + $i * 2); Vert = $false }
-                $samples += @{ X = [int]($pad + $w - 1); Y = [int]($pad + $h / 2 + $i * 2); Vert = $false }
+                $samples += @{ X = [int]($pad + $w / 2 + $i * 2); Y = [int]$pad; Vert = $true; In = 1 }
+                $samples += @{ X = [int]($pad + $w / 2 + $i * 2); Y = [int]($pad + $h - 1); Vert = $true; In = -1 }
+                $samples += @{ X = [int]$pad; Y = [int]($pad + $h / 2 + $i * 2); Vert = $false; In = 1 }
+                $samples += @{ X = [int]($pad + $w - 1); Y = [int]($pad + $h / 2 + $i * 2); Vert = $false; In = -1 }
               }
               $hits = 0
               foreach ($sample in $samples) {
@@ -443,21 +450,34 @@ jobs:
                   if ($x -lt 0 -or $y -lt 0 -or $x -ge $shot.Width -or $y -ge $shot.Height) { continue }
                   $px = $shot.GetPixel($x, $y)
                   foreach ($want in $borderColors) {
-                    if (([Math]::Abs([int]$px.R - [int]$want.R) -le 24) -and
-                        ([Math]::Abs([int]$px.G - [int]$want.G) -le 24) -and
-                        ([Math]::Abs([int]$px.B - [int]$want.B) -le 24)) { $found = $true; break }
+                    if (([Math]::Abs([int]$px.R - [int]$want.R) -le $tolerance) -and
+                        ([Math]::Abs([int]$px.G - [int]$want.G) -le $tolerance) -and
+                        ([Math]::Abs([int]$px.B - [int]$want.B) -le $tolerance)) { $found = $true; break }
                   }
                 }
-                if ($found) { $hits++ }
+                if (-not $found) { continue }
+                # Тот же край, но на 3 px внутрь окна: там фон, и рамка должна от него
+                # отличаться хотя бы на $contrast по одному каналу.
+                $x = [int]$sample.X
+                $y = [int]$sample.Y
+                if ($sample.Vert) { $y = $y + $sample.In * $inner } else { $x = $x + $sample.In * $inner }
+                if ($x -lt 0 -or $y -lt 0 -or $x -ge $shot.Width -or $y -ge $shot.Height) { continue }
+                $bg = $shot.GetPixel($x, $y)
+                $diff = [Math]::Max(
+                  [Math]::Abs([int]$bg.R - [int]$px.R),
+                  [Math]::Max([Math]::Abs([int]$bg.G - [int]$px.G), [Math]::Abs([int]$bg.B - [int]$px.B)))
+                if ($diff -lt $contrast) { continue }
+                $hits++
               }
               Write-Host "пикселей периметра цветом --bt-border: $hits из $($samples.Count)"
+              Write-Host "контраст рамки с фоном на 3 px внутрь: не меньше $contrast по каналу"
               if ($corner -eq 2) {
                 Write-Host 'DWM скруглил окно: рамку рисует система, периметр снимка сверен'
               } else {
                 Write-Host 'DWM не скруглил окно: свою рамку рисует приложение'
               }
               if ($hits -lt [int]($samples.Count * 0.9)) {
-                Write-Host 'рамка окна не совпадает с --bt-border на снимке'
+                Write-Host 'рамка окна не совпадает с --bt-border на снимке или не видна на белом'
                 $failed = $true
               }
               $shot.Dispose(); $canvas.Dispose()
@@ -680,9 +700,17 @@ jobs:
             $line = "CPU при записи 100 фрагментов/с за 10 с: {0:N2} % одного ядра (WARP, программный растр)" -f $busy
             Write-Host $line
             $line | Out-File -Encoding utf8 smoke/cpu-recording.txt
-            # Цена кадра на WARP у раннера своя, это диагностика: порог тут мягкий,
-            # а жёсткая проверка — частота кадров из журнала запуска ниже.
-            if ($busy -ge 450.0) { Write-Host "CPU при записи $busy % — заняты все ядра"; $failed = $true }
+            # Замер до правки частоты кадров (run 28b98b3): 306 % одного ядра и 6.2
+            # кадра/с — кадр WARP стоит ~160 мс и окно просило его 30 раз в секунду.
+            # Теперь период выбирается по цене кадра (live::next_period): кадр 160 мс —
+            # ожидание 320 мс, то есть около двух кадров в секунду, и лента догоняет
+            # буфером. Порог — в полтора раза ниже прежнего замера.
+            $beforeCpu = 306.0
+            $beforeFps = 6.2
+            $line = "было: {0:N0} % одного ядра и {1:N1} кадра/с; стало: {2:N2} % и см. кадры/с из журнала" -f $beforeCpu, $beforeFps, $busy
+            Write-Host $line
+            $line | Out-File -Encoding utf8 smoke/cpu-recording.txt -Append
+            if ($busy -ge 200.0) { Write-Host "CPU при записи $busy % — больше 200 % одного ядра"; $failed = $true }
           }
           # Остановка штатная (WM_CLOSE): журнал запуска получает итог кадров записи.
           if (-not $p.HasExited) {
@@ -696,6 +724,9 @@ jobs:
               $fps = [double]$frames.Matches[0].Groups[2].Value
               $count | Out-File -Encoding utf8 smoke/cpu-recording.txt -Append
               Write-Host ("кадров за запись: {0}, {1:N1} в секунду" -f $count, $fps)
+              # Данные ленты не теряются при редких кадрах — их держит буфер, — но совсем
+              # замереть лента не должна: кадр идёт и при записи без новых событий.
+              if ($fps -lt 1.0) { Write-Host "перерисовка $fps кадров в секунду — лента не идёт"; $failed = $true }
               if ($fps -gt 33.0) { Write-Host "перерисовка $fps кадров в секунду — чаще 30"; $failed = $true }
             } else {
               Write-Host 'в журнале запуска нет итога кадров записи'
