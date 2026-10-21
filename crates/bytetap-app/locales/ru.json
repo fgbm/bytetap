@@ -143,7 +143,7 @@
     "responderAutoHl7": "HL7 (авто)",
     "responderAutoAstm": "ASTM (авто)",
     "closeTimeout": "Запись не остановилась за 15 секунд, окно закрыто принудительно: журнал мог быть дописан не полностью.",
-    "journalIncomplete": "Журнал мог быть дописан не полностью: {reason}.",
+    "journalIncomplete": "Журнал мог быть дописан не полностью: {reason}",
     "stopFailed": "Запись остановлена с ошибкой: {reason}"
   },
   "feed": {

@@ -310,6 +310,60 @@ fn closing_the_window_stops_the_recording_first() {
     assert!(types.iter().any(|t| t == "data"));
 }
 
+/// Закрытие окна во время записи отменяется один раз, а не по каждому кадру: иначе
+/// окно гоняло бы `CancelClose` и не дошло бы до закрытия (U1-AC17).
+#[test]
+fn the_close_is_canceled_once_and_not_in_a_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let handle = rt.handle().clone();
+    let log_dir = dir.path().to_string_lossy().into_owned();
+    let mut harness = Harness::builder()
+        .with_size((1200.0, 800.0))
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, Settings::with_log_dir(&log_dir), None, None)
+                .with_runtime(handle)
+                .with_test_autostart(&cc.egui_ctx, "tcp_server:127.0.0.1:0")
+        });
+    step_until(&mut harness, "запись", |h| {
+        h.state().phase() == Phase::Recording
+    });
+
+    harness
+        .input_mut()
+        .viewports
+        .get_mut(&ViewportId::ROOT)
+        .unwrap()
+        .events
+        .push(ViewportEvent::Close);
+    harness.step();
+    assert!(
+        commands(&harness).contains(&ViewportCommand::CancelClose),
+        "закрытие отменено до остановки"
+    );
+
+    // Пока идёт остановка, отменять закрытие снова нельзя: событие закрытия может
+    // висеть в кадре дольше одного прохода (у свёрнутого окна кадр рисует логика).
+    let mut canceled = 0;
+    let mut closed = false;
+    for _ in 0..200 {
+        harness.step();
+        let commands = commands(&harness);
+        canceled += commands
+            .iter()
+            .filter(|command| **command == ViewportCommand::CancelClose)
+            .count();
+        closed |= commands.contains(&ViewportCommand::Close);
+        if closed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(canceled, 0, "повторной отмены закрытия нет");
+    assert!(closed, "окно закрылось после остановки записи");
+    assert!(!harness.state().session_busy());
+}
+
 /// «Старт» на занятом порту из формы: ошибка у поля порта, экран формы, журнала нет.
 #[test]
 fn a_busy_port_from_the_form_stays_on_the_form() {

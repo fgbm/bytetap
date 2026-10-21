@@ -1189,6 +1189,62 @@ fn a_row_has_a_copy_menu() {
     assert!(copied.is_some_and(|text| text.starts_with("0B 4D 53 48")));
 }
 
+/// «Скопировать текст» отдаёт весь фрагмент, а не первые 2048 байт строки ленты
+/// (U1-AC16).
+#[test]
+fn the_copied_text_is_the_whole_fragment() {
+    use bytetap_core::journal::{Data, Dir, Event};
+
+    // Фрагмент длиннее предела показа в строке ленты (2048 байт).
+    let payload = vec![b'A'; 3000];
+    let fixture = RecordingFixture {
+        events: vec![Event::Data(Data::new(
+            "2026-10-19T23:27:11.546+03:00",
+            1_546_000,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            &payload,
+        ))],
+        stats: bytetap_core::journal::Stats::default(),
+        elapsed: std::time::Duration::from_secs(5),
+        local_addr: String::new(),
+        journal_path: None,
+        dropped: 0,
+    };
+    let mut settings = settings(false);
+    settings.feed.view = FeedView::Text;
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings, None, None)
+                .with_fixtures(fixtures())
+                .with_recording_fixture(fixture)
+        });
+    harness.run_steps(3);
+    harness
+        .get_by_label_contains("23:27:11.546 → ")
+        .click_secondary();
+    harness.run_steps(2);
+    harness.get_by_label("Скопировать текст").click();
+    harness.step();
+    let copied = harness
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("текст скопирован");
+    assert_eq!(
+        copied.chars().count(),
+        3000,
+        "скопирован весь фрагмент, а не предел показа"
+    );
+}
+
 /// «↓ N новых» возвращает ленту вниз и включает догон.
 #[test]
 fn the_new_rows_pill_returns_to_the_bottom() {
