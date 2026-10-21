@@ -55,7 +55,11 @@ function crates() {
       version: pkg.version,
       license: pkg.license ?? (pkg.license_file ? `см. ${pkg.license_file}` : "не указана"),
     }))
-    .sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version));
+    .sort(
+      // Порядок без локали: `localeCompare` на Windows и Linux сортирует по-разному,
+      // и проверка `--check` падала бы на релизной сборке.
+      (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.version < b.version ? -1 : a.version > b.version ? 1 : 0),
+    );
 }
 
 /** Лицензия встроенного ресурса целиком: заголовок и текст файла. */

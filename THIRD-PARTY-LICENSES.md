@@ -17,9 +17,9 @@
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
 | ahash | 0.8.12 | MIT OR Apache-2.0 |
 | allocator-api2 | 0.2.21 | MIT OR Apache-2.0 |
-| android_system_properties | 0.1.6 | MIT OR Apache-2.0 |
 | android-activity | 0.6.1 | MIT OR Apache-2.0 |
 | android-properties | 0.2.2 | MIT |
+| android_system_properties | 0.1.6 | MIT OR Apache-2.0 |
 | arboard | 3.7.0 | MIT OR Apache-2.0 |
 | arrayref | 0.3.9 | BSD-2-Clause |
 | arrayvec | 0.7.8 | MIT OR Apache-2.0 |
@@ -60,9 +60,9 @@
 | calloop-wayland-source | 0.3.0 | MIT |
 | calloop-wayland-source | 0.4.1 | MIT |
 | cc | 1.9.0 | MIT OR Apache-2.0 |
-| cfg_aliases | 0.2.2 | MIT |
 | cfg-expr | 0.15.8 | MIT OR Apache-2.0 |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 |
+| cfg_aliases | 0.2.2 | MIT |
 | cgl | 0.3.2 | MIT / Apache-2.0 |
 | chrono | 0.4.45 | MIT OR Apache-2.0 |
 | clipboard-win | 5.4.1 | BSL-1.0 |
@@ -91,10 +91,10 @@
 | ecolor | 0.37.0 | MIT OR Apache-2.0 |
 | eframe | 0.37.0 | MIT OR Apache-2.0 |
 | egui | 0.37.0 | MIT OR Apache-2.0 |
-| egui_extras | 0.37.0 | MIT OR Apache-2.0 |
-| egui_glow | 0.37.0 | MIT OR Apache-2.0 |
 | egui-wgpu | 0.37.0 | MIT OR Apache-2.0 |
 | egui-winit | 0.37.0 | MIT OR Apache-2.0 |
+| egui_extras | 0.37.0 | MIT OR Apache-2.0 |
+| egui_glow | 0.37.0 | MIT OR Apache-2.0 |
 | either | 1.19.0 | MIT OR Apache-2.0 |
 | emath | 0.37.0 | MIT OR Apache-2.0 |
 | encoding_rs | 0.8.35 | (Apache-2.0 OR MIT) AND BSD-3-Clause |
@@ -143,10 +143,10 @@
 | glifo | 0.3.0 | Apache-2.0 OR MIT |
 | glow | 0.17.0 | MIT OR Apache-2.0 OR Zlib |
 | glutin | 0.32.3 | Apache-2.0 |
+| glutin-winit | 0.5.0 | MIT |
 | glutin_egl_sys | 0.7.1 | Apache-2.0 |
 | glutin_glx_sys | 0.6.1 | Apache-2.0 |
 | glutin_wgl_sys | 0.6.1 | Apache-2.0 |
-| glutin-winit | 0.5.0 | MIT |
 | gobject-sys | 0.18.0 | MIT |
 | gpu-allocator | 0.28.0 | MIT OR Apache-2.0 |
 | gtk-sys | 0.18.2 | MIT |
@@ -175,8 +175,8 @@
 | jni-sys-macros | 0.4.1 | MIT OR Apache-2.0 |
 | jobserver | 0.1.35 | MIT OR Apache-2.0 |
 | js-sys | 0.3.106 | MIT OR Apache-2.0 |
-| khronos_api | 3.1.0 | Apache-2.0 |
 | khronos-egl | 6.0.0 | MIT/Apache-2.0 |
+| khronos_api | 3.1.0 | Apache-2.0 |
 | kurbo | 0.11.3 | Apache-2.0 OR MIT |
 | kurbo | 0.13.1 | Apache-2.0 OR MIT |
 | libc | 0.2.191 | MIT OR Apache-2.0 |
@@ -208,9 +208,9 @@
 | nix | 0.31.3 | MIT |
 | nohash-hasher | 0.2.0 | Apache-2.0 OR MIT |
 | nom | 8.0.0 | MIT |
+| num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | num_enum | 0.7.6 | BSD-3-Clause OR MIT OR Apache-2.0 |
 | num_enum_derive | 0.7.6 | BSD-3-Clause OR MIT OR Apache-2.0 |
-| num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | objc-sys | 0.3.5 | MIT |
 | objc2 | 0.5.3 | MIT |
 | objc2 | 0.6.5 | MIT |
@@ -306,9 +306,9 @@
 | rfd | 0.16.0 | MIT |
 | rgb | 0.8.53 | MIT |
 | roxmltree | 0.20.0 | MIT OR Apache-2.0 |
-| rustc_version | 0.4.1 | MIT OR Apache-2.0 |
 | rustc-hash | 1.1.0 | Apache-2.0/MIT |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT |
+| rustc_version | 0.4.1 | MIT OR Apache-2.0 |
 | rustix | 0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | rustversion | 1.0.23 | MIT OR Apache-2.0 |
@@ -327,8 +327,8 @@
 | serialport | 4.10.1 | MPL-2.0 |
 | shlex | 2.0.1 | MIT OR Apache-2.0 |
 | signal-hook-registry | 1.4.8 | MIT OR Apache-2.0 |
-| simd_cesu8 | 1.2.0 | Apache-2.0 OR MIT |
 | simd-adler32 | 0.3.10 | MIT |
+| simd_cesu8 | 1.2.0 | Apache-2.0 OR MIT |
 | simdutf8 | 0.1.5 | MIT OR Apache-2.0 |
 | simplecss | 0.2.2 | Apache-2.0 OR MIT |
 | siphasher | 1.0.4 | MIT OR Apache-2.0 |
@@ -383,8 +383,8 @@
 | uuid | 1.28.0 | Apache-2.0 OR MIT |
 | vello_common | 0.2.0 | Apache-2.0 OR MIT |
 | vello_cpu | 0.2.0 | Apache-2.0 OR MIT |
-| version_check | 0.9.5 | MIT/Apache-2.0 |
 | version-compare | 0.2.1 | MIT |
+| version_check | 0.9.5 | MIT/Apache-2.0 |
 | walkdir | 2.5.0 | Unlicense/MIT |
 | wasi | 0.11.1+wasi-snapshot-preview1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | wasip2 | 1.0.4+wasi-0.2.12 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
@@ -421,6 +421,21 @@
 | winapi-util | 0.1.11 | Unlicense OR MIT |
 | winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT/Apache-2.0 |
 | windows | 0.62.2 | MIT OR Apache-2.0 |
+| windows-collections | 0.3.2 | MIT OR Apache-2.0 |
+| windows-core | 0.62.2 | MIT OR Apache-2.0 |
+| windows-future | 0.3.2 | MIT OR Apache-2.0 |
+| windows-implement | 0.60.2 | MIT OR Apache-2.0 |
+| windows-interface | 0.59.3 | MIT OR Apache-2.0 |
+| windows-link | 0.2.1 | MIT OR Apache-2.0 |
+| windows-numerics | 0.3.1 | MIT OR Apache-2.0 |
+| windows-result | 0.4.1 | MIT OR Apache-2.0 |
+| windows-strings | 0.5.1 | MIT OR Apache-2.0 |
+| windows-sys | 0.52.0 | MIT OR Apache-2.0 |
+| windows-sys | 0.60.2 | MIT OR Apache-2.0 |
+| windows-sys | 0.61.2 | MIT OR Apache-2.0 |
+| windows-targets | 0.52.6 | MIT OR Apache-2.0 |
+| windows-targets | 0.53.5 | MIT OR Apache-2.0 |
+| windows-threading | 0.2.1 | MIT OR Apache-2.0 |
 | windows_aarch64_gnullvm | 0.52.6 | MIT OR Apache-2.0 |
 | windows_aarch64_gnullvm | 0.53.1 | MIT OR Apache-2.0 |
 | windows_aarch64_msvc | 0.52.6 | MIT OR Apache-2.0 |
@@ -437,21 +452,6 @@
 | windows_x86_64_gnullvm | 0.53.1 | MIT OR Apache-2.0 |
 | windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 |
 | windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 |
-| windows-collections | 0.3.2 | MIT OR Apache-2.0 |
-| windows-core | 0.62.2 | MIT OR Apache-2.0 |
-| windows-future | 0.3.2 | MIT OR Apache-2.0 |
-| windows-implement | 0.60.2 | MIT OR Apache-2.0 |
-| windows-interface | 0.59.3 | MIT OR Apache-2.0 |
-| windows-link | 0.2.1 | MIT OR Apache-2.0 |
-| windows-numerics | 0.3.1 | MIT OR Apache-2.0 |
-| windows-result | 0.4.1 | MIT OR Apache-2.0 |
-| windows-strings | 0.5.1 | MIT OR Apache-2.0 |
-| windows-sys | 0.52.0 | MIT OR Apache-2.0 |
-| windows-sys | 0.60.2 | MIT OR Apache-2.0 |
-| windows-sys | 0.61.2 | MIT OR Apache-2.0 |
-| windows-targets | 0.52.6 | MIT OR Apache-2.0 |
-| windows-targets | 0.53.5 | MIT OR Apache-2.0 |
-| windows-threading | 0.2.1 | MIT OR Apache-2.0 |
 | winit | 0.30.13 | Apache-2.0 |
 | winnow | 0.5.40 | MIT |
 | winnow | 1.0.4 | MIT |
@@ -466,11 +466,11 @@
 | xml-rs | 0.8.29 | MIT |
 | xmlwriter | 0.1.0 | MIT |
 | zbus | 5.19.0 | MIT |
+| zbus-lockstep | 0.5.2 | MIT |
+| zbus-lockstep-macros | 0.5.2 | MIT |
 | zbus_macros | 5.19.0 | MIT |
 | zbus_names | 4.3.5 | MIT |
 | zbus_xml | 5.2.1 | MIT |
-| zbus-lockstep | 0.5.2 | MIT |
-| zbus-lockstep-macros | 0.5.2 | MIT |
 | zcheapstr | 1.1.0 | MIT |
 | zerocopy | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT |
 | zerocopy-derive | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT |
