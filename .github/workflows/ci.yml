@@ -372,55 +372,86 @@ jobs:
               $corner = 0
               [void][FrameWin]::DwmGetWindowAttribute($hwnd, 33, [ref]$corner, 4)
               Write-Host ("скругление: {0}" -f $corner)
-              # Снимок окна на белом фоне: рамка 1 px видна только на нём.
-              $shot = New-Object System.Drawing.Bitmap $w, $h
+              # Снимок окна на белом фоне: рамка 1 px видна только на нём. Кадр берётся
+              # шире границ окна (DWMWA_EXTENDED_FRAME_BOUNDS) на $pad пикселей: рамку
+              # DWM рисует по краю окна и при снимке «ровно по границам» её пиксели
+              # попадают на самый край, где сглаживание скругления их размывает.
+              $pad = 8
+              $shot = New-Object System.Drawing.Bitmap ($w + 2 * $pad), ($h + 2 * $pad)
               $g = [System.Drawing.Graphics]::FromImage($shot)
-              $g.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $shot.Size)
+              $g.CopyFromScreen($rect.Left - $pad, $rect.Top - $pad, 0, 0, $shot.Size)
               $g.Dispose()
               $margin = 24
-              $canvas = New-Object System.Drawing.Bitmap ($w + 2 * $margin), ($h + 2 * $margin)
+              $canvas = New-Object System.Drawing.Bitmap ($shot.Width + 2 * $margin), ($shot.Height + 2 * $margin)
               $cg = [System.Drawing.Graphics]::FromImage($canvas)
               $cg.Clear([System.Drawing.Color]::White)
               $cg.DrawImage($shot, $margin, $margin)
               $cg.Dispose()
               $canvas.Save((Join-Path $out 'window-frame-white.png'), [System.Drawing.Imaging.ImageFormat]::Png)
-              # Своя рамка (DWM не скруглил окно): цвет периметра снимка сверяется с
-              # токеном --bt-border из design/tokens.css с допуском на сглаживание.
-              $ownFrame = $corner -ne 2
-              if ($ownFrame) {
-                Write-Host "DWM не скруглил окно: проверяем свою рамку 1 px по периметру"
-                $tokens = Get-Content design/tokens.css -Raw
-                $borders = [regex]::Matches($tokens, '--bt-border:\s*#([0-9a-fA-F]{6})') |
-                  ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
-                Write-Host "цвета --bt-border: $($borders -join ', ')"
-                $samples = @()
-                foreach ($x in ($w / 2 - 20)..($w / 2 + 20)) {
-                  $samples += $shot.GetPixel([int]$x, 0)
+
+              # Рамка окна сверяется с токеном --bt-border из design/tokens.css с
+              # допуском на сглаживание — и когда её рисует DWM, и когда приложение.
+              $tokens = Get-Content design/tokens.css -Raw
+              $borderHex = [regex]::Matches($tokens, '--bt-border:\s*#([0-9a-fA-F]{6})') |
+                ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+              Write-Host "цвета --bt-border: $($borderHex -join ', ')"
+              if (-not $borderHex) {
+                Write-Host 'в design/tokens.css нет --bt-border'
+                $failed = $true
+              }
+              $borderRgb = @($borderHex | ForEach-Object {
+                @{
+                  R = [Convert]::ToInt32($_.Substring(0, 2), 16)
+                  G = [Convert]::ToInt32($_.Substring(2, 2), 16)
+                  B = [Convert]::ToInt32($_.Substring(4, 2), 16)
                 }
-                foreach ($x in ($w / 2 - 20)..($w / 2 + 20)) {
-                  $samples += $shot.GetPixel([int]$x, $h - 1)
+              })
+              function Test-BorderPx([System.Drawing.Color]$sample) {
+                foreach ($rgb in $borderRgb) {
+                  if (([Math]::Abs($sample.R - $rgb.R) -le 24) -and
+                      ([Math]::Abs($sample.G - $rgb.G) -le 24) -and
+                      ([Math]::Abs($sample.B - $rgb.B) -le 24)) { return $true }
                 }
-                foreach ($y in ($h / 2 - 20)..($h / 2 + 20)) {
-                  $samples += $shot.GetPixel(0, [int]$y)
-                  $samples += $shot.GetPixel($w - 1, [int]$y)
-                }
-                $hit = 0
-                foreach ($sample in $samples) {
-                  foreach ($hex in $borders) {
-                    $r = [Convert]::ToInt32($hex.Substring(0, 2), 16)
-                    $g2 = [Convert]::ToInt32($hex.Substring(2, 2), 16)
-                    $b = [Convert]::ToInt32($hex.Substring(4, 2), 16)
-                    $near = ([Math]::Abs($sample.R - $r) -le 24) -and
-                      ([Math]::Abs($sample.G - $g2) -le 24) -and
-                      ([Math]::Abs($sample.B - $b) -le 24)
-                    if ($near) { $hit++; break }
+                return $false
+              }
+              # Углы не трогаем: там скругление и сглаживание. По середине каждой стороны
+              # берём 21 точку через 2 px и ищем цвет рамки в полосе ±4 px от края окна:
+              # рамка DWM ложится на край или на пиксель внутрь, и точное место зависит
+              # от масштаба экрана раннера.
+              $band = 4
+              $hits = 0
+              $total = 0
+              for ($i = -10; $i -le 10; $i++) {
+                $x = [int]($pad + $w / 2 + $i * 2)
+                foreach ($edge in @($pad, $pad + $h - 1)) {
+                  $total++
+                  for ($d = -$band; $d -le $band; $d++) {
+                    $y = $edge + $d
+                    if ($y -lt 0 -or $y -ge $shot.Height) { continue }
+                    if (Test-BorderPx $shot.GetPixel($x, $y)) { $hits++; break }
                   }
                 }
-                Write-Host "пикселей периметра цветом --bt-border: $hit из $($samples.Count)"
-                if ($hit -lt [int]($samples.Count * 0.9)) {
-                  Write-Host 'рамка окна не совпадает с --bt-border'
-                  $failed = $true
+              }
+              for ($i = -10; $i -le 10; $i++) {
+                $y = [int]($pad + $h / 2 + $i * 2)
+                foreach ($edge in @($pad, $pad + $w - 1)) {
+                  $total++
+                  for ($d = -$band; $d -le $band; $d++) {
+                    $x = $edge + $d
+                    if ($x -lt 0 -or $x -ge $shot.Width) { continue }
+                    if (Test-BorderPx $shot.GetPixel($x, $y)) { $hits++; break }
+                  }
                 }
+              }
+              Write-Host "пикселей периметра цветом --bt-border: $hits из $total"
+              if ($corner -eq 2) {
+                Write-Host 'DWM скруглил окно: рамку рисует система, периметр снимка сверен'
+              } else {
+                Write-Host 'DWM не скруглил окно: свою рамку рисует приложение'
+              }
+              if ($hits -lt [int]($total * 0.9)) {
+                Write-Host 'рамка окна не совпадает с --bt-border на снимке'
+                $failed = $true
               }
               $shot.Dispose(); $canvas.Dispose()
             } catch { Write-Host "снимок окна на белом фоне: $_"; $failed = $true }
