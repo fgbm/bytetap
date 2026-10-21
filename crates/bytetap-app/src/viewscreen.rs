@@ -11,6 +11,8 @@ use eframe::egui::{
     Sense, Stroke, Ui, UiBuilder, WidgetInfo, pos2, vec2,
 };
 
+use bytetap_core::journal::view::DENSITY_BUCKETS;
+
 use crate::app::BytetapApp;
 use crate::feedrows::{HEX_ROW_HEIGHT, TEXT_ROW_HEIGHT, hex_row, text_row};
 use crate::icons::{self, Icon};
@@ -369,7 +371,7 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
         return;
     }
     let row_height = if hex { HEX_ROW_HEIGHT } else { TEXT_ROW_HEIGHT };
-    let multi = view.conns.len() > 1;
+    let multi = view.conns().len() > 1;
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut scroll = ScrollArea::vertical()
         .id_salt("bt-journal-feed")
@@ -415,8 +417,6 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
 }
 
 /// Количество корзин плотности — как в UI v2.
-use bytetap_core::journal::view::DENSITY_BUCKETS;
-
 fn view_label(view: FeedView) -> &'static str {
     match view {
         FeedView::Text => t!("feed.viewText"),

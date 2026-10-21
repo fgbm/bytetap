@@ -147,7 +147,6 @@ fn journal_view() -> JournalView {
         .read(&opened.path, 0, bytetap_app::journal::PAGE_SIZE)
         .expect("страница");
     view.source.store_page(0, events);
-    view.collect_conns();
     // Временная папка удалится — путь в снимке показываем как настоящий.
     view.path = PathBuf::from(format!(
         r"{LOG_DIR}\bytetap-20261019101500-tcp_server.jsonl"
@@ -316,7 +315,6 @@ fn the_comment_from_the_header_reaches_the_journal() {
                 .read(&opened.path, 0, bytetap_app::journal::PAGE_SIZE)
                 .expect("страница");
             view.source.store_page(0, events);
-            view.collect_conns();
             BytetapApp::new(&cc.egui_ctx, settings(false), None, None)
                 .with_fixtures(fixtures())
                 .with_journal_fixture(view)
@@ -355,8 +353,12 @@ fn a_file_that_is_not_a_journal_gives_an_error() {
 }
 
 /// Миллион строк: лента считает по общему числу событий, а не по загруженным.
+///
+/// Файл получается большой (около 100 МБ), поэтому строки пишутся потоком, а не
+/// собираются в память: иначе проверка сама съела бы память.
 #[test]
 fn a_million_events_do_not_grow_the_memory() {
+    const EVENTS: u64 = 1_000_000;
     let dir = tempfile::tempdir().expect("временная папка");
     let path = dir.path().join("big.jsonl");
     let mut header = Session::new(
@@ -368,9 +370,15 @@ fn a_million_events_do_not_grow_the_memory() {
         },
     );
     header.analyzer = Some("ANALYZER".to_owned());
-    let mut text = serde_json::to_string(&Event::Session(header)).expect("заголовок");
-    text.push('\n');
-    for index in 0..100_000u64 {
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&path).expect("файл"));
+    use std::io::Write as _;
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&Event::Session(header)).expect("заголовок")
+    )
+    .expect("заголовок");
+    for index in 0..EVENTS {
         let event = Event::Data(Data::new(
             "2026-10-19T10:15:03.000000+03:00",
             index * 100,
@@ -379,14 +387,14 @@ fn a_million_events_do_not_grow_the_memory() {
             false,
             b"A",
         ));
-        text.push_str(&serde_json::to_string(&event).expect("событие"));
-        text.push('\n');
+        writeln!(file, "{}", serde_json::to_string(&event).expect("событие")).expect("событие");
     }
-    std::fs::write(&path, text).expect("журнал");
+    file.flush().expect("сброс");
+
     let cache = JournalCacheHandle::default();
     let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
     assert_eq!(
-        opened.summary.events, 100_000,
+        opened.summary.events, EVENTS as usize,
         "события посчитаны по индексу"
     );
     // Страница читается целиком, а не весь файл.
@@ -403,14 +411,53 @@ fn a_million_events_do_not_grow_the_memory() {
     view.source.store_page(0, page);
     assert_eq!(
         view.rows(false),
-        100_000,
+        EVENTS as usize,
         "строки ленты — по общему числу событий"
     );
     assert_eq!(
-        view.source.missing_pages(50_000, 50_010),
-        vec![(100, 50_000)],
+        view.source.missing_pages(500_000, 500_010),
+        vec![(1000, 500_000)],
         "нужна только страница видимого окна"
     );
+    // В памяти журнала — страницы LRU, а не миллион событий.
+    assert!(
+        view.source.pages_in_memory() <= bytetap_app::journal::PAGES_KEPT,
+        "в памяти {} страниц",
+        view.source.pages_in_memory()
+    );
+}
+
+/// После «Стоп» записанный журнал открывается со стартового экрана.
+#[test]
+fn the_recorded_journal_opens_from_the_start_screen() {
+    use bytetap_app::live;
+    use bytetap_core::session::SessionConfig;
+
+    let dir = tempfile::tempdir().expect("временная папка");
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let path = rt.block_on(async {
+        let session = live::start(
+            SessionConfig::new("127.0.0.1:0".parse().unwrap()).with_log_dir(dir.path()),
+            eframe::egui::Context::default(),
+        )
+        .await
+        .expect("старт");
+        let path = session.journal_path().to_path_buf();
+        session.stop().await;
+        path
+    });
+    let journal = path.clone();
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings(false), None, None)
+                .with_fixtures(fixtures())
+                .with_recorded_path(journal.clone())
+        });
+    harness.run_steps(3);
+    harness.get_by_label_contains("Открыть записанное").click();
+    harness.run_steps(4);
+    assert_eq!(harness.state().screen, Screen::Viewing);
 }
 
 /// Журнал сессии на loopback открывается на просмотре и показывает те же события.

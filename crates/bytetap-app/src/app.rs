@@ -332,6 +332,13 @@ impl BytetapApp {
         self
     }
 
+    /// Журнал последней записи: со стартового экрана его можно открыть сразу.
+    #[must_use]
+    pub fn with_recorded_path(mut self, path: PathBuf) -> Self {
+        self.recorded_path = Some(path);
+        self
+    }
+
     /// Положение окна в физических пикселях (уже проверенное на видимость) и разворот,
     /// которые окно получит в первом кадре.
     #[must_use]
@@ -680,7 +687,6 @@ impl BytetapApp {
             match result {
                 Ok(events) => {
                     view.source.store_page(page, events);
-                    view.collect_conns();
                 }
                 Err(err) => {
                     diag::error(format!("страница журнала не прочитана: {err}"));

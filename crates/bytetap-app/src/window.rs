@@ -49,35 +49,13 @@ impl DwmSetup {
 }
 
 /// Поддерживает ли система скругление окон DWM: Windows 11 build 22000 и новее.
+///
+/// Версию ОС спрашивать нельзя: `GetVersionExW` без манифеста совместимости
+/// возвращает 6.2 на любой Windows 10 и новее. Поэтому скругление проверяется по
+/// ответу DWM: атрибут принят — скругление есть.
 #[must_use]
 pub fn dwm_round_supported() -> bool {
-    cfg!(windows) && windows_build() >= 21_000
-}
-
-/// Номер сборки Windows: 22000 и новее — Windows 11. Вне Windows — 0.
-#[cfg(windows)]
-fn windows_build() -> u32 {
-    use windows_sys::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
-    let mut info = OSVERSIONINFOW {
-        dwOSVersionInfoSize: u32::try_from(std::mem::size_of::<OSVERSIONINFOW>())
-            .unwrap_or_default(),
-        ..Default::default()
-    };
-    // SAFETY: `info` — структура версии ОС, размер и указатель верны.
-    if unsafe { GetVersionExW(&mut info) } == 0 {
-        return 0;
-    }
-    // «10.0.22000» и новее — Windows 11; у Windows 10 сборка 19045.
-    if info.dwMajorVersion == 10 && info.dwBuildNumber >= 21_000 {
-        info.dwBuildNumber
-    } else {
-        0
-    }
-}
-
-#[cfg(not(windows))]
-fn windows_build() -> u32 {
-    0
+    cfg!(windows)
 }
 
 /// Настроить окно средствами DWM: скругление, цвет рамки, тень.
@@ -102,27 +80,25 @@ pub fn setup_dwm(handle: RawWindowHandle, border: Color32) -> DwmSetup {
     let mut setup = DwmSetup::NONE;
 
     // Скругление: DWM рисует углы и рамку сам, иначе своя рамка дала бы квадратные
-    // углы поверх скругления.
-    if dwm_round_supported() {
-        let corner = DWMWCP_ROUND;
-        // SAFETY: атрибут — целое число, размер совпадает с типом.
-        let ok = unsafe {
-            DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_WINDOW_CORNER_PREFERENCE as u32,
-                &corner as *const i32 as *const std::ffi::c_void,
-                u32::try_from(std::mem::size_of::<i32>()).unwrap_or_default(),
-            )
-        };
-        if ok == 0 {
-            setup.applied = true;
-            setup.dwm_border = true;
-            diag::info("рамка окна: DWM скругляет углы (DWMWA_WINDOW_CORNER_PREFERENCE)");
-        } else {
-            diag::error(format!("рамка окна: DWM не скруглил углы: HRESULT {ok:#x}"));
-        }
+    // углы поверх скругления. На Windows 10 атрибута нет — вызов вернёт ошибку.
+    let corner = DWMWCP_ROUND;
+    // SAFETY: атрибут — целое число, размер совпадает с типом.
+    let ok = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &corner as *const i32 as *const std::ffi::c_void,
+            u32::try_from(std::mem::size_of::<i32>()).unwrap_or_default(),
+        )
+    };
+    if ok == 0 {
+        setup.applied = true;
+        setup.dwm_border = true;
+        diag::info("рамка окна: DWM скругляет углы (DWMWA_WINDOW_CORNER_PREFERENCE)");
     } else {
-        diag::info("рамка окна: система без скругления DWM — рамку рисует приложение");
+        diag::info(format!(
+            "рамка окна: DWM не скругляет углы (HRESULT {ok:#x}) — рамку рисует приложение"
+        ));
     }
 
     // Тень окна без декораций: рамка в 1 px в область клиента. Запасной путь: egui-winit
@@ -150,6 +126,7 @@ pub fn setup_dwm(handle: RawWindowHandle, border: Color32) -> DwmSetup {
     }
     setup
 }
+
 #[cfg(not(windows))]
 pub fn setup_dwm(_handle: RawWindowHandle, _border: Color32) -> DwmSetup {
     DwmSetup::NONE
@@ -235,14 +212,11 @@ pub fn draw_frame(ui: &mut egui::Ui, p: &Palette, maximized: bool) {
 mod tests {
     use super::*;
 
-    /// На системе без скругления DWM рамку рисует приложение; на Windows 11 — DWM.
+    /// Скругление DWM проверяется по ответу DWM, а не по версии ОС: версию без
+    /// манифеста совместимости Windows отдаёт как 6.2 на любой Windows 10 и новее.
     #[test]
-    fn the_border_is_drawn_by_the_app_without_dwm_rounding() {
-        assert_eq!(
-            dwm_round_supported(),
-            cfg!(windows) && windows_build() >= 21_000,
-            "скругление DWM есть только на Windows 11 build 22000 и новее"
-        );
+    fn the_dwm_rounding_is_asked_only_on_windows() {
+        assert_eq!(dwm_round_supported(), cfg!(windows));
     }
 
     #[test]

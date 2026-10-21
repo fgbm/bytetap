@@ -33,10 +33,6 @@ pub struct JournalView {
     pub first_event: Vec<usize>,
     /// Видимая область ленты в долях времени — рамка на карте сессии.
     pub visible: Option<(f32, f32)>,
-    /// Фильтр соединения: `None` — все соединения.
-    pub filter: Option<u32>,
-    /// Номера соединений, найденные в загруженных страницах.
-    pub conns: Vec<u32>,
     /// Прокрутка к номеру события: `None` — не прокручивать.
     pub seek: Option<usize>,
     /// Префиксные суммы строк HEX-дампа: считаются один раз при первом HEX-виде.
@@ -58,8 +54,6 @@ impl JournalView {
             source: PageSource::new(path, total, lengths),
             first_event,
             visible: None,
-            filter: None,
-            conns: Vec::new(),
             seek: None,
             hex_prefix: None,
         }
@@ -159,11 +153,12 @@ impl JournalView {
         self.hex_prefix().get(index).copied().unwrap_or(0) as usize
     }
 
-    /// Собрать номера соединений по загруженным страницам: фильтр соединений.
+    /// Номера соединений в загруженных страницах: по ним лента решает, показывать ли
+    /// колонку номера соединения.
     ///
     /// В журнале соединения видны только у загруженных страниц — как и в UI v2, где
     /// фильтр строится по загруженным страницам.
-    pub fn collect_conns(&mut self) {
+    pub fn conns(&self) -> Vec<u32> {
         let mut conns: Vec<u32> = Vec::new();
         for event in self.source.events() {
             if let Some(conn) = event_conn(event)
@@ -173,10 +168,7 @@ impl JournalView {
             }
         }
         conns.sort_unstable();
-        self.conns = conns;
-        if self.filter.is_some_and(|conn| !self.conns.contains(&conn)) {
-            self.filter = None;
-        }
+        conns
     }
 }
 

@@ -405,9 +405,24 @@ fn a_recent_journal_opens_the_viewer() {
         .click();
     harness.run_steps(2);
     assert_eq!(harness.state().screen, Screen::Viewing);
-    // Файла записи нет — журнал не открылся, и под шапкой строка с причиной.
+    // Файла записи нет — журнал не открылся, и под шапкой строка с причиной. Открытие
+    // журнала идёт в фоне, поэтому ждём результата.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        harness.run_steps(2);
+        if harness
+            .query_by_label_contains("Не удалось открыть журнал")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "журнал не открылся и не сообщил о причине"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     assert!(harness.state().viewing().is_none(), "журнал не открылся");
-    harness.get_by_label_contains("Не удалось открыть журнал");
 }
 
 #[test]

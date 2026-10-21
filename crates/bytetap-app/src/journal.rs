@@ -187,6 +187,11 @@ impl PageSource {
             .flat_map(|events| events.iter())
     }
 
+    /// Сколько страниц сейчас в памяти: для проверки LRU и диагностики.
+    pub fn pages_in_memory(&self) -> usize {
+        self.pages.len()
+    }
+
     /// Страницы, покрывающие события `[from, to)`: их надо загрузить.
     pub fn missing_pages(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         if to <= from || self.total == 0 {

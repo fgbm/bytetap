@@ -19,6 +19,7 @@ use crate::theme::tokens::{
     TEXT_XS,
 };
 use crate::theme::{self, Palette, radius};
+use crate::widgets;
 
 /// Карточки сценариев в порядке экрана.
 pub const CARDS: [SessionMode; 3] = [
@@ -215,6 +216,22 @@ impl BytetapApp {
                     } else if response.clicked() {
                         open_recent = Some(journal.path.clone());
                     }
+                }
+            }
+            // Запись только что остановилась: записанный журнал открывается сразу.
+            if let Some(path) = self.recorded_path.clone()
+                && !self.session_busy()
+            {
+                ui.add_space(SPACE_3);
+                let name = path
+                    .to_string_lossy()
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                let label = format!("{} — {}", t!("banner.openRecorded"), name);
+                if widgets::link_button(ui, &p, Icon::FileText, 15.0, &label, false).clicked() {
+                    open_recent = Some(path);
                 }
             }
             ui.add_space(SPACE_6);
