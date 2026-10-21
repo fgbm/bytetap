@@ -372,10 +372,6 @@ jobs:
               $corner = 0
               [void][FrameWin]::DwmGetWindowAttribute($hwnd, 33, [ref]$corner, 4)
               Write-Host ("скругление: {0}" -f $corner)
-              if ($corner -ne 2) {
-                Write-Host "DWM не скруглил окно (ожидалось DWMWCP_ROUND=2)"
-                $failed = $true
-              }
               # Снимок окна на белом фоне: рамка 1 px видна только на нём.
               $shot = New-Object System.Drawing.Bitmap $w, $h
               $g = [System.Drawing.Graphics]::FromImage($shot)
@@ -388,6 +384,44 @@ jobs:
               $cg.DrawImage($shot, $margin, $margin)
               $cg.Dispose()
               $canvas.Save((Join-Path $out 'window-frame-white.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+              # Своя рамка (DWM не скруглил окно): цвет периметра снимка сверяется с
+              # токеном --bt-border из design/tokens.css с допуском на сглаживание.
+              $ownFrame = $corner -ne 2
+              if ($ownFrame) {
+                Write-Host "DWM не скруглил окно: проверяем свою рамку 1 px по периметру"
+                $tokens = Get-Content design/tokens.css -Raw
+                $borders = [regex]::Matches($tokens, '--bt-border:\s*#([0-9a-fA-F]{6})') |
+                  ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+                Write-Host "цвета --bt-border: $($borders -join ', ')"
+                $samples = @()
+                foreach ($x in ($w / 2 - 20)..($w / 2 + 20)) {
+                  $samples += $shot.GetPixel([int]$x, 0)
+                }
+                foreach ($x in ($w / 2 - 20)..($w / 2 + 20)) {
+                  $samples += $shot.GetPixel([int]$x, $h - 1)
+                }
+                foreach ($y in ($h / 2 - 20)..($h / 2 + 20)) {
+                  $samples += $shot.GetPixel(0, [int]$y)
+                  $samples += $shot.GetPixel($w - 1, [int]$y)
+                }
+                $hit = 0
+                foreach ($sample in $samples) {
+                  foreach ($hex in $borders) {
+                    $r = [Convert]::ToInt32($hex.Substring(0, 2), 16)
+                    $g2 = [Convert]::ToInt32($hex.Substring(2, 2), 16)
+                    $b = [Convert]::ToInt32($hex.Substring(4, 2), 16)
+                    $near = ([Math]::Abs($sample.R - $r) -le 24) -and
+                      ([Math]::Abs($sample.G - $g2) -le 24) -and
+                      ([Math]::Abs($sample.B - $b) -le 24)
+                    if ($near) { $hit++; break }
+                  }
+                }
+                Write-Host "пикселей периметра цветом --bt-border: $hit из $($samples.Count)"
+                if ($hit -lt [int]($samples.Count * 0.9)) {
+                  Write-Host 'рамка окна не совпадает с --bt-border'
+                  $failed = $true
+                }
+              }
               $shot.Dispose(); $canvas.Dispose()
             } catch { Write-Host "снимок окна на белом фоне: $_"; $failed = $true }
             Stop-Process -Id $p.Id -Force
@@ -401,12 +435,22 @@ jobs:
             Write-Host 'в журнале запуска нет записей о рамке окна'
             $failed = $true
           }
-          if (-not (Select-String -Path $log -Pattern 'DWM скругляет углы' -Quiet -Encoding utf8)) {
-            Write-Host 'DWM не скруглил окно'
-            $failed = $true
-          }
-          if (-not (Select-String -Path $log -Pattern 'DWM рисует рамку цветом border' -Quiet -Encoding utf8)) {
-            Write-Host 'DWM не принял цвет рамки'
+          # Рамка применяется после первого кадра, когда окно уже видимо: смоук
+          # проверяет её без переключения темы — так ловится баг «рамка появляется
+          # только после смены темы».
+          $corner_log = Select-String -Path $log -Pattern 'DWM скругляет углы' -Quiet -Encoding utf8
+          $color_log = Select-String -Path $log -Pattern 'цвет рамки DWM принят: #[0-9a-f]{6}' -Quiet -Encoding utf8
+          $own_log = Select-String -Path $log -Pattern 'рамку рисует приложение' -Quiet -Encoding utf8
+          if ($corner_log) {
+            Write-Host 'DWM скругляет углы: рамку рисует система'
+            if (-not $color_log) {
+              Write-Host 'DWM не принял цвет рамки'
+              $failed = $true
+            }
+          } elseif ($own_log) {
+            Write-Host 'DWM-рамки нет: рамку рисует приложение (пиксели периметра сверены)'
+          } else {
+            Write-Host 'в журнале запуска нет ни DWM-рамки, ни своей'
             $failed = $true
           }
           if ($failed) { exit 1 }
