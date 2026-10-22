@@ -6,6 +6,7 @@
 //!
 //! Хук глобальный для процесса, поэтому тест живёт в отдельном бинаре.
 
+use std::io::ErrorKind;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -81,11 +82,15 @@ async fn a_journal_failure_stops_the_forwarding() {
     .expect("сессия сообщила об отказе журнала");
 
     // Обе стороны пары закрыты: анализатор читает до конца, ЛИС видит закрытие.
+    // Сброс на закрытии — тоже признак того, что пара закрыта: в буфере могли остаться
+    // невычитанные байты эха.
     let mut tail = Vec::new();
-    timeout(WAIT, stream.read_to_end(&mut tail))
-        .await
-        .expect("анализатор увидел закрытие")
-        .expect("чтение остатка");
+    match timeout(WAIT, stream.read_to_end(&mut tail)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionReset => {}
+        Ok(Err(error)) => panic!("чтение остатка: {error}"),
+        Err(_) => panic!("анализатор не увидел закрытие пары"),
+    }
     timeout(WAIT, lis_task)
         .await
         .expect("ЛИС увидела закрытие пары")
