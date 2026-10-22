@@ -2,10 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use bytetap_app::settings::{Settings, Store, WindowState};
-use bytetap_app::{
-    AUTOSTART_ENV, BytetapApp, FORCED_EXIT, SCREEN_ENV, WINDOW_MIN_SIZE, WINDOW_SIZE, diag, gpu,
-    hooks, placement, probe, t,
-};
+#[cfg(feature = "test-hooks")]
+use bytetap_app::{AUTOSTART_ENV, SCREEN_ENV, hooks, probe};
+use bytetap_app::{BytetapApp, FORCED_EXIT, WINDOW_MIN_SIZE, WINDOW_SIZE, diag, gpu, placement, t};
 use eframe::egui;
 
 fn main() {
@@ -64,25 +63,34 @@ fn main() {
         Err(err) => diag::fatal(&t!("diag.startFailed", reason = err)),
     };
     let handle = runtime.handle().clone();
-    // Тестовые ключи читаются только вместе с `BYTETAP_TEST_HOOKS=1` (`hooks.rs`):
-    // поставляемый exe не должен начинать запись от одной переменной окружения.
+    // Тестовые ключи есть только в сборке с feature `test-hooks` (`hooks.rs`):
+    // релизный exe не читает их вовсе, тем более не начинает запись от одной
+    // переменной окружения.
+    #[cfg(feature = "test-hooks")]
     let autostart = hooks::var(AUTOSTART_ENV);
-    // Снимки для согласования (CI, U1-AC21): экран по имени, только вместе с ключом
-    // хуков. Переменная окружения сама по себе приложение не переключает.
+    // Снимки для согласования (CI, U1-AC21): экран по имени.
+    #[cfg(feature = "test-hooks")]
     let screen = hooks::var(SCREEN_ENV);
     // Цена кадра на CI (U1-AC24): проба меряет живые кадры и сама завершает процесс.
-    let probe = hooks::enabled() && hooks::var(crate::probe::ENV).is_some();
+    #[cfg(feature = "test-hooks")]
+    let probe = hooks::var(probe::ENV).is_some();
+    #[cfg(feature = "test-hooks")]
     if probe {
-        crate::probe::start();
+        probe::start();
     }
+    // Проба просит свой размер окна и MSAA: у обычного окна размер из настроек и 0.
+    #[cfg(feature = "test-hooks")]
+    let (probe_size, msaa) = (
+        probe.then(crate::probe::size).flatten(),
+        if probe { gpu::msaa() } else { 0 },
+    );
+    #[cfg(not(feature = "test-hooks"))]
+    let (probe_size, msaa) = (None, 0u16);
     let options = eframe::NativeOptions {
-        viewport: viewport(
-            settings.window.as_ref(),
-            probe.then(crate::probe::size).flatten(),
-        ),
+        viewport: viewport(settings.window.as_ref(), probe_size),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: gpu::configuration(),
-        multisampling: if probe { gpu::msaa() } else { 0 },
+        multisampling: msaa,
         centered: position.is_none(),
         // Размер и положение окна хранятся в settings.json, а не в хранилище eframe.
         persist_window: false,
@@ -93,15 +101,11 @@ fn main() {
         "bytetap",
         options,
         Box::new(move |cc| {
-            let mut app = BytetapApp::new(&cc.egui_ctx, settings, warning, store)
+            let app = BytetapApp::new(&cc.egui_ctx, settings, warning, store)
                 .with_window_restore(position, maximized)
                 .with_runtime(handle);
-            if let Some(spec) = &screen {
-                app = app.with_test_screen(&cc.egui_ctx, spec);
-            }
-            if let Some(spec) = autostart {
-                app = app.with_test_autostart(&cc.egui_ctx, &spec);
-            }
+            #[cfg(feature = "test-hooks")]
+            let app = with_test_hooks(app, &cc.egui_ctx, screen.as_deref(), autostart.as_deref());
             Ok(Box::new(app))
         }),
     );
@@ -160,6 +164,26 @@ fn relaunch_with_warp() {
             exe.display()
         )),
     }
+}
+
+/// Хуки смоука (`BYTETAP_TEST_SCREEN`, `BYTETAP_TEST_AUTOSTART`): синтетический экран
+/// для снимков (U1-AC21) и запись для смоуков CI. Есть только в сборке с feature
+/// `test-hooks`: в релизном exe этих вызовов нет.
+#[cfg(feature = "test-hooks")]
+fn with_test_hooks(
+    app: BytetapApp,
+    ctx: &egui::Context,
+    screen: Option<&str>,
+    autostart: Option<&str>,
+) -> BytetapApp {
+    let mut app = app;
+    if let Some(spec) = screen {
+        app = app.with_test_screen(ctx, spec);
+    }
+    if let Some(spec) = autostart {
+        app = app.with_test_autostart(ctx, spec);
+    }
+    app
 }
 
 /// Окно без рамки: запомненный размер или 1200×800. Положение и разворот ставятся в

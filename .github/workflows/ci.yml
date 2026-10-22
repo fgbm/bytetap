@@ -160,76 +160,11 @@ jobs:
         with:
           shared-key: native-windows
 
-      - name: cargo build --release
-        run: cargo build --release -p bytetap-app --bin bytetap
-
-      - name: Размер и DLL exe
-        shell: pwsh
-        run: |
-          $exe = Get-Item target\release\bytetap.exe
-          Write-Host ("bytetap.exe: {0:N2} МБ ({1} байт)" -f ($exe.Length / 1MB), $exe.Length)
-          if ($exe.Length -gt 25MB) { throw 'bytetap.exe больше 25 МБ (NFR-7)' }
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
-          $deps = & $dumpbin /nologo /dependents $exe.FullName
-          $deps | Write-Host
-          # Белый список по факту: каждая DLL должна лежать в System32 (наборы API
-          # api-ms-win-* Windows разрешает сама, файлов у них может не быть).
-          $dlls = foreach ($line in $deps) { if ($line -match '^\s+(\S+\.dll)\s*$') { $Matches[1] } }
-          if (-not $dlls) { throw 'dumpbin не показал ни одной DLL' }
-          $system32 = Join-Path $env:SystemRoot 'System32'
-          $extra = $dlls | Where-Object { $_ -notmatch '^api-ms-win-' -and -not (Test-Path (Join-Path $system32 $_)) }
-          if ($extra) { throw "exe зависит от DLL не из System32: $($extra -join ', ')" }
-
-      # U1-AC1 (NFR-7): у exe есть иконка приложения и VERSIONINFO из ресурса.
-      #
-      # Ресурс (`crates/bytetap-app/assets/bytetap.rc`) собирает `build.rs` для Windows
-      # MSVC: свойства файла — ProductName, версия из `CARGO_PKG_VERSION`, без CompanyName,
-      # — читает `FileVersionInfo`, иконку — `ExtractAssociatedIcon`. Иконку сверяем с
-      # `assets/icon.ico` (иконка проекта из v0.1.0, MIT): у exe без ресурса
-      # `ExtractAssociatedIcon` отдаёт стандартную иконку приложения, и пиксели с ней не
-      # совпадут.
-      - name: Иконка и версия exe
-        shell: pwsh
-        run: |
-          Add-Type -AssemblyName System.Drawing
-          $exe = (Get-Item target\release\bytetap.exe).FullName
-          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
-          if (-not $match) { throw "в корневом Cargo.toml не найдена версия [workspace.package]" }
-          $version = $match.Matches[0].Groups[1].Value
-          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
-          Write-Host "exe: ProductName '$($info.ProductName)', версия '$($info.ProductVersion)', файл '$($info.FileVersion)'"
-          if ($info.ProductName -ne 'bytetap') { throw "ProductName exe: '$($info.ProductName)'" }
-          if (-not ($info.ProductVersion -eq $version -or $info.ProductVersion -eq "$version.0")) {
-            throw "ProductVersion exe '$($info.ProductVersion)' не $version"
-          }
-          if ($info.CompanyName) { throw "CompanyName в свойствах exe: '$($info.CompanyName)'" }
-
-          $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
-          if ($null -eq $icon) { throw 'у exe нет иконки' }
-          $stream = [System.IO.File]::OpenRead((Resolve-Path 'crates\bytetap-app\assets\icon.ico'))
-          $expected = New-Object System.Drawing.Icon($stream, 32, 32)
-          $got = $icon.ToBitmap()
-          $want = $expected.ToBitmap()
-          $stream.Dispose()
-          if ($got.Width -ne $want.Width -or $got.Height -ne $want.Height) {
-            # Размер иконки выбирает оболочка; сверяем картинку в её размере.
-            $scaled = New-Object System.Drawing.Bitmap $got.Width, $got.Height
-            $g = [System.Drawing.Graphics]::FromImage($scaled)
-            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-            $g.DrawImage($want, 0, 0, $got.Width, $got.Height)
-            $g.Dispose()
-            $want = $scaled
-          }
-          $different = 0
-          for ($y = 0; $y -lt $got.Height; $y++) {
-            for ($x = 0; $x -lt $got.Width; $x++) {
-              if ($got.GetPixel($x, $y).ToArgb() -ne $want.GetPixel($x, $y).ToArgb()) { $different++ }
-            }
-          }
-          $total = $got.Width * $got.Height
-          Write-Host "иконка exe $($got.Width)x$($got.Height): расхождений с assets/icon.ico $different из $total"
-          if ($different -gt [int]($total * 0.2)) { throw 'иконка exe не совпадает с иконкой проекта (стандартная иконка?)' }
+      # Смоук-задачи собирают exe с тестовыми хуками (`--features test-hooks`): проба
+      # цены кадра, автозапуск записи, паника первого кадра и снимки экранов есть
+      # только в такой сборке. Релизный exe — без feature, его проверки ниже.
+      - name: cargo build --release (смоук, feature test-hooks)
+        run: cargo build --release -p bytetap-app --bin bytetap --features test-hooks
 
       - name: Смоук — запуск exe
         shell: pwsh
@@ -721,14 +656,6 @@ jobs:
           }
           if ($failed) { exit 1 }
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: bytetap-native-windows-x64
-          path: |
-            target/release/bytetap.exe
-            THIRD-PARTY-LICENSES.md
-          if-no-files-found: error
-
       # U1-AC24 (NFR-5): CPU живого процесса. В простое окно не рисует кадров, и
       # процесс почти не занимает ядро; во время записи кадр рисуется ~30 раз в
       # секунду, и его цена на WARP — это цена интерфейса. Оба числа пишутся в
@@ -1046,6 +973,88 @@ jobs:
           path: review/
           if-no-files-found: warn
 
+      # exe релиза — без feature `test-hooks`: размер, DLL, иконка и версия проверяются
+      # на нём — на том же exe, что собирает `release.yml` для владельца. Сборка идёт
+      # последней, после смоука: в артефакте `bytetap-native-windows-x64` лежит ровно
+      # релизный exe. Зависимости — из того же кеша (`Swatinem/rust-cache`).
+      - name: cargo build --release (exe релиза, без хуков)
+        run: cargo build --release -p bytetap-app --bin bytetap
+
+      - name: Размер и DLL exe
+        shell: pwsh
+        run: |
+          $exe = Get-Item target\release\bytetap.exe
+          Write-Host ("bytetap.exe: {0:N2} МБ ({1} байт)" -f ($exe.Length / 1MB), $exe.Length)
+          if ($exe.Length -gt 25MB) { throw 'bytetap.exe больше 25 МБ (NFR-7)' }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          $deps = & $dumpbin /nologo /dependents $exe.FullName
+          $deps | Write-Host
+          # Белый список по факту: каждая DLL должна лежать в System32 (наборы API
+          # api-ms-win-* Windows разрешает сама, файлов у них может не быть).
+          $dlls = foreach ($line in $deps) { if ($line -match '^\s+(\S+\.dll)\s*$') { $Matches[1] } }
+          if (-not $dlls) { throw 'dumpbin не показал ни одной DLL' }
+          $system32 = Join-Path $env:SystemRoot 'System32'
+          $extra = $dlls | Where-Object { $_ -notmatch '^api-ms-win-' -and -not (Test-Path (Join-Path $system32 $_)) }
+          if ($extra) { throw "exe зависит от DLL не из System32: $($extra -join ', ')" }
+
+      # U1-AC1 (NFR-7): у exe есть иконка приложения и VERSIONINFO из ресурса.
+      #
+      # Ресурс (`crates/bytetap-app/assets/bytetap.rc`) собирает `build.rs` для Windows
+      # MSVC: свойства файла — ProductName, версия из `CARGO_PKG_VERSION`, без CompanyName,
+      # — читает `FileVersionInfo`, иконку — `ExtractAssociatedIcon`. Иконку сверяем с
+      # `assets/icon.ico` (иконка проекта из v0.1.0, MIT): у exe без ресурса
+      # `ExtractAssociatedIcon` отдаёт стандартную иконку приложения, и пиксели с ней не
+      # совпадут.
+      - name: Иконка и версия exe
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $exe = (Get-Item target\release\bytetap.exe).FullName
+          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "в корневом Cargo.toml не найдена версия [workspace.package]" }
+          $version = $match.Matches[0].Groups[1].Value
+          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+          Write-Host "exe: ProductName '$($info.ProductName)', версия '$($info.ProductVersion)', файл '$($info.FileVersion)'"
+          if ($info.ProductName -ne 'bytetap') { throw "ProductName exe: '$($info.ProductName)'" }
+          if (-not ($info.ProductVersion -eq $version -or $info.ProductVersion -eq "$version.0")) {
+            throw "ProductVersion exe '$($info.ProductVersion)' не $version"
+          }
+          if ($info.CompanyName) { throw "CompanyName в свойствах exe: '$($info.CompanyName)'" }
+
+          $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
+          if ($null -eq $icon) { throw 'у exe нет иконки' }
+          $stream = [System.IO.File]::OpenRead((Resolve-Path 'crates\bytetap-app\assets\icon.ico'))
+          $expected = New-Object System.Drawing.Icon($stream, 32, 32)
+          $got = $icon.ToBitmap()
+          $want = $expected.ToBitmap()
+          $stream.Dispose()
+          if ($got.Width -ne $want.Width -or $got.Height -ne $want.Height) {
+            # Размер иконки выбирает оболочка; сверяем картинку в её размере.
+            $scaled = New-Object System.Drawing.Bitmap $got.Width, $got.Height
+            $g = [System.Drawing.Graphics]::FromImage($scaled)
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.DrawImage($want, 0, 0, $got.Width, $got.Height)
+            $g.Dispose()
+            $want = $scaled
+          }
+          $different = 0
+          for ($y = 0; $y -lt $got.Height; $y++) {
+            for ($x = 0; $x -lt $got.Width; $x++) {
+              if ($got.GetPixel($x, $y).ToArgb() -ne $want.GetPixel($x, $y).ToArgb()) { $different++ }
+            }
+          }
+          $total = $got.Width * $got.Height
+          Write-Host "иконка exe $($got.Width)x$($got.Height): расхождений с assets/icon.ico $different из $total"
+          if ($different -gt [int]($total * 0.2)) { throw 'иконка exe не совпадает с иконкой проекта (стандартная иконка?)' }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bytetap-native-windows-x64
+          path: |
+            target/release/bytetap.exe
+            THIRD-PARTY-LICENSES.md
+          if-no-files-found: error
   # U1-AC24 (NFR-5): цена кадра на WARP. Раскладка и тесселяция кадра 1200×800 стоят
   # 0.13–0.30 мс (`cargo test --test performance frame_cost_probe`), а живой кадр —
   # сотни миллисекунд, поэтому цена кадра меряется в живом окне: проба
@@ -1073,8 +1082,8 @@ jobs:
         with:
           shared-key: native-windows
 
-      - name: cargo build --release
-        run: cargo build --release -p bytetap-app --bin bytetap
+      - name: cargo build --release (смоук, feature test-hooks)
+        run: cargo build --release -p bytetap-app --bin bytetap --features test-hooks
 
       - name: Проба цены кадра
         shell: pwsh
@@ -1231,8 +1240,8 @@ jobs:
         with:
           shared-key: native-windows
 
-      - name: cargo build --release
-        run: cargo build --release -p bytetap-app --bin bytetap
+      - name: cargo build --release (смоук, feature test-hooks)
+        run: cargo build --release -p bytetap-app --bin bytetap --features test-hooks
 
       - name: Запись потоком и замер памяти
         shell: pwsh

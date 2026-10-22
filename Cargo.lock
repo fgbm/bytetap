@@ -684,6 +684,7 @@ name = "bytetap-app"
 version = "0.2.0"
 dependencies = [
  "base64",
+ "bytetap-app",
  "bytetap-core",
  "bytetap-testkit",
  "chrono",

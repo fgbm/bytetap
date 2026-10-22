@@ -25,14 +25,18 @@ pub const WARP_ADAPTER: &str = "basic render";
 /// Диагностика цены кадра (`probe.rs`): режим представления, MSAA и задержка кадров.
 ///
 /// Ключи читаются только вместе с `BYTETAP_TEST_PROBE` и `BYTETAP_TEST_HOOKS=1`
-/// (`hooks.rs`): без пробы окно берёт [`egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT`] и
-/// MSAA 0, как и раньше.
+/// (`hooks.rs`) и существуют только в сборке с feature `test-hooks`: без неё окно
+/// берёт [`egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT`] и MSAA 0, как и раньше.
+#[cfg(feature = "test-hooks")]
 pub const PRESENT_ENV: &str = "BYTETAP_TEST_PROBE_PRESENT";
+#[cfg(feature = "test-hooks")]
 pub const MSAA_ENV: &str = "BYTETAP_TEST_PROBE_MSAA";
+#[cfg(feature = "test-hooks")]
 pub const LATENCY_ENV: &str = "BYTETAP_TEST_PROBE_LATENCY";
 
 /// Диагностика включена: задан хотя бы один ключ замера.
 #[must_use]
+#[cfg(feature = "test-hooks")]
 pub fn diagnostics() -> bool {
     [PRESENT_ENV, MSAA_ENV, LATENCY_ENV]
         .iter()
@@ -41,6 +45,7 @@ pub fn diagnostics() -> bool {
 
 /// Режим представления из [`PRESENT_ENV`]: `fifo`, `immediate`, `novsync`, `mailbox`.
 #[must_use]
+#[cfg(feature = "test-hooks")]
 pub fn present() -> Option<wgpu::PresentMode> {
     let value = crate::hooks::var(PRESENT_ENV)?;
     Some(match value.trim().to_lowercase().as_str() {
@@ -54,6 +59,7 @@ pub fn present() -> Option<wgpu::PresentMode> {
 
 /// Имя режима представления для журнала запуска.
 #[must_use]
+#[cfg(feature = "test-hooks")]
 pub fn present_name() -> String {
     match present() {
         Some(mode) => format!("{mode:?}"),
@@ -63,6 +69,7 @@ pub fn present_name() -> String {
 
 /// Число сэмплов MSAA из [`MSAA_ENV`].
 #[must_use]
+#[cfg(feature = "test-hooks")]
 pub fn msaa() -> u16 {
     crate::hooks::var(MSAA_ENV)
         .and_then(|value| value.trim().parse().ok())
@@ -71,6 +78,7 @@ pub fn msaa() -> u16 {
 
 /// Желаемая задержка кадров из [`LATENCY_ENV`].
 #[must_use]
+#[cfg(feature = "test-hooks")]
 pub fn latency() -> Option<u32> {
     crate::hooks::var(LATENCY_ENV).and_then(|value| value.trim().parse().ok())
 }
@@ -161,6 +169,7 @@ pub fn configuration() -> WgpuConfiguration {
 /// Настройка поверхности: как у `WgpuConfiguration` по умолчанию
 /// ([`egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT`]), а в диагностике пробы кадра —
 /// режим представления и задержка из ключей замера.
+#[cfg(feature = "test-hooks")]
 fn surface_config() -> eframe::egui_wgpu::SurfaceConfig {
     let mut config = eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT;
     if let Some(mode) = present() {
@@ -170,6 +179,12 @@ fn surface_config() -> eframe::egui_wgpu::SurfaceConfig {
         config.desired_maximum_frame_latency = Some(latency);
     }
     config
+}
+
+/// Настройка поверхности в релизном exe: [`egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT`].
+#[cfg(not(feature = "test-hooks"))]
+fn surface_config() -> eframe::egui_wgpu::SurfaceConfig {
+    eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT
 }
 
 /// Адаптер в списке выбора.

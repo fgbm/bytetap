@@ -111,6 +111,31 @@ jobs:
           Write-Host "иконка exe $($got.Width)x$($got.Height): расхождений с assets/icon.ico $different из $total"
           if ($different -gt [int]($total * 0.2)) { throw 'иконка exe не совпадает с иконкой проекта (стандартная иконка?)' }
 
+      # Тестовые хуки (`BYTETAP_TEST_HOOKS`, `BYTETAP_TEST_AUTOSTART`, `BYTETAP_TEST_PROBE*`)
+      # в релизный exe не компилируются: они за feature `test-hooks` (`Cargo.toml`), и
+      # `cargo build --release` её не включает. Проверка по байтам: бинарник читается
+      # один к одному (ISO-8859-1) и в нём не должно быть ни одного ключа хуков —
+      # все они начинаются с `BYTETAP_TEST`.
+      - name: В exe нет тестовых хуков
+        shell: pwsh
+        run: |
+          $path = (Resolve-Path 'target\release\bytetap.exe').Path
+          $text = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($path))
+          $found = @{}
+          foreach ($pattern in @('BYTETAP_TEST', 'BYTETAP_TEST_HOOKS')) {
+            $count = 0
+            $index = $text.IndexOf($pattern)
+            while ($index -ge 0) {
+              $count++
+              $index = $text.IndexOf($pattern, $index + 1)
+            }
+            $found[$pattern] = $count
+            Write-Host "вхождений '$pattern' в bytetap.exe: $count"
+          }
+          if ($found['BYTETAP_TEST'] -gt 0 -or $found['BYTETAP_TEST_HOOKS'] -gt 0) {
+            throw 'в exe есть строки тестовых хуков — хуки попали в релиз'
+          }
+
       # Лицензии встроенных шрифтов, иконок и сторонних crate едут в архиве рядом с exe.
       - name: Сторонние лицензии актуальны
         run: node scripts/licenses.mjs --check

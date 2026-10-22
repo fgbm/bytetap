@@ -15,6 +15,9 @@ pub mod icons;
 pub mod journal;
 pub mod live;
 pub mod placement;
+// Цена кадра на живой машине (`BYTETAP_TEST_PROBE`): только сборка с feature
+// `test-hooks` — в релизном exe пробы нет.
+#[cfg(feature = "test-hooks")]
 pub mod probe;
 pub mod recording;
 pub mod scenarios;
@@ -28,9 +31,11 @@ mod viewscreen;
 pub mod widgets;
 pub mod window;
 
+/// Тестовые ключи смоуков: только сборка с feature `test-hooks` (`hooks.rs`).
+#[cfg(feature = "test-hooks")]
+pub use app::{AUTOSTART_ENV, HOOKS_ENV, JOURNAL_ENV, PANIC_ENV, SCREEN_ENV};
 pub use app::{
-    AUTOSTART_ENV, BytetapApp, CLOSE_NOTICE, FORCED_EXIT, Fixtures, HOOKS_ENV, JOURNAL_ENV,
-    PANIC_ENV, SCREEN_ENV, Screen, resolve_dark, take_close_notice,
+    BytetapApp, CLOSE_NOTICE, FORCED_EXIT, Fixtures, Screen, resolve_dark, take_close_notice,
 };
 
 /// Размер окна при первом запуске (U1-AC3).

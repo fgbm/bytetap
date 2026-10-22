@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Изменено
+
+- Тестовые переключатели больше не входят в релизный exe: хуки (`BYTETAP_TEST_HOOKS`, `BYTETAP_TEST_AUTOSTART`, `BYTETAP_TEST_PANIC`, `BYTETAP_TEST_SCREEN`, `BYTETAP_TEST_JOURNAL`) и проба цены кадра (`BYTETAP_TEST_PROBE*`) собираются только с feature `test-hooks`, а `cargo build --release` и `release.yml` её не включают — в релизном exe нет ни кода хуков, ни строк `BYTETAP_TEST`, и это проверяет `release.yml`. CI собирает для смоуков отдельный exe с `--features test-hooks`, а размер, DLL, иконку и версию проверяет на exe без неё. `cargo test` включает feature сам.
+
 ## [0.2.0] - 2026-10-22
 
 Второй релиз: нативный интерфейс вместо Tauri и Vue. Поставляется тот же переносимый `bytetap.exe` без установщика и подписи, и с этой версии он собирается из `crates/bytetap-app`: окно рисует само приложение на egui, eframe и wgpu, а зависимости exe — только системные DLL Windows (WebView2, .NET и Visual C++ Redistributable больше не нужны). В zip релиза входят `bytetap.exe`, `README.md`, `LICENSE` и `THIRD-PARTY-LICENSES.md`, а рядом с архивом лежит `SHA256SUMS`; имя архива — `bytetap-v0.2.0-windows-x64.zip`. Порядок выпуска: тег `v0.2.0` на коммит релиза, по тегу собирается zip и создаётся черновик релиза, владелец проходит ручной смоук на черновике по `docs/dev/testing.md`, затем нажимает «Publish release».

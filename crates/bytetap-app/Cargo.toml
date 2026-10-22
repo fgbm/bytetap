@@ -60,9 +60,19 @@ windows-sys = { version = "0.61", features = [
 # свойства файла и иконка в проводнике. Компилируется только для Windows MSVC.
 embed-resource = "3.0"
 
+[features]
+# Тестовые хуки (`hooks.rs`, `probe.rs`, `gpu.rs`) и проба цены кадра: смоуки CI и
+# тесты. В релизном exe feature выключена, и кода хуков в нём нет вовсе — ни
+# переменных окружения `BYTETAP_TEST_*`, ни их чтения. Хуки ядра (задержка писателя
+# журнала, предел остановки) включаются вместе с ней.
+test-hooks = ["bytetap-core/test-hooks"]
+
 [dev-dependencies]
 base64.workspace = true
 bytetap-core = { workspace = true, features = ["test-hooks"] }
+# Своя же сборка с хуками — как в ядре: `cargo test` получает их без флагов, а
+# `cargo build --release` — без них.
+bytetap-app = { path = ".", features = ["test-hooks"] }
 bytetap-testkit.workspace = true
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu", "snapshot"] }
 tempfile.workspace = true

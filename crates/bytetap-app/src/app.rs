@@ -21,6 +21,8 @@ use eframe::egui::{self, Align, Layout, RichText, Sense, Stroke, Theme, Ui, vec2
 use crate::background::{self, Interface, Loaded, Task};
 use crate::errors::StartError;
 use crate::form::FormState;
+#[cfg(feature = "test-hooks")]
+use crate::hooks;
 use crate::icons::Icon;
 use crate::journal::{
     JournalCache, JournalOpen, NoteWritten, PageDone, PageError, PageJob, PageLoad, PageReader,
@@ -31,7 +33,7 @@ use crate::settings::{LoadWarning, SessionMode, Settings, Store, ThemeMode, Wind
 use crate::theme::tokens::{SPACE_2, SPACE_3, SPACE_5, TEXT_XS};
 use crate::theme::{self, Palette, mix};
 use crate::viewing::JournalView;
-use crate::{diag, hooks, t, titlebar, widgets};
+use crate::{diag, t, titlebar, widgets};
 
 /// Сколько последних записей показывает стартовый экран.
 pub const RECENT_SHOWN: usize = 3;
@@ -58,23 +60,28 @@ pub fn take_close_notice() -> Option<String> {
 
 /// Тестовый хук смоука записи (CI): `tcp_server:127.0.0.1:0` — запись стартует сразу.
 /// Читается только вместе с [`HOOKS_ENV`], как и остальные тестовые ключи.
+#[cfg(feature = "test-hooks")]
 pub const AUTOSTART_ENV: &str = "BYTETAP_TEST_AUTOSTART";
 
 /// Тестовый хук паники первого кадра (CI, NFR-3): окно о сбое и запись в журнал
 /// запуска. Читается только вместе с [`HOOKS_ENV`].
+#[cfg(feature = "test-hooks")]
 pub const PANIC_ENV: &str = "BYTETAP_TEST_PANIC";
 
 /// Тестовый хук снимков для согласования (CI, U1-AC21): экран и тема снимка,
 /// `BYTETAP_TEST_SCREEN=recording-hex-dark`. Читается только вместе с
 /// [`HOOKS_ENV`]: случайная переменная окружения в чужой оболочке не переключит
 /// приложение на синтетический экран и не запишет журнал в чужую папку.
+#[cfg(feature = "test-hooks")]
 pub const SCREEN_ENV: &str = "BYTETAP_TEST_SCREEN";
 
 /// Второй ключ тестовых хуков: без него [`SCREEN_ENV`] не читается вовсе.
+#[cfg(feature = "test-hooks")]
 pub const HOOKS_ENV: &str = "BYTETAP_TEST_HOOKS";
 
 /// Журнал для снимка просмотра: файл, который откроется на экране просмотра.
 /// Читается только вместе с [`HOOKS_ENV`], как и остальные тестовые ключи.
+#[cfg(feature = "test-hooks")]
 pub const JOURNAL_ENV: &str = "BYTETAP_TEST_JOURNAL";
 
 /// Данные окружения для снимков и тестов вместо фонового опроса системы.
@@ -90,6 +97,7 @@ pub struct Fixtures {
 /// Окружение снимков для согласования (U1-AC21): те же порты, адреса и последние
 /// записи, что у эталонов `egui_kittest`, чтобы снимок в exe сравнивался с эталоном.
 #[must_use]
+#[cfg(feature = "test-hooks")]
 pub fn review_fixtures() -> Fixtures {
     let journal = |name: &str, started_at: &str, analyzer: &str, minutes: u64| RecentJournal {
         path: format!(r"C:\Users\operator\Documents\bytetap\{name}").into(),
@@ -443,6 +451,7 @@ impl BytetapApp {
     /// Тестовый хук смоука (CI, [`AUTOSTART_ENV`]): `tcp_server:<адрес>` — запись
     /// TCP-сервера с автоответом «Авто» в папку журналов из настроек сразу после запуска.
     #[must_use]
+    #[cfg(feature = "test-hooks")]
     pub fn with_test_autostart(mut self, ctx: &egui::Context, spec: &str) -> Self {
         let listen = spec
             .strip_prefix("tcp_server:")
@@ -473,6 +482,7 @@ impl BytetapApp {
     /// `recording-*` — пустая лента: строки приходят, если CI запускает сессию хуком
     /// [`AUTOSTART_ENV`] и шлёт в неё сообщения.
     #[must_use]
+    #[cfg(feature = "test-hooks")]
     pub fn with_test_screen(mut self, ctx: &egui::Context, spec: &str) -> Self {
         let (name, dark) = match spec.rsplit_once('-') {
             Some((name, "dark")) => (name, true),
@@ -566,6 +576,8 @@ impl BytetapApp {
     }
 
     /// Шаг режима с полями из настроек; `more` раскрывает «Дополнительно».
+    /// Нужен только снимкам по хуку `BYTETAP_TEST_SCREEN` (feature `test-hooks`).
+    #[cfg(feature = "test-hooks")]
     fn show_step(&mut self, mode: SessionMode, more: bool) {
         self.settings.config.mode = mode;
         self.form = FormState::new(&self.settings.config);
@@ -2052,6 +2064,20 @@ fn describe(source: &Source) -> String {
     }
 }
 
+/// Проба цены кадра (`probe.rs`) просит кадр без интерфейса: только фон.
+#[must_use]
+#[cfg(feature = "test-hooks")]
+fn probe_background_only() -> bool {
+    crate::probe::enabled() && crate::probe::mode() == crate::probe::EMPTY
+}
+
+/// Без feature `test-hooks` пробы нет: кадр рисуется целиком, как в релизе.
+#[must_use]
+#[cfg(not(feature = "test-hooks"))]
+fn probe_background_only() -> bool {
+    false
+}
+
 impl eframe::App for BytetapApp {
     /// Каждый кадр, и когда окно свёрнуто: итоги задач записи и закрытие окна.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -2062,6 +2088,7 @@ impl eframe::App for BytetapApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        #[cfg(feature = "test-hooks")]
         let probe = crate::probe::frame_start();
         // Ожидание и запрос прошлого кадра: `draw` ниже поставит новые, а цена кадра
         // считается по тому, что действовало в измеряемом промежутке.
@@ -2079,6 +2106,7 @@ impl eframe::App for BytetapApp {
             ));
         }
         // Смоук окна о сбое в CI (NFR-3): паника главного потока в первом кадре.
+        #[cfg(feature = "test-hooks")]
         if !self.ready && hooks::flag(crate::app::PANIC_ENV) {
             panic!("{}: test panic in the first frame", crate::app::PANIC_ENV);
         }
@@ -2110,7 +2138,7 @@ impl eframe::App for BytetapApp {
         );
         // Проба цены кадра (`probe.rs`): в режиме `empty` рисуется только фон — столько
         // стоит кадр без интерфейса.
-        if crate::probe::enabled() && crate::probe::mode() == crate::probe::EMPTY {
+        if probe_background_only() {
             let p = self.pal();
             let rect = ui.max_rect();
             ui.painter().rect_filled(rect, 0, p.surface_0);
@@ -2139,6 +2167,7 @@ impl eframe::App for BytetapApp {
             frame_request,
             frame_started.elapsed(),
         );
+        #[cfg(feature = "test-hooks")]
         crate::probe::frame_end(&ctx, frame, probe);
     }
 

@@ -31,6 +31,14 @@ cargo build --release -p bytetap-app --bin bytetap
 
 Готовый файл — `target\release\bytetap.exe`. Тяжёлый нагрузочный тест NFR-5/NFR-6 помечен `#[ignore]` и в обычный прогон не входит.
 
+Сборка с тестовыми хуками — та, которой пользуются смоуки CI (`BYTETAP_TEST_*`, проба цены кадра):
+
+```powershell
+cargo build --release -p bytetap-app --bin bytetap --features test-hooks
+```
+
+Feature `test-hooks` добавляет в exe `crates/bytetap-app/src/hooks.rs` (ключи `BYTETAP_TEST_HOOKS`, `BYTETAP_TEST_AUTOSTART`, `BYTETAP_TEST_PANIC`, `BYTETAP_TEST_SCREEN`, `BYTETAP_TEST_JOURNAL`), `probe.rs` (`BYTETAP_TEST_PROBE*`) и переключатели отрисовки в `gpu.rs`; заодно включаются хуки ядра (`bytetap-core/test-hooks`). Без feature этого кода в exe нет вовсе, и переменные `BYTETAP_TEST_*` не читаются: `cargo build --release` и `release.yml` собирают без неё, а `release.yml` проверяет, что строк `BYTETAP_TEST` в бинарнике нет. `cargo test` включает feature сама — dev-dependency `bytetap-app` на себя, — поэтому отдельный флаг тестам не нужен.
+
 CI на GitHub Actions повторяет это на Ubuntu и Windows (`ci.yml`), включая `actionlint` и `zizmor`, и складывает `bytetap.exe` в артефакт `bytetap-native-windows-x64`.
 
 ## Автоматические проверки нативного интерфейса (U1)
@@ -42,7 +50,7 @@ CI на GitHub Actions повторяет это на Ubuntu и Windows (`ci.yml
 - `cargo clippy -p bytetap-core -p bytetap-app --all-targets --target x86_64-pc-windows-gnu -- -D warnings` — Windows-ветки кода (`windows-sys`, DWM) под линтом;
 - `node scripts/licenses.mjs --check` — `THIRD-PARTY-LICENSES.md` соответствует графу зависимостей для платформы поставки (`x86_64-pc-windows-msvc`) и содержит полные тексты лицензий: одинаковые тексты собраны в группы со списком пакетов, для пакета без файла лицензии взят стандартный текст SPDX из `scripts/license-texts/`; пересобрать — `node scripts/licenses.mjs`.
 
-Job `native-windows` в `ci.yml` собирает `bytetap.exe` из `crates/bytetap-app` и проверяет на `windows-latest`:
+Job `native-windows` в `ci.yml` собирает `bytetap.exe` из `crates/bytetap-app` и проверяет на `windows-latest`. Сборок две, обе из одного кеша зависимостей: сначала exe с `--features test-hooks` (на нём идут смоуки), в конце — exe без feature, тот же, что уходит в релиз, и на нём проверяются размер, DLL, иконка и версия. Проверки:
 
 - размер exe ≤ 25 МБ (U1-AC22) и зависимости только из System32 (U1-AC1);
 - запуск с аппаратным адаптером и с WARP: процесс жив, в журнале запуска «интерфейс готов» и выбранный адаптер (U1-AC2);
@@ -53,7 +61,7 @@ Job `native-windows` в `ci.yml` собирает `bytetap.exe` из `crates/byt
 - CPU живого процесса: в простое за 10 с — меньше 2 % одного ядра, при записи с потоком 100 фрагментов в секунду — мягкий порог 90 %; оба числа печатаются в журнал CI и лежат в артефакте `bytetap-native-smoke` (`cpu-idle.txt`, `cpu-recording.txt`) (U1-AC24);
 - снимки всех экранов в обеих темах из настоящего exe — артефакт `bytetap-native-review-shots` (U1-AC21). Окно ставится по рабочему столу раннера: на `windows-latest` он 1024×720, поэтому снимки exe — 1000×696 (1200×800 не влезает и вышел бы обрезанным), а эталон 1200×800 в точках — те же снимки `egui_kittest` в подпапке `kittest/`.
 
-Экраны для снимков задаёт тестовый хук: `BYTETAP_TEST_SCREEN=<экран>-<тема>` читается, только если задан ещё `BYTETAP_TEST_HOOKS=1`. Остальные тестовые ключи (`BYTETAP_TEST_AUTOSTART`, `BYTETAP_TEST_PANIC`, `BYTETAP_TEST_PROBE*`, `BYTETAP_TEST_JOURNAL`) читаются по тому же правилу — только вместе с `BYTETAP_TEST_HOOKS=1` (`crates/bytetap-app/src/hooks.rs`); без него одиночная переменная окружения поведение exe не меняет, и это проверяет тест. Риск: в release-exe обе переменные видны любому, кто запускает процесс, — с ними приложение показывает синтетические данные (порты, последние записи, ошибку журнала) и может открыть журнал по `BYTETAP_TEST_JOURNAL`. На диск хук не пишет: хранилище настроек он отключает, а тема задаётся только в памяти. В релизной сборке это всё равно лишняя возможность: когда снимки согласованы владельцем (U1-AC21), хук стоит убрать.
+Экраны для снимков задаёт тестовый хук: `BYTETAP_TEST_SCREEN=<экран>-<тема>` читается, только если задан ещё `BYTETAP_TEST_HOOKS=1`. Остальные тестовые ключи (`BYTETAP_TEST_AUTOSTART`, `BYTETAP_TEST_PANIC`, `BYTETAP_TEST_PROBE*`, `BYTETAP_TEST_JOURNAL`) читаются по тому же правилу — только вместе с `BYTETAP_TEST_HOOKS=1` (`crates/bytetap-app/src/hooks.rs`); без него одиночная переменная окружения поведение exe не меняет, и это проверяет тест. Все хуки собраны под feature `test-hooks`: в релизном exe их нет — ни чтения окружения, ни синтетических экранов, ни пробы цены кадра, — поэтому показать синтетические данные или открыть чужой журнал хуком там нельзя, и `release.yml` проверяет отсутствие строк `BYTETAP_TEST` в бинарнике. Локально хуки включаются сборкой с `--features test-hooks` (см. «Автоматические проверки»): без неё те же переменные окружения ничего не делают. На диск хук не пишет: хранилище настроек он отключает, а тема задаётся только в памяти.
 
 ## Ручной смоук v0.2.0 на Windows (нативный интерфейс, U1-AC20)
 
