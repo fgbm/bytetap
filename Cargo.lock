@@ -643,7 +643,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "bytetap-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "bytetap-app",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "bytetap-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "bytetap-core",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "bytetap-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "bytetap-core",
@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "bytetap-testkit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tokio",
 ]

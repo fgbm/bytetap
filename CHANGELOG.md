@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-22
+
+Третий релиз: режим «прокси» — bytetap встаёт в разрыв между анализатором и ЛИС и записывает обмен, пока ЛИС работает, поэтому отключать ЛИС и останавливать передачу результатов больше не нужно. Поставка та же: переносимый `bytetap.exe` без установщика и подписи, в zip входят `bytetap.exe`, `README.md`, `LICENSE` и `THIRD-PARTY-LICENSES.md`, рядом лежит `SHA256SUMS`, имя архива — `bytetap-v0.3.0-windows-x64.zip`. Все режимы пишут журнал формата `bytetap-session/2`; журналы `/1` читаются как раньше, а журналы `/2` не открывает и не проверяет v0.2.0 и старше.
+
 ### Добавлено
 
 - Режим «прокси» (FR-5…FR-8): bytetap встаёт в разрыв между анализатором и ЛИС, слушает свой порт, на каждое входящее соединение открывает исходящее к цели и пересылает байты в обе стороны без изменений, пока ЛИС работает. Запись идёт при живой ЛИС, автоответчик в этом режиме выключен всегда: подтверждения даёт ЛИС, а не bytetap.
@@ -101,6 +105,7 @@
 - Журналы реальных сессий не хранятся в репозитории: тестовые данные синтетические (`ANALYZER`, `LIS`, `PATIENT^TEST`).
 - В GitHub Actions закреплены commit SHA сторонних actions, у workflow минимальные `permissions`, проверки actionlint и zizmor.
 
-[Unreleased]: https://github.com/fgbm/bytetap/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/fgbm/bytetap/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/fgbm/bytetap/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/fgbm/bytetap/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/fgbm/bytetap/releases/tag/v0.1.0
