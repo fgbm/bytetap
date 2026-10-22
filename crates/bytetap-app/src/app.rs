@@ -519,8 +519,8 @@ impl BytetapApp {
                 } else {
                     crate::settings::FeedView::Text
                 };
-                match std::env::var(JOURNAL_ENV) {
-                    Ok(path) if !path.is_empty() => self.open_journal(ctx, path.into()),
+                match hooks::var(JOURNAL_ENV) {
+                    Some(path) if !path.is_empty() => self.open_journal(ctx, path.into()),
                     _ => diag::error(format!(
                         "{SCREEN_ENV}: для {name} нужен {JOURNAL_ENV}=<путь к журналу>"
                     )),

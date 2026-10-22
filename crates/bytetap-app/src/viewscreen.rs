@@ -82,15 +82,11 @@ pub fn title_bar(app: &mut BytetapApp, ui: &mut Ui) {
                 ui.painter()
                     .layout_no_wrap(meta_text.clone(), meta_font.clone(), p.text_muted);
             let available = ui.available_width().max(0.0);
-            // Имя файла и метаданные делят остаток: имя — не больше половины, чтобы
-            // длинный анализатор не оставлял от имени одно «…». Имя журнала — одно
-            // длинное слово без пробелов, поэтому и «…» по остатку ширины.
-            let name_fits = full_name.size().x + full_meta.size().x + SPACE_2 <= available;
-            let name_width = if name_fits {
-                full_name.size().x
-            } else {
-                available * 0.45
-            };
+            // Имя файла и метаданные делят остаток: имя берёт свою фактическую ширину, но
+            // не больше половины, чтобы длинный анализатор не оставлял от имени одно «…».
+            // Метаданным достаётся всё остальное. Имя журнала — одно длинное слово без
+            // пробелов, поэтому и «…» по остатку ширины.
+            let name_width = full_name.size().x.min(available * 0.45);
             let job = egui::text::LayoutJob::simple_singleline(name.clone(), name_font, p.text);
             let name_galley = truncated(ui, job, name_width);
             let (rect, response) = ui.allocate_exact_size(name_galley.size(), Sense::hover());
@@ -109,7 +105,9 @@ pub fn title_bar(app: &mut BytetapApp, ui: &mut Ui) {
             let (rect, response) = ui.allocate_exact_size(meta_galley.size(), Sense::hover());
             response.widget_info(|| WidgetInfo::labeled(Role::Label, true, &meta));
             if full_meta.size().x > meta_width {
-                response.on_hover_text(&meta_text);
+                // Подсказка — без ведущего «· »: он отделяет метаданные от имени файла, а
+                // в подсказке отделять нечего.
+                response.on_hover_text(&meta);
             }
             ui.painter().galley(rect.min, meta_galley, p.text_muted);
         },

@@ -322,6 +322,47 @@ fn assert_header_fits(harness: &Harness<'static, BytetapApp>, size: (f32, f32), 
             );
         }
     }
+    // Обрезанная подпись не теряется целиком: её полный текст остаётся в AccessKit, и
+    // его находит поиск по точной подписи — так его читает экранный диктор (находка
+    // повторного ревью шага 5).
+    let full = header_full_texts(harness);
+    assert!(
+        !full.is_empty(),
+        "{screen}: у шапки нет подписей с полным текстом"
+    );
+    for text in full {
+        assert!(
+            harness.query_by_label(&text).is_some(),
+            "{screen}: в AccessKit нет полного текста {text:?}"
+        );
+    }
+}
+
+/// Полные тексты подписей шапки: сводка записи, имя файла и метаданные просмотра.
+///
+/// В узком окне они обрезаны «…», и полный текст виден только в подсказке и в AccessKit.
+fn header_full_texts(harness: &Harness<'static, BytetapApp>) -> Vec<String> {
+    if let Some(rec) = harness.state().recording() {
+        let stats = rec.stats();
+        return vec![rec.summary(&stats)];
+    }
+    if let Some(view) = harness.state().viewing() {
+        let analyzer = view
+            .summary
+            .header
+            .analyzer
+            .clone()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| bytetap_app::t!("journal.notSpecified").to_owned());
+        return vec![
+            bytetap_app::viewing::file_name(&view.path),
+            format!(
+                "{analyzer} · {}",
+                bytetap_app::viewing::duration(view.summary.duration_us)
+            ),
+        ];
+    }
+    Vec::new()
 }
 
 #[test]
@@ -1019,9 +1060,15 @@ fn the_corrupt_settings_warning_is_shown() {
     );
 }
 
-/// Кириллица, стрелки направлений и управляющие символы — без «тофу» (U1-AC5).
+/// Кириллица, греческий, стрелки направлений и управляющие символы — без «тофу»
+/// (U1-AC5). Отсутствующий глиф роняет харнесс (`MissingGlyphPolicy::Panic`).
+///
+/// Греческого нет в Plex Mono, а лента показывает им единицы измерения («γ-GT
+/// μmol/L»): у моноширинных семейств запасной Plex Sans, поэтому глиф есть и там.
 #[test]
 fn the_fonts_have_every_glyph_the_interface_uses() {
+    let sample = "Ёжик съел щи · «Журнал» — №5 … ‹CR›‹LF›‹STX›‹ETX› → ← ↓ ↑ ✓ × \
+                  ° ± ² µ ‹x2039›‹x203A› γ μ Ω α ΓΔΘΛΞΠΣΦΨ";
     let mut harness = Harness::builder()
         .with_size((800.0, 200.0))
         .with_context_setup(|ctx| {
@@ -1029,7 +1076,6 @@ fn the_fonts_have_every_glyph_the_interface_uses() {
             theme::apply(ctx, false);
         })
         .build_ui(|ui| {
-            let sample = "Ёжик съел щи · «Журнал» — №5 … ‹CR›‹LF›‹STX›‹ETX› → ← ↓ ↑ ✓ ×";
             ui.label(sample);
             ui.label(egui::RichText::new(sample).font(theme::mono(13.0)));
             ui.label(egui::RichText::new(sample).font(theme::mono_medium(13.0)));
@@ -1037,6 +1083,73 @@ fn the_fonts_have_every_glyph_the_interface_uses() {
             ui.label(egui::RichText::new(sample).font(theme::sans_medium(13.0)));
         });
     harness.run();
+    // Проверка по семействам, а не только по нарисованным строкам: глиф, которого нет
+    // ни в одном семействе, виден здесь по имени, а не «тофу» на снимке.
+    let fonts = [
+        theme::sans(13.0),
+        theme::mono(13.0),
+        theme::mono_medium(13.0),
+        theme::sans_medium(13.0),
+        theme::sans_semibold(20.0),
+    ];
+    let mut missing = Vec::new();
+    harness.ctx.fonts_mut(|fonts_view| {
+        for font in &fonts {
+            for c in sample.chars() {
+                if !fonts_view.has_glyph(font, c) {
+                    missing.push(format!("{c:?} в {:?}", font.family));
+                }
+            }
+        }
+    });
+    assert!(missing.is_empty(), "нет глифов: {missing:?}");
+}
+
+/// Строка ленты с греческим в данных, UTF-8: «γ-GT μmol/L» (U1-AC5).
+///
+/// Моноширинный Plex Mono греческого не содержит, и строка результата анализатора
+/// показывала бы «тофу» вместо единиц измерения. Харнесс роняет тест на отсутствующем
+/// глифе, а подпись строки в AccessKit проверяется целиком.
+#[test]
+fn a_feed_row_shows_greek_units_without_tofu() {
+    use bytetap_app::settings::Encoding;
+    use bytetap_core::journal::{Data, Dir, Event};
+
+    let data = Event::Data(Data::new(
+        "2026-10-19T23:27:10.046000+03:00",
+        1_000,
+        1,
+        Dir::AnalyzerToLis,
+        false,
+        "\x0bMSH|^~\\&|ANALYZER|LAB|LIS||20261019232710||ORU^R01|MSG1|P|2.3.1\rOBX|1|NM|GGT^γ-GT||5.4|μmol/L\r\x1c\r"
+            .as_bytes(),
+    ));
+    let fixture = RecordingFixture {
+        events: vec![data],
+        stats: bytetap_core::journal::Stats {
+            connections: 1,
+            bytes_analyzer_to_lis: 1,
+            bytes_lis_to_analyzer: 0,
+        },
+        elapsed: std::time::Duration::from_secs(1),
+        local_addr: "0.0.0.0:5000".into(),
+        journal_path: None,
+        dropped: 0,
+    };
+    let mut settings = settings(false);
+    settings.feed.encoding = Encoding::Utf8;
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .with_theme(Theme::Light)
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings, None, None)
+                .with_fixtures(fixtures())
+                .with_recording_fixture(fixture)
+        });
+    harness.run_steps(8);
+    // Строка ленты видна целиком: «γ-GT» и «μmol/L» дошли до подписи AccessKit.
+    harness.get_by_label_contains("γ-GT");
+    harness.get_by_label_contains("μmol/L");
 }
 
 /// Масштаб экрана Windows: 100, 125 и 150 % (U1-AC26).
