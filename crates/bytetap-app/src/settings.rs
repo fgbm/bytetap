@@ -1046,6 +1046,24 @@ mod tests {
         assert_eq!(profile.proxy_role, ProxyMode::AnalyzerServer);
         assert_eq!(profile.proxy_host, "192.168.1.51");
         assert_eq!(profile.proxy_port, 5000);
+
+        // Фильтр по адресу входа хранится в настройках и в профиле; пусто — фильтра нет.
+        assert_eq!(
+            settings.config.proxy_allow_from, "",
+            "по умолчанию фильтра нет"
+        );
+        let raw = json!({
+            "config": { "mode": "proxy", "proxyAllowFrom": " 192.168.1.51 " },
+            "profiles": [{ "name": "Прокси", "config": {
+                "mode": "proxy", "proxyAllowFrom": "10.0.0.5"
+            }}]
+        });
+        let settings = normalize(&raw, "");
+        assert_eq!(
+            settings.config.proxy_allow_from, "192.168.1.51",
+            "пробелы режутся"
+        );
+        assert_eq!(settings.profiles[0].config.proxy_allow_from, "10.0.0.5");
     }
 
     #[test]
