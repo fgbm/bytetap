@@ -355,16 +355,16 @@ jobs:
           if (-not $dialog -or -not $panicked) { $failed = $true }
           if ($failed) { exit 1 }
 
-      # U1-AC17, NFR-5: запись HL7 и закрытие окна во время записи. Тестовый хук
-      # BYTETAP_TEST_AUTOSTART запускает запись TCP-сервера на свободном порту loopback;
-      # адрес и журнал сессии exe пишет в журнал запуска. Клиент шлёт синтетическое
-      # сообщение HL7 в рамке MLLP и ждёт ACK, затем окно получает WM_CLOSE: журнал
-      # сессии должен закончиться session_end, а процесс — выйти сам.
-      # Рамка окна: на белом фоне окно без рамки сливается с фоном (решение владельца
-      # 2026-10-21). Снимок окна на белом фоне показывает рамку 1 px по периметру, а
-      # ответ DWM (скругление и цвет рамки) читается обратно из окна. Пиксели периметра
-      # сверяются с токеном --bt-border в обеих ветвях: и когда рамку рисует DWM, и
-      # когда её рисует приложение.
+      # U1-AC3: рамка окна 1 px видна на белом фоне и не пропадает.
+      #
+      # Рамку рисует приложение (`window::draw_frame`, последней в кадре), а DWM только
+      # скругляет углы: свою рамку DWM видно лишь у активного окна и после смены
+      # активности он гасит её, поэтому приложение заказывает ему `DWMWA_COLOR_NONE`.
+      # Смоук снимает окно на белом фоне трижды: стартовый экран, экран записи
+      # (`BYTETAP_TEST_AUTOSTART` поднимает TCP-сервер) и то же окно записи, когда фокус
+      # забрал другой процесс (блокнот) — именно так рамка пропадала у владельца на
+      # Windows 11 22000. Пиксели периметра сверяются с токеном `--bt-border` из
+      # `design/tokens.css`, контраст — с фоном в 3 px внутрь окна.
       - name: Смоук — рамка окна на белом фоне
         shell: pwsh
         run: |
@@ -375,6 +375,7 @@ jobs:
           public static class FrameWin {
             [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
             [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+            [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
             [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
             [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
             [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT rect, int size);
@@ -384,157 +385,229 @@ jobs:
           [void][FrameWin]::SetProcessDPIAware()
           $out = New-Item -ItemType Directory -Force -Path smoke
           $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
+          $failed = $false
+
+          # Цвета рамки — из токенов темы, допуск на канал 8: снимок проходит через
+          # масштаб экрана раннера.
+          $tokens = Get-Content design/tokens.css -Raw
+          $borderHex = @([regex]::Matches($tokens, '--bt-border:\s*#([0-9a-fA-F]{6})') |
+            ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+          Write-Host "цвета --bt-border: $($borderHex -join ', ')"
+          if ($borderHex.Count -eq 0) {
+            Write-Host 'в design/tokens.css нет --bt-border'
+            $failed = $true
+          }
+          $borderColors = @(foreach ($hex in $borderHex) {
+            [System.Drawing.Color]::FromArgb(255,
+              [Convert]::ToInt32($hex.Substring(0, 2), 16),
+              [Convert]::ToInt32($hex.Substring(2, 2), 16),
+              [Convert]::ToInt32($hex.Substring(4, 2), 16))
+          })
+
+          # Снимок окна на белом фоне и сверка периметра. Углы не трогаем: там
+          # скругление и сглаживание. По середине каждой стороны берём 21 точку через
+          # 2 px и ищем цвет рамки в полосе ±2 px от края окна; кадр шире границ окна
+          # на $pad пикселей, иначе размытие скругления съедает пиксели края.
+          function Measure-Frame {
+            param([IntPtr]$hwnd, [string]$name)
+            $pad = 8
+            $band = 2
+            $tolerance = 8
+            $contrast = 12
+            $inner = 3
+            $rect = New-Object FrameWin+RECT
+            # DWMWA_EXTENDED_FRAME_BOUNDS = 9: границы окна без невидимой тени.
+            [void][FrameWin]::DwmGetWindowAttribute($hwnd, 9, [ref]$rect, [System.Runtime.InteropServices.Marshal]::SizeOf($rect))
+            $w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
+            Write-Host "$name: окно ${w}x${h}"
+            if ($w -lt 100 -or $h -lt 100) {
+              Write-Host "$name: окно не найдено"
+              return $null
+            }
+            # Скругление (33) — как его задало приложение. Цвет рамки (34) атрибут
+            # только для записи, его не прочитать: о нём пишет журнал запуска.
+            $corner = 0
+            [void][FrameWin]::DwmGetWindowAttribute($hwnd, 33, [ref]$corner, 4)
+            $shot = New-Object System.Drawing.Bitmap ($w + 2 * $pad), ($h + 2 * $pad)
+            $g = [System.Drawing.Graphics]::FromImage($shot)
+            $g.CopyFromScreen($rect.Left - $pad, $rect.Top - $pad, 0, 0, $shot.Size)
+            $g.Dispose()
+            $margin = 24
+            $canvas = New-Object System.Drawing.Bitmap ($shot.Width + 2 * $margin), ($shot.Height + 2 * $margin)
+            $cg = [System.Drawing.Graphics]::FromImage($canvas)
+            $cg.Clear([System.Drawing.Color]::White)
+            $cg.DrawImage($shot, $margin, $margin)
+            $cg.Dispose()
+            $canvas.Save((Join-Path $out "window-frame-$name.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+
+            $samples = @()
+            for ($i = -10; $i -le 10; $i++) {
+              $samples += @{ X = [int]($pad + $w / 2 + $i * 2); Y = [int]$pad; Vert = $true; In = 1 }
+              $samples += @{ X = [int]($pad + $w / 2 + $i * 2); Y = [int]($pad + $h - 1); Vert = $true; In = -1 }
+              $samples += @{ X = [int]$pad; Y = [int]($pad + $h / 2 + $i * 2); Vert = $false; In = 1 }
+              $samples += @{ X = [int]($pad + $w - 1); Y = [int]($pad + $h / 2 + $i * 2); Vert = $false; In = -1 }
+            }
+            $hits = 0
+            foreach ($sample in $samples) {
+              $found = $false
+              for ($d = -$band; $d -le $band -and -not $found; $d++) {
+                $x = [int]$sample.X
+                $y = [int]$sample.Y
+                if ($sample.Vert) { $y = $y + $d } else { $x = $x + $d }
+                if ($x -lt 0 -or $y -lt 0 -or $x -ge $shot.Width -or $y -ge $shot.Height) { continue }
+                $px = $shot.GetPixel($x, $y)
+                foreach ($want in $borderColors) {
+                  if (([Math]::Abs([int]$px.R - [int]$want.R) -le $tolerance) -and
+                      ([Math]::Abs([int]$px.G - [int]$want.G) -le $tolerance) -and
+                      ([Math]::Abs([int]$px.B - [int]$want.B) -le $tolerance)) { $found = $true; break }
+                }
+              }
+              if (-not $found) { continue }
+              # Тот же край, но на 3 px внутрь окна: там фон, и рамка должна от него
+              # отличаться хотя бы на $contrast по одному каналу.
+              $x = [int]$sample.X
+              $y = [int]$sample.Y
+              if ($sample.Vert) { $y = $y + $sample.In * $inner } else { $x = $x + $sample.In * $inner }
+              if ($x -lt 0 -or $y -lt 0 -or $x -ge $shot.Width -or $y -ge $shot.Height) { continue }
+              $bg = $shot.GetPixel($x, $y)
+              $diff = [Math]::Max(
+                [Math]::Abs([int]$bg.R - [int]$px.R),
+                [Math]::Max([Math]::Abs([int]$bg.G - [int]$px.G), [Math]::Abs([int]$bg.B - [int]$px.B)))
+              if ($diff -lt $contrast) { continue }
+              $hits++
+            }
+            Write-Host "$name : пикселей периметра цветом --bt-border: $hits из $($samples.Count), скругление $corner"
+            $shot.Dispose(); $canvas.Dispose()
+            return @{ Hits = $hits; Total = $samples.Count; Corner = $corner }
+          }
+
+          # Окно меньше экрана раннера (1024×768) и в верхнем левом углу: видны все
+          # четыре стороны рамки.
+          function Place-Window {
+            param([IntPtr]$hwnd, [int]$x, [int]$y, [int]$w, [int]$h)
+            # SWP_NOZORDER | SWP_NOACTIVATE
+            [void][FrameWin]::SetWindowPos($hwnd, [IntPtr]::Zero, $x, $y, $w, $h, 0x14)
+          }
+
+          function Check-Frame {
+            param($measured, [string]$name)
+            if ($null -eq $measured) { return $false }
+            if ($measured.Hits -lt [int]($measured.Total * 0.9)) {
+              Write-Host "$name : рамка окна не совпадает с --bt-border на снимке или не видна на белом"
+              return $false
+            }
+            return $true
+          }
+
+          # Проверка журнала запуска: рамка, скругление и скрытая рамка DWM.
+          function Check-FrameLog {
+            param([string]$name)
+            if (-not (Test-Path $log)) { Write-Host "$name : журнала нет"; return $false }
+            Copy-Item $log (Join-Path $out "bytetap-frame-$name.log") -Force
+            Get-Content -Encoding utf8 $log
+            $ok = $true
+            if (-not (Select-String -Path $log -Pattern 'рамка окна' -Quiet -Encoding utf8)) {
+              Write-Host "$name : в журнале запуска нет записей о рамке окна"
+              $ok = $false
+            }
+            $corner = Select-String -Path $log -Pattern 'DWM скругляет углы' -Quiet -Encoding utf8
+            $hidden = Select-String -Path $log -Pattern 'DWM-рамка скрыта \(DWMWA_COLOR_NONE\), свою рисует приложение цветом #[0-9a-f]{6}' -Quiet -Encoding utf8
+            $own = Select-String -Path $log -Pattern 'рамку рисует приложение' -Quiet -Encoding utf8
+            if ($corner) {
+              Write-Host "$name : DWM скругляет углы, рамку рисует приложение"
+              if (-not $hidden) {
+                Write-Host "$name : DWM не принял DWMWA_COLOR_NONE — рамку может нарисовать DWM"
+                $ok = $false
+              }
+            } elseif ($own) {
+              Write-Host "$name : DWM-скругления нет: рамку рисует приложение с квадратными углами"
+            } else {
+              Write-Host "$name : в журнале запуска нет ни DWM-скругления, ни своей рамки"
+              $ok = $false
+            }
+            return $ok
+          }
+
+          # 1. Стартовый экран: рамку видно без переключения темы и без записи.
           Remove-Item $log -ErrorAction SilentlyContinue
           $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
           $null = $p.Handle
           Start-Sleep -Seconds 15
-          $failed = $false
           if ($p.HasExited) {
-            Write-Host "bytetap.exe завершился, код $($p.ExitCode)"
+            Write-Host "стартовый экран: bytetap.exe завершился, код $($p.ExitCode)"
             $failed = $true
           } else {
             try {
               $p.Refresh()
               $hwnd = $p.MainWindowHandle
               [void][FrameWin]::SetForegroundWindow($hwnd)
-              # Окно 1200×800 на экране раннера 1024×768 упирается в край, и нижнюю сторону
-              # рамки закрывает панель задач: периметра на снимке нет. Ставим окно меньше
-              # экрана и ближе к верхнему левому углу — видны все четыре стороны.
-              [void][FrameWin]::SetWindowPos($hwnd, [IntPtr]::Zero, 8, 8, 960, 680, 0x14)
+              Place-Window $hwnd 8 8 720 560
               Start-Sleep -Milliseconds 900
-              $rect = New-Object FrameWin+RECT
-              # DWMWA_EXTENDED_FRAME_BOUNDS = 9: границы окна без невидимой тени.
-              [void][FrameWin]::DwmGetWindowAttribute($hwnd, 9, [ref]$rect, [System.Runtime.InteropServices.Marshal]::SizeOf($rect))
-              $w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
-              Write-Host "окно ${w}x${h}"
-              # Скругление (33) — как его задало приложение. Цвет рамки (34) атрибут
-              # только для записи, его не прочитать: о нём пишет журнал запуска.
-              $corner = 0
-              [void][FrameWin]::DwmGetWindowAttribute($hwnd, 33, [ref]$corner, 4)
-              Write-Host ("скругление: {0}" -f $corner)
-              # Снимок окна на белом фоне: рамка 1 px видна только на нём. Кадр берётся
-              # шире границ окна (DWMWA_EXTENDED_FRAME_BOUNDS) на $pad пикселей: рамку
-              # DWM рисует по краю окна и при снимке «ровно по границам» её пиксели
-              # попадают на самый край, где сглаживание скругления их размывает.
-              $pad = 8
-              $shot = New-Object System.Drawing.Bitmap ($w + 2 * $pad), ($h + 2 * $pad)
-              $g = [System.Drawing.Graphics]::FromImage($shot)
-              $g.CopyFromScreen($rect.Left - $pad, $rect.Top - $pad, 0, 0, $shot.Size)
-              $g.Dispose()
-              $margin = 24
-              $canvas = New-Object System.Drawing.Bitmap ($shot.Width + 2 * $margin), ($shot.Height + 2 * $margin)
-              $cg = [System.Drawing.Graphics]::FromImage($canvas)
-              $cg.Clear([System.Drawing.Color]::White)
-              $cg.DrawImage($shot, $margin, $margin)
-              $cg.Dispose()
-              $canvas.Save((Join-Path $out 'window-frame-white.png'), [System.Drawing.Imaging.ImageFormat]::Png)
-
-              # Рамка окна сверяется с токеном --bt-border из design/tokens.css с
-              # допуском на сглаживание — и когда её рисует DWM, и когда приложение.
-              $tokens = Get-Content design/tokens.css -Raw
-              $borderHex = @([regex]::Matches($tokens, '--bt-border:\s*#([0-9a-fA-F]{6})') |
-                ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
-              Write-Host "цвета --bt-border: $($borderHex -join ', ')"
-              if ($borderHex.Count -eq 0) {
-                Write-Host 'в design/tokens.css нет --bt-border'
-                $failed = $true
-              }
-              $borderColors = @(foreach ($hex in $borderHex) {
-                [System.Drawing.Color]::FromArgb(255,
-                  [Convert]::ToInt32($hex.Substring(0, 2), 16),
-                  [Convert]::ToInt32($hex.Substring(2, 2), 16),
-                  [Convert]::ToInt32($hex.Substring(4, 2), 16))
-              })
-              # Углы не трогаем: там скругление и сглаживание. По середине каждой стороны
-              # берём 21 точку через 2 px и ищем цвет рамки в полосе ±2 px от края окна:
-              # своя рамка — ровно 1 физический пиксель по краю, DWM рисует её по краю же.
-              # Допуск на канал — 8: рамка не сглаживается, но снимок проходит через
-              # масштаб экрана раннера.
-              $band = 2
-              $tolerance = 8
-              # Контраст: в 3 px внутрь окна лежит фон (`--bt-surface-0`), и рамка обязана
-              # от него отличаться. Иначе белая рамка на белом фоне прошла бы по цвету,
-              # но её не было бы видно — а рамка нужна именно на белом.
-              $contrast = 12
-              $inner = 3
-              $samples = @()
-              for ($i = -10; $i -le 10; $i++) {
-                $samples += @{ X = [int]($pad + $w / 2 + $i * 2); Y = [int]$pad; Vert = $true; In = 1 }
-                $samples += @{ X = [int]($pad + $w / 2 + $i * 2); Y = [int]($pad + $h - 1); Vert = $true; In = -1 }
-                $samples += @{ X = [int]$pad; Y = [int]($pad + $h / 2 + $i * 2); Vert = $false; In = 1 }
-                $samples += @{ X = [int]($pad + $w - 1); Y = [int]($pad + $h / 2 + $i * 2); Vert = $false; In = -1 }
-              }
-              $hits = 0
-              foreach ($sample in $samples) {
-                $found = $false
-                for ($d = -$band; $d -le $band -and -not $found; $d++) {
-                  $x = [int]$sample.X
-                  $y = [int]$sample.Y
-                  if ($sample.Vert) { $y = $y + $d } else { $x = $x + $d }
-                  if ($x -lt 0 -or $y -lt 0 -or $x -ge $shot.Width -or $y -ge $shot.Height) { continue }
-                  $px = $shot.GetPixel($x, $y)
-                  foreach ($want in $borderColors) {
-                    if (([Math]::Abs([int]$px.R - [int]$want.R) -le $tolerance) -and
-                        ([Math]::Abs([int]$px.G - [int]$want.G) -le $tolerance) -and
-                        ([Math]::Abs([int]$px.B - [int]$want.B) -le $tolerance)) { $found = $true; break }
-                  }
-                }
-                if (-not $found) { continue }
-                # Тот же край, но на 3 px внутрь окна: там фон, и рамка должна от него
-                # отличаться хотя бы на $contrast по одному каналу.
-                $x = [int]$sample.X
-                $y = [int]$sample.Y
-                if ($sample.Vert) { $y = $y + $sample.In * $inner } else { $x = $x + $sample.In * $inner }
-                if ($x -lt 0 -or $y -lt 0 -or $x -ge $shot.Width -or $y -ge $shot.Height) { continue }
-                $bg = $shot.GetPixel($x, $y)
-                $diff = [Math]::Max(
-                  [Math]::Abs([int]$bg.R - [int]$px.R),
-                  [Math]::Max([Math]::Abs([int]$bg.G - [int]$px.G), [Math]::Abs([int]$bg.B - [int]$px.B)))
-                if ($diff -lt $contrast) { continue }
-                $hits++
-              }
-              Write-Host "пикселей периметра цветом --bt-border: $hits из $($samples.Count)"
-              Write-Host "контраст рамки с фоном на 3 px внутрь: не меньше $contrast по каналу"
-              if ($corner -eq 2) {
-                Write-Host 'DWM скруглил окно: рамку рисует система, периметр снимка сверен'
-              } else {
-                Write-Host 'DWM не скруглил окно: свою рамку рисует приложение'
-              }
-              if ($hits -lt [int]($samples.Count * 0.9)) {
-                Write-Host 'рамка окна не совпадает с --bt-border на снимке или не видна на белом'
-                $failed = $true
-              }
-              $shot.Dispose(); $canvas.Dispose()
-            } catch { Write-Host "снимок окна на белом фоне: $_"; $failed = $true }
+              if (-not (Check-Frame (Measure-Frame $hwnd 'start') 'стартовый экран')) { $failed = $true }
+            } catch { Write-Host "стартовый экран: $_"; $failed = $true }
             Stop-Process -Id $p.Id -Force
           }
-          if (Test-Path $log) {
-            Copy-Item $log (Join-Path $out 'bytetap-frame.log')
-            Get-Content -Encoding utf8 $log
-          } else { Write-Host "журнала $log нет"; $failed = $true }
-          # Журнал запуска пишет результат вызовов DWM: рамка, скругление и тень.
-          if (-not (Select-String -Path $log -Pattern 'рамка окна' -Quiet -Encoding utf8)) {
-            Write-Host 'в журнале запуска нет записей о рамке окна'
-            $failed = $true
-          }
-          # Рамка применяется после первого кадра, когда окно уже видимо: смоук
-          # проверяет её без переключения темы — так ловится баг «рамка появляется
-          # только после смены темы».
-          $corner_log = Select-String -Path $log -Pattern 'DWM скругляет углы' -Quiet -Encoding utf8
-          $color_log = Select-String -Path $log -Pattern 'цвет рамки DWM принят: #[0-9a-f]{6}' -Quiet -Encoding utf8
-          $own_log = Select-String -Path $log -Pattern 'рамку рисует приложение' -Quiet -Encoding utf8
-          if ($corner_log) {
-            Write-Host 'DWM скругляет углы: рамку рисует система'
-            if (-not $color_log) {
-              Write-Host 'DWM не принял цвет рамки'
-              $failed = $true
+          if (-not (Check-FrameLog 'start')) { $failed = $true }
+
+          # 2. Экран записи: прослушивание уже идёт, шапка, трасса и лента нарисованы.
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $env:BYTETAP_TEST_HOOKS = '1'
+          $env:BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0'
+          $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
+          $null = $p.Handle
+          $env:BYTETAP_TEST_AUTOSTART = ''
+          $env:BYTETAP_TEST_HOOKS = ''
+          $recording = $false
+          for ($i = 0; $i -lt 60 -and -not $recording -and -not $p.HasExited; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Test-Path $log) {
+              $recording = Select-String -Path $log -Pattern 'запись идёт: адрес' -Quiet -Encoding utf8
             }
-          } elseif ($own_log) {
-            Write-Host 'DWM-рамки нет: рамку рисует приложение (пиксели периметра сверены)'
-          } else {
-            Write-Host 'в журнале запуска нет ни DWM-рамки, ни своей'
-            $failed = $true
           }
+          if (-not $recording) {
+            Write-Host 'экран записи: прослушивание не началось'
+            $failed = $true
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          } else {
+            Start-Sleep -Seconds 2
+            try {
+              $p.Refresh()
+              $hwnd = $p.MainWindowHandle
+              [void][FrameWin]::SetForegroundWindow($hwnd)
+              Place-Window $hwnd 8 8 720 560
+              Start-Sleep -Milliseconds 900
+              if (-not (Check-Frame (Measure-Frame $hwnd 'recording') 'экран записи')) { $failed = $true }
+
+              # 3. То же окно записи без фокуса: рамка DWM гасится при смене
+              # активности, своя — нет. Блокнот ставим рядом, чтобы не накрыть окно.
+              $note = Start-Process -FilePath 'notepad.exe' -PassThru
+              $null = $note.Handle
+              $noteHwnd = [IntPtr]::Zero
+              for ($i = 0; $i -lt 20 -and $noteHwnd -eq [IntPtr]::Zero -and -not $note.HasExited; $i++) {
+                Start-Sleep -Milliseconds 500
+                $note.Refresh()
+                $noteHwnd = $note.MainWindowHandle
+              }
+              if ($noteHwnd -eq [IntPtr]::Zero) {
+                Write-Host 'окно без фокуса: блокнот не открылся'
+                $failed = $true
+              } else {
+                Place-Window $noteHwnd 760 120 240 200
+                [void][FrameWin]::SetForegroundWindow($noteHwnd)
+                Start-Sleep -Milliseconds 900
+                $active = [FrameWin]::GetForegroundWindow()
+                Write-Host "окно без фокуса: активно чужое окно $($active -ne $hwnd)"
+                if ($active -eq $hwnd) {
+                  Write-Host 'окно без фокуса: фокус остался у bytetap'
+                  $failed = $true
+                }
+                if (-not (Check-Frame (Measure-Frame $hwnd 'inactive') 'окно без фокуса')) { $failed = $true }
+                Stop-Process -Id $note.Id -Force -ErrorAction SilentlyContinue
+              }
+            } catch { Write-Host "экран записи: $_"; $failed = $true }
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          }
+          if (-not (Check-FrameLog 'recording')) { $failed = $true }
           if ($failed) { exit 1 }
 
       - name: Смоук — запись HL7 и закрытие окна

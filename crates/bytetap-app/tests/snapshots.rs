@@ -2076,3 +2076,61 @@ fn escape_closes_menus_and_dialogs() {
     );
     assert!(harness.state().settings().profiles.is_empty());
 }
+
+/// Рамка окна на экране записи (U1-AC3, жалоба владельца: на записи рамка пропадала).
+///
+/// Экран записи рисует шапку, трассу, панель и ленту в том же слое, что и рамку, поэтому
+/// рамка идёт последней и панели её не перекрывают: по середине каждой стороны ровно
+/// один физический пиксель цвета `--bt-border`, а следующий за ним — фон `--bt-surface-0`.
+/// Обе темы: цвет рамки у них разный.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "рендер проверяется на Linux (lavapipe)"
+)]
+fn the_recording_screen_keeps_the_window_frame() {
+    let _gpu = gpu();
+    for (dark, border, surface) in [
+        (false, [0xe2, 0xe5, 0xe9], [0xff, 0xff, 0xff]),
+        (true, [0x25, 0x2d, 0x36], [0x0d, 0x10, 0x13]),
+    ] {
+        let mut harness = recording(dark, FeedView::Text, 0);
+        harness.run_steps(2);
+        let image = harness.render().expect("рендер экрана записи");
+        let (w, h) = (image.width() as i32, image.height() as i32);
+        let at = |x: i32, y: i32| {
+            let pixel = image.get_pixel(x as u32, y as u32);
+            [pixel[0], pixel[1], pixel[2]]
+        };
+        // По середине стороны и в 3 px от неё внутрь: рамка должна быть ровно 1 px.
+        let mut edges = Vec::new();
+        for (x, y, dx, dy) in [
+            (w / 2, 0, 0, 3),
+            (w / 2, h - 1, 0, -3),
+            (0, h / 2, 3, 0),
+            (w - 1, h / 2, -3, 0),
+        ] {
+            edges.push((at(x, y), at(x + dx, y + dy)));
+        }
+        for (edge, inner) in edges {
+            assert!(
+                near(edge, border),
+                "тема {dark}: периметр {edge:?} — не цвет --bt-border {border:?}"
+            );
+            assert!(
+                near(inner, surface),
+                "тема {dark}: в 3 px внутрь {inner:?} — не фон --bt-surface-0 {surface:?}, \
+                 рамка толще одного пикселя"
+            );
+        }
+    }
+}
+
+/// Пиксель совпадает с ожидаемым цветом с допуском 8 на канал: снимок идёт через растр
+/// lavapipe, и последний разряд канала там гуляет.
+fn near(pixel: [u8; 3], want: [u8; 3]) -> bool {
+    pixel
+        .iter()
+        .zip(want)
+        .all(|(got, want)| got.abs_diff(want) <= 8)
+}
