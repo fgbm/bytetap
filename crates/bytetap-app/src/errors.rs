@@ -96,18 +96,27 @@ pub enum ErrorField {
     Address,
     /// Порт цели прокси (FR-5): «Адрес ЛИС» и «Порт цели» — разные поля.
     TargetPort,
+    /// Интерфейс прослушивания: адреса, который занял или занял бы bytetap, нет на
+    /// машине. У прокси это поле стоит рядом с портом, у сервера — в «Дополнительно».
+    Interface,
     Serial,
     LogDir,
     Start,
 }
 
 /// Куда отнести ошибку: порт TCP у сервера и порт COM — разные поля, поэтому нужен и
-/// режим.
+/// режим. У прокси адрес прослушивания и адрес цели — два разных поля: недоступный
+/// интерфейс встаёт под «Интерфейс», неразборчивая цель — под адрес цели (M4-AC13).
 pub fn error_field(code: ErrorCode, mode: SessionMode) -> ErrorField {
     let serial = mode == SessionMode::Serial;
     match code {
         ErrorCode::PortInUse | ErrorCode::PermissionDenied if serial => ErrorField::Serial,
         ErrorCode::PortInUse | ErrorCode::PermissionDenied => ErrorField::Port,
+        ErrorCode::AddressUnavailable
+            if matches!(mode, SessionMode::Proxy | SessionMode::TcpServer) =>
+        {
+            ErrorField::Interface
+        }
         ErrorCode::AddressUnavailable | ErrorCode::AddressInvalid => ErrorField::Address,
         ErrorCode::PortNotFound
         | ErrorCode::PortBusy
@@ -196,14 +205,18 @@ mod tests {
     #[test]
     fn codes_are_bound_to_their_fields() {
         use ErrorCode::*;
-        use SessionMode::{Serial as Com, TcpClient, TcpServer};
+        use SessionMode::{Proxy, Serial as Com, TcpClient, TcpServer};
         let cases = [
             (PortInUse, TcpServer, ErrorField::Port),
             (PortInUse, Com, ErrorField::Serial),
             (PermissionDenied, TcpServer, ErrorField::Port),
             (PermissionDenied, Com, ErrorField::Serial),
-            (AddressUnavailable, TcpServer, ErrorField::Address),
+            (AddressUnavailable, TcpServer, ErrorField::Interface),
+            (AddressUnavailable, Proxy, ErrorField::Interface),
+            (AddressUnavailable, TcpClient, ErrorField::Address),
             (AddressInvalid, TcpClient, ErrorField::Address),
+            // В прокси цель отдельная от интерфейса: разбор адреса — под адресом цели.
+            (AddressInvalid, Proxy, ErrorField::Address),
             (PortNotFound, Com, ErrorField::Serial),
             (PortBusy, Com, ErrorField::Serial),
             (PortSettings, Com, ErrorField::Serial),

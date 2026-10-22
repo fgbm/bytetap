@@ -310,18 +310,20 @@ pub fn proxy_summary(header: &Session) -> Option<String> {
 }
 
 /// Подпись журнала в шапке просмотра: «ANALYZER · 00:42:18»; у журнала прокси вместо
-/// модели анализатора — сводка двух сторон (M4-AC13).
+/// модели анализатора — сводка двух сторон, а имя анализатора, если оно записано,
+/// стоит перед ней: «ANALYZER · bytetap :50025 ⇄ ЛИС 10.0.0.5:5000 · 00:00:06»
+/// (M4-AC13).
 #[must_use]
 pub fn journal_meta(header: &Session, duration_us: u64) -> String {
     let span = duration(duration_us);
+    let analyzer = header.analyzer.clone().filter(|value| !value.is_empty());
     match proxy_summary(header) {
-        Some(summary) => format!("{summary} · {span}"),
+        Some(summary) => match analyzer {
+            Some(analyzer) => format!("{analyzer} · {summary} · {span}"),
+            None => format!("{summary} · {span}"),
+        },
         None => {
-            let analyzer = header
-                .analyzer
-                .clone()
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| t!("journal.notSpecified").to_owned());
+            let analyzer = analyzer.unwrap_or_else(|| t!("journal.notSpecified").to_owned());
             format!("{analyzer} · {span}")
         }
     }
@@ -412,6 +414,44 @@ mod tests {
         let bars = density_bars(&[0, 10, 20, 40]);
         assert_eq!(bars, vec![0.0, 0.25, 0.5, 1.0]);
         assert_eq!(density_bars(&[0, 0]), vec![0.0, 0.0]);
+    }
+
+    /// Подпись журнала прокси: имя анализатора из заголовка, сводка двух сторон и время
+    /// записи (M4-AC13).
+    #[test]
+    fn the_meta_of_a_proxy_journal_names_the_analyzer_and_both_sides() {
+        use bytetap_core::journal::{Autoresponder, Host};
+        let mut header = Session::new(
+            Mode::Proxy,
+            Autoresponder::None,
+            serde_json::json!({
+                "listen": "0.0.0.0:50025",
+                "target": "10.0.0.5:5000",
+                "role": "analyzer_client",
+            }),
+            Host {
+                os: "Windows 11".into(),
+            },
+        );
+        assert_eq!(
+            journal_meta(&header, 6_120_000),
+            "bytetap :50025 ⇄ ЛИС 10.0.0.5:5000 · 00:00:06"
+        );
+        header.analyzer = Some("ANALYZER".into());
+        assert_eq!(
+            journal_meta(&header, 6_120_000),
+            "ANALYZER · bytetap :50025 ⇄ ЛИС 10.0.0.5:5000 · 00:00:06"
+        );
+        // Топология «анализатор — сервер»: цель — анализатор, роль своя.
+        header.settings = serde_json::json!({
+            "listen": "0.0.0.0:5000",
+            "target": "192.168.1.51:5000",
+            "role": "analyzer_server",
+        });
+        assert_eq!(
+            journal_meta(&header, 6_120_000),
+            "ANALYZER · анализатор 192.168.1.51:5000 ⇄ bytetap :5000 · 00:00:06"
+        );
     }
 
     #[test]

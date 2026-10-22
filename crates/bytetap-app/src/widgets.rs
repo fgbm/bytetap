@@ -5,9 +5,9 @@
 //! каждого своего виджета — роль и подпись для AccessKit.
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, CursorIcon, EventFilter, Frame, Id, Margin, Popup, Rect,
-    Response, RichText, Role, ScrollArea, Sense, Stroke, TextEdit, TextWrapMode, Ui, Vec2,
-    WidgetInfo, pos2, vec2,
+    self, Align2, Color32, CornerRadius, CursorIcon, EventFilter, Frame, Id, Key, Margin,
+    Modifiers, Popup, Rect, Response, RichText, Role, ScrollArea, Sense, Stroke, TextEdit,
+    TextWrapMode, Ui, Vec2, WidgetInfo, pos2, vec2,
 };
 
 use crate::icons::{self, Icon};
@@ -505,10 +505,19 @@ pub fn radio(ui: &mut Ui, p: &Palette, id: Id, selected: bool, text: &str) -> Re
         galley.size().y.max(dot_size).max(20.0),
     );
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    let response = ui.interact(rect, id, Sense::click());
+    let mut response = ui.interact(rect, id, Sense::click());
     // Фильтр ставится на ту кнопку пары, что в фокусе: вызов для остальных — не действие.
     ui.ctx()
         .memory_mut(|memory| memory.set_focus_lock_filter(id, RADIO_FILTER));
+    // Своя кнопка не получает нажатий от клавиатуры сама: Space и Enter на выбранной
+    // паре делают то же, что щелчок (U1-AC25, M4-В1).
+    if response.has_focus()
+        && ui.input_mut(|i| {
+            i.consume_key(Modifiers::NONE, Key::Space) || i.consume_key(Modifiers::NONE, Key::Enter)
+        })
+    {
+        response.mark_changed();
+    }
     response
         .widget_info(|| WidgetInfo::selected(Role::RadioButton, ui.is_enabled(), selected, text));
     let center = pos2(rect.left() + dot_size / 2.0, rect.center().y);

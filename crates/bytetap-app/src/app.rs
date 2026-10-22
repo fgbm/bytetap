@@ -114,7 +114,7 @@ pub fn review_fixtures() -> Fixtures {
             },
             Interface {
                 name: "Wi-Fi".into(),
-                addr: "10.0.0.5".into(),
+                addr: "172.16.4.21".into(),
             },
         ],
         ports: vec![PortInfo {
@@ -206,6 +206,12 @@ pub struct BytetapApp {
     /// Ошибка последнего «Старт» по коду: текст под своим полем.
     pub(crate) start_error: Option<StartError>,
     pub(crate) interfaces: Loaded<Vec<Interface>>,
+    /// Адрес источника исходящего соединения к цели, увиденный в первом `open` записи
+    /// (`link.local`): его показывает строка FR-8, когда к шагу вернулись (M4-AC7).
+    pub(crate) proxy_source: Option<String>,
+    /// Тот же адрес, посчитанный в фоне до старта по цели из формы (FR-8): ключ
+    /// «адрес:порт» и результат.
+    pub(crate) proxy_probe: Option<(String, Loaded<Option<String>>)>,
     pub(crate) ports: Loaded<Vec<PortInfo>>,
     pub(crate) recents: Loaded<Vec<RecentJournal>>,
     /// Предупреждение о папке журналов и папка, для которой оно посчитано.
@@ -262,7 +268,7 @@ pub struct BytetapApp {
     /// Итоги последней записи: строка на стартовом экране (U1-AC17).
     pub(crate) stop_stats: Option<Stats>,
     /// Снимки и тесты: данные окружения даны заранее, фоновых опросов нет.
-    fixtures: bool,
+    pub(crate) fixtures: bool,
     pub(crate) now: Option<DateTime<FixedOffset>>,
     /// Настройки изменены и ещё не записаны.
     dirty: bool,
@@ -345,6 +351,8 @@ impl BytetapApp {
             form,
             start_error: None,
             interfaces: Loaded::Idle,
+            proxy_source: None,
+            proxy_probe: None,
             ports: Loaded::Idle,
             recents: Loaded::Idle,
             log_dir_warning: None,
@@ -449,7 +457,7 @@ impl BytetapApp {
     }
 
     /// Тестовый хук смоука (CI, [`AUTOSTART_ENV`]): `tcp_server:<адрес>` — запись
-    /// TCP-сервера с автоответом «Авто», `proxy:<адрес>> <цель>:<роль>` — запись прокси
+    /// TCP-сервера с автоответом «Авто», `proxy:<адрес>><цель>:<роль>` — запись прокси
     /// (`proxy:127.0.0.1:0>127.0.0.1:5000:analyzer_client`). Папка журналов — из настроек,
     /// старт сразу после запуска.
     #[must_use]
@@ -807,6 +815,14 @@ impl BytetapApp {
         self.interfaces.poll();
         self.ports.poll();
         self.recents.poll();
+        if let Some((_, probe)) = &mut self.proxy_probe {
+            probe.poll();
+        }
+        // Адрес, с которого вторая сторона видит bytetap (FR-8): известен из первого
+        // `open` записи — `link.local` исходящего сокета к цели.
+        if let Some(addr) = self.rec.as_ref().and_then(RecordingView::outgoing_local) {
+            self.proxy_source = Some(addr.to_owned());
+        }
         if let Some((dir, task)) = &mut self.log_dir_warning_task
             && let Some(kind) = task.poll()
         {
@@ -1281,6 +1297,8 @@ impl BytetapApp {
         self.stop_error = None;
         self.stop_stats = None;
         self.copied_until = None;
+        // Адрес цели мог смениться, пока шага не было: пробу FR-8 считаем заново.
+        self.proxy_probe = None;
         self.screen = Screen::Step(mode);
         self.save_settings();
     }
@@ -1333,7 +1351,7 @@ impl BytetapApp {
         let mode = self.settings.config.mode;
         let field = error.field(mode);
         if field == crate::errors::ErrorField::LogDir
-            || (field == crate::errors::ErrorField::Address && mode == SessionMode::TcpServer)
+            || (field == crate::errors::ErrorField::Interface && mode == SessionMode::TcpServer)
         {
             self.form.more = true;
         }
@@ -1349,6 +1367,9 @@ impl BytetapApp {
         cfg: crate::settings::AppConfig,
     ) {
         self.pending = Some(config.clone());
+        // Адрес, с которого вторая сторона видела bytetap, у новой записи свой: его
+        // даст первый `open` (FR-8).
+        self.proxy_source = None;
         let Some(runtime) = self.runtime.clone() else {
             self.rec = Some(RecordingView::detached(cfg));
             self.screen = Screen::Recording;

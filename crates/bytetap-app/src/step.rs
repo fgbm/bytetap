@@ -12,6 +12,7 @@ use eframe::egui::{
 };
 
 use crate::app::{BytetapApp, Screen, centered};
+use crate::background::{self, Loaded, Task};
 use crate::errors::ErrorField;
 use crate::form::{FORMATS, apply_format, check_baud, check_port, parse_reconnect, serial_format};
 use crate::icons::{self, Icon};
@@ -29,8 +30,6 @@ use crate::{diag, t};
 
 /// Ширина колонки формы: 560px минус поля по 24px.
 const FORM_WIDTH: f32 = 512.0;
-/// Ширина колонки «Порт цели»: вдвое уже адреса второй стороны (макет M4-2).
-const TARGET_COLUMN: f32 = 248.0;
 /// Сколько «Скопировано» держится на кнопке, секунды.
 const COPIED_FOR: f64 = 1.5;
 
@@ -65,11 +64,11 @@ fn flow_text(flow: Flow) -> &'static str {
 /// адрес второй стороны.
 pub fn shown_field(field: ErrorField, mode: SessionMode) -> ErrorField {
     match (field, mode) {
-        (ErrorField::Port | ErrorField::Address, SessionMode::Serial)
-        | (
-            ErrorField::Serial,
-            SessionMode::TcpServer | SessionMode::TcpClient | SessionMode::Proxy,
-        ) => ErrorField::Start,
+        (ErrorField::Port | ErrorField::Address | ErrorField::Interface, SessionMode::Serial)
+        | (ErrorField::Serial | ErrorField::Interface, SessionMode::TcpClient) => ErrorField::Start,
+        // У сервера единственное поле адреса — интерфейс прослушивания.
+        (ErrorField::Address, SessionMode::TcpServer) => ErrorField::Interface,
+        (ErrorField::Serial, SessionMode::TcpServer | SessionMode::Proxy) => ErrorField::Start,
         (
             ErrorField::TargetPort,
             SessionMode::TcpServer | SessionMode::TcpClient | SessionMode::Serial,
@@ -119,6 +118,20 @@ fn chip_width(ui: &Ui, text: &str) -> f32 {
         + 20.0
 }
 
+/// Прокрутка к виджету, получившему фокус: Tab уводит к полям ниже края окна, а
+/// раскрытое «Дополнительно» шага прокси в окно 800 точек не помещается (M4-AC13).
+///
+/// Поля рисуются в общей прокрутке экрана, поэтому прокручивается не своё поле, а
+/// ближайшая к нему прокрутка: виджет целиком попадает в видимую область.
+fn scroll_to_focus(ui: &Ui) {
+    if let Some(focused) = ui.memory(|memory| memory.focused())
+        && let Some(response) = ui.ctx().read_response(focused)
+        && response.gained_focus()
+    {
+        ui.scroll_to_rect(response.rect, None);
+    }
+}
+
 impl BytetapApp {
     /// Две колонки с промежутком 16px; высота строки — по более высокой колонке.
     fn row(
@@ -127,24 +140,10 @@ impl BytetapApp {
         left: impl FnOnce(&mut Self, &mut Ui),
         right: impl FnOnce(&mut Self, &mut Ui),
     ) {
-        let column = ((ui.available_width() - SPACE_4) / 2.0).floor();
-        self.row_sized(ui, column, left, right);
-    }
-
-    /// Две колонки, правая — фиксированной ширины: у прокси «Порт цели» вдвое уже поля
-    /// «Адрес ЛИС» (макет M4-2), и ошибка под адресом помещается в строку.
-    fn row_sized(
-        &mut self,
-        ui: &mut Ui,
-        right_width: f32,
-        left: impl FnOnce(&mut Self, &mut Ui),
-        right: impl FnOnce(&mut Self, &mut Ui),
-    ) {
         let width = ui.available_width();
-        let right_width = right_width.min((width - SPACE_4).max(0.0));
-        let left_width = (width - SPACE_4 - right_width).max(0.0);
+        let column = ((width - SPACE_4) / 2.0).floor();
         let top = ui.cursor().min;
-        let child = |ui: &mut Ui, x: f32, column: f32| {
+        let child = |ui: &mut Ui, x: f32| {
             ui.new_child(
                 UiBuilder::new()
                     .max_rect(Rect::from_min_size(
@@ -154,9 +153,9 @@ impl BytetapApp {
                     .layout(Layout::top_down(Align::Min)),
             )
         };
-        let mut left_ui = child(ui, 0.0, left_width);
+        let mut left_ui = child(ui, 0.0);
         left(self, &mut left_ui);
-        let mut right_ui = child(ui, width - right_width, right_width);
+        let mut right_ui = child(ui, width - column);
         right(self, &mut right_ui);
         let used = left_ui.min_rect().union(right_ui.min_rect());
         ui.advance_cursor_after_rect(used);
@@ -177,6 +176,13 @@ impl BytetapApp {
         let p = self.pal();
         let mut back = false;
         let mut start = false;
+        // Адреса этого компьютера: по ним форма проверяет, что цель прокси не ведёт на
+        // собственный порт bytetap.
+        self.form.own_addresses = self
+            .interfaces
+            .ready()
+            .map(|list| list.iter().map(|iface| iface.addr.clone()).collect())
+            .unwrap_or_default();
         centered(ui, FORM_WIDTH, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add_space(SPACE_4);
@@ -204,6 +210,7 @@ impl BytetapApp {
                 ui.vertical_centered(|ui| widgets::field_error(ui, p.danger, &error));
             }
             ui.add_space(SPACE_5);
+            scroll_to_focus(ui);
         });
         if back {
             self.back_to_scenarios(&ctx);
@@ -287,28 +294,41 @@ impl BytetapApp {
             };
             ui.memory_mut(|memory| memory.request_focus(id));
         }
-        let client = widgets::radio(
-            ui,
-            p,
-            client_id,
-            role == ProxyMode::AnalyzerClient,
-            t!("form.topologyAnalyzerClient"),
+        // Пара — один узел AccessKit с ролью `RadioGroup` и подписью «Топология»:
+        // экранный диктор читает её как группу выбора, а не как две кнопки подряд.
+        let mut client = None;
+        let mut server = None;
+        ui.scope_builder(
+            UiBuilder::new()
+                .accessibility_role(Role::RadioGroup)
+                .accessibility_label(t!("form.topology")),
+            |ui| {
+                client = Some(widgets::radio(
+                    ui,
+                    p,
+                    client_id,
+                    role == ProxyMode::AnalyzerClient,
+                    t!("form.topologyAnalyzerClient"),
+                ));
+                ui.add_space(2.0);
+                server = Some(widgets::radio(
+                    ui,
+                    p,
+                    server_id,
+                    role == ProxyMode::AnalyzerServer,
+                    t!("form.topologyAnalyzerServer"),
+                ));
+            },
         );
-        ui.add_space(2.0);
-        let server = widgets::radio(
-            ui,
-            p,
-            server_id,
-            role == ProxyMode::AnalyzerServer,
-            t!("form.topologyAnalyzerServer"),
-        );
+        let (client, server) = (client.expect("first radio"), server.expect("second radio"));
         // Радио-пара — один выбор: стрелки ходят по ней, фокус переходит выбранной
-        // кнопке (M4-В1). Tab обходит обе, как обычные поля формы.
+        // кнопке (M4-В1). Tab обходит обе, как обычные поля формы, Space нажимает ту,
+        // что в фокусе.
         let mut chosen = None;
-        if client.clicked() {
+        if client.clicked() || client.changed() {
             chosen = Some(ProxyMode::AnalyzerClient);
         }
-        if server.clicked() {
+        if server.clicked() || server.changed() {
             chosen = Some(ProxyMode::AnalyzerServer);
         }
         let focused = if client.has_focus() {
@@ -350,12 +370,14 @@ impl BytetapApp {
         self.row(
             ui,
             |app, ui| app.listen_port_field(ui, p, t!("form.listenPortProxy")),
-            |app, ui| app.interface_field(ui, p, None),
+            |app, ui| {
+                let error = app.error_text(ErrorField::Interface);
+                app.interface_field(ui, p, error);
+            },
         );
         ui.add_space(SPACE_2);
-        self.row_sized(
+        self.row(
             ui,
-            TARGET_COLUMN,
             |app, ui| {
                 let error = app.error_text(ErrorField::Address);
                 let label = match app.settings.config.proxy_role {
@@ -401,7 +423,7 @@ impl BytetapApp {
                             Id::unique("bt-proxy-port"),
                             &mut app.form.proxy_port_text,
                             label,
-                            "",
+                            t!("form.targetPortPlaceholder"),
                             look,
                         );
                         if response.changed() {
@@ -485,23 +507,33 @@ impl BytetapApp {
         }
         if let Some(role) = proxy {
             // FR-8: ЛИС (или анализатор) определяет собеседника по IP — значит, там должен
-            // стоять адрес ноутбука, а не прежний адрес второй стороны.
+            // стоять адрес ноутбука, а не прежний адрес второй стороны. Это адрес
+            // источника исходящего соединения к цели, а не адрес прослушивания: у
+            // ноутбука с двумя сетями они разные (M4-AC7). Пока запись не дала пары,
+            // адрес считается в фоне; нет и его — остаётся адрес прослушивания.
+            let ctx = ui.ctx().clone();
+            let source = self.source_address(&ctx).unwrap_or_else(|| host.clone());
             let text = match role {
-                ProxyMode::AnalyzerClient => t!("form.proxyWarning", addr = host.clone()),
-                ProxyMode::AnalyzerServer => t!("form.proxyWarningServer", addr = host.clone()),
+                ProxyMode::AnalyzerClient => t!("form.proxyWarning", addr = source),
+                ProxyMode::AnalyzerServer => t!("form.proxyWarningServer", addr = source),
             };
             hint_with_info(ui, p, &text, t!("form.proxyWarningHint"));
         }
+        let firewall_hint = if proxy.is_some() {
+            // В прокси приложение не «не ходит в сеть», а соединяется со второй стороной.
+            t!("form.firewallHintProxy")
+        } else {
+            t!("form.firewallHint")
+        };
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             widgets::hint(ui, p, t!("form.firewall"));
             let (rect, response) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
-            response
-                .widget_info(|| WidgetInfo::labeled(Role::Image, true, t!("form.firewallHint")));
+            response.widget_info(|| WidgetInfo::labeled(Role::Image, true, firewall_hint));
             icons::paint(ui, Icon::Info, rect.center(), 13.0, p.text_faint);
             response
                 .on_hover_cursor(CursorIcon::Help)
-                .on_hover_text(t!("form.firewallHint"));
+                .on_hover_text(firewall_hint);
         });
         ui.spacing_mut().item_spacing.y = 0.0;
     }
@@ -713,6 +745,46 @@ impl BytetapApp {
         self.responder_field(ui, p);
     }
 
+    /// Адрес, с которого вторая сторона увидит bytetap (FR-8).
+    ///
+    /// Сначала — фактический адрес из первого `open` записи (`link.local` исходящего
+    /// сокета к цели): точнее него не бывает. Затем — посчитанный в фоне до старта по
+    /// цели из формы: соединение UDP не отправляет пакетов, но выбирает локальный адрес
+    /// по таблице маршрутов. `None` — адрес неизвестен; строка FR-8 покажет тогда адрес
+    /// прослушивания, как в остальных режимах.
+    fn source_address(&mut self, ctx: &egui::Context) -> Option<String> {
+        if let Some(addr) = &self.proxy_source {
+            return Some(addr.clone());
+        }
+        let cfg = &self.settings.config;
+        let host = cfg.proxy_host.trim().to_owned();
+        let port = cfg.proxy_port;
+        if host.is_empty() || port == 0 {
+            return None;
+        }
+        // Снимки и тесты: окружение синтетическое, в сеть не ходим.
+        if self.fixtures {
+            return None;
+        }
+        let key = format!("{host}:{port}");
+        if self
+            .proxy_probe
+            .as_ref()
+            .is_none_or(|(probed, _)| *probed != key)
+        {
+            let probe_host = host;
+            self.proxy_probe = Some((
+                key,
+                Loaded::Loading(Task::spawn(ctx, move || {
+                    background::source_addr(&probe_host, port)
+                })),
+            ));
+        }
+        self.proxy_probe
+            .as_ref()
+            .and_then(|(_, probe)| probe.ready().cloned().flatten())
+    }
+
     /// «Дополнительно»: свёрнуто, пока его не раскрыли или под ним нет ошибки.
     fn more(&mut self, ui: &mut Ui, p: &Palette, mode: SessionMode) {
         ui.add_space(SPACE_4);
@@ -740,7 +812,7 @@ impl BytetapApp {
         ui.add_space(SPACE_3);
         match mode {
             SessionMode::TcpServer => {
-                let error = self.error_text(ErrorField::Address);
+                let error = self.error_text(ErrorField::Interface);
                 self.interface_field(ui, p, error);
                 ui.add_space(SPACE_3);
             }
@@ -866,7 +938,7 @@ impl BytetapApp {
     }
 
     /// Интерфейс прослушивания; `error` — ошибка адреса, если поле её показывает
-    /// (у TCP-сервера — в «Дополнительно», у прокси — у адреса цели).
+    /// (у TCP-сервера — в «Дополнительно», у прокси — рядом с портом).
     fn interface_field(&mut self, ui: &mut Ui, p: &Palette, error: Option<String>) {
         field(ui, p, t!("form.listenOn"), error.as_deref(), |ui, _| {
             let mut hosts = vec![ALL_INTERFACES.to_owned()];
@@ -1127,7 +1199,14 @@ mod tests {
     fn an_error_of_a_hidden_field_goes_under_start() {
         use ErrorField::*;
         assert_eq!(shown_field(Port, SessionMode::TcpServer), Port);
-        assert_eq!(shown_field(Address, SessionMode::TcpServer), Address);
+        assert_eq!(
+            shown_field(Address, SessionMode::TcpServer),
+            Interface,
+            "у сервера единственное поле адреса — интерфейс"
+        );
+        assert_eq!(shown_field(Interface, SessionMode::TcpServer), Interface);
+        assert_eq!(shown_field(Interface, SessionMode::TcpClient), Start);
+        assert_eq!(shown_field(Interface, SessionMode::Proxy), Interface);
         assert_eq!(shown_field(Address, SessionMode::TcpClient), Address);
         assert_eq!(shown_field(Serial, SessionMode::Serial), Serial);
         assert_eq!(shown_field(Serial, SessionMode::TcpClient), Start);

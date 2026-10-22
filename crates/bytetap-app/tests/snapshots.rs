@@ -8,7 +8,7 @@
 //! последние записи, «сейчас») — синтетическое, через `Fixtures`.
 
 use bytetap_app::background::Interface;
-use bytetap_app::errors::{ErrorCode, StartError};
+use bytetap_app::errors::{ErrorCode, ErrorField, StartError};
 use bytetap_app::live::{JournalFailure, JournalFailureCode};
 use bytetap_app::recording::RecordingFixture;
 use bytetap_app::settings::{
@@ -54,7 +54,7 @@ fn fixtures() -> Fixtures {
             },
             Interface {
                 name: "Wi-Fi".into(),
-                addr: "10.0.0.5".into(),
+                addr: "172.16.4.21".into(),
             },
         ],
         ports: vec![PortInfo {
@@ -610,17 +610,30 @@ fn step_serial_more_dark() {
     serial_more(true).snapshot_options("step-serial-more-dark", &options());
 }
 
-/// Прокси: радио-пара топологии с AccessKit-ролью `radio` — щелчок и стрелки выбирают
-/// сторону, Tab обходит обе кнопки (M4-В1, M4-AC13).
+/// Прокси: радио-пара топологии — группа `RadioGroup` с подписью «Топология»; щелчок,
+/// стрелки и Space выбирают сторону, `toggled` говорит состояние, Tab обходит обе кнопки
+/// (M4-В1, M4-AC13).
 #[test]
 fn the_proxy_topology_is_a_radio_pair() {
+    use egui_kittest::kittest::NodeT as _;
     let mut harness = plain(
         proxy_settings(false, ProxyMode::AnalyzerClient),
         None,
         Screen::Step(SessionMode::Proxy),
     );
-    harness.get_by_role_and_label(Role::RadioButton, "Анализатор подключается к ЛИС");
-    harness.get_by_role_and_label(Role::RadioButton, "ЛИС подключается к анализатору");
+    // Пара — один узел дерева AccessKit: экранный диктор читает её как группу выбора.
+    harness.get_by_role_and_label(Role::RadioGroup, "Топология");
+    let client = harness.get_by_role_and_label(Role::RadioButton, "Анализатор подключается к ЛИС");
+    assert_eq!(
+        client.accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True),
+        "выбранная кнопка пары"
+    );
+    let server = harness.get_by_role_and_label(Role::RadioButton, "ЛИС подключается к анализатору");
+    assert_eq!(
+        server.accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False)
+    );
     assert_eq!(
         harness.state().settings().config.proxy_role,
         ProxyMode::AnalyzerClient
@@ -648,11 +661,15 @@ fn the_proxy_topology_is_a_radio_pair() {
         .get_by_role_and_label(Role::RadioButton, "Анализатор подключается к ЛИС")
         .focus();
     harness.run_steps(1);
-    harness.key_press(Key::ArrowDown);
+    // Space нажимает кнопку пары, как обычную кнопку: Tab увёл фокус на вторую.
+    harness.key_press(Key::Tab);
+    harness.run_steps(1);
+    harness.key_press(Key::Space);
     harness.run_steps(2);
     assert_eq!(
         harness.state().settings().config.proxy_role,
-        ProxyMode::AnalyzerServer
+        ProxyMode::AnalyzerServer,
+        "Space нажимает кнопку пары"
     );
     harness.key_press(Key::ArrowUp);
     harness.run_steps(2);
@@ -683,6 +700,98 @@ fn replace_in(harness: &mut Harness<'static, BytetapApp>, label: &str, text: &st
         .get_by_role_and_label(Role::TextInput, label)
         .type_text(text);
     harness.run_steps(1);
+}
+
+/// Свежие настройки: цель прокси пуста — ни адреса, ни порта, только подсказки, — и
+/// «Старт» просит адрес второй стороны, а сессии не собирает (M4-AC13). Подставленный
+/// адрес чужого узла отправил бы к нему живой обмен.
+#[test]
+fn a_fresh_proxy_form_asks_for_the_target() {
+    let settings = settings(false);
+    assert_eq!(settings.config.proxy_host, "");
+    assert_eq!(settings.config.proxy_port, 0);
+    let mut harness = plain(settings, None, Screen::Step(SessionMode::Proxy));
+    harness.get_by_role_and_label(Role::TextInput, "Адрес ЛИС");
+    harness.get_by_role_and_label(Role::TextInput, "Порт цели");
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    harness.get_by_label("Укажите адрес ЛИС");
+    assert!(
+        harness.state().pending_session().is_none(),
+        "без цели сессия не собирается"
+    );
+    assert_eq!(harness.state().screen, Screen::Step(SessionMode::Proxy));
+
+    // Порт цели тоже пуст: подсказка «5000» — пример, а не значение.
+    assert_eq!(
+        harness.state().settings().config.proxy_port,
+        0,
+        "порт цели не подставлен"
+    );
+}
+
+/// Ошибка адреса в прокси встаёт под своим полем: недоступный интерфейс — под
+/// «Интерфейс», неразборчивая цель — под адресом цели, и «Дополнительно» не
+/// раскрывается — оба поля на виду (M4-AC13).
+#[test]
+fn the_proxy_address_errors_keep_their_own_fields() {
+    let harness = harness_with(
+        proxy_settings(false, ProxyMode::AnalyzerClient),
+        None,
+        Screen::Step(SessionMode::Proxy),
+        WINDOW,
+        |app| {
+            app.with_start_error(
+                StartError::new(
+                    ErrorCode::AddressUnavailable,
+                    "cannot assign requested address",
+                )
+                .with_param("addr", "192.168.1.99"),
+            )
+        },
+    );
+    assert_eq!(
+        harness
+            .state()
+            .start_error()
+            .map(|error| error.field(SessionMode::Proxy)),
+        Some(ErrorField::Interface),
+        "недоступный адрес прослушивания — поле «Интерфейс»"
+    );
+    harness.get_by_label(
+        "Адрес 192.168.1.99 недоступен на этом компьютере. Выберите другой интерфейс.",
+    );
+    {
+        use egui_kittest::kittest::NodeT as _;
+        let more = harness.get_by_role_and_label(Role::Button, "Дополнительно");
+        assert_eq!(
+            more.accesskit_node().toggled(),
+            Some(egui::accesskit::Toggled::False),
+            "«Дополнительно» не раскрыто: поле «Интерфейс» на виду"
+        );
+    }
+
+    let harness = harness_with(
+        proxy_settings(false, ProxyMode::AnalyzerClient),
+        None,
+        Screen::Step(SessionMode::Proxy),
+        WINDOW,
+        |app| {
+            app.with_start_error(StartError::new(
+                ErrorCode::AddressInvalid,
+                "target is not an address",
+            ))
+        },
+    );
+    assert_eq!(
+        harness
+            .state()
+            .start_error()
+            .map(|error| error.field(SessionMode::Proxy)),
+        Some(ErrorField::Address),
+        "неразборчивая цель — поле адреса цели"
+    );
+    harness.get_by_label("Адрес цели указан неверно: нужен IPv4-адрес или имя.");
 }
 
 /// Прокси: поля проверяются до старта — порт прослушивания, адрес и порт цели; ошибка
@@ -960,7 +1069,7 @@ fn widgets_have_roles_and_names() {
         "Разрешение нужно только для частных сетей; само приложение в сеть не ходит.",
     );
     harness.get_by_label("192.168.1.10:5000");
-    harness.get_by_label("другая сеть: 10.0.0.5 (Wi-Fi)");
+    harness.get_by_label("другая сеть: 172.16.4.21 (Wi-Fi)");
 }
 
 #[test]
@@ -2484,6 +2593,37 @@ fn every_screen_names_its_widgets() {
     ] {
         assert!(has(&nodes, role, label), "нет {role:?} «{label}»");
     }
+}
+
+/// Раскрытое «Дополнительно» шага прокси в окно 800 точек не помещается и
+/// прокручивается: Tab до «Старт» подтягивает кнопку в видимую область (M4-AC13,
+/// отступление от макета M4-3).
+#[test]
+fn tab_brings_the_focused_field_into_view() {
+    use egui_kittest::kittest::NodeT as _;
+    let mut harness = proxy_more((1200.0, 800.0));
+    let mut focused = None;
+    for _ in 0..40 {
+        harness.key_press(Key::Tab);
+        harness.run_steps(2);
+        let Some(node) = harness
+            .root()
+            .children_recursive()
+            .find(egui_kittest::Node::is_focused)
+        else {
+            continue;
+        };
+        let label = node.accesskit_node().label().unwrap_or_default();
+        if label == "Старт" {
+            focused = Some(node.rect());
+            break;
+        }
+    }
+    let rect = focused.expect("Tab не дошёл до «Старт»");
+    assert!(
+        rect.bottom() <= 800.0 + 1.0 && rect.top() >= -1.0,
+        "«Старт» не в видимой области: {rect:?}"
+    );
 }
 
 /// Tab обходит экран в порядке чтения: сверху вниз, внутри строки — слева направо

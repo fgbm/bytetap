@@ -120,12 +120,18 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
                 )
             }
         }
-        FeedKind::Close { by } => {
+        FeedKind::Close { by, reason } => {
             let text = if pair.is_pair() {
                 match by {
                     ClosedBy::Analyzer => t!("feed.closedPairAnalyzer", conn = conn),
                     ClosedBy::Lis => t!("feed.closedPairLis", conn = conn),
-                    ClosedBy::Bytetap => t!("feed.closedPairApp", conn = conn),
+                    // Причина видна, когда закрыл сам bytetap: срок ожидания и сброс —
+                    // не его решение, а то, что сделала вторая сторона.
+                    ClosedBy::Bytetap => match reason.as_str() {
+                        "timeout" => t!("feed.closedPairAppTimeout", conn = conn),
+                        "reset" => t!("feed.closedPairAppReset", conn = conn),
+                        _ => t!("feed.closedPairApp", conn = conn),
+                    },
                 }
             } else {
                 t!("feed.closedSimple", conn = conn, by = closed_by(*by))
@@ -555,12 +561,25 @@ mod tests {
             "#1 открыто: ЛИС → анализатор"
         );
 
-        for (by, text) in [
-            (ClosedBy::Lis, "#1 ЛИС закрыла соединение"),
-            (ClosedBy::Analyzer, "#1 анализатор закрыл соединение"),
-            (ClosedBy::Bytetap, "#1 bytetap закрыл соединение"),
+        for (by, reason, text) in [
+            (ClosedBy::Lis, "eof", "#1 ЛИС закрыла соединение"),
+            (ClosedBy::Analyzer, "eof", "#1 анализатор закрыл соединение"),
+            (ClosedBy::Bytetap, "stop", "#1 bytetap закрыл соединение"),
+            (
+                ClosedBy::Bytetap,
+                "timeout",
+                "#1 bytetap закрыл соединение: вторая сторона не ответила за 5 с",
+            ),
+            (
+                ClosedBy::Bytetap,
+                "reset",
+                "#1 bytetap закрыл соединение: сброс другой стороной",
+            ),
         ] {
-            let close = event(FeedKind::Close { by });
+            let close = event(FeedKind::Close {
+                by,
+                reason: reason.into(),
+            });
             assert_eq!(row_text(&close, Pair::TargetLis).1, text);
         }
     }
@@ -576,7 +595,10 @@ mod tests {
             row_text(&opened, Pair::None).1,
             "#1 подключился 192.168.1.51:49152"
         );
-        let close = event(FeedKind::Close { by: ClosedBy::Lis });
+        let close = event(FeedKind::Close {
+            by: ClosedBy::Lis,
+            reason: "eof".into(),
+        });
         assert_eq!(row_text(&close, Pair::None).1, "#1 отключился · ЛИС");
     }
 

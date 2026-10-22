@@ -143,6 +143,9 @@ pub struct RecordingView {
     /// Адреса сторон пары прокси из последнего `open` (FR-5, M4-AC13): сводка двух
     /// сторон в шапке. До первого соединения оба пусты.
     sides: (Option<String>, Option<String>),
+    /// Локальный адрес исходящего сокета к цели из последнего `open`: с него вторая
+    /// сторона видит bytetap (FR-8).
+    outgoing_local: Option<String>,
     /// Фактический адрес слушателя TCP-сервера или адрес анализатора.
     pub(crate) local_addr: String,
     pub(crate) journal_path: Option<PathBuf>,
@@ -179,6 +182,7 @@ impl RecordingView {
             fixed_elapsed: None,
             config,
             sides: (None, None),
+            outgoing_local: None,
             local_addr,
             journal_path: None,
             failure: None,
@@ -428,12 +432,19 @@ impl RecordingView {
         else {
             return;
         };
+        self.outgoing_local = Some(link.local.clone());
         self.sides = match link.role {
             bytetap_core::journal::LinkRole::Lis => (Some(peer.clone()), Some(link.peer.clone())),
             bytetap_core::journal::LinkRole::Analyzer => {
                 (Some(link.peer.clone()), Some(peer.clone()))
             }
         };
+    }
+
+    /// Локальный адрес исходящего сокета к цели из первого `open`: с него вторая
+    /// сторона видит bytetap (FR-8).
+    pub fn outgoing_local(&self) -> Option<&str> {
+        self.outgoing_local.as_deref()
     }
 
     fn responder_name(&self) -> &'static str {
@@ -477,9 +488,9 @@ impl PairPiece {
     }
 }
 
-/// Адрес анализатора в сводке — без порта соединения: у принятой стороны он случайный,
-/// а в макете M4-4 показан адрес прибора.
-fn analyzer_address(address: &str) -> &str {
+/// Адрес стороны без порта соединения: у принятой стороны порт случайный (его выбрала
+/// операционная система), а в макете M4-4 показан адрес прибора или ЛИС.
+fn without_port(address: &str) -> &str {
     match address.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|ch| ch.is_ascii_digit()) && !host.is_empty() => {
             host
@@ -495,7 +506,10 @@ const PAIR_SEPARATOR: char = '⇄';
 /// 10.0.0.5:5000».
 ///
 /// Пока пары не было, известна одна сторона — цель из настроек и порт прослушивания:
-/// адрес второй стороны прокси узнаёт только из её соединения.
+/// адрес второй стороны прокси узнаёт только из её соединения. Порт отрезается у
+/// принятой стороны — в обеих топологиях: у анализатора он случайный, у ЛИС порт
+/// соединения тоже не тот, на котором она слушает. Порт цели остаётся: именно его
+/// набирают в настройках второй стороны.
 fn pair_pieces(
     role: ProxyMode,
     listen: &str,
@@ -505,18 +519,25 @@ fn pair_pieces(
 ) -> Vec<PairPiece> {
     let analyzer_label = || PairPiece::Label(t!("feed.byAnalyzer").to_owned());
     let lis_label = || PairPiece::Label(t!("feed.byLis").to_owned());
-    let bytetap = || PairPiece::Label("bytetap".to_owned());
+    let bytetap = || PairPiece::Label(t!("feed.byApp").to_owned());
     match (analyzer, lis) {
-        (Some(analyzer), Some(lis)) => vec![
-            analyzer_label(),
-            PairPiece::Address(analyzer_address(analyzer).to_owned()),
-            PairPiece::Separator,
-            bytetap(),
-            PairPiece::Address(listen.to_owned()),
-            PairPiece::Separator,
-            lis_label(),
-            PairPiece::Address(lis.to_owned()),
-        ],
+        (Some(analyzer), Some(lis)) => {
+            // Пара есть: принятая сторона пришла сама, её порт — соединения.
+            let (analyzer, lis) = match role {
+                ProxyMode::AnalyzerClient => (without_port(analyzer), lis),
+                ProxyMode::AnalyzerServer => (analyzer, without_port(lis)),
+            };
+            vec![
+                analyzer_label(),
+                PairPiece::Address(analyzer.to_owned()),
+                PairPiece::Separator,
+                bytetap(),
+                PairPiece::Address(listen.to_owned()),
+                PairPiece::Separator,
+                lis_label(),
+                PairPiece::Address(lis.to_owned()),
+            ]
+        }
         _ => match role {
             ProxyMode::AnalyzerClient => vec![
                 bytetap(),
@@ -527,7 +548,7 @@ fn pair_pieces(
             ],
             ProxyMode::AnalyzerServer => vec![
                 analyzer_label(),
-                PairPiece::Address(analyzer_address(target).to_owned()),
+                PairPiece::Address(target.to_owned()),
                 PairPiece::Separator,
                 bytetap(),
                 PairPiece::Address(listen.to_owned()),
@@ -1544,6 +1565,9 @@ mod tests {
     }
 
     /// Сводка прокси: до первого соединения — порт и цель, после — обе стороны пары.
+    ///
+    /// Порт отрезается у принятой стороны — она пришла сама, и порт у неё случайный;
+    /// порт цели остаётся: его набирают в настройках второй стороны (M4-4).
     #[test]
     fn the_proxy_summary_shows_both_sides() {
         let mut cfg = AppConfig::with_log_dir("C:/logs");
@@ -1555,23 +1579,37 @@ mod tests {
         let stats = Stats::default();
         assert_eq!(view.summary(&stats), "bytetap :50025 ⇄ ЛИС 10.0.0.5:5000");
 
-        let open = FeedEvent {
+        let link = |role, peer: &str, local: &str| {
+            Some(bytetap_core::journal::Link {
+                role,
+                peer: peer.into(),
+                local: local.into(),
+            })
+        };
+        let open = |peer: &str, link| FeedEvent {
             time: "10:15:03.000".into(),
             mono_us: Some(0),
             conn: Some(1),
             kind: FeedKind::Open {
-                peer: "192.168.1.51:49152".into(),
-                link: Some(bytetap_core::journal::Link {
-                    role: bytetap_core::journal::LinkRole::Lis,
-                    peer: "10.0.0.5:5000".into(),
-                    local: "192.168.1.10:50231".into(),
-                }),
+                peer: peer.into(),
+                link,
             },
         };
-        view.remember_sides(&open);
+        use bytetap_core::journal::LinkRole;
+
+        // «Анализатор — клиент»: пришёл анализатор, порт его соединения не показывается.
+        view.remember_sides(&open(
+            "192.168.1.51:49152",
+            link(LinkRole::Lis, "10.0.0.5:5000", "192.168.1.10:50231"),
+        ));
         assert_eq!(
             view.summary(&stats),
             "анализатор 192.168.1.51 ⇄ bytetap :50025 ⇄ ЛИС 10.0.0.5:5000"
+        );
+        assert_eq!(
+            view.outgoing_local(),
+            Some("192.168.1.10:50231"),
+            "адрес, с которого вторая сторона видела bytetap (FR-8)"
         );
 
         // Топология «анализатор — сервер»: ЛИС приходит сама, цель — анализатор.
@@ -1581,7 +1619,22 @@ mod tests {
         view.local_addr = "0.0.0.0:50025".into();
         assert_eq!(
             view.summary(&stats),
-            "анализатор 192.168.1.51 ⇄ bytetap :50025"
+            "анализатор 192.168.1.51:5000 ⇄ bytetap :50025",
+            "порт цели остаётся, пока пары нет"
+        );
+
+        // Пара есть: порт отрезается теперь у ЛИС, порт анализатора-цели остаётся.
+        view.remember_sides(&open(
+            "10.0.1.20:51234",
+            link(
+                LinkRole::Analyzer,
+                "192.168.1.51:5000",
+                "192.168.1.10:50231",
+            ),
+        ));
+        assert_eq!(
+            view.summary(&stats),
+            "анализатор 192.168.1.51:5000 ⇄ bytetap :50025 ⇄ ЛИС 10.0.1.20"
         );
     }
 }

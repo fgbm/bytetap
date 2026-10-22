@@ -3,6 +3,7 @@
 //! Поток окна никогда не ждёт ввод-вывод (этап U1): задача идёт в своём потоке, результат
 //! приходит через канал, а окно перерисовывается по `request_repaint`.
 
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -102,6 +103,29 @@ pub fn list_interfaces() -> Vec<Interface> {
     interfaces
 }
 
+/// Адрес источника исходящего соединения к `host:port` — тот, с которого вторая сторона
+/// увидит ноутбук (FR-8).
+///
+/// Соединение UDP ничего не отправляет: `connect` только выбирает локальный адрес по
+/// таблице маршрутов, и `local_addr` отдаёт адрес интерфейса, через который пошёл бы
+/// обмен. Имя цели разрешается здесь же, поэтому вызов идёт в фоновом потоке. `None` —
+/// цель не разрешилась или соединение невозможно: тогда форма показывает адрес
+/// прослушивания.
+pub fn source_addr(host: &str, port: u16) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() || port == 0 {
+        return None;
+    }
+    let target = (host, port).to_socket_addrs().ok()?.next()?;
+    let bind = match target {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    };
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(target).ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
 /// Выбор папки журналов; `None` — диалог закрыт.
 pub fn pick_folder(start: &str) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new();
@@ -177,6 +201,13 @@ mod tests {
             folder_to_open(&dir.path().join("missing").to_string_lossy()),
             None
         );
+    }
+
+    #[test]
+    fn the_source_address_of_a_loopback_target_is_loopback() {
+        assert_eq!(source_addr("127.0.0.1", 9).as_deref(), Some("127.0.0.1"));
+        assert_eq!(source_addr("", 5000), None, "цель не набрана");
+        assert_eq!(source_addr("127.0.0.1", 0), None, "порт не набран");
     }
 
     #[test]

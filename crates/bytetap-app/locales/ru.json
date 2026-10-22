@@ -41,6 +41,7 @@
     "noInterfaces": "сетевые интерфейсы не найдены",
     "firewall": "При первом старте Windows спросит разрешение брандмауэра — разрешите для частных сетей.",
     "firewallHint": "Разрешение нужно только для частных сетей; само приложение в сеть не ходит.",
+    "firewallHintProxy": "Разрешение нужно только для частных сетей; в сеть bytetap выходит только к цели обмена, которую вы указали.",
     "connectAddress": "Адрес анализатора",
     "connectPlaceholder": "192.168.1.50",
     "addressRequired": "Укажите адрес анализатора",
@@ -84,6 +85,8 @@
     "proxyLisRequired": "Укажите адрес ЛИС",
     "proxyAnalyzerRequired": "Укажите адрес анализатора",
     "targetPort": "Порт цели",
+    "targetPortPlaceholder": "5000",
+    "targetPortOwn": "Порт цели совпадает с портом bytetap на этом же адресе: bytetap подключится сам к себе. Укажите порт второй стороны.",
     "noResponderInProxy": "Автоответ выключен: байты идут без изменений.",
     "writeIntoAnalyzer": "Впишите в анализатор",
     "writeIntoLis": "Впишите в ЛИС",
@@ -195,7 +198,9 @@
     "openedPair": "#{conn} открыто: {from} → {to}",
     "closedPairLis": "#{conn} ЛИС закрыла соединение",
     "closedPairAnalyzer": "#{conn} анализатор закрыл соединение",
-    "closedPairApp": "#{conn} bytetap закрыл соединение"
+    "closedPairApp": "#{conn} bytetap закрыл соединение",
+    "closedPairAppTimeout": "#{conn} bytetap закрыл соединение: вторая сторона не ответила за 5 с",
+    "closedPairAppReset": "#{conn} bytetap закрыл соединение: сброс другой стороной"
   },
   "events": {
     "accept_failed": "Не удалось принять соединение — повторяю.",

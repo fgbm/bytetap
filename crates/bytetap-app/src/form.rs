@@ -145,10 +145,15 @@ pub fn last_run_of(cfg: &AppConfig) -> LastRun {
             baud: cfg.serial.baud,
         },
         // У прокси сторона две: порт прослушивания и цель — карточка показывает обе.
+        // Пустая цель не показывается: карточка говорит только о порте.
         SessionMode::Proxy => LastRun {
             mode: cfg.mode,
             port: cfg.listen_port.to_string(),
-            host: format!("{}:{}", cfg.proxy_host, cfg.proxy_port),
+            host: if cfg.proxy_host.trim().is_empty() || cfg.proxy_port == 0 {
+                String::new()
+            } else {
+                format!("{}:{}", cfg.proxy_host, cfg.proxy_port)
+            },
             baud: 0,
         },
         SessionMode::TcpServer => LastRun {
@@ -181,6 +186,9 @@ pub struct FormState {
     pub proxy_host: String,
     /// Порт цели прокси.
     pub proxy_port_text: String,
+    /// Адреса этого компьютера: интерфейсы и loopback. По ним проверяется, что порт цели
+    /// не указывает на собственный порт bytetap — иначе bytetap подключится сам к себе.
+    pub own_addresses: Vec<String>,
     pub reconnect_text: String,
     pub baud_text: String,
     /// Скорость вне типового списка: поле ввода вместо списка.
@@ -205,6 +213,7 @@ impl FormState {
             connect_port_text: String::new(),
             proxy_host: String::new(),
             proxy_port_text: String::new(),
+            own_addresses: Vec::new(),
             reconnect_text: String::new(),
             baud_text: String::new(),
             baud_other: false,
@@ -224,7 +233,12 @@ impl FormState {
         self.connect_host = cfg.connect_host.clone();
         self.connect_port_text = cfg.connect_port.to_string();
         self.proxy_host = cfg.proxy_host.clone();
-        self.proxy_port_text = cfg.proxy_port.to_string();
+        self.proxy_port_text = if cfg.proxy_port == 0 {
+            // Порт цели не набран: поле пустое, подсказка в нём — пример, а не значение.
+            String::new()
+        } else {
+            cfg.proxy_port.to_string()
+        };
         self.reconnect_text = cfg.reconnect_sec.to_string();
         self.baud_text = cfg.serial.baud.to_string();
         self.baud_other = !BAUD_RATES.contains(&cfg.serial.baud);
@@ -242,6 +256,31 @@ impl FormState {
         }
     }
 
+    /// Цель прокси ведёт на собственный порт bytetap: адрес второй стороны — этот же
+    /// компьютер (loopback, все интерфейсы или свой адрес из списка), а порт совпадает с
+    /// портом прослушивания. Тогда bytetap на каждое входящее соединение подключался б
+    /// сам к себе, и пара замкнулась бы на себя.
+    pub fn target_is_own_port(&self, cfg: &AppConfig) -> bool {
+        let Ok(port) = check_port(&self.proxy_port_text) else {
+            return false;
+        };
+        if cfg.mode != SessionMode::Proxy || port != cfg.listen_port {
+            return false;
+        }
+        let host = self
+            .proxy_host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        const LOOPBACK: [&str; 4] = ["0.0.0.0", "127.0.0.1", "localhost", "::1"];
+        LOOPBACK.contains(&host.as_str())
+            || self
+                .own_addresses
+                .iter()
+                .any(|own| own.trim().eq_ignore_ascii_case(&host))
+    }
+
     /// Своя проверка поля: текст ошибки или `None`.
     pub fn local_error(&self, cfg: &AppConfig, field: ErrorField) -> Option<&'static str> {
         let shown = self.attempted
@@ -250,7 +289,8 @@ impl FormState {
                 ErrorField::Address => self.touched.address,
                 ErrorField::TargetPort => self.touched.target_port,
                 ErrorField::Serial => self.touched.serial,
-                ErrorField::LogDir | ErrorField::Start => false,
+                // Ошибка интерфейса приходит только от старта; своя проверка не нужна.
+                ErrorField::Interface | ErrorField::LogDir | ErrorField::Start => false,
             };
         if !shown {
             return None;
@@ -281,9 +321,12 @@ impl FormState {
                         .then(|| t!("form.addressRequired"))
                 }
             }
-            ErrorField::TargetPort => check_port(&self.proxy_port_text)
-                .err()
-                .map(PortProblem::text),
+            ErrorField::TargetPort => match check_port(&self.proxy_port_text) {
+                Err(problem) => Some(problem.text()),
+                Ok(_) => self
+                    .target_is_own_port(cfg)
+                    .then(|| t!("form.targetPortOwn")),
+            },
             ErrorField::Serial => {
                 if Self::serial_port_missing(cfg) {
                     Some(t!("form.serialRequired"))
@@ -293,7 +336,7 @@ impl FormState {
                     None
                 }
             }
-            ErrorField::LogDir | ErrorField::Start => None,
+            ErrorField::Interface | ErrorField::LogDir | ErrorField::Start => None,
         }
     }
 
@@ -308,6 +351,7 @@ impl FormState {
                 check_port(&self.port_text).is_ok()
                     && check_port(&self.proxy_port_text).is_ok()
                     && !self.proxy_host.trim().is_empty()
+                    && !self.target_is_own_port(cfg)
             }
             SessionMode::Serial => {
                 !Self::serial_port_missing(cfg) && self.baud_value(cfg).is_some()
@@ -659,7 +703,7 @@ mod tests {
         cfg.listen_host = "eth0".into();
         let error = session_config(&cfg, None).expect_err("не IPv4");
         assert_eq!(error.code, ErrorCode::AddressUnavailable);
-        assert_eq!(error.field(cfg.mode), ErrorField::Address);
+        assert_eq!(error.field(cfg.mode), ErrorField::Interface);
         assert_eq!(error.params["addr"], "eth0");
     }
 
@@ -802,6 +846,43 @@ mod tests {
         assert_eq!(cfg.proxy_host, "192.168.1.51");
         assert_eq!(cfg.proxy_port, 5000);
         assert_eq!(cfg.listen_port, 50025);
+    }
+
+    /// Цель прокси ведёт на собственный порт bytetap: адрес второй стороны — этот же
+    /// компьютер, и пара замкнулась бы на себя (M4-AC13).
+    #[test]
+    fn a_target_on_the_own_listen_port_is_an_error() {
+        let mut cfg = config(SessionMode::Proxy);
+        cfg.listen_port = 50025;
+        let mut form = FormState::new(&cfg);
+        form.own_addresses = vec!["192.168.1.10".into()];
+        form.attempted = true;
+        for host in ["127.0.0.1", "localhost", "0.0.0.0", "::1", "192.168.1.10"] {
+            form.proxy_host = host.into();
+            form.proxy_port_text = "50025".into();
+            assert!(
+                !form.valid(&cfg),
+                "{host}:50025 — собственный порт прослушивания"
+            );
+            assert_eq!(
+                form.local_error(&cfg, ErrorField::TargetPort),
+                Some(
+                    "Порт цели совпадает с портом bytetap на этом же адресе: bytetap подключится сам к себе. Укажите порт второй стороны."
+                ),
+                "{host}"
+            );
+        }
+
+        // Чужой порт или чужая машина — не петля.
+        form.proxy_port_text = "5000".into();
+        assert!(form.valid(&cfg), "свой адрес, но порт второй стороны");
+        form.proxy_port_text = "50025".into();
+        form.proxy_host = "192.168.1.51".into();
+        assert!(form.valid(&cfg), "другая машина, тот же номер порта");
+        assert_eq!(form.local_error(&cfg, ErrorField::TargetPort), None);
+        // Пустой адрес — про него своя ошибка у поля «Адрес ЛИС», а не про петлю.
+        form.proxy_host.clear();
+        assert!(!form.target_is_own_port(&cfg));
     }
 
     #[test]

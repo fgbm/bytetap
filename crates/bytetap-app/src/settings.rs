@@ -27,7 +27,12 @@ pub const FILE: &str = "settings.json";
 pub const ALL_INTERFACES: &str = "";
 pub const DEFAULT_PORT: u16 = 5000;
 pub const DEFAULT_CONNECT_HOST: &str = "192.168.1.50";
-pub const DEFAULT_PROXY_HOST: &str = "10.0.0.5";
+/// Цель прокси по умолчанию пуста: адрес второй стороны знает только человек, а
+/// подставленный чужой узел отправил бы к нему живой обмен (FR-5, M4-AC13).
+pub const DEFAULT_PROXY_HOST: &str = "";
+/// Цель по умолчанию прежней сборки ветки M4 — `10.0.0.5:5000`. В релиз она не
+/// попадала, но сохранённые ею настройки очищаются, как и пустые (M4-AC13).
+const LEGACY_PROXY_HOST: &str = "10.0.0.5";
 pub const DEFAULT_BAUD: u32 = 9600;
 pub const DEFAULT_RECONNECT_SEC: u32 = 5;
 
@@ -163,8 +168,9 @@ pub struct AppConfig {
     /// Топология прокси (FR-5): кто приходит на порт bytetap.
     pub proxy_role: ProxyMode,
     /// Цель прокси: адрес второй стороны без порта; в остальных режимах поле не читается.
+    /// Пусто по умолчанию — форма тогда просит заполнить поле.
     pub proxy_host: String,
-    /// Цель прокси: порт второй стороны.
+    /// Цель прокси: порт второй стороны; 0 — порт не набран.
     pub proxy_port: u16,
     pub serial: SerialSettings,
     pub responder: Responder,
@@ -185,7 +191,7 @@ impl AppConfig {
             reconnect_sec: DEFAULT_RECONNECT_SEC,
             proxy_role: ProxyMode::AnalyzerClient,
             proxy_host: DEFAULT_PROXY_HOST.to_owned(),
-            proxy_port: DEFAULT_PORT,
+            proxy_port: 0,
             serial: SerialSettings::default(),
             responder: Responder::Auto,
             astm_nak_on_bad_checksum: false,
@@ -334,6 +340,10 @@ pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig 
     let Some(raw) = raw.filter(|v| v.is_object()) else {
         return fallback.clone();
     };
+    let (proxy_host, proxy_port) = proxy_target(
+        text(raw.get("proxyHost"), &fallback.proxy_host),
+        int(raw.get("proxyPort"), fallback.proxy_port, 1, u16::MAX),
+    );
     AppConfig {
         mode: choice(raw.get("mode"), fallback.mode),
         listen_host: text(raw.get("listenHost"), &fallback.listen_host),
@@ -342,8 +352,8 @@ pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig 
         connect_port: int(raw.get("connectPort"), fallback.connect_port, 1, u16::MAX),
         reconnect_sec: int(raw.get("reconnectSec"), fallback.reconnect_sec, 0, 3600),
         proxy_role: choice(raw.get("proxyRole"), fallback.proxy_role),
-        proxy_host: text(raw.get("proxyHost"), &fallback.proxy_host),
-        proxy_port: int(raw.get("proxyPort"), fallback.proxy_port, 1, u16::MAX),
+        proxy_host,
+        proxy_port,
         serial: serial(raw.get("serial"), &fallback.serial),
         responder: choice(raw.get("responder"), fallback.responder),
         astm_nak_on_bad_checksum: flag(
@@ -353,6 +363,17 @@ pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig 
         analyzer: text(raw.get("analyzer"), &fallback.analyzer),
         note: text(raw.get("note"), &fallback.note),
         log_dir: text(raw.get("logDir"), &fallback.log_dir),
+    }
+}
+
+/// Цель прокси из файла: пустая по умолчанию и прежняя цель ветки `10.0.0.5:5000`
+/// очищаются — форма просит вписать адрес второй стороны, а не подставляет чужой узел
+/// (M4-AC13).
+fn proxy_target(host: String, port: u16) -> (String, u16) {
+    if host.trim().is_empty() || (host.trim() == LEGACY_PROXY_HOST && port == DEFAULT_PORT) {
+        (String::new(), 0)
+    } else {
+        (host, port)
     }
 }
 
@@ -734,7 +755,8 @@ mod tests {
         assert_eq!(value["config"]["mode"], "serial");
         assert_eq!(value["config"]["listenPort"], 5000);
         assert_eq!(value["config"]["proxyRole"], "analyzer_client");
-        assert_eq!(value["config"]["proxyHost"], "10.0.0.5");
+        assert_eq!(value["config"]["proxyHost"], "", "цель по умолчанию пуста");
+        assert_eq!(value["config"]["proxyPort"], 0);
         assert_eq!(value["config"]["serial"]["dataBits"], 8);
         assert_eq!(value["config"]["astmNakOnBadChecksum"], false);
         assert_eq!(value["lastRun"]["port"], "COM5");
@@ -986,8 +1008,17 @@ mod tests {
         let raw = json!({ "config": { "proxyRole": "analyzer_sideways", "proxyPort": 0 } });
         let settings = normalize(&raw, "");
         assert_eq!(settings.config.proxy_role, ProxyMode::AnalyzerClient);
-        assert_eq!(settings.config.proxy_port, DEFAULT_PORT);
+        assert_eq!(settings.config.proxy_port, 0, "порт цели не набран");
         assert_eq!(settings.config.proxy_host, DEFAULT_PROXY_HOST);
+
+        // Цель по умолчанию прежней сборки ветки `10.0.0.5:5000` очищается: форма
+        // просит вписать адрес второй стороны, а не отправляет обмен на чужой узел.
+        let raw = json!({ "config": {
+            "mode": "proxy", "proxyHost": "10.0.0.5", "proxyPort": 5000
+        }});
+        let settings = normalize(&raw, "");
+        assert_eq!(settings.config.proxy_host, "");
+        assert_eq!(settings.config.proxy_port, 0);
 
         // Профиль прокси хранит обе стороны и топологию: выбор профиля вернёт их.
         let raw = json!({

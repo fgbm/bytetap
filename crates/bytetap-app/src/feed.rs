@@ -255,6 +255,8 @@ pub enum FeedKind {
     },
     Close {
         by: ClosedBy,
+        /// Причина из журнала: `eof`, `reset`, `timeout`, `stop`, `error`.
+        reason: String,
     },
     Error {
         code: Option<String>,
@@ -308,7 +310,10 @@ impl FeedEvent {
                 &close.t,
                 Some(close.mono_us),
                 Some(close.conn),
-                FeedKind::Close { by: close.by },
+                FeedKind::Close {
+                    by: close.by,
+                    reason: close.reason.clone(),
+                },
             ),
             Event::Error(error) => (
                 &error.t,
@@ -1160,7 +1165,8 @@ mod tests {
         assert!(matches!(
             FeedEvent::from_session(&close).unwrap().kind,
             FeedKind::Close {
-                by: ClosedBy::Analyzer
+                by: ClosedBy::Analyzer,
+                ..
             }
         ));
         let note = Event::Note(Note {
