@@ -190,11 +190,19 @@ impl FrameBudget {
         self.present
     }
 
-    /// Забыть замеры: новая запись, разворот, восстановление или свёртывание окна.
+    /// Забыть оценку: разворот, восстановление, свёртывание окна или запись на просмотр
+    /// с другим размером.
     ///
     /// Кадр после смены размера рисует другую раскладку, а кадр после свёрнутого окна
-    /// приходит через секунды: прежняя оценка к ним не относится.
+    /// приходит через секунды: прежняя оценка к ним не относится. Подтверждённая цена
+    /// кадра остаётся — с неё окно начинает заново и не тратит кадры на догадку.
     pub fn reset(&mut self) {
+        self.cost = Duration::ZERO;
+        self.pending = None;
+    }
+
+    /// Забыть всё: новая запись. Прежняя цена кадра к новой сессии не относится.
+    pub fn clear(&mut self) {
         *self = Self::default();
     }
 
@@ -857,6 +865,47 @@ mod tests {
             "выброс поднял цену с {settled:?} до {:?}",
             budget.cost()
         );
+    }
+
+    /// Смена окна забывает оценку, но не цену кадра: новой записи — новая цена.
+    ///
+    /// Оценка после разворота не годится (другая раскладка), а подтверждённая цена
+    /// кадра остаётся: с неё окно начинает заново и не тратит кадры на догадку. Новая
+    /// сессия забывает и её.
+    #[test]
+    fn a_window_change_forgets_the_estimate_but_keeps_the_price() {
+        let work = Duration::from_millis(1);
+        let requested = Duration::from_millis(2);
+        let price = Duration::from_millis(180);
+        let mut budget = FrameBudget::default();
+        for _ in 0..2 {
+            budget.sample(
+                Some(requested + price),
+                Some(FRAME_SOFTWARE),
+                Some(requested),
+                work,
+            );
+        }
+        assert_eq!(budget.measured(), price + work);
+        assert!(next_period(true, budget.cost()) > FRAME_SOFTWARE);
+        budget.reset();
+        assert_eq!(budget.cost(), Duration::ZERO, "оценка забыта");
+        assert_eq!(budget.measured(), price + work, "цена кадра осталась");
+        // После смены окна цена подтверждается заново: пара замеров — и период снова
+        // три цены кадра.
+        for _ in 0..2 {
+            budget.sample(
+                Some(requested + price),
+                Some(FRAME_SOFTWARE),
+                Some(requested),
+                work,
+            );
+        }
+        assert_eq!(next_period(true, budget.cost()), (price + work) * 3);
+        // Новая запись забывает и цену.
+        budget.clear();
+        assert_eq!(budget.measured(), Duration::ZERO);
+        assert_eq!(budget.cost(), Duration::ZERO);
     }
 
     /// Предел промежутка считается от ожидания: пауза свёрнутого окна в цену не идёт.

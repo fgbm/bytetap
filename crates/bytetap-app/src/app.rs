@@ -1271,7 +1271,7 @@ impl BytetapApp {
         }
         self.phase = live::reduce(self.phase, Action::StartRequested);
         self.frames = 0;
-        self.frame_cost.reset();
+        self.frame_cost.clear();
         self.frame_delay = None;
         self.frame_request = None;
         self.frame_started = None;
@@ -1407,7 +1407,10 @@ impl BytetapApp {
                 // Цена кадра и период: по ним видно, почему кадров столько (NFR-5).
                 // Цена — последний подтверждённый замер: сглаженная оценка к концу
                 // записи тает, когда кадры идут без событий.
-                let period = live::next_period(crate::gpu::software(), self.frame_cost.cost());
+                let period = live::next_period(
+                    crate::gpu::software(),
+                    self.frame_cost.cost().max(self.frame_cost.measured()),
+                );
                 diag::info(format!(
                     "цена кадра записи: {} мс, период запроса кадра {} мс (работа {} мс, ожидание презентации {} мс)",
                     self.frame_cost.measured().as_millis(),
@@ -1891,11 +1894,13 @@ impl BytetapApp {
                 .is_none_or(|delay| delay <= PULSE_MAX_PERIOD)
     }
 
-    /// Разворот, восстановление и свёртывание окна: цена кадра записи забывается.
+    /// Разворот, восстановление и свёртывание окна: оценка цены кадра забывается.
     ///
     /// Кадр после смены размера рисует другую раскладку, а кадр после свёрнутого окна
-    /// приходит через секунды. Промежуток, накопленный до такой смены, ценой кадра не
-    /// считается: `frame_started` тоже забывается.
+    /// приходит через секунды. Оценка и запрошенный в прошлом кадре период — тоже:
+    /// `frame_delay` сбрасывается, а промежуток до кадра после смены ценой не считается
+    /// (`frame_started` забывается). Подтверждённая цена кадра остаётся: с неё окно
+    /// начинает заново.
     fn reset_frame_cost_on_window_change(&mut self, ctx: &egui::Context) {
         let window = ctx.input(|i| {
             let viewport = i.viewport();
@@ -1911,6 +1916,8 @@ impl BytetapApp {
             return;
         }
         self.frame_cost.reset();
+        self.frame_delay = None;
+        self.frame_request = None;
         self.frame_started = None;
     }
 
