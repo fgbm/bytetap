@@ -71,7 +71,7 @@ function crates() {
     .map((pkg) => ({
       name: pkg.name,
       version: pkg.version,
-      license: pkg.license ?? (pkg.license_file ? `см. ${pkg.license_file}` : "не указана"),
+      license: licenseOf(pkg),
       dir: dirname(pkg.manifest_path),
       repository: pkg.repository ?? "",
     }))
@@ -81,6 +81,69 @@ function crates() {
       (a, b) =>
         a.name < b.name ? -1 : a.name > b.name ? 1 : a.version < b.version ? -1 : a.version > b.version ? 1 : 0,
     );
+}
+
+/**
+ * Идентификатор лицензии пакета.
+ *
+ * Скобки в выражении SPDX поднимают приоритет OR над AND, и `licenseGroups` их
+ * учитывает: группы AND — вне скобок, варианты OR — внутри. Всё, что так не разбирается
+ * (несбалансированные скобки, AND внутри скобок), — ошибка с именем пакета, а не тихо
+ * неверный набор текстов в файле.
+ */
+function licenseOf(pkg) {
+  const license = pkg.license ?? (pkg.license_file ? `см. ${pkg.license_file}` : "не указана");
+  const broken = (why) =>
+    new Error(
+      `у пакета ${pkg.name} ${pkg.version} лицензия «${license}»: ${why} — ` +
+        "разбор групп AND/OR в scripts/licenses.mjs такую запись не поддерживает",
+    );
+  if (!balanced(license)) throw broken("несбалансированные скобки");
+  for (const part of splitOutsideParens(license, "AND")) {
+    // После разбиения по AND вне скобок внутри части скобки держат только варианты OR.
+    if (splitOutsideParens(part.replace(/[()]/g, " "), "AND").length > 1) {
+      throw broken("AND внутри скобок");
+    }
+  }
+  return license;
+}
+
+/** Скобки сбалансированы: каждая закрывается не раньше, чем открылась. */
+function balanced(expression) {
+  let depth = 0;
+  for (const char of expression) {
+    if (char === "(") depth += 1;
+    else if (char === ")" && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+/**
+ * Части выражения, разделённые оператором `operator` вне скобок.
+ *
+ * `MIT OR Apache-2.0 AND Unicode-3.0` → `["MIT OR Apache-2.0", "Unicode-3.0"]`, а
+ * `(MIT OR Apache-2.0) AND Unicode-3.0` → `["(MIT OR Apache-2.0)", "Unicode-3.0"]`:
+ * вариант OR не распадается на два AND.
+ */
+function splitOutsideParens(expression, operator) {
+  const pattern = new RegExp(`^\\s+${operator}\\s+`, "i");
+  const text = expression.trim();
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (let i = 0; i < text.length; i++) {
+    current += text[i];
+    if (text[i] === "(") depth += 1;
+    else if (text[i] === ")") depth -= 1;
+    const split = depth === 0 ? pattern.exec(text.slice(i + 1)) : null;
+    if (split) {
+      parts.push(current);
+      current = "";
+      i += split[0].length - 1;
+    }
+  }
+  parts.push(current);
+  return parts.map((part) => part.trim()).filter(Boolean);
 }
 
 /**
@@ -113,23 +176,17 @@ function spdxText(id) {
   return existsSync(path) ? readText(path) : null;
 }
 
-/** Идентификаторы SPDX выражения лицензии: `MIT OR Apache-2.0` → `MIT`, `Apache-2.0`. */
-function spdxIds(expression) {
-  return expression
-    .replace(/[()]/g, " ")
-    .split(/\s+AND\s+|\s+OR\s+|\s+WITH\s+/i)
-    .map((id) => id.trim())
-    .filter(Boolean);
-}
-
 /**
- * Лицензия как группы AND из вариантов OR: `(MIT OR Apache-2.0) AND BSD-3-Clause` —
+ * Лицензия как группы AND из вариантов OR: `MIT OR Apache-2.0 AND BSD-3-Clause` —
  * `[[MIT, Apache-2.0], [BSD-3-Clause]]`, а `MIT/Apache-2.0` — `[[MIT, Apache-2.0]]`.
  * Полный текст нужен каждому идентификатору из AND и хотя бы одному варианту из OR.
+ *
+ * Скобки учитывает {@link splitOutsideParens}: AND делит на группы только вне скобок, а
+ * внутри части скобки держат варианты OR, и снять их безопасно (запись вида `AND внутри
+ * скобок` отвергает {@link licenseOf}).
  */
 function licenseGroups(expression) {
-  return expression
-    .split(/\s+AND\s+/i)
+  return splitOutsideParens(expression, "AND")
     .map((part) =>
       part
         .replace(/[()]/g, " ")
@@ -252,30 +309,37 @@ function groups(packages) {
   const byText = new Map();
   const perPackage = new Map();
   for (const pkg of packages) {
+    const entry = { name: pkg.name, version: pkg.version };
     const numbers = [];
     const groupsOfLicense = licenseGroups(pkg.license);
     for (const item of texts(pkg)) {
+      // Файл, который не является полным текстом ни одной лицензии пакета, —
+      // уведомление о лицензии (`guillotiere`, `serialport`): он остаётся в файле как
+      // есть, но подписан честно, а полный текст идёт отдельной группой. Признак — по
+      // пакету: в одной группе сходятся пакеты, у которых тот же текст полный.
+      const notice =
+        !item.spdx &&
+        !groupsOfLicense.some((ids) => ids.some((id) => isFullText(id, item.text)));
       let group = byText.get(item.text);
       if (!group) {
         group = {
           text: item.text,
-          // Файл, который не является полным текстом ни одной лицензии пакета, —
-          // уведомление о лицензии (`guillotiere`, `serialport`): он остаётся в файле
-          // как есть, но подписан честно, а полный текст идёт отдельной группой.
-          notice:
-            !item.spdx &&
-            !groupsOfLicense.some((ids) => ids.some((id) => isFullText(id, item.text))),
           packages: [],
           // Пакеты, у которых этот текст — полный текст из `scripts/license-texts/`, а
           // не файл из пакета: пометка ставится по пакету, а не по группе (в одной
           // группе MIT сходятся и пакеты со своим LICENSE, и пакеты без него).
           spdxPackages: [],
+          // Пакеты, у которых этот текст — уведомление, а не текст лицензии.
+          noticePackages: [],
           repositories: new Set(),
         };
         byText.set(item.text, group);
       }
       if (!group.packages.some((other) => other.name === pkg.name && other.version === pkg.version)) {
-        group.packages.push({ name: pkg.name, version: pkg.version });
+        group.packages.push({ ...entry });
+      }
+      if (notice && !group.noticePackages.some((other) => other.name === pkg.name && other.version === pkg.version)) {
+        group.noticePackages.push({ ...entry });
       }
       if (
         item.spdx &&
@@ -288,13 +352,13 @@ function groups(packages) {
         });
       }
       if (pkg.license.includes("MPL") && pkg.repository) group.repositories.add(pkg.repository);
-      numbers.push(group);
+      numbers.push({ group, notice });
     }
     perPackage.set(`${pkg.name} ${pkg.version}`, numbers);
   }
   const list = [...byText.values()];
   for (const group of list) {
-    for (const entries of [group.packages, group.spdxPackages]) {
+    for (const entries of [group.packages, group.spdxPackages, group.noticePackages]) {
       entries.sort((a, b) =>
         a.name < b.name ? -1 : a.name > b.name ? 1 : a.version < b.version ? -1 : 1,
       );
@@ -325,7 +389,7 @@ push("| Crate | Версия | Лицензия | Текст |");
 push("| --- | --- | --- | --- |");
 for (const pkg of packages) {
   const numbers = (perPackage.get(`${pkg.name} ${pkg.version}`) ?? []).map(
-    (group) => list.indexOf(group) + 1,
+    (entry) => list.indexOf(entry.group) + 1,
   );
   const references = [...new Set(numbers)].sort((a, b) => a - b).join(", ");
   push(`| ${pkg.name} | ${pkg.version} | ${pkg.license} | ${references} |`);
@@ -352,16 +416,18 @@ list.forEach((group, index) => {
     `Пакеты: ${group.packages.map((pkg) => `${pkg.name} ${pkg.version}`).join(", ")}.`,
   );
   push("");
-  if (group.notice) {
+  if (group.noticePackages.length > 0) {
     // Полные тексты этих пакетов лежат своими группами: сюда попало только уведомление.
+    // Признак — по пакету: тот же текст у другого пакета может быть полной лицензией.
     const numbers = new Set();
-    for (const pkg of group.packages) {
+    for (const pkg of group.noticePackages) {
       for (const other of perPackage.get(`${pkg.name} ${pkg.version}`) ?? []) {
-        if (!other.notice) numbers.add(list.indexOf(other) + 1);
+        if (!other.notice) numbers.add(list.indexOf(other.group) + 1);
       }
     }
+    const names = group.noticePackages.map((pkg) => `${pkg.name} ${pkg.version}`);
     push(
-      `В пакете лежит уведомление о лицензии, а не её текст${numbers.size > 0 ? `; полный текст — группа ${[...numbers].sort((a, b) => a - b).join(", ")}` : ""}.`,
+      `Уведомление о лицензии, а не её текст — у ${names.join(", ")}${numbers.size > 0 ? `; полный текст — группа ${[...numbers].sort((a, b) => a - b).join(", ")}` : ""}.`,
     );
     push("");
   }

@@ -4548,7 +4548,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Пакеты: guillotiere 0.7.0.
 
-В пакете лежит уведомление о лицензии, а не её текст; полный текст — группа 66.
+Уведомление о лицензии, а не её текст — у guillotiere 0.7.0; полный текст — группа 66.
 
 ```text
 Copyright 2019 Nicolas Silva
@@ -5132,7 +5132,7 @@ DEALINGS IN THE SOFTWARE.
 
 Пакеты: memchr 2.8.3, termcolor 1.4.1, winapi-util 0.1.11.
 
-В пакете лежит уведомление о лицензии, а не её текст; полный текст — группа 23, 137.
+Уведомление о лицензии, а не её текст — у memchr 2.8.3, termcolor 1.4.1, winapi-util 0.1.11; полный текст — группа 23, 137.
 
 ```text
 This project is dual-licensed under the Unlicense and MIT licenses.
@@ -7263,7 +7263,7 @@ Public License instead of this License.
 
 Пакеты: serialport 4.10.1.
 
-В пакете лежит уведомление о лицензии, а не её текст; полный текст — группа 89.
+Уведомление о лицензии, а не её текст — у serialport 4.10.1; полный текст — группа 89.
 
 MPL-2.0: полный текст — https://mozilla.org/MPL/2.0/, исходники — https://github.com/serialport/serialport-rs.
 
@@ -7332,7 +7332,7 @@ SOFTWARE.
 
 Пакеты: siphasher 1.0.4.
 
-В пакете лежит уведомление о лицензии, а не её текст; полный текст — группа 30, 116.
+Уведомление о лицензии, а не её текст — у siphasher 1.0.4; полный текст — группа 30, 116.
 
 ```text
 Copyright 2012-2016 The Rust Project Developers.
