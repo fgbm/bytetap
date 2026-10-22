@@ -16,10 +16,12 @@ import "../../../design/tokens.css";
 import "./style.css";
 import Layout from "./Layout.vue";
 import ExchangeSample from "./components/ExchangeSample.vue";
+import Screenshot from "./components/Screenshot.vue";
 import SignalTrace from "./components/SignalTrace.vue";
 
 /**
- * Тема сайта: DefaultTheme с токенами bytetap и компонентами примеров обмена.
+ * Тема сайта: DefaultTheme с токенами bytetap, компонентами примеров обмена и
+ * снимками приложения в обеих темах.
  * Шрифты IBM Plex подключены локально из @fontsource — внешних запросов нет.
  */
 export default {
@@ -27,6 +29,7 @@ export default {
   Layout,
   enhanceApp({ app }) {
     app.component("ExchangeSample", ExchangeSample);
+    app.component("Screenshot", Screenshot);
     app.component("SignalTrace", SignalTrace);
   },
 } satisfies Theme;

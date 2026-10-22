@@ -27,7 +27,6 @@ export default defineConfig({
             { text: "Введение", link: "/guide/" },
             { text: "Установка", link: "/guide/install" },
             { text: "SmartScreen и антивирусы", link: "/guide/smartscreen" },
-            { text: "WebView2", link: "/guide/webview2" },
             { text: "Первый запуск", link: "/guide/first-run" },
             { text: "Режимы работы", link: "/guide/modes" },
             { text: "Запуск из командной строки", link: "/guide/cli" },

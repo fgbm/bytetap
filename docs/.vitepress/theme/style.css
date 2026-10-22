@@ -43,3 +43,32 @@
   width: min(100%, 34rem);
   max-width: 34rem;
 }
+
+/*
+ * Снимки экрана приложения (U1-AC21): в папке лежат `<имя>.png` и `<имя>-dark.png`,
+ * показывается тот, который совпадает с темой сайта. Классы глобальные, а не scoped:
+ * правило темы должно быть специфичнее, чем `.bt-shot img`.
+ */
+.bt-shot {
+  margin: 16px 0;
+}
+
+.bt-shot img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--bt-border);
+  border-radius: var(--bt-radius-panel);
+}
+
+.bt-shot .shot-dark {
+  display: none;
+}
+
+.dark .bt-shot .shot-light {
+  display: none;
+}
+
+.dark .bt-shot .shot-dark {
+  display: block;
+}
