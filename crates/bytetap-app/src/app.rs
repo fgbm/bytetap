@@ -26,7 +26,7 @@ use crate::journal::{
     JournalCache, JournalOpen, NoteWritten, PageDone, PageError, PageJob, PageLoad, PageReader,
 };
 use crate::live::{self, Action, JournalFailure, LiveSession, Phase, StopOutcome};
-use crate::recording::{RecordingFixture, RecordingView};
+use crate::recording::{PULSE_MAX_PERIOD, RecordingFixture, RecordingView};
 use crate::settings::{LoadWarning, SessionMode, Settings, Store, ThemeMode, WindowState};
 use crate::theme::tokens::{SPACE_2, SPACE_3, SPACE_5, TEXT_XS};
 use crate::theme::{self, Palette, mix};
@@ -76,10 +76,6 @@ pub const HOOKS_ENV: &str = "BYTETAP_TEST_HOOKS";
 /// Журнал для снимка просмотра: файл, который откроется на экране просмотра.
 /// Читается только вместе с [`HOOKS_ENV`], как и остальные тестовые ключи.
 pub const JOURNAL_ENV: &str = "BYTETAP_TEST_JOURNAL";
-
-/// Промежуток между кадрами, который ещё считается кадром, а не паузой: свёрнутое или
-/// перекрытое окно не рисует, и ждать от него цену кадра нечего.
-const MAX_GAP: Duration = Duration::from_secs(2);
 
 /// Данные окружения для снимков и тестов вместо фонового опроса системы.
 #[derive(Clone, Debug)]
@@ -290,6 +286,9 @@ pub struct BytetapApp {
     frame_began: Option<Instant>,
     /// Сколько длился прошлый кадр: от начала `ui` до её конца, то есть работа окна.
     frame_work: Duration,
+    /// Размер окна в точках и свёрнутость в прошлом кадре: по их смене цена кадра
+    /// записи забывается (разворот, восстановление, свёртывание).
+    frame_window: Option<([u32; 2], bool)>,
 }
 
 impl BytetapApp {
@@ -372,6 +371,7 @@ impl BytetapApp {
             frame_started: None,
             frame_began: None,
             frame_work: Duration::ZERO,
+            frame_window: None,
         };
         app.preselect_last_card();
         app.interfaces = Loaded::Loading(Task::spawn(ctx, background::list_interfaces));
@@ -1720,17 +1720,21 @@ impl BytetapApp {
                 let period = self.frame_period();
                 live::set_repaint_period(period);
                 // Новые строки — по периоду кадра. Без новых событий трассу и ленту
-                // перерисовывать незачем: кадр идёт к смене секунды таймера, и он же
-                // несёт пульс «Стоп» (U1-AC24). Кадр к целой секунде не даёт подписи
-                // перескакивать: `elapsed` показан ровно раз на секунду.
+                // перерисовывать незачем, но пульс «Стоп» идёт непрерывно, как
+                // CSS-анимация в UI v2: на аппаратном растре кадр всё равно приходит раз
+                // в [`live::FRAME`] (пульс и таймер), а на WARP — к смене секунды
+                // таймера, и там пульса нет (U1-AC24).
+                let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
                 let delay = if added > 0 {
                     period
-                } else {
+                } else if crate::gpu::software() || minimized {
                     let elapsed = self
                         .rec
                         .as_ref()
                         .map_or(Duration::ZERO, |rec| rec.elapsed());
                     live::next_second(elapsed).max(live::FRAME)
+                } else {
+                    live::FRAME
                 };
                 self.frame_delay = Some(delay);
                 ctx.request_repaint_after(delay);
@@ -1866,9 +1870,46 @@ impl BytetapApp {
         }
     }
 
-    /// Период кадра записи: потолок по адаптеру и по цене прошлых кадров.
+    /// Период кадра записи: на аппаратном растре — [`live::FRAME`], на WARP — по цене
+    /// прошлых кадров.
     pub(crate) fn frame_period(&self) -> Duration {
         live::next_period(crate::gpu::software(), self.frame_cost.cost())
+    }
+
+    /// Пульс точки «Стоп»: он расходится, только когда следующий кадр придёт не позже
+    /// [`crate::recording::PULSE_MAX_PERIOD`], — то есть на аппаратном растре.
+    ///
+    /// На WARP кадр стоит сотни миллисекунд, а без событий окно просыпается к смене
+    /// секунды: фаза кольца к каждому кадру случайна, и точка стоит статично — это
+    /// отступление от UI v2, где пульс непрерывный (см. `docs/dev/design.md`).
+    pub(crate) fn pulse(&self) -> bool {
+        !crate::gpu::software()
+            && self
+                .frame_delay
+                .is_none_or(|delay| delay <= PULSE_MAX_PERIOD)
+    }
+
+    /// Разворот, восстановление и свёртывание окна: цена кадра записи забывается.
+    ///
+    /// Кадр после смены размера рисует другую раскладку, а кадр после свёрнутого окна
+    /// приходит через секунды. Промежуток, накопленный до такой смены, ценой кадра не
+    /// считается: `frame_started` тоже забывается.
+    fn reset_frame_cost_on_window_change(&mut self, ctx: &egui::Context) {
+        let window = ctx.input(|i| {
+            let viewport = i.viewport();
+            let size = viewport.inner_rect.map_or([0; 2], |rect| {
+                [
+                    rect.width().round().max(0.0) as u32,
+                    rect.height().round().max(0.0) as u32,
+                ]
+            });
+            (size, viewport.minimized.unwrap_or(false))
+        });
+        if self.frame_window.replace(window) == Some(window) {
+            return;
+        }
+        self.frame_cost.reset();
+        self.frame_started = None;
     }
 
     /// Цена кадра записи: время самого кадра — работа окна плюс ожидание презентации.
@@ -1897,10 +1938,12 @@ impl BytetapApp {
         if self.live.is_none() {
             return;
         }
-        // Свёрнутое окно кадров не рисует: промежуток в секунды — не цена кадра.
+        // Свёрнутое окно кадров не рисует: промежуток в секунды — не цена кадра. Предел
+        // берётся от самого ожидания, а не общий: на WARP ожидание и так доходит до
+        // секунды, и общий предел пропускал бы в цену паузу свёрнутого окна.
         let spacing = spacing.filter(|spacing| {
             delay.is_none_or(|delay| {
-                *spacing <= delay + requested.unwrap_or(Duration::ZERO) + MAX_GAP
+                *spacing <= requested.unwrap_or(Duration::ZERO) + live::max_gap(delay)
             })
         });
         self.frame_cost.sample(spacing, delay, requested, work);
@@ -1946,6 +1989,7 @@ fn describe(source: &Source) -> String {
 impl eframe::App for BytetapApp {
     /// Каждый кадр, и когда окно свёрнуто: итоги задач записи и закрытие окна.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.reset_frame_cost_on_window_change(ctx);
         self.poll_session(ctx);
         self.handle_close(ctx);
     }

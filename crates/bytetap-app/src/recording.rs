@@ -42,8 +42,9 @@ const PULSE_PERIOD: f64 = 1.6;
 ///
 /// Программный растр (WARP) рисует кадр сотни миллисекунд, а окно просит его реже
 /// секунды: фаза пульса к каждому кадру случайна, и кольцо мигает вместо того, чтобы
-/// расходиться. Тогда точка стоит статично — отступление от UI v2.
-const PULSE_MAX_PERIOD: Duration = Duration::from_millis(200);
+/// расходиться. Тогда точка стоит статично — отступление от UI v2, где пульс идёт
+/// непрерывной CSS-анимацией ([`crate::app::BytetapApp::pulse`]).
+pub(crate) const PULSE_MAX_PERIOD: Duration = Duration::from_millis(200);
 
 /// Индекс строк ленты: номер события и номер его первой строки.
 ///
@@ -451,14 +452,7 @@ impl BytetapApp {
             |app, ui| {
                 app.brand(ui);
                 let p = app.pal();
-                if stop_pill(
-                    ui,
-                    &p,
-                    &feed::format_duration(elapsed),
-                    app.frame_period() <= PULSE_MAX_PERIOD,
-                )
-                .clicked()
-                {
+                if stop_pill(ui, &p, &feed::format_duration(elapsed), app.pulse()).clicked() {
                     let ctx = ui.ctx().clone();
                     app.stop_recording(&ctx);
                 }

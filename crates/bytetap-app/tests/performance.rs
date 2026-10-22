@@ -36,6 +36,10 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 /// загруженного раннера.
 const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Сколько последних задержек задают установившийся период кадра: по нему видно,
+/// залипла ли оценка цены, а минимум по всему окну этого не показывает.
+const SETTLED_FRAMES: usize = 5;
+
 fn settings() -> Settings {
     let mut settings = Settings::with_log_dir(LOG_DIR);
     settings.config.mode = SessionMode::TcpServer;
@@ -147,11 +151,11 @@ fn an_idle_window_asks_for_no_frames() {
     );
 }
 
-/// Запись идёт, новых событий нет: кадр просится к следующей целой секунде таймера — то
-/// есть не чаще раза в секунду, — а трассу и ленту без новых строк перерисовывать
-/// незачем (NFR-5, U1-AC24).
+/// Запись идёт, новых событий нет: кадр всё равно просится по таймеру — на аппаратном
+/// растре раз в [`FRAME`] ради пульса «Стоп», на WARP к смене секунды таймера (NFR-5,
+/// U1-AC24).
 #[test]
-fn a_quiet_recording_asks_for_one_frame_per_second() {
+fn a_quiet_recording_keeps_the_pulse_frame() {
     let dir = tempfile::tempdir().expect("временная папка");
     let log_dir = dir.path().to_string_lossy().into_owned();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -186,13 +190,20 @@ fn a_quiet_recording_asks_for_one_frame_per_second() {
         asked.iter().all(|delay| *delay != Duration::MAX),
         "запись идёт: кадр просится по таймеру, а не по событию: {asked:?}"
     );
-    // Кадр без событий идёт к границе секунды `elapsed`: не чаще раза в секунду и не
-    // реже, чем позволяет период кадра. Ровно секунда — тоже не «чаще».
+    // Кадр без событий идёт по таймеру: на аппаратном растре — пульсом каждые
+    // [`FRAME`], на WARP — к границе секунды `elapsed`, но не чаще раза в секунду.
     assert!(
         asked
             .iter()
             .all(|delay| (FRAME..=FRAME_SLOWEST).contains(delay)),
         "без новых событий кадр не чаще раза в секунду: {asked:?}"
+    );
+    // Харнесс едет на аппаратном адаптере: пульс там непрерывный, кадр раз в 33 мс —
+    // так же, как в UI v2 с его CSS-анимацией. На WARP кадры без событий идут к смене
+    // секунды, и точка стоит статично (`recording::stop_pill`).
+    assert!(
+        asked.iter().all(|delay| *delay == FRAME),
+        "на аппаратном растре кадр без событий — раз в {FRAME:?}: {asked:?}"
     );
 }
 
@@ -385,14 +396,25 @@ fn a_recording_session_asks_for_at_most_thirty_frames_per_second() {
         (FRAME..=FRAME_SLOWEST).contains(&fastest),
         "кадры ленты — по таймеру от {FRAME:?} до {FRAME_SLOWEST:?}: {fastest:?}"
     );
-    // И не залипает на редком кадре: при активном потоке на быстром растре период —
-    // [`FRAME`], а не секунда. Ранние пробуждения (событие через полсекунды при
-    // периоде в секунду) не должны записываться в цену кадра (находка ревью шага 5).
+    // Установившийся период — последние запросы потока, а не минимум по всему окну:
+    // минимум прошёл бы и на залипшем периоде, если в начале замера случился один
+    // частый кадр. Поток идёт, а период — [`FRAME`], а не секунда (находка ревью шага 5).
+    let settled = periodic
+        .iter()
+        .rev()
+        .take(SETTLED_FRAMES)
+        .copied()
+        .max()
+        .expect("есть запросы");
     assert!(
-        fastest <= 2 * FRAME,
-        "поток идёт, а кадр просится раз в {fastest:?}: период залип"
+        (FRAME..=FRAME_SLOWEST).contains(&settled),
+        "установившийся период кадра ленты — от {FRAME:?} до {FRAME_SLOWEST:?}: {settled:?}"
     );
-    let per_second = 1.0 / fastest.as_secs_f64();
+    assert!(
+        settled <= 2 * FRAME,
+        "поток идёт, а кадр просится раз в {settled:?}: период залип"
+    );
+    let per_second = 1.0 / settled.as_secs_f64();
     // Сколько кадров нарисует цикл событий за окно замера: мгновенные плюс таймер.
     let window = started.elapsed().as_secs_f64().max(0.001);
     let drawn = immediate as f64 + window / fastest.as_secs_f64();

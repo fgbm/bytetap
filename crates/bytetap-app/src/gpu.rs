@@ -90,7 +90,7 @@ pub fn retry_with_warp(wgpu_failed: bool, adapter_set: bool, retried: bool) -> b
 /// Выбранный адаптер рисует кадр на процессоре (`Microsoft Basic Render Driver`).
 ///
 /// Такой кадр стоит сотни миллисекунд на 1200×800, поэтому окно во время записи просит
-/// его реже (`live::frame_period`). Флаг ставится при выборе адаптера, до первого кадра.
+/// его реже (`live::next_period`). Флаг ставится при выборе адаптера, до первого кадра.
 static SOFTWARE: AtomicBool = AtomicBool::new(false);
 
 /// Кадры рисует программный растр: WARP или адаптер без GPU.
