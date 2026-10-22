@@ -156,11 +156,11 @@ fn long_analyzer() -> String {
     name
 }
 
-/// Журнал с длинным именем анализатора: шапка просмотра в узком окне.
+/// Журнал с анализатором `analyzer`: шапка просмотра в узком окне.
 ///
 /// Файл лежит во временной папке, а страница 0 прочитана заранее — снимок и проверка
 /// раскладки видят шапку и первую страницу, как настоящее открытие журнала.
-fn long_journal_view() -> bytetap_app::viewing::JournalView {
+fn journal_view(analyzer: Option<String>) -> bytetap_app::viewing::JournalView {
     use bytetap_app::journal::{JournalCache, JournalOpen};
 
     let dir = tempfile::tempdir().expect("временная папка");
@@ -173,7 +173,7 @@ fn long_journal_view() -> bytetap_app::viewing::JournalView {
             os: "Windows 11 23H2".to_owned(),
         },
     );
-    header.analyzer = Some(long_analyzer());
+    header.analyzer = analyzer;
     let mut text =
         serde_json::to_string(&bytetap_core::journal::Event::Session(header)).expect("заголовок");
     text.push('\n');
@@ -208,6 +208,11 @@ fn long_journal_view() -> bytetap_app::viewing::JournalView {
 
 /// Просмотр журнала с длинным анализатором в окне `size`.
 fn long_analyzer_viewing(size: (f32, f32)) -> Harness<'static, BytetapApp> {
+    analyzer_viewing(size, Some(long_analyzer()))
+}
+
+/// Просмотр журнала с анализатором `analyzer` в окне `size`.
+fn analyzer_viewing(size: (f32, f32), analyzer: Option<String>) -> Harness<'static, BytetapApp> {
     let mut harness = Harness::builder()
         .with_size(size)
         .with_theme(Theme::Light)
@@ -215,7 +220,7 @@ fn long_analyzer_viewing(size: (f32, f32)) -> Harness<'static, BytetapApp> {
         .build_eframe(move |cc| {
             BytetapApp::new(&cc.egui_ctx, settings(false), None, None)
                 .with_fixtures(fixtures())
-                .with_journal_fixture(long_journal_view())
+                .with_journal_fixture(journal_view(analyzer))
         });
     harness.run_steps(8);
     harness
@@ -1498,6 +1503,36 @@ fn viewing_text_at_720() {
 fn viewing_text_at_1366() {
     let _gpu = gpu();
     long_analyzer_viewing(LAPTOP).snapshot_options("viewing-text-1366-light", &options());
+}
+
+/// Широкое окно с коротким анализатором: имя файла не режется «…».
+///
+/// Имя всегда брало не больше 45 % остатка шапки, и короткое имя с короткими метаданными
+/// показывалось с «…» на ровном месте (находка контрольного ревью шага 5). Снимок
+/// 910 px — эталон вида, тест сверяет ширину подписи с шириной самого текста.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn a_short_analyzer_keeps_the_journal_name_whole() {
+    let _gpu = gpu();
+    let mut harness = analyzer_viewing((910.0, 600.0), Some("ANALYZER".to_owned()));
+    let name =
+        bytetap_app::viewing::file_name(&harness.state().viewing().expect("журнал открыт").path);
+    let full = harness.ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(
+                name.clone(),
+                theme::mono(bytetap_app::theme::tokens::TEXT_XS),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x
+    });
+    let width = harness.get_by_label(&name).rect().width();
+    assert!(
+        (width - full).abs() <= 0.5,
+        "имя обрезано: {width} px из {full}"
+    );
+    harness.snapshot_options("viewing-short-analyzer-910-light", &options());
 }
 
 #[test]
