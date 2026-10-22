@@ -470,6 +470,13 @@ pub struct ErrorEvent {
     /// английским для журнала, а русскую строку интерфейс берёт по коду из i18n.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// Адрес отвергнутой входящей стороны без порта (формат `/2`).
+    ///
+    /// Есть только у отказа по фильтру адресов (`proxy_peer_rejected`): строка ленты
+    /// называет адрес из этого поля, а не разбирает английский `message`. У прочих
+    /// ошибок поля нет, и журналы без него читаются как раньше.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
     /// Описание ошибки для инженера.
     pub message: String,
 }
@@ -720,6 +727,7 @@ mod tests {
             mono_us: 9_100_000,
             conn: Some(1),
             code: Some("checksum_mismatch".to_owned()),
+            peer: None,
             message: "ASTM checksum mismatch: got 3A, expected 3B".to_owned(),
         });
         assert_eq!(
@@ -836,6 +844,7 @@ mod tests {
                 mono_us: 4,
                 conn: None,
                 code: None,
+                peer: None,
                 message: "boom".to_owned(),
             }),
             Event::Info(InfoEvent {

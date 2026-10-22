@@ -195,3 +195,121 @@ async fn the_allowed_address_reaches_the_target() {
         "отказов по адресу нет"
     );
 }
+
+/// Чужой адрес на этой машине: так проверяется фильтр. `127.0.0.0/8` — петлевые адреса,
+/// и второй из них есть только в Linux; другие среды случай пропускают.
+async fn foreign_peer(to: SocketAddr) -> Option<TcpStream> {
+    let socket = tokio::net::TcpSocket::new_v4().ok()?;
+    socket.bind(SocketAddr::from(([127, 0, 0, 2], 0))).ok()?;
+    socket.connect(to).await.ok()
+}
+
+/// Отвергнутая сторона, затем разрешённая в той же сессии: отказ схлопывается, серия
+/// восстановлена (`source_recovered`), а разрешённая сторона даёт пару (FR-8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_peer_is_recovered_by_the_allowed_one() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let lis = LisEmulator::listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("ЛИС слушает")
+        .with_connections(1)
+        .with_behaviour(LisBehaviour::Echo);
+    let target = lis.local_addr().expect("адрес ЛИС");
+    let lis_task = tokio::spawn(lis.run());
+
+    let handle = Session::start(
+        SessionConfig::proxy(
+            "0.0.0.0:0".parse().unwrap(),
+            target.to_string(),
+            ProxyRole::AnalyzerClient,
+            RETRY,
+        )
+        .with_allow_from(Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+        .with_log_dir(dir.path()),
+    )
+    .await
+    .expect("сессия прокси");
+    let listen: SocketAddr = handle.local_addr().parse().expect("адрес прослушивания");
+    let path = handle.journal_path().to_path_buf();
+
+    // Два чужих входа подряд: серия повторов, а потом восстановление.
+    for _ in 0..2 {
+        let Some(mut stream) =
+            foreign_peer(SocketAddr::from(([127, 0, 0, 2], listen.port()))).await
+        else {
+            handle.stop().await.expect("остановка");
+            return;
+        };
+        let mut buffer = [0u8; 8];
+        let read = timeout(WAIT, stream.read(&mut buffer))
+            .await
+            .expect("чужое входящее закрылось")
+            .expect("чтение");
+        assert_eq!(read, 0, "чужое соединение закрывается без байтов");
+    }
+
+    // Разрешённый адрес приходит следом и сразу получает пару.
+    let mut stream = TcpStream::connect(listen).await.expect("анализатор пришёл");
+    stream
+        .write_all(b"MSH|^~\\&|A|L|LIS|LAB|20261022101500||ORU^R01|1|P|2.3.1\r")
+        .await
+        .expect("запрос");
+    let mut buffer = [0u8; 256];
+    let read = timeout(WAIT, stream.read(&mut buffer))
+        .await
+        .expect("ответ пришёл")
+        .expect("чтение ответа");
+    assert!(read > 0, "эхо цели вернулось через прокси");
+    stream.shutdown().await.expect("FIN стороны");
+
+    for _ in 0..200 {
+        if read_all(&path).is_ok_and(|outcome| {
+            outcome
+                .lines
+                .iter()
+                .any(|line| matches!(line.event, Event::Open(_)))
+        }) {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    handle.stop().await.expect("остановка");
+    timeout(WAIT, lis_task)
+        .await
+        .expect("цель закончила")
+        .expect("задача цели")
+        .expect("обмен цели");
+
+    let outcome = read_all(&path).expect("журнал читается");
+    let errors: Vec<_> = outcome
+        .lines
+        .iter()
+        .filter_map(|line| match &line.event {
+            Event::Error(error) => Some(error),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors.len(), 1, "серия отвергнутых схлопнута: {errors:?}");
+    assert_eq!(errors[0].code.as_deref(), Some("proxy_peer_rejected"));
+    assert_eq!(
+        errors[0].peer.as_deref(),
+        Some("127.0.0.2"),
+        "адрес отвергнутого — отдельным полем события, а не в английском тексте"
+    );
+    assert!(
+        outcome.lines.iter().any(|line| matches!(
+            &line.event,
+            Event::Info(info) if info.code.as_deref() == Some("source_recovered")
+                && info.repeats == Some(1)
+        )),
+        "серия восстановлена разрешённой стороной: {:?}",
+        outcome.lines
+    );
+    assert!(
+        outcome
+            .lines
+            .iter()
+            .any(|line| matches!(line.event, Event::Open(_))),
+        "разрешённая сторона даёт пару"
+    );
+}

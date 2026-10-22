@@ -304,6 +304,17 @@ impl std::fmt::Display for ProxyPeerRejected {
 
 impl std::error::Error for ProxyPeerRejected {}
 
+/// Адрес отвергнутой стороны из отказа [`ProxyPeerRejected`], если это он.
+///
+/// Сессия кладёт адрес в отдельное поле события: строка ленты называет его, не разбирая
+/// английский текст журнала (FR-8).
+#[must_use]
+pub fn rejected_peer(err: &io::Error) -> Option<IpAddr> {
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<ProxyPeerRejected>())
+        .and_then(|rejected| rejected.peer)
+}
+
 /// `true`, если ошибка источника — «входящее с неразрешённого адреса».
 #[must_use]
 pub fn is_proxy_peer_rejected(err: &io::Error) -> bool {
@@ -528,7 +539,7 @@ impl Source {
                 ..
             } => {
                 // Фильтр попадает в журнал, только если он включён: отсутствие поля
-                // значит «принимаю с любого адреса», как и до фильтра (M4-AC17).
+                // значит «принимаю с любого адреса», как и до фильтра (M4-AC18).
                 let mut settings = serde_json::json!({
                     "listen": local,
                     "target": target,
@@ -646,9 +657,13 @@ impl ConnectionSource for ProxySource {
                                     let peer = peer_ip(&connection.peer);
                                     if !peer.is_some_and(|peer| same_ip(peer, allowed)) {
                                         drop(connection);
+                                        // Пауза тут не нужна: приём не сломан, а
+                                        // следующее входящее может быть разрешено. Ждать
+                                        // сто миллисекунд значило бы тормозить обмен
+                                        // (FR-8).
                                         return Next::Retry {
                                             error: peer_rejected_error(peer, allowed),
-                                            after,
+                                            after: Duration::ZERO,
                                             stage: Stage::Accept,
                                         };
                                     }
@@ -969,6 +984,8 @@ impl ConnectionSource for SerialSource {
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
     use super::*;
 
     #[test]
@@ -1166,6 +1183,109 @@ mod tests {
             },
             bound,
         ))
+    }
+
+    /// Клиент с чужого петлевого адреса `127.0.0.2`: так проверяется фильтр по адресу
+    /// входящего. На этой машине такой адрес есть только в Linux, остальные среды
+    /// случай пропускают.
+    async fn foreign_client(to: SocketAddr) -> Option<TcpStream> {
+        let socket = tokio::net::TcpSocket::new_v4().ok()?;
+        socket.bind(SocketAddr::from(([127, 0, 0, 2], 0))).ok()?;
+        socket.connect(to).await.ok()
+    }
+
+    /// Цель, к которой прокси подключается: любой принимающий слушатель.
+    async fn any_target() -> (tokio::net::TcpListener, SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("цель слушает");
+        let addr = listener.local_addr().expect("адрес цели");
+        (listener, addr)
+    }
+
+    /// `same_ip` видит один адрес за IPv4-mapped записью двойного стека (FR-8).
+    #[test]
+    fn a_peer_address_is_compared_without_the_ipv4_mapped_prefix() {
+        let v4: IpAddr = "192.168.1.51".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.168.1.51".parse().unwrap();
+        assert!(same_ip(mapped, v4), "двойной стек отдаёт IPv4 как IPv6");
+        assert!(same_ip(v4, mapped));
+        assert!(same_ip(v4, v4));
+        assert!(!same_ip(v4, "192.168.1.52".parse().unwrap()));
+        assert!(!same_ip(
+            "fe80::1".parse().unwrap(),
+            "fe80::2".parse().unwrap()
+        ));
+        // Принятая сторона — `IP:порт` в журнале: для фильтра важен только адрес.
+        assert_eq!(peer_ip("192.168.1.51:49152"), Some(v4));
+        assert_eq!(peer_ip("[::ffff:192.168.1.51]:49152"), Some(mapped));
+        assert_eq!(peer_ip("192.168.1.51"), None, "журнал всегда с портом");
+    }
+
+    /// Чужой вход перед разрешённым: отказ приходит без паузы, и следующее входящее с
+    /// разрешённого адреса сразу даёт пару — фильтр не тормозит приём (FR-8).
+    #[tokio::test]
+    async fn a_rejected_peer_does_not_delay_the_allowed_one() {
+        let (_target, target) = any_target().await;
+        let (mut source, bound) = proxy_on("0.0.0.0:0".parse().unwrap())
+            .await
+            .expect("слушатель");
+        source.target = target.to_string();
+        source.allow_from = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        let Some(_foreign) = foreign_client(SocketAddr::from(([127, 0, 0, 2], bound.port()))).await
+        else {
+            return;
+        };
+        match source.next().await {
+            Next::Retry {
+                error,
+                after,
+                stage,
+            } => {
+                assert!(is_proxy_peer_rejected(&error), "{error}");
+                assert_eq!(stage, Stage::Accept, "отказ приёма, а не подключения");
+                assert_eq!(after, Duration::ZERO, "отказ по фильтру не тормозит приём");
+                assert_eq!(
+                    rejected_peer(&error),
+                    Some("127.0.0.2".parse().unwrap()),
+                    "адрес отвергнутого виден снаружи"
+                );
+            }
+            Next::Connected(_) => panic!("чужой адрес дал пару"),
+        }
+
+        let _allowed = TcpStream::connect(("127.0.0.1", bound.port()))
+            .await
+            .expect("разрешённая сторона пришла");
+        match source.next().await {
+            Next::Connected(pair) => {
+                assert!(pair.link.is_some(), "пара собрана целиком");
+            }
+            Next::Retry { error, .. } => panic!("разрешённый адрес отвергнут: {error}"),
+        }
+    }
+
+    /// Слушатель `[::]` на двойном стеке, клиент — IPv4: адрес входящего приходит
+    /// IPv4-mapped, а разрешён IPv4, и фильтр их не различает (FR-8). Окружение без
+    /// IPv6 или с выключенным двойным стеком случай пропускает.
+    #[tokio::test]
+    async fn a_dual_stack_listener_matches_an_ipv4_peer() {
+        let Ok((mut source, bound)) = proxy_on("[::]:0".parse().unwrap()).await else {
+            return;
+        };
+        let (_target, target) = any_target().await;
+        source.target = target.to_string();
+        source.allow_from = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let Ok(_client) = TcpStream::connect(("127.0.0.1", bound.port())).await else {
+            return;
+        };
+        match source.next().await {
+            Next::Connected(pair) => assert!(pair.link.is_some(), "пара собрана целиком"),
+            Next::Retry { error, .. } => {
+                panic!("IPv4-адрес за IPv4-mapped записью отвергнут: {error}")
+            }
+        }
     }
 
     /// Одна петля: входящее закрывается, пара не создаётся, отказ — `proxy_target_is_self`.

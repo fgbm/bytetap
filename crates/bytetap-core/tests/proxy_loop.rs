@@ -33,9 +33,14 @@ fn free_port(host: IpAddr) -> Option<u16> {
 
 /// Петля на себя: одно `error` с кодом петли, ни одного `open`, сессия жива.
 ///
-/// `listen_host` — адрес прослушивания, `target_host` — как цель называет тот же порт.
+/// `listen_host` — адрес прослушивания, `target_host` — как цель называет тот же порт,
+/// `allow_from` — фильтр по адресу входящего.
 /// `false` — окружение такую петлю не даёт (нет IPv6 или двойного стека).
-async fn assert_a_loop_is_one_error(listen_host: IpAddr, target_host: &str) -> bool {
+async fn assert_a_loop_is_one_error(
+    listen_host: IpAddr,
+    target_host: &str,
+    allow_from: Option<IpAddr>,
+) -> bool {
     let Some(port) = free_port(listen_host) else {
         return false;
     };
@@ -47,6 +52,7 @@ async fn assert_a_loop_is_one_error(listen_host: IpAddr, target_host: &str) -> b
             ProxyRole::AnalyzerClient,
             RETRY,
         )
+        .with_allow_from(allow_from)
         .with_log_dir(dir.path()),
     )
     .await
@@ -126,16 +132,27 @@ async fn a_loop_to_the_listening_address_is_one_error_and_no_pair() {
     // Порт занимается и отпускается: цель и прослушивание — один номер. Цель приходит
     // строкой, поэтому проверка старта петлю не видит, её ловит подключение (M4-AC6).
     assert!(
-        assert_a_loop_is_one_error(IpAddr::V4(Ipv4Addr::LOCALHOST), "localhost").await,
+        assert_a_loop_is_one_error(IpAddr::V4(Ipv4Addr::LOCALHOST), "localhost", None).await,
         "петля через имя узла на петлевом адресе"
     );
     // Слушатель на всех адресах: петля та же, а адрес цели — петлевой. Цель-адрес с тем
     // же портом на старте отвергается как ошибка настройки, строкой — ловится здесь.
     assert!(
-        assert_a_loop_is_one_error(IpAddr::V4(Ipv4Addr::UNSPECIFIED), "localhost").await,
+        assert_a_loop_is_one_error(IpAddr::V4(Ipv4Addr::UNSPECIFIED), "localhost", None).await,
         "петля через имя узла при слушателе на всех адресах"
     );
     // `::` на двойном стеке принимает IPv4: семейства адресов разные, слушатель один.
     // Окружение без IPv6 или с выключенным двойным стеком случай пропускает.
-    assert_a_loop_is_one_error(IpAddr::V6(Ipv6Addr::UNSPECIFIED), "127.0.0.1").await;
+    assert_a_loop_is_one_error(IpAddr::V6(Ipv6Addr::UNSPECIFIED), "127.0.0.1", None).await;
+}
+
+/// Фильтр по адресу входящего не мешает увидеть петлю: разрешённая сторона проходит
+/// фильтр, а пара не создаётся — цель оказалась адресом прослушивания (FR-8, M4-AC6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_loop_is_seen_through_the_peer_filter() {
+    let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    assert!(
+        assert_a_loop_is_one_error(loopback, "localhost", Some(loopback)).await,
+        "петля при включённом фильтре"
+    );
 }

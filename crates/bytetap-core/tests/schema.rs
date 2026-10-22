@@ -71,6 +71,7 @@ fn events() -> Vec<Event> {
             mono_us: 9_100_000,
             conn: Some(1),
             code: Some("connect_failed".to_owned()),
+            peer: None,
             message: "connect failed: connection refused".to_owned(),
         }),
         Event::Info(InfoEvent {
@@ -214,6 +215,7 @@ fn a_proxy_pair_validates_against_the_schema() {
             mono_us: 4000,
             conn: None,
             code: Some("proxy_connect_timeout".to_owned()),
+            peer: None,
             message: "connect failed: connect to 10.0.0.5:5000 timed out after 10 s".to_owned(),
         }),
     ];

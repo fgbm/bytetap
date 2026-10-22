@@ -156,6 +156,74 @@ fn verify_checks_a_proxy_journal_of_the_second_format() {
     assert!(text.contains("Проверка пройдена"), "{text}");
 }
 
+/// Смена ошибки источника без единого повтора: в журнале два разных `error` и нет `info`
+/// с `source_retry_repeats`, потому что поле `repeats` схемы `/2` начинается с единицы.
+/// `verify` такой журнал принимает, а замечание с нулём отверг бы (M4-AC6).
+#[test]
+fn verify_accepts_an_error_change_without_repeats() {
+    use bytetap_core::journal::{
+        Autoresponder, Event, Host, Mode, Session, SessionEnd, Stats, now_rfc3339,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy-change.jsonl");
+    let error = |code: &str, message: &str, mono_us: u64| {
+        json!({
+            "type": "error",
+            "t": now_rfc3339(),
+            "mono_us": mono_us,
+            "code": code,
+            "message": message,
+        })
+    };
+    // Заголовок и итоги — из ядра, ошибки — строками: так видно ровно то, что проверяет
+    // схема, а `repeats` в них нет вовсе.
+    let header = Event::Session(Session::new(
+        Mode::Proxy,
+        Autoresponder::None,
+        json!({"listen": "127.0.0.1:50025", "target": "127.0.0.1:5000", "role": "analyzer_client"}),
+        Host::current(),
+    ));
+    let end = Event::SessionEnd(SessionEnd {
+        t: now_rfc3339(),
+        mono_us: 3000,
+        stats: Stats::default(),
+    });
+    let mut text = format!("{}\n", serde_json::to_string(&header).unwrap());
+    for line in [
+        error(
+            "proxy_connect_failed",
+            "connect failed: connection refused",
+            1000,
+        ),
+        error("accept_failed", "accept failed: too many files", 2000),
+    ] {
+        text.push_str(&format!("{}\n", serde_json::to_string(&line).unwrap()));
+    }
+    text.push_str(&format!("{}\n", serde_json::to_string(&end).unwrap()));
+    std::fs::write(&path, text).unwrap();
+
+    let output = verify(&path);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("Проверка пройдена"),
+        "{}",
+        stdout(&output)
+    );
+
+    // Замечание о нуле повторов схема не принимает: поэтому сессия его и не пишет.
+    let broken = dir.path().join("repeats-zero.jsonl");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.insert_str(
+        text.find("\n{\"code\":").expect("строка ошибки") + 1,
+        "{\"type\":\"info\",\"t\":\"2026-10-22T10:15:01.000000+03:00\",\"mono_us\":1500,\"code\":\"source_retry_repeats\",\"repeats\":0,\"message\":\"changed\"}\n",
+    );
+    std::fs::write(&broken, text).unwrap();
+    let output = verify(&broken);
+    assert!(!output.status.success(), "repeats: 0 схема отвергает");
+    assert!(stderr(&output).contains("repeats"), "{}", stderr(&output));
+}
+
 #[test]
 fn verify_rejects_a_journal_of_an_unknown_format() {
     let dir = tempfile::tempdir().unwrap();

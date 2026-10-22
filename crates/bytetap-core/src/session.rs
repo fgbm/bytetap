@@ -53,7 +53,7 @@ use crate::journal::{
 use crate::responder::{Action, ControlIdSource, Now, Responder, ResponderEvent, ResponderKind};
 use crate::transport::{
     Connection, ConnectionSource, Link, Next, ProxyRole, ResetSocket, Source, Stage, Transport,
-    is_proxy_peer_rejected, is_proxy_target_is_self,
+    is_proxy_peer_rejected, is_proxy_target_is_self, rejected_peer,
 };
 
 /// Сколько событий держат каналы подписчиков.
@@ -720,6 +720,27 @@ impl Shared {
             mono_us: self.clock.now_us(),
             conn,
             code: code.map(str::to_owned),
+            peer: None,
+            message: message.into(),
+        }));
+    }
+
+    /// Ошибка источника с адресом отвергнутой стороны (FR-8).
+    ///
+    /// Адрес уходит отдельным полем события: та же строка ленты должна называть его, не
+    /// разбирая английский `message`. `peer` есть только у отказа по фильтру.
+    fn error_with_peer(
+        &self,
+        code: Option<&str>,
+        peer: Option<String>,
+        message: impl Into<String>,
+    ) {
+        self.publish(Event::Error(ErrorEvent {
+            t: now_rfc3339(),
+            mono_us: self.clock.now_us(),
+            conn: None,
+            code: code.map(str::to_owned),
+            peer,
             message: message.into(),
         }));
     }
@@ -779,6 +800,7 @@ impl Shared {
             mono_us: self.clock.now_us(),
             conn: None,
             code: Some(reason.code().unwrap_or("journal_failure").to_owned()),
+            peer: None,
             message: format!("journal write failed: {reason}{}", after_failure(self.mode)),
         })));
     }
@@ -880,7 +902,8 @@ struct SourceSeries {
 enum SourceReport {
     /// Ошибка новая: нужен `error`.
     First(String),
-    /// Ошибка сменилась: `info` о повторах прежней и `error` о новой.
+    /// Ошибка сменилась: `error` о новой, а `info` о повторах прежней — только если
+    /// повторы были (поле `repeats` схемы `/2` начинается с единицы).
     Changed {
         previous: String,
         repeats: u32,
@@ -922,6 +945,21 @@ impl SourceErrors {
                 SourceReport::First(message)
             }
         }
+    }
+
+    /// Замечание о повторах прежней ошибки при её смене.
+    ///
+    /// `None`, когда повторов не было: ошибки сменились сразу, и записывать в `info`
+    /// нечего. Поле `repeats` схемы `/2` начинается с единицы — замечание с нулём
+    /// `verify` забраковал бы (M4-AC6).
+    fn changed_note(previous: String, repeats: u32) -> Option<SourceNote> {
+        (repeats > 0).then(|| SourceNote {
+            code: "source_retry_repeats",
+            repeats,
+            text: format!(
+                "source error changed after {repeats} repeats of the previous one: {previous}"
+            ),
+        })
     }
 
     /// Приём восстановился: отчёт о схлопнутых повторах, если они были.
@@ -1161,21 +1199,19 @@ async fn run(
                     let (prefix, base_code) = source_failure(mode, stage);
                     let message = format!("{prefix}: {}", io_message(&error));
                     let code = source_failure_code(mode, base_code, &error);
+                    // Отвергнутая сторона остаётся в событии адресом: интерфейс называет
+                    // его в ленте, а не разбирает английский текст журнала (FR-8).
+                    let peer = rejected_peer(&error).map(|ip| ip.to_string());
                     match source_errors.failed(prefix, message) {
                         SourceReport::Repeated => {}
                         SourceReport::First(message) => {
-                            shared.error_with_code(None, Some(code), message);
+                            shared.error_with_peer(Some(code), peer, message);
                         }
                         SourceReport::Changed { previous, repeats, message } => {
-                            shared.info_repeating(
-                                None,
-                                "source_retry_repeats",
-                                repeats,
-                                format!(
-                                    "source error changed after {repeats} repeats of the previous one: {previous}"
-                                ),
-                            );
-                            shared.error_with_code(None, Some(code), message);
+                            if let Some(note) = SourceErrors::changed_note(previous, repeats) {
+                                shared.info_repeating(None, note.code, note.repeats, note.text);
+                            }
+                            shared.error_with_peer(Some(code), peer, message);
                         }
                     }
                     tokio::select! {
@@ -1758,6 +1794,7 @@ async fn apply(
                         mono_us,
                         conn: Some(conn),
                         code: code.map(|code| code.as_str().to_owned()),
+                        peer: None,
                         message,
                     }),
                     ResponderEvent::Info { message, code } => Event::Info(InfoEvent {
@@ -2252,6 +2289,29 @@ mod tests {
             other => panic!("смена ошибки не сообщена: {other:?}"),
         }
         assert_eq!(errors.recovered(), None, "у новой ошибки повторов не было");
+    }
+
+    /// Ошибка сменилась сразу, без единого повтора: `info` не пишется, потому что поле
+    /// `repeats` схемы `/2` начинается с единицы и `verify` забраковал бы журнал.
+    #[test]
+    fn an_error_change_without_repeats_gives_no_note() {
+        let mut errors = SourceErrors::default();
+        let _ = errors.failed("accept", "first".to_owned());
+        match errors.failed("connect", "second".to_owned()) {
+            SourceReport::Changed {
+                previous, repeats, ..
+            } => {
+                assert_eq!(previous, "first");
+                assert_eq!(repeats, 0);
+                assert_eq!(SourceErrors::changed_note(previous, repeats), None);
+            }
+            other => panic!("смена ошибки не сообщена: {other:?}"),
+        }
+        // С повторами замечание есть: число уходит в своё поле, а не в текст.
+        let note = SourceErrors::changed_note("first".to_owned(), 2).expect("повторы были");
+        assert_eq!(note.code, "source_retry_repeats");
+        assert_eq!(note.repeats, 2);
+        assert!(note.text.contains("after 2 repeats"), "{}", note.text);
     }
 
     #[test]

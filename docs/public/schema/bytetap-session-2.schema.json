@@ -179,6 +179,11 @@
         "mono_us": { "$ref": "#/$defs/mono_us" },
         "conn": { "$ref": "#/$defs/conn" },
         "code": { "$ref": "#/$defs/code" },
+        "peer": {
+          "description": "Адрес отвергнутой входящей стороны без порта: есть только у кода proxy_peer_rejected, чтобы строка ленты назвала адрес из поля, а не из английского message",
+          "type": "string",
+          "minLength": 1
+        },
         "message": { "type": "string" }
       },
       "additionalProperties": false
