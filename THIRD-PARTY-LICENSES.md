@@ -144,7 +144,7 @@
 | read-fonts | 0.41.0 | MIT OR Apache-2.0 | 56, 57 |
 | renderdoc-sys | 1.1.0 | MIT OR Apache-2.0 | 6, 107 |
 | resvg | 0.45.1 | Apache-2.0 OR MIT | 8, 108 |
-| rfd | 0.16.0 | MIT | 109 |
+| rfd | 0.17.2 | MIT | 109 |
 | rgb | 0.8.53 | MIT | 110 |
 | roxmltree | 0.20.0 | MIT OR Apache-2.0 | 6, 111 |
 | rustc-hash | 1.1.0 | Apache-2.0/MIT | 5, 6 |
@@ -224,13 +224,10 @@
 | windows-result | 0.4.1 | MIT OR Apache-2.0 | 145, 146 |
 | windows-strings | 0.5.1 | MIT OR Apache-2.0 | 145, 146 |
 | windows-sys | 0.52.0 | MIT OR Apache-2.0 | 145, 146 |
-| windows-sys | 0.60.2 | MIT OR Apache-2.0 | 145, 146 |
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 | 145, 146 |
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 | 145, 146 |
-| windows-targets | 0.53.5 | MIT OR Apache-2.0 | 145, 146 |
 | windows-threading | 0.2.1 | MIT OR Apache-2.0 | 145, 146 |
 | windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 | 145, 146 |
-| windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 | 145, 146 |
 | winit | 0.30.13 | Apache-2.0 | 33 |
 | winnow | 1.0.4 | MIT | 147 |
 | winreg | 0.56.0 | MIT | 148 |
@@ -6879,7 +6876,7 @@ DEALINGS IN THE SOFTWARE.
 
 ### 109. MIT — 1 пакет
 
-Пакеты: rfd 0.16.0.
+Пакеты: rfd 0.17.2.
 
 ```text
 MIT License
@@ -9011,9 +9008,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 145. MIT OR Apache-2.0 — 18 пакетов
+### 145. MIT OR Apache-2.0 — 15 пакетов
 
-Пакеты: windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-implement 0.60.2, windows-interface 0.59.3, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.52.0, windows-sys 0.60.2, windows-sys 0.61.2, windows-targets 0.52.6, windows-targets 0.53.5, windows-threading 0.2.1, windows_x86_64_msvc 0.52.6, windows_x86_64_msvc 0.53.1.
+Пакеты: windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-implement 0.60.2, windows-interface 0.59.3, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.52.0, windows-sys 0.61.2, windows-targets 0.52.6, windows-threading 0.2.1, windows_x86_64_msvc 0.52.6.
 
 ```text
 Apache License
@@ -9219,9 +9216,9 @@ Apache License
    limitations under the License.
 ```
 
-### 146. MIT OR Apache-2.0 — 18 пакетов
+### 146. MIT OR Apache-2.0 — 15 пакетов
 
-Пакеты: windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-implement 0.60.2, windows-interface 0.59.3, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.52.0, windows-sys 0.60.2, windows-sys 0.61.2, windows-targets 0.52.6, windows-targets 0.53.5, windows-threading 0.2.1, windows_x86_64_msvc 0.52.6, windows_x86_64_msvc 0.53.1.
+Пакеты: windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-implement 0.60.2, windows-interface 0.59.3, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.52.0, windows-sys 0.61.2, windows-targets 0.52.6, windows-threading 0.2.1, windows_x86_64_msvc 0.52.6.
 
 ```text
 MIT License
