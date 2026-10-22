@@ -68,16 +68,28 @@ pub fn next_period(software: bool, cost: Duration) -> Duration {
     cost.saturating_mul(3).clamp(floor, FRAME_SLOWEST)
 }
 
-/// Ожидание презентации по замеру кадра: промежуток между кадрами минус то, что окно
-/// просило подождать, минус работа над кадром.
+/// Допуск на пробуждение по таймеру: система будит окно на десятки миллисекунд позже
+/// запрошенного, и этот разброс — не остаток кадра.
+const PRESENT_SLACK: Duration = Duration::from_millis(50);
+
+/// Ожидание презентации по замеру кадра: сколько кадр рисовался после того, как окно
+/// попросило следующий.
 ///
-/// `None` — кадр пришёл раньше, чем окно просило (`spacing < delay`): это пробуждение
-/// по событию (фрагмент ленты, ответ задачи), а не цена кадра. Такой замер в цену не
-/// идёт: после кадра без событий (ожидание [`FRAME_SLOWEST`]) событие через 500 мс
-/// записалось бы кадром в 500 мс, и период ушёл бы в секунду.
+/// Окно просит кадр посреди своей работы — через `requested` от начала кадра, — и ждёт
+/// `delay`. Значит, промежуток между началами кадров — это `requested + max(delay, P)`,
+/// где `P` — остаток кадра: растр, отправка и представление. Если промежуток больше
+/// `requested + delay` (с допуском [`PRESENT_SLACK`] на пробуждение по таймеру), кадр не
+/// уложился в своё ожидание, и `P` из него видно целиком: `spacing − requested`.
+///
+/// `None` — замер цены не даёт: окно выждало свой период целиком (тогда видно только,
+/// что `P ≤ delay`), или проснулось раньше по событию (фрагмент ленты, ответ задачи).
+/// Такой промежуток в цену кадра не идёт: после кадра без событий (ожидание
+/// [`FRAME_SLOWEST`]) событие через 500 мс записалось бы кадром в 500 мс, и период ушёл
+/// бы в секунду даже на быстром растре.
 #[must_use]
-pub fn present_wait(spacing: Duration, delay: Duration, work: Duration) -> Option<Duration> {
-    (spacing >= delay).then(|| spacing.saturating_sub(delay).saturating_sub(work))
+pub fn present_wait(spacing: Duration, delay: Duration, requested: Duration) -> Option<Duration> {
+    let overrun = spacing.saturating_sub(requested + delay + PRESENT_SLACK);
+    (!overrun.is_zero()).then(|| spacing.saturating_sub(requested))
 }
 
 /// Цена кадра записи: работа над кадром плюс ожидание презентации, со сглаживанием.
@@ -122,11 +134,18 @@ impl FrameBudget {
 
     /// Учесть кадр: `spacing` — промежуток от прошлого кадра (`None` — кадр первый или
     /// после паузы, промежуток ценой не считается), `delay` — ожидание, которое окно
-    /// просило в прошлом кадре (`None` — прошлый кадр прошёл без таймера), `work` —
-    /// сколько заняла работа над только что нарисованным кадром.
-    pub fn sample(&mut self, spacing: Option<Duration>, delay: Option<Duration>, work: Duration) {
-        if let (Some(spacing), Some(delay)) = (spacing, delay)
-            && let Some(present) = present_wait(spacing, delay, self.work)
+    /// просило в прошлом кадре (`None` — прошлый кадр прошёл без таймера), `requested` —
+    /// сколько прошло от начала того кадра до запроса следующего, `work` — сколько
+    /// заняла работа над только что нарисованным кадром.
+    pub fn sample(
+        &mut self,
+        spacing: Option<Duration>,
+        delay: Option<Duration>,
+        requested: Option<Duration>,
+        work: Duration,
+    ) {
+        if let (Some(spacing), Some(delay), Some(requested)) = (spacing, delay, requested)
+            && let Some(present) = present_wait(spacing, delay, requested)
         {
             // Ожидание презентации — медленно меняющаяся часть цены: кадр растра и
             // дисплея. Среднее сглаживает разброс между кадрами.
@@ -566,24 +585,46 @@ mod tests {
     #[test]
     fn the_cost_of_a_frame_is_the_time_of_the_frame_itself() {
         let work = Duration::from_micros(500);
+        let requested = Duration::from_millis(2);
         let mut budget = FrameBudget::default();
         // Первый кадр: промежутка нет, цены тоже.
-        budget.sample(None, None, work);
+        budget.sample(None, None, None, work);
         assert_eq!(budget.cost(), work);
-        // Окно просило 30 мс, кадр пришёл через 193 мс: 160 мс — цена кадра.
-        budget.sample(Some(Duration::from_millis(193)), Some(FRAME), work);
-        assert_eq!(
-            budget.cost(),
-            Duration::from_millis(193) - FRAME,
-            "цена кадра — промежуток минус ожидание"
+        // Окно попросило кадр через 2 мс работы и ждало 100 мс, а следующий кадр
+        // начался через 202 мс: кадр не уложился в ожидание, и его остаток — растр и
+        // представление — 200 мс.
+        budget.sample(
+            Some(Duration::from_millis(202)),
+            Some(FRAME_SOFTWARE),
+            Some(requested),
+            work,
         );
+        assert_eq!(budget.present(), Duration::from_millis(200));
+        assert_eq!(budget.cost(), Duration::from_millis(200) + work);
         assert_eq!(
-            present_wait(Duration::from_millis(193), FRAME, work),
-            Some(Duration::from_millis(160) - Duration::from_micros(500))
+            present_wait(Duration::from_millis(202), FRAME_SOFTWARE, requested),
+            Some(Duration::from_millis(200))
+        );
+        // Окно выждало свой период целиком: видно только, что остаток кадра не больше
+        // ожидания, — цену такой промежуток не уточняет, но и не портит.
+        budget.sample(
+            Some(Duration::from_millis(606)),
+            Some(Duration::from_millis(600)),
+            Some(requested),
+            work,
+        );
+        assert_eq!(budget.present(), Duration::from_millis(200));
+        assert_eq!(
+            present_wait(
+                Duration::from_millis(606),
+                Duration::from_millis(600),
+                requested
+            ),
+            None
         );
         // Пауза (свёрнутое окно) в цену кадра не идёт вовсе.
-        budget.sample(None, Some(FRAME), work);
-        assert_eq!(budget.cost(), Duration::from_millis(160));
+        budget.sample(None, Some(FRAME), Some(requested), work);
+        assert_eq!(budget.cost(), Duration::from_millis(200) + work);
     }
 
     /// Раннее пробуждение не становится ценой кадра (находка ревью шага 5).
@@ -594,12 +635,14 @@ mod tests {
     #[test]
     fn an_early_frame_does_not_become_the_cost_of_a_frame() {
         let work = Duration::from_micros(300);
+        let requested = Duration::from_millis(1);
         let mut budget = FrameBudget::default();
-        budget.sample(None, None, work);
+        budget.sample(None, None, None, work);
         // Кадр без событий: спали секунду, кадр быстрый — цена кадра мала.
         budget.sample(
-            Some(FRAME_SLOWEST + Duration::from_millis(8)),
+            Some(FRAME_SLOWEST + requested),
             Some(FRAME_SLOWEST),
+            Some(requested),
             work,
         );
         assert!(
@@ -609,7 +652,12 @@ mod tests {
         );
         assert_eq!(next_period(false, budget.cost()), FRAME);
         // Событие через 500 мс: окно проснулось раньше своего периода.
-        budget.sample(Some(Duration::from_millis(500)), Some(FRAME_SLOWEST), work);
+        budget.sample(
+            Some(Duration::from_millis(500)),
+            Some(FRAME_SLOWEST),
+            Some(requested),
+            work,
+        );
         assert!(
             budget.cost() <= Duration::from_millis(20),
             "раннее пробуждение — не цена кадра: {:?}",
@@ -622,7 +670,7 @@ mod tests {
         );
         // И дальше: период остаётся прежним, пока события идут чаще секунды.
         for _ in 0..5 {
-            budget.sample(Some(FRAME + Duration::from_millis(1)), Some(FRAME), work);
+            budget.sample(Some(FRAME + requested), Some(FRAME), Some(requested), work);
         }
         assert_eq!(next_period(false, budget.cost()), FRAME);
     }

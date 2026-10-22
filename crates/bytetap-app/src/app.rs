@@ -281,8 +281,13 @@ pub struct BytetapApp {
     /// Промежуток, который окно попросило в прошлом кадре: без него не отделить
     /// ожидание по таймеру от работы над кадром.
     frame_delay: Option<Duration>,
+    /// Сколько прошло от начала прошлого кадра до запроса следующего: кадр рисуется
+    /// после этого запроса, и без него не видно, уложился ли он в своё ожидание.
+    frame_request: Option<Duration>,
     /// Когда начался прошлый кадр — по часам, а не по `unstable_dt` egui.
     frame_started: Option<Instant>,
+    /// Когда начался текущий кадр: по нему считается время до запроса перерисовки.
+    frame_began: Option<Instant>,
     /// Сколько длился прошлый кадр: от начала `ui` до её конца, то есть работа окна.
     frame_work: Duration,
 }
@@ -363,7 +368,9 @@ impl BytetapApp {
             frames: 0,
             frame_cost: live::FrameBudget::default(),
             frame_delay: None,
+            frame_request: None,
             frame_started: None,
+            frame_began: None,
             frame_work: Duration::ZERO,
         };
         app.preselect_last_card();
@@ -1266,7 +1273,9 @@ impl BytetapApp {
         self.frames = 0;
         self.frame_cost.reset();
         self.frame_delay = None;
+        self.frame_request = None;
         self.frame_started = None;
+        self.frame_began = None;
         self.frame_work = Duration::ZERO;
         self.journal_failure = None;
         diag::info(format!("старт записи: {}", describe(&config.source)));
@@ -1725,6 +1734,9 @@ impl BytetapApp {
                 };
                 self.frame_delay = Some(delay);
                 ctx.request_repaint_after(delay);
+                // Отсюда и до конца кадра — растр, отправка и представление: остаток
+                // кадра рисуется уже после запроса (`live::present_wait`).
+                self.frame_request = self.frame_began.map(|began| began.elapsed());
             }
         } else if viewing {
             crate::viewscreen::error(self, ui);
@@ -1867,7 +1879,13 @@ impl BytetapApp {
     /// меряется по часам, а не по `unstable_dt` egui: в тестах и на первом кадре он
     /// равен предсказанному, а не прожитому. `started` — начало кадра, `work` — его
     /// длительность.
-    fn measure_frame_cost(&mut self, started: Instant, delay: Option<Duration>, work: Duration) {
+    fn measure_frame_cost(
+        &mut self,
+        started: Instant,
+        delay: Option<Duration>,
+        requested: Option<Duration>,
+        work: Duration,
+    ) {
         let spacing = self
             .frame_started
             .replace(started)
@@ -1880,9 +1898,12 @@ impl BytetapApp {
             return;
         }
         // Свёрнутое окно кадров не рисует: промежуток в секунды — не цена кадра.
-        let spacing =
-            spacing.filter(|spacing| delay.is_none_or(|delay| *spacing <= delay + MAX_GAP));
-        self.frame_cost.sample(spacing, delay, work);
+        let spacing = spacing.filter(|spacing| {
+            delay.is_none_or(|delay| {
+                *spacing <= delay + requested.unwrap_or(Duration::ZERO) + MAX_GAP
+            })
+        });
+        self.frame_cost.sample(spacing, delay, requested, work);
     }
 }
 
@@ -1932,10 +1953,12 @@ impl eframe::App for BytetapApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let probe = crate::probe::frame_start();
-        // Ожидание, которое окно просило в прошлом кадре: `draw` ниже поставит новое, а
-        // цена кадра считается по тому, что действовало в измеряемом промежутке.
+        // Ожидание и запрос прошлого кадра: `draw` ниже поставит новые, а цена кадра
+        // считается по тому, что действовало в измеряемом промежутке.
         let frame_delay = self.frame_delay;
+        let frame_request = self.frame_request;
         let frame_started = Instant::now();
+        self.frame_began = Some(frame_started);
         if !self.ready
             && let Some(state) = frame.wgpu_render_state()
         {
@@ -1987,7 +2010,12 @@ impl eframe::App for BytetapApp {
         }
         // Работа над кадром — время до `frame_end`: она и есть та часть цены кадра,
         // которую окно знает про себя (остальное — ожидание презентации).
-        self.measure_frame_cost(frame_started, frame_delay, frame_started.elapsed());
+        self.measure_frame_cost(
+            frame_started,
+            frame_delay,
+            frame_request,
+            frame_started.elapsed(),
+        );
         crate::probe::frame_end(&ctx, frame, probe);
     }
 
