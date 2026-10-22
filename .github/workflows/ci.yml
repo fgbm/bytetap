@@ -664,6 +664,161 @@ jobs:
           }
           if ($failed) { exit 1 }
 
+      # M4-AC15 (FR-5…FR-8): смоук прокси. Тестовый хук `BYTETAP_TEST_AUTOSTART` в формате
+      # `proxy:<адрес>><цель>:<роль>` поднимает сессию прокси на loopback; «ЛИС» —
+      # слушатель PowerShell в отдельном задании (порт он сообщает через файл, чтобы
+      # bytetap получил его до старта). Анализатор шлёт HL7 через прокси, ЛИС отвечает
+      # ACK, анализатор получает этот ACK. Затем окно закрывается штатно: в журнале
+      # прокси есть `open` пары с `link`, обе стороны в `data` и `session_end`.
+      - name: Смоук — прокси между анализатором и ЛИС
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Force -Path smoke
+          $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $portFile = Join-Path $env:TEMP 'bytetap-lis-port.txt'
+          Remove-Item $portFile -ErrorAction SilentlyContinue
+          $failed = $false
+
+          # ЛИС: слушает свой порт, принимает одно соединение прокси и отвечает ACK.
+          $lis = Start-Job -ArgumentList $portFile -ScriptBlock {
+            param([string]$portFile)
+            $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+            $listener.Start()
+            Set-Content -Path $portFile -Value $listener.LocalEndpoint.Port -Encoding ascii
+            $client = $listener.AcceptTcpClient()
+            $stream = $client.GetStream()
+            $buffer = New-Object byte[] 4096
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { Write-Output 'no data'; return }
+            $text = "MSH|^~\&|LIS|LAB|ANALYZER|LAB|20261022101530||ACK^R01|BT0001|P|2.3.1`rMSA|AA|MSG00001`r"
+            [byte[]]$frame = @(0x0b) + [System.Text.Encoding]::ASCII.GetBytes($text) + @(0x1c, 0x0d)
+            $stream.Write($frame, 0, $frame.Length)
+            $stream.Flush()
+            Start-Sleep -Milliseconds 200
+            $client.Close()
+            $listener.Stop()
+            Write-Output 'ok'
+          }
+          $port = $null
+          for ($i = 0; $i -lt 40 -and -not $port; $i++) {
+            Start-Sleep -Milliseconds 250
+            if (Test-Path $portFile) { $port = (Get-Content $portFile -Raw).Trim() }
+          }
+          if (-not $port) {
+            Write-Host 'ЛИС не поднялась: порт не сообщён'
+            $failed = $true
+          } else {
+            Write-Host "ЛИС слушает 127.0.0.1:$port"
+            $env:BYTETAP_TEST_HOOKS = '1'
+            $env:BYTETAP_TEST_AUTOSTART = "proxy:127.0.0.1:0>127.0.0.1:${port}:analyzer_client"
+            $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
+            $null = $p.Handle
+            $env:BYTETAP_TEST_AUTOSTART = ''
+            $env:BYTETAP_TEST_HOOKS = ''
+            $addr = $null
+            $journal = $null
+            for ($i = 0; $i -lt 60 -and -not $addr -and -not $p.HasExited; $i++) {
+              Start-Sleep -Milliseconds 500
+              if (Test-Path $log) {
+                $found = Select-String -Path $log -Pattern 'запись идёт: адрес ([^,\s]+), журнал (.+)$' -Encoding utf8 | Select-Object -First 1
+                if ($found) {
+                  $addr = $found.Matches[0].Groups[1].Value
+                  $journal = $found.Matches[0].Groups[2].Value.Trim()
+                }
+              }
+            }
+            if (-not $addr) {
+              Write-Host 'прокси не поднялся: прослушивания нет'
+              $failed = $true
+            } else {
+              Write-Host "прокси: $addr, журнал $journal"
+              try {
+                $proxyPort = [int]($addr -split ':')[-1]
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.Connect('127.0.0.1', $proxyPort)
+                $stream = $client.GetStream()
+                $stream.ReadTimeout = 10000
+                $text = "MSH|^~\&|ANALYZER|LAB|LIS||20261022101500||ORU^R01|MSG00001|P|2.3.1`rPID|1||000001||PATIENT^TEST`r"
+                [byte[]]$frame = @(0x0b) + [System.Text.Encoding]::ASCII.GetBytes($text) + @(0x1c, 0x0d)
+                $stream.Write($frame, 0, $frame.Length)
+                $buffer = New-Object byte[] 4096
+                $ack = New-Object System.Collections.Generic.List[byte]
+                while (-not ($ack.Count -ge 2 -and $ack[$ack.Count - 2] -eq 0x1c -and $ack[$ack.Count - 1] -eq 0x0d)) {
+                  $n = $stream.Read($buffer, 0, $buffer.Length)
+                  if ($n -le 0) { break }
+                  $ack.AddRange([byte[]]$buffer[0..($n - 1)])
+                }
+                $ackText = [System.Text.Encoding]::ASCII.GetString($ack.ToArray())
+                Write-Host "ACK через прокси: $($ackText -replace "`r", '<CR>')"
+                if ($ackText -notmatch 'MSA\|AA\|MSG00001') { Write-Host 'ACK от ЛИС не дошёл'; $failed = $true }
+                $client.Close()
+              } catch {
+                Write-Host "клиент HL7 через прокси: $_"
+                $failed = $true
+              }
+              # Задание ЛИС ждёт соединения: срок на ответ, чтобы шаг не висел.
+              $null = Wait-Job -Job $lis -Timeout 30
+              $jobOutput = Receive-Job -Job $lis
+              Write-Host "ЛИС: $jobOutput"
+              if ($jobOutput -notcontains 'ok') { Write-Host 'ЛИС не подтвердила сообщение'; $failed = $true }
+            }
+            if (-not $p.HasExited) {
+              Start-Sleep -Seconds 1
+              $p.Refresh()
+              [void]$p.CloseMainWindow()
+              if (-not $p.WaitForExit(30000)) {
+                Write-Host 'bytetap.exe не закрылся за 30 с'
+                Stop-Process -Id $p.Id -Force
+                $failed = $true
+              } elseif ($p.ExitCode -ne 0) {
+                Write-Host "bytetap.exe закрылся, код $($p.ExitCode)"
+                $failed = $true
+              } else {
+                Write-Host "bytetap.exe закрылся, код $($p.ExitCode)"
+              }
+            } else {
+              Write-Host "bytetap.exe завершился сам, код $($p.ExitCode)"
+              $failed = $true
+            }
+          }
+          Stop-Job -Job $lis -ErrorAction SilentlyContinue
+          Remove-Job -Job $lis -Force -ErrorAction SilentlyContinue
+          if (Test-Path $log) {
+            Copy-Item $log (Join-Path $out 'bytetap-proxy.log')
+            Get-Content -Encoding utf8 $log
+            if (-not (Select-String -Path $log -Pattern 'интерфейс готов' -Quiet -Encoding utf8)) {
+              Write-Host 'в журнале запуска нет «интерфейс готов»'
+              $failed = $true
+            }
+          }
+          if ($journal -and (Test-Path $journal)) {
+            # Журнал синтетический: сообщение выше, данных приборов в нём нет.
+            Copy-Item $journal (Join-Path $out 'proxy-session.jsonl')
+            $lines = Get-Content -Encoding utf8 $journal
+            $lines | Select-Object -Last 5
+            if ($lines[-1] -notmatch '"type":"session_end"') { Write-Host 'журнал не закончен session_end'; $failed = $true }
+            $open = $lines | Where-Object { $_ -match '"type":"open"' } | Select-Object -First 1
+            if (-not ($open -and $open -match '"link":\{"role":"lis"')) {
+              Write-Host "в журнале нет open с link на ЛИС: $open"
+              $failed = $true
+            }
+            $dirs = ($lines | Where-Object { $_ -match '"type":"data"' } | ForEach-Object {
+              if ($_ -match '"dir":"analyzer_to_lis"') { 'a2l' } elseif ($_ -match '"dir":"lis_to_analyzer"') { 'l2a' }
+            })
+            Write-Host "направления в журнале прокси: $($dirs -join ', ')"
+            if (-not ($dirs -contains 'a2l' -and $dirs -contains 'l2a')) {
+              Write-Host 'в журнале нет фрагментов обеих сторон'
+              $failed = $true
+            }
+            $header = $lines | Select-Object -First 1
+            if ($header -notmatch '"mode":"proxy"') { Write-Host 'режим журнала не proxy'; $failed = $true }
+          } else {
+            Write-Host "журнала прокси $journal нет"
+            $failed = $true
+          }
+          if ($failed) { exit 1 }
+
       # U1-AC24 (NFR-5): CPU живого процесса. В простое окно не рисует кадров, и
       # процесс почти не занимает ядро; во время записи кадр рисуется ~30 раз в
       # секунду, и его цена на WARP — это цена интерфейса. Оба числа пишутся в
