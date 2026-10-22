@@ -1,14 +1,14 @@
 # Сторонние лицензии
 
-Граф зависимостей `bytetap-app` для платформы поставки `x86_64-pc-windows-msvc` — того, из чего собирается `bytetap.exe`. В exe встроены ещё два набора ресурсов: шрифты IBM Plex и иконки Lucide; шрифты egui (`default_fonts`) в exe не входят. Ниже — пакеты с версиями и идентификаторами SPDX, а затем полные тексты лицензий. Одинаковые тексты собраны в одну группу со списком пакетов — MIT у сотни crate это один и тот же текст. Где в пакете файла лицензии не было, приведён стандартный текст SPDX из `scripts/license-texts/` с пометкой. Файл собирается скриптом `scripts/licenses.mjs` из `cargo metadata`; CI проверяет, что он актуален.
+Граф зависимостей `bytetap-app` для платформы поставки `x86_64-pc-windows-msvc` — того, из чего собирается `bytetap.exe`. В exe встроены ещё два набора ресурсов: шрифты IBM Plex и иконки Lucide; шрифты egui (`default_fonts`) в exe не входят. Ниже — пакеты с версиями и идентификаторами SPDX, а затем полные тексты лицензий. Одинаковые тексты собраны в одну группу со списком пакетов — MIT у сотни crate это один и тот же текст. Где в пакете файла лицензии не было, а где он оказался не текстом, а ссылкой на лицензию (у `serialport` — одна строка про MPL-2.0), приведён полный текст лицензии из `scripts/license-texts/` с пометкой и списком таких пакетов. Файл собирается скриптом `scripts/licenses.mjs` из `cargo metadata`; CI проверяет, что он актуален и что полные тексты на месте.
 
 ## Crate
 
 | Crate | Версия | Лицензия | Текст |
 | --- | --- | --- | --- |
-| accesskit | 0.25.1 | MIT OR Apache-2.0 | 1, 2 |
-| accesskit_consumer | 0.39.1 | MIT OR Apache-2.0 | 1, 2 |
-| accesskit_windows | 0.35.1 | MIT OR Apache-2.0 | 1, 2 |
+| accesskit | 0.25.1 | MIT OR Apache-2.0 | 1 |
+| accesskit_consumer | 0.39.1 | MIT OR Apache-2.0 | 1 |
+| accesskit_windows | 0.35.1 | MIT OR Apache-2.0 | 1 |
 | accesskit_winit | 0.34.1 | Apache-2.0 | 2 |
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 | 3, 4, 5 |
 | ahash | 0.8.12 | MIT OR Apache-2.0 | 6, 7 |
@@ -40,19 +40,19 @@
 | dirs-sys | 0.5.0 | MIT OR Apache-2.0 | 38, 39 |
 | document-features | 0.2.12 | MIT OR Apache-2.0 | 40, 41 |
 | dpi | 0.1.2 | Apache-2.0 AND MIT | 32, 42 |
-| ecolor | 0.37.0 | MIT OR Apache-2.0 | 1, 2 |
-| eframe | 0.37.0 | MIT OR Apache-2.0 | 1, 2 |
-| egui | 0.37.0 | MIT OR Apache-2.0 | 1, 2 |
-| egui-wgpu | 0.37.0 | MIT OR Apache-2.0 | 1, 2 |
-| egui-winit | 0.37.0 | MIT OR Apache-2.0 | 1, 2 |
-| egui_extras | 0.37.0 | MIT OR Apache-2.0 | 1, 2 |
-| egui_glow | 0.37.0 | MIT OR Apache-2.0 | 1, 2 |
+| ecolor | 0.37.0 | MIT OR Apache-2.0 | 1 |
+| eframe | 0.37.0 | MIT OR Apache-2.0 | 1 |
+| egui | 0.37.0 | MIT OR Apache-2.0 | 1 |
+| egui-wgpu | 0.37.0 | MIT OR Apache-2.0 | 1 |
+| egui-winit | 0.37.0 | MIT OR Apache-2.0 | 1 |
+| egui_extras | 0.37.0 | MIT OR Apache-2.0 | 1 |
+| egui_glow | 0.37.0 | MIT OR Apache-2.0 | 1 |
 | either | 1.19.0 | MIT OR Apache-2.0 | 6, 43 |
-| emath | 0.37.0 | MIT OR Apache-2.0 | 1, 2 |
+| emath | 0.37.0 | MIT OR Apache-2.0 | 1 |
 | encoding_rs | 0.8.35 | (Apache-2.0 OR MIT) AND BSD-3-Clause | 30, 44, 45 |
-| enum-map | 3.1.0 | MIT OR Apache-2.0 | 1, 2 |
-| enum-map-derive | 1.0.1 | MIT OR Apache-2.0 | 1, 2 |
-| epaint | 0.37.0 | MIT OR Apache-2.0 | 1, 2 |
+| enum-map | 3.1.0 | MIT OR Apache-2.0 | 1 |
+| enum-map-derive | 1.0.1 | MIT OR Apache-2.0 | 1 |
+| epaint | 0.37.0 | MIT OR Apache-2.0 | 1 |
 | equivalent | 1.0.3 | Apache-2.0 OR MIT | 6, 46 |
 | error-code | 3.4.0 | BSL-1.0 | 29 |
 | euclid | 0.22.14 | MIT OR Apache-2.0 | 6, 47 |
@@ -126,7 +126,7 @@
 | polycool | 0.4.0 | MIT OR Apache-2.0 | 30, 50 |
 | presser | 0.3.1 | MIT OR Apache-2.0 | 16, 96 |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 | 2, 5 |
-| profiling | 1.0.18 | MIT OR Apache-2.0 | 1, 2 |
+| profiling | 1.0.18 | MIT OR Apache-2.0 | 1 |
 | pxfm | 0.1.30 | BSD-3-Clause OR Apache-2.0 | 85, 86 |
 | quick-error | 2.0.1 | MIT/Apache-2.0 | 32, 97 |
 | quote | 1.0.47 | MIT OR Apache-2.0 | 2, 5 |
@@ -149,7 +149,7 @@
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | 2, 5 |
 | serde_derive | 1.0.229 | MIT OR Apache-2.0 | 2, 5 |
 | serde_json | 1.0.154 | MIT OR Apache-2.0 | 2, 5 |
-| serialport | 4.10.1 | MPL-2.0 | 112 |
+| serialport | 4.10.1 | MPL-2.0 | 89, 112 |
 | simd-adler32 | 0.3.10 | MIT | 113 |
 | simplecss | 0.2.2 | Apache-2.0 OR MIT | 6, 114 |
 | siphasher | 1.0.4 | MIT OR Apache-2.0 | 30, 115, 116 |
@@ -225,13 +225,13 @@
 
 ## Тексты лицензий
 
-Номер группы — из столбца «Текст». Пометка «стандартный текст SPDX» значит, что в пакете не было файла лицензии: приведён стандартный текст лицензии, а правообладатели и год — в метаданных пакета (`authors` на crates.io).
+Номер группы — из столбца «Текст». Пометка о стандартном тексте значит, что полного текста лицензии в пакете не было (только уведомление о ней): приведён полный текст лицензии из `scripts/license-texts/`, а правообладатели и год — в метаданных пакета (`authors` на crates.io), в тексте на их месте `<year> <copyright holders>`.
 
 ### 1. MIT OR Apache-2.0 — 15 пакетов
 
 Пакеты: accesskit 0.25.1, accesskit_consumer 0.39.1, accesskit_windows 0.35.1, ecolor 0.37.0, eframe 0.37.0, egui 0.37.0, egui-wgpu 0.37.0, egui-winit 0.37.0, egui_extras 0.37.0, egui_glow 0.37.0, emath 0.37.0, enum-map 3.1.0, enum-map-derive 1.0.1, epaint 0.37.0, profiling 1.0.18.
 
-Стандартный текст SPDX: файла лицензии в пакете нет, текст взят из `scripts/license-texts/`.
+Стандартный текст SPDX из `scripts/license-texts/`: полного текста лицензии в пакете не было у accesskit 0.25.1, accesskit_consumer 0.39.1, accesskit_windows 0.35.1, ecolor 0.37.0, eframe 0.37.0, egui 0.37.0, egui-wgpu 0.37.0, egui-winit 0.37.0, egui_extras 0.37.0, egui_glow 0.37.0, emath 0.37.0, enum-map 3.1.0, enum-map-derive 1.0.1, epaint 0.37.0, profiling 1.0.18. Правообладатели и год — в метаданных пакета, исходники — https://codeberg.org/sugar700/enum-map, https://github.com/AccessKit/accesskit, https://github.com/aclysma/profiling, https://github.com/emilk/egui, https://github.com/emilk/egui/tree/main/crates/eframe, https://github.com/emilk/egui/tree/main/crates/egui-wgpu, https://github.com/emilk/egui/tree/main/crates/egui-winit, https://github.com/emilk/egui/tree/main/crates/egui_glow, https://github.com/emilk/egui/tree/main/crates/emath, https://github.com/emilk/egui/tree/main/crates/epaint.
 
 ```text
 MIT License
@@ -257,11 +257,11 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 2. (MIT OR Apache-2.0) AND Unicode-3.0, Apache-2.0, Apache-2.0 OR MIT, MIT OR Apache-2.0 — 36 пакетов
+### 2. (MIT OR Apache-2.0) AND Unicode-3.0, Apache-2.0, Apache-2.0 OR MIT, MIT OR Apache-2.0 — 21 пакет
 
-Пакеты: accesskit 0.25.1, accesskit_consumer 0.39.1, accesskit_windows 0.35.1, accesskit_winit 0.34.1, allocator-api2 0.2.21, ecolor 0.37.0, eframe 0.37.0, egui 0.37.0, egui-wgpu 0.37.0, egui-winit 0.37.0, egui_extras 0.37.0, egui_glow 0.37.0, emath 0.37.0, enum-map 3.1.0, enum-map-derive 1.0.1, epaint 0.37.0, gl_generator 0.14.0, glifo 0.3.0, itoa 1.0.18, khronos_api 3.1.0, libc 0.2.191, litrs 1.0.1, proc-macro2 1.0.107, profiling 1.0.18, quote 1.0.47, rustc-hash 2.1.3, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, spirv 0.4.0+sdk-1.4.341.0, syn 2.0.119, syn 3.0.9, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.27.
+Пакеты: accesskit_winit 0.34.1, allocator-api2 0.2.21, gl_generator 0.14.0, glifo 0.3.0, itoa 1.0.18, khronos_api 3.1.0, libc 0.2.191, litrs 1.0.1, proc-macro2 1.0.107, quote 1.0.47, rustc-hash 2.1.3, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, spirv 0.4.0+sdk-1.4.341.0, syn 2.0.119, syn 3.0.9, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.27.
 
-Стандартный текст SPDX: файла лицензии в пакете нет, текст взят из `scripts/license-texts/`.
+Стандартный текст SPDX из `scripts/license-texts/`: полного текста лицензии в пакете не было у accesskit_winit 0.34.1, gl_generator 0.14.0, khronos_api 3.1.0, spirv 0.4.0+sdk-1.4.341.0. Правообладатели и год — в метаданных пакета, исходники — https://github.com/AccessKit/accesskit, https://github.com/brendanzab/gl-rs/, https://github.com/gfx-rs/rspirv.
 
 ```text
 Apache License
@@ -2178,7 +2178,7 @@ limitations under the License.
 
 Пакеты: clipboard-win 5.4.1, error-code 3.4.0.
 
-Стандартный текст SPDX: файла лицензии в пакете нет, текст взят из `scripts/license-texts/`.
+Стандартный текст SPDX из `scripts/license-texts/`: полного текста лицензии в пакете не было у clipboard-win 5.4.1. Правообладатели и год — в метаданных пакета, исходники — https://github.com/DoumanAsh/clipboard-win.
 
 ```text
 Boost Software License - Version 1.0 - August 17th, 2003
@@ -4548,6 +4548,8 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 Пакеты: guillotiere 0.7.0.
 
+В пакете лежит уведомление о лицензии, а не её текст; полный текст — группа 66.
+
 ```text
 Copyright 2019 Nicolas Silva
 
@@ -5130,6 +5132,8 @@ DEALINGS IN THE SOFTWARE.
 
 Пакеты: memchr 2.8.3, termcolor 1.4.1, winapi-util 0.1.11.
 
+В пакете лежит уведомление о лицензии, а не её текст; полный текст — группа 23, 137.
+
 ```text
 This project is dual-licensed under the Unlicense and MIT licenses.
 
@@ -5594,11 +5598,13 @@ WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 89. MPL-2.0 — 1 пакет
+### 89. MPL-2.0 — 2 пакета
 
-Пакеты: option-ext 0.2.0.
+Пакеты: option-ext 0.2.0, serialport 4.10.1.
 
-MPL-2.0: исходники — https://github.com/soc/option-ext.git.
+Стандартный текст SPDX из `scripts/license-texts/`: полного текста лицензии в пакете не было у serialport 4.10.1. Правообладатели и год — в метаданных пакета, исходники — https://github.com/serialport/serialport-rs.
+
+MPL-2.0: полный текст — https://mozilla.org/MPL/2.0/, исходники — https://github.com/serialport/serialport-rs, https://github.com/soc/option-ext.git.
 
 ```text
 Mozilla Public License Version 2.0
@@ -7257,7 +7263,9 @@ Public License instead of this License.
 
 Пакеты: serialport 4.10.1.
 
-MPL-2.0: исходники — https://github.com/serialport/serialport-rs.
+В пакете лежит уведомление о лицензии, а не её текст; полный текст — группа 89.
+
+MPL-2.0: полный текст — https://mozilla.org/MPL/2.0/, исходники — https://github.com/serialport/serialport-rs.
 
 ```text
 This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of
@@ -7323,6 +7331,8 @@ SOFTWARE.
 ### 115. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: siphasher 1.0.4.
+
+В пакете лежит уведомление о лицензии, а не её текст; полный текст — группа 30, 116.
 
 ```text
 Copyright 2012-2016 The Rust Project Developers.

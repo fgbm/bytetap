@@ -122,22 +122,129 @@ function spdxIds(expression) {
     .filter(Boolean);
 }
 
+/**
+ * Лицензия как группы AND из вариантов OR: `(MIT OR Apache-2.0) AND BSD-3-Clause` —
+ * `[[MIT, Apache-2.0], [BSD-3-Clause]]`, а `MIT/Apache-2.0` — `[[MIT, Apache-2.0]]`.
+ * Полный текст нужен каждому идентификатору из AND и хотя бы одному варианту из OR.
+ */
+function licenseGroups(expression) {
+  return expression
+    .split(/\s+AND\s+/i)
+    .map((part) =>
+      part
+        .replace(/[()]/g, " ")
+        .split(/\s+OR\s+|\s+WITH\s+|\//i)
+        .map((id) => id.trim())
+        .filter(Boolean),
+    )
+    .filter((group) => group.length > 0);
+}
+
+/**
+ * Признаки полного текста лицензии: чем текст должен содержаться, чтобы это был текст
+ * лицензии `id`, а не ссылка на неё.
+ *
+ * Файл `LICENSE` в пакете часто не текст, а уведомление: у `serialport` `LICENSE.txt` —
+ * одна строка про MPL 2.0 и адрес. Такая строка лицензию не заменяет, и полный текст
+ * берётся из `scripts/license-texts/`. `none` — признаки чужой лицензии: BSD-2-Clause
+ * отличается от BSD-3-Clause третьим пунктом, а 0BSD от ISC — требованием сохранять
+ * уведомление.
+ *
+ * Новая лицензия в графе: либо полный текст в `scripts/license-texts/<id>.txt`, либо
+ * сигнатура здесь — иначе `--check` падает и называет пакет с идентификатором.
+ */
+const SIGNATURES = {
+  MIT: {
+    all: [/permission is hereby granted, free of charge/i, /without restriction/i],
+  },
+  "Apache-2.0": { all: [/Apache License/i, /Version 2\.0, January 2004/] },
+  "BSD-2-Clause": {
+    all: [
+      /Redistribution and use in source and binary forms/i,
+      /this list of conditions and the following disclaimer/i,
+    ],
+    none: [/Neither the name/i],
+  },
+  "BSD-3-Clause": {
+    all: [
+      /Redistribution and use in source and binary forms/i,
+      /this list of conditions and the following disclaimer/i,
+      /Neither the name/i,
+    ],
+  },
+  "0BSD": {
+    all: [
+      /Permission to use, copy, modify, and\/or distribute this software for any purpose/i,
+      /with or without fee is hereby granted/i,
+    ],
+    none: [/this permission notice appear in all copies/i],
+  },
+  ISC: {
+    all: [
+      /Permission to use, copy, modify, and\/or distribute this software for any purpose/i,
+      /this permission notice appear in all copies/i,
+    ],
+  },
+  Zlib: {
+    all: [
+      /this software is provided 'as-is'/i,
+      /altered source versions must be plainly marked/i,
+    ],
+  },
+  Unlicense: {
+    all: [/This is free and unencumbered software released into the public domain/i],
+  },
+  "MPL-2.0": { all: [/Mozilla Public License Version 2\.0/] },
+  "BSL-1.0": { all: [/Boost Software License - Version 1\.0/] },
+  "Unicode-3.0": { all: [/UNICODE LICENSE V3/i] },
+  "GPL-2.0-only": { all: [/GNU GENERAL PUBLIC LICENSE/i, /Version 2, June 1991/] },
+};
+
+/** Полный ли текст лицензии `id`: по сигнатуре, а не по имени файла. */
+function isFullText(id, text) {
+  const signature = SIGNATURES[id];
+  if (!signature) return false;
+  // Переносы строк в текстах лицензий стоят где попало: сигнатура сверяется по тексту с
+  // одиночными пробелами.
+  const flat = text.replace(/\s+/g, " ");
+  return (
+    signature.all.every((pattern) => pattern.test(flat)) &&
+    !(signature.none ?? []).some((pattern) => pattern.test(flat))
+  );
+}
+
 /** Тексты лицензий одного пакета: из его каталога или стандартные SPDX с пометкой. */
 function texts(pkg) {
-  const files = licenseFiles(pkg.dir);
-  if (files.length > 0) {
-    return files.map((file) => ({ ...file, spdx: false }));
-  }
-  const out = spdxIds(pkg.license)
-    .map((id) => ({ text: spdxText(id), id }))
-    .filter((item) => item.text !== null)
-    .map((item) => ({ source: `SPDX ${item.id}`, text: item.text, spdx: true }));
-  if (out.length === 0) {
-    throw new Error(
-      `у пакета ${pkg.name} ${pkg.version} нет файла лицензии и нет шаблона в scripts/license-texts для «${pkg.license}»`,
-    );
+  const files = licenseFiles(pkg.dir).map((file) => ({ ...file, spdx: false }));
+  const out = [...files];
+  for (const id of missingIds(pkg, files)) {
+    const text = spdxText(id);
+    if (text === null) {
+      const have =
+        files.length > 0
+          ? `в каталоге пакета только ${files.map((file) => file.source).join(", ")}`
+          : "файла лицензии в пакете нет";
+      throw new Error(
+        `у пакета ${pkg.name} ${pkg.version} нужен полный текст лицензии «${id}», а ${have}: положите его в scripts/license-texts/${id}.txt`,
+      );
+    }
+    out.push({ source: `SPDX ${id}`, text, spdx: true, id });
   }
   return out;
+}
+
+/**
+ * Идентификаторы, которым нужен полный текст, а в каталоге пакета его нет: на каждую
+ * группу AND — хотя бы один вариант OR, а без файла лицензии вовсе — все группы.
+ */
+function missingIds(pkg, files) {
+  const missing = [];
+  for (const group of licenseGroups(pkg.license)) {
+    if (group.some((id) => files.some((file) => isFullText(id, file.text)))) continue;
+    // Вариант с готовым шаблоном: за него не приходится заводить новый файл текста.
+    missing.push(group.find((id) => spdxText(id) !== null) ?? group[0]);
+  }
+  return missing;
 }
 
 /** Группы одинаковых текстов: текст → пакеты с ним и признак стандартного SPDX. */
@@ -146,14 +253,39 @@ function groups(packages) {
   const perPackage = new Map();
   for (const pkg of packages) {
     const numbers = [];
+    const groupsOfLicense = licenseGroups(pkg.license);
     for (const item of texts(pkg)) {
       let group = byText.get(item.text);
       if (!group) {
-        group = { text: item.text, spdx: item.spdx, packages: [], repositories: new Set() };
+        group = {
+          text: item.text,
+          // Файл, который не является полным текстом ни одной лицензии пакета, —
+          // уведомление о лицензии (`guillotiere`, `serialport`): он остаётся в файле
+          // как есть, но подписан честно, а полный текст идёт отдельной группой.
+          notice:
+            !item.spdx &&
+            !groupsOfLicense.some((ids) => ids.some((id) => isFullText(id, item.text))),
+          packages: [],
+          // Пакеты, у которых этот текст — полный текст из `scripts/license-texts/`, а
+          // не файл из пакета: пометка ставится по пакету, а не по группе (в одной
+          // группе MIT сходятся и пакеты со своим LICENSE, и пакеты без него).
+          spdxPackages: [],
+          repositories: new Set(),
+        };
         byText.set(item.text, group);
       }
       if (!group.packages.some((other) => other.name === pkg.name && other.version === pkg.version)) {
         group.packages.push({ name: pkg.name, version: pkg.version });
+      }
+      if (
+        item.spdx &&
+        !group.spdxPackages.some((other) => other.name === pkg.name && other.version === pkg.version)
+      ) {
+        group.spdxPackages.push({
+          name: pkg.name,
+          version: pkg.version,
+          repository: pkg.repository,
+        });
       }
       if (pkg.license.includes("MPL") && pkg.repository) group.repositories.add(pkg.repository);
       numbers.push(group);
@@ -162,9 +294,11 @@ function groups(packages) {
   }
   const list = [...byText.values()];
   for (const group of list) {
-    group.packages.sort((a, b) =>
-      a.name < b.name ? -1 : a.name > b.name ? 1 : a.version < b.version ? -1 : 1,
-    );
+    for (const entries of [group.packages, group.spdxPackages]) {
+      entries.sort((a, b) =>
+        a.name < b.name ? -1 : a.name > b.name ? 1 : a.version < b.version ? -1 : 1,
+      );
+    }
   }
   // Порядок групп — по первому пакету: он не зависит от порядка обхода графа.
   list.sort((a, b) => {
@@ -182,7 +316,7 @@ const push = (...items) => lines.push(...items);
 push("# Сторонние лицензии");
 push("");
 push(
-  `Граф зависимостей \`bytetap-app\` для платформы поставки \`${PLATFORM}\` — того, из чего собирается \`bytetap.exe\`. В exe встроены ещё два набора ресурсов: шрифты IBM Plex и иконки Lucide; шрифты egui (\`default_fonts\`) в exe не входят. Ниже — пакеты с версиями и идентификаторами SPDX, а затем полные тексты лицензий. Одинаковые тексты собраны в одну группу со списком пакетов — MIT у сотни crate это один и тот же текст. Где в пакете файла лицензии не было, приведён стандартный текст SPDX из \`scripts/license-texts/\` с пометкой. Файл собирается скриптом \`scripts/licenses.mjs\` из \`cargo metadata\`; CI проверяет, что он актуален.`,
+  `Граф зависимостей \`bytetap-app\` для платформы поставки \`${PLATFORM}\` — того, из чего собирается \`bytetap.exe\`. В exe встроены ещё два набора ресурсов: шрифты IBM Plex и иконки Lucide; шрифты egui (\`default_fonts\`) в exe не входят. Ниже — пакеты с версиями и идентификаторами SPDX, а затем полные тексты лицензий. Одинаковые тексты собраны в одну группу со списком пакетов — MIT у сотни crate это один и тот же текст. Где в пакете файла лицензии не было, а где он оказался не текстом, а ссылкой на лицензию (у \`serialport\` — одна строка про MPL-2.0), приведён полный текст лицензии из \`scripts/license-texts/\` с пометкой и списком таких пакетов. Файл собирается скриптом \`scripts/licenses.mjs\` из \`cargo metadata\`; CI проверяет, что он актуален и что полные тексты на месте.`,
 );
 push("");
 push("## Crate");
@@ -200,7 +334,7 @@ push("");
 push("## Тексты лицензий");
 push("");
 push(
-  "Номер группы — из столбца «Текст». Пометка «стандартный текст SPDX» значит, что в пакете не было файла лицензии: приведён стандартный текст лицензии, а правообладатели и год — в метаданных пакета (`authors` на crates.io).",
+  "Номер группы — из столбца «Текст». Пометка о стандартном тексте значит, что полного текста лицензии в пакете не было (только уведомление о ней): приведён полный текст лицензии из `scripts/license-texts/`, а правообладатели и год — в метаданных пакета (`authors` на crates.io), в тексте на их месте `<year> <copyright holders>`.",
 );
 push("");
 list.forEach((group, index) => {
@@ -218,15 +352,32 @@ list.forEach((group, index) => {
     `Пакеты: ${group.packages.map((pkg) => `${pkg.name} ${pkg.version}`).join(", ")}.`,
   );
   push("");
-  if (group.spdx) {
+  if (group.notice) {
+    // Полные тексты этих пакетов лежат своими группами: сюда попало только уведомление.
+    const numbers = new Set();
+    for (const pkg of group.packages) {
+      for (const other of perPackage.get(`${pkg.name} ${pkg.version}`) ?? []) {
+        if (!other.notice) numbers.add(list.indexOf(other) + 1);
+      }
+    }
     push(
-      "Стандартный текст SPDX: файла лицензии в пакете нет, текст взят из `scripts/license-texts/`.",
+      `В пакете лежит уведомление о лицензии, а не её текст${numbers.size > 0 ? `; полный текст — группа ${[...numbers].sort((a, b) => a - b).join(", ")}` : ""}.`,
+    );
+    push("");
+  }
+  if (group.spdxPackages.length > 0) {
+    const names = group.spdxPackages.map((pkg) => `${pkg.name} ${pkg.version}`);
+    const repositories = [
+      ...new Set(group.spdxPackages.map((pkg) => pkg.repository).filter(Boolean)),
+    ].sort((a, b) => (a < b ? -1 : 1));
+    push(
+      `Стандартный текст SPDX из \`scripts/license-texts/\`: полного текста лицензии в пакете не было у ${names.join(", ")}. Правообладатели и год — в метаданных пакета, исходники — ${repositories.length > 0 ? repositories.join(", ") : "там же"}.`,
     );
     push("");
   }
   if (group.repositories.size > 0) {
     push(
-      `MPL-2.0: исходники — ${[...group.repositories].sort((a, b) => (a < b ? -1 : 1)).join(", ")}.`,
+      `MPL-2.0: полный текст — https://mozilla.org/MPL/2.0/, исходники — ${[...group.repositories].sort((a, b) => (a < b ? -1 : 1)).join(", ")}.`,
     );
     push("");
   }
