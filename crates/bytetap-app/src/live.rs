@@ -1235,6 +1235,7 @@ mod tests {
             target: "127.0.0.1:50025".into(),
             role: ProxyRole::AnalyzerClient,
             retry: Duration::from_secs(5),
+            allow_from: None,
         };
         let looped = io::Error::new(
             io::ErrorKind::InvalidInput,

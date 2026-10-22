@@ -19,7 +19,7 @@ pub mod tcp;
 
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(feature = "test-hooks")]
@@ -276,6 +276,67 @@ pub fn is_proxy_target_is_self(err: &io::Error) -> bool {
         .is_some_and(|inner| inner.is::<ProxyTargetIsSelf>())
 }
 
+/// Входящее соединение пришло с адреса, который не разрешён настройкой `allow_from`.
+///
+/// Отдельный тип нужен, чтобы сессия дала отказу свой код (`proxy_peer_rejected`),
+/// а не общий код отказа приёма: причина не в слушателе, а в том, кто пришёл.
+#[derive(Debug)]
+pub struct ProxyPeerRejected {
+    /// Адрес отвергнутой стороны без порта: порт входящего выбирает клиент, и в тексте
+    /// отказа он не нужен — одинаковые отказы должны схлопываться в одно событие.
+    pub peer: Option<IpAddr>,
+    /// Адрес, с которого принимать разрешено.
+    pub allowed: IpAddr,
+}
+
+impl std::fmt::Display for ProxyPeerRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let peer = self
+            .peer
+            .map_or_else(|| "an unrecognised address".to_owned(), |ip| ip.to_string());
+        write!(
+            f,
+            "proxy peer {peer} is not allowed: only {} may connect, the connection is closed without reaching the target",
+            self.allowed
+        )
+    }
+}
+
+impl std::error::Error for ProxyPeerRejected {}
+
+/// `true`, если ошибка источника — «входящее с неразрешённого адреса».
+#[must_use]
+pub fn is_proxy_peer_rejected(err: &io::Error) -> bool {
+    err.get_ref()
+        .is_some_and(|inner| inner.is::<ProxyPeerRejected>())
+}
+
+/// Ошибка «входящее с неразрешённого адреса» в обёртке [`io::Error`].
+///
+/// Вид ошибки — `PermissionDenied`: отказ в доступе по настройке, а не сбой сокета.
+fn peer_rejected_error(peer: Option<IpAddr>, allowed: IpAddr) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        ProxyPeerRejected { peer, allowed },
+    )
+}
+
+/// IP-адрес принятой стороны; порт входящего для фильтра не важен.
+fn peer_ip(peer: &str) -> Option<IpAddr> {
+    peer.parse::<SocketAddr>().ok().map(|addr| addr.ip())
+}
+
+/// Один и тот же адрес без IPv4-mapped префикса.
+fn same_ip(a: IpAddr, b: IpAddr) -> bool {
+    fn plain(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            IpAddr::V4(_) => ip,
+        }
+    }
+    plain(a) == plain(b)
+}
+
 /// Источник соединений сессии.
 ///
 /// `next` — единственный метод: источник либо отдаёт соединение, либо говорит, через
@@ -335,6 +396,8 @@ pub enum Source {
         role: ProxyRole,
         /// Пауза после неудачного подключения к цели.
         retry: Duration,
+        /// Принимать входящие только с этого адреса; `None` — с любого (FR-5, FR-8).
+        allow_from: Option<IpAddr>,
     },
 }
 
@@ -395,6 +458,7 @@ impl Source {
                 target,
                 role,
                 retry,
+                allow_from,
             } => {
                 // Цель стартом не проверяется: недоступная ЛИС — событие `error`,
                 // а не отказ старта (M3-AC1, M4-AC6). Проверяется только петля на себя:
@@ -415,6 +479,7 @@ impl Source {
                         target: target.clone(),
                         role: *role,
                         retry: *retry,
+                        allow_from: *allow_from,
                         connecting: JoinSet::new(),
                         listen: bound,
                         self_loop: Arc::new(AtomicBool::new(false)),
@@ -456,11 +521,29 @@ impl Source {
                 "dtr": settings.dtr,
                 "rts": settings.rts,
             }),
-            Self::Proxy { target, role, .. } => serde_json::json!({
-                "listen": local,
-                "target": target,
-                "role": role.as_str(),
-            }),
+            Self::Proxy {
+                target,
+                role,
+                allow_from,
+                ..
+            } => {
+                // Фильтр попадает в журнал, только если он включён: отсутствие поля
+                // значит «принимаю с любого адреса», как и до фильтра (M4-AC17).
+                let mut settings = serde_json::json!({
+                    "listen": local,
+                    "target": target,
+                    "role": role.as_str(),
+                });
+                if let Some(allowed) = allow_from
+                    && let Some(map) = settings.as_object_mut()
+                {
+                    map.insert(
+                        "allow_from".to_owned(),
+                        serde_json::json!(allowed.to_string()),
+                    );
+                }
+                settings
+            }
         }
     }
 }
@@ -492,6 +575,11 @@ struct ProxySource {
     target: String,
     role: ProxyRole,
     retry: Duration,
+    /// Принимать входящие только с этого адреса; `None` — с любого.
+    ///
+    /// Фильтр стоит до подключения к цели: любой узел сети, достучавшийся до порта,
+    /// иначе говорил бы с ЛИС от имени анализатора (FR-8).
+    allow_from: Option<IpAddr>,
     /// Подключения к цели, которые уже идут, и их результаты для сессии.
     connecting: JoinSet<Next>,
     /// Адрес прослушивания: по нему узнаётся петля на себя.
@@ -551,6 +639,20 @@ impl ConnectionSource for ProxySource {
                     accepted = self.accepted.next(), if self.connecting.len() < MAX_CONNECTING => {
                         match accepted {
                             Next::Connected(connection) => {
+                                // Чужой адрес: соединение закрывается сразу, к цели
+                                // bytetap не подключается, а отказ схлопывается с
+                                // остальными ошибками источника (FR-8).
+                                if let Some(allowed) = self.allow_from {
+                                    let peer = peer_ip(&connection.peer);
+                                    if !peer.is_some_and(|peer| same_ip(peer, allowed)) {
+                                        drop(connection);
+                                        return Next::Retry {
+                                            error: peer_rejected_error(peer, allowed),
+                                            after,
+                                            stage: Stage::Accept,
+                                        };
+                                    }
+                                }
                                 // Петля уже найдена: пара не создаётся, входящее
                                 // закрывается, а серия схлопывается в одно `error`.
                                 if self.self_loop.load(Ordering::Acquire) {
@@ -912,6 +1014,7 @@ mod tests {
             target: "10.0.0.5:5000".to_owned(),
             role: ProxyRole::AnalyzerClient,
             retry: Duration::from_millis(100),
+            allow_from: None,
         };
         assert_eq!(proxy.mode(), crate::journal::Mode::Proxy);
         assert_eq!(
@@ -941,6 +1044,7 @@ mod tests {
             target: target.to_string(),
             role: ProxyRole::AnalyzerClient,
             retry: Duration::from_millis(100),
+            allow_from: None,
         };
         let mut opened = source.open().await.expect("старт без цели");
         assert_ne!(
@@ -1055,6 +1159,7 @@ mod tests {
                 target: String::new(),
                 role: ProxyRole::AnalyzerClient,
                 retry: Duration::from_millis(100),
+                allow_from: None,
                 connecting: JoinSet::new(),
                 listen: bound,
                 self_loop: Arc::new(AtomicBool::new(false)),
@@ -1142,6 +1247,7 @@ mod tests {
             target: addr.to_string(),
             role: ProxyRole::AnalyzerClient,
             retry: Duration::from_millis(100),
+            allow_from: None,
         };
         let err = match source.open().await {
             Ok(_) => panic!("цель — свой же порт"),

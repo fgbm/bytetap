@@ -200,6 +200,7 @@ pub fn event_text(code: Option<&str>, message: &str, pair: Pair, repeats: Option
         Some("proxy_connect_failed") => proxy_failure_text(pair, true),
         Some("proxy_connect_timeout") => proxy_failure_text(pair, false),
         Some("proxy_target_is_self") => t!("events.proxy_target_is_self"),
+        Some("proxy_peer_rejected") => t!("events.proxy_peer_rejected"),
         Some("journal_backlog_warning") => t!("events.journal_backlog_warning"),
         _ => message,
     };
@@ -708,6 +709,14 @@ mod tests {
         let (class, text) = row_text(&error("accept_failed"), Pair::TargetLis);
         assert_eq!(class, RowClass::Error);
         assert_eq!(text, "Не удалось принять соединение — повторяю.");
+
+        // Отказ по адресу — не сломанный приём: строка называет именно причину.
+        let (class, text) = row_text(&error("proxy_peer_rejected"), Pair::TargetLis);
+        assert_eq!(class, RowClass::Error);
+        assert_eq!(
+            text,
+            "Соединение с неразрешённого адреса закрыто — жду следующее."
+        );
 
         let warning = event(FeedKind::Info {
             code: Some("journal_backlog_warning".into()),

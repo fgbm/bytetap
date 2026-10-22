@@ -172,6 +172,8 @@ pub struct AppConfig {
     pub proxy_host: String,
     /// Цель прокси: порт второй стороны; 0 — порт не набран.
     pub proxy_port: u16,
+    /// Прокси принимает входящие только с этого адреса; пусто — с любого (FR-8).
+    pub proxy_allow_from: String,
     pub serial: SerialSettings,
     pub responder: Responder,
     pub astm_nak_on_bad_checksum: bool,
@@ -192,6 +194,7 @@ impl AppConfig {
             proxy_role: ProxyMode::AnalyzerClient,
             proxy_host: DEFAULT_PROXY_HOST.to_owned(),
             proxy_port: 0,
+            proxy_allow_from: String::new(),
             serial: SerialSettings::default(),
             responder: Responder::Auto,
             astm_nak_on_bad_checksum: false,
@@ -354,6 +357,9 @@ pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig 
         proxy_role: choice(raw.get("proxyRole"), fallback.proxy_role),
         proxy_host,
         proxy_port,
+        proxy_allow_from: text(raw.get("proxyAllowFrom"), &fallback.proxy_allow_from)
+            .trim()
+            .to_owned(),
         serial: serial(raw.get("serial"), &fallback.serial),
         responder: choice(raw.get("responder"), fallback.responder),
         astm_nak_on_bad_checksum: flag(

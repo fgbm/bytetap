@@ -794,6 +794,47 @@ fn the_proxy_address_errors_keep_their_own_fields() {
     harness.get_by_label("Адрес цели указан неверно: нужен IPv4-адрес или имя.");
 }
 
+/// Фильтр по адресу входа в «Дополнительно» шага прокси: поле, подсказка и разбор
+/// адреса — на шаге, а не только в настройках (FR-8).
+#[test]
+fn the_proxy_more_has_the_peer_filter() {
+    let mut harness = harness_with(
+        proxy_settings(false, ProxyMode::AnalyzerClient),
+        None,
+        Screen::Step(SessionMode::Proxy),
+        WINDOW,
+        |app| app.with_more(),
+    );
+    harness.get_by_role_and_label(Role::TextInput, "Принимать только с адреса");
+    harness.get_by_label(
+        "Пусто — принимать с любого адреса сети. Для топологии «анализатор подключается к ЛИС» — IP анализатора, для обратной — IP ЛИС.",
+    );
+
+    // Неразборчивый адрес: ошибка у своего поля, а не у цели или интерфейса.
+    type_into(
+        &mut harness,
+        "Принимать только с адреса",
+        "192.168.1.51:5000",
+    );
+    harness.get_by_label("Адрес — IPv4 или IPv6 без порта, например 192.168.1.51.");
+    assert!(
+        harness.query_by_label("Укажите адрес ЛИС").is_none(),
+        "цель заполнена — её ошибка не всплывает"
+    );
+    // Набранное доходит до настроек как есть: адрес проверяется формой при вводе,
+    // а «Старт» с неверным адресом сессию не собирает.
+    assert_eq!(
+        harness.state().settings().config.proxy_allow_from,
+        "192.168.1.51:5000"
+    );
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    assert!(
+        harness.state().pending_session().is_none(),
+        "с неверным адресом сессия не собирается"
+    );
+}
+
 /// Прокси: поля проверяются до старта — порт прослушивания, адрес и порт цели; ошибка
 /// встаёт под своим полем, а сборка конфигурации несёт топологию и цель (M4-AC13).
 #[test]
@@ -838,6 +879,7 @@ fn the_proxy_form_checks_its_fields_and_builds_the_config() {
             target: "10.0.0.5:5000".into(),
             role: bytetap_core::transport::ProxyRole::AnalyzerClient,
             retry: bytetap_app::form::PROXY_RETRY,
+            allow_from: None,
         }
     );
     assert_eq!(

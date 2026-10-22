@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -156,6 +156,10 @@ struct CaptureArgs {
         value_parser = ["analyzer-client", "analyzer-server"]
     )]
     role: Option<String>,
+    /// Принимать входящие только с этого адреса, например `192.168.1.51`;
+    /// без флага — с любого адреса сети
+    #[arg(long, value_name = "IP", requires = "proxy")]
+    allow_from: Option<IpAddr>,
     /// Скорость порта: 1…4 000 000, типовые 300–115200
     #[arg(
         long,
@@ -317,9 +321,16 @@ fn capture(args: CaptureArgs) -> ExitCode {
                 ProxyRole::AnalyzerClient => "анализатор — клиент",
                 ProxyRole::AnalyzerServer => "анализатор — сервер",
             };
+            // Фильтр по адресу (FR-8): без него любой узел сети, достучавшийся до порта,
+            // говорит с ЛИС от имени анализатора.
+            let filter = match args.allow_from {
+                Some(allowed) => format!(", только с {allowed}"),
+                None => String::new(),
+            };
             (
-                SessionConfig::proxy(*proxy, to.clone(), role, PROXY_RETRY),
-                format!("Слушаю {proxy} → {to} ({title})"),
+                SessionConfig::proxy(*proxy, to.clone(), role, PROXY_RETRY)
+                    .with_allow_from(args.allow_from),
+                format!("Слушаю {proxy} → {to} ({title}){filter}"),
             )
         }
         // clap требует ровно один источник: сюда не попадает ни один набор аргументов.
@@ -876,6 +887,7 @@ fn stress_journal(out: &Path, max_seconds: u64) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytetap_core::transport::Source;
     use clap::CommandFactory;
 
     #[test]
@@ -1187,6 +1199,75 @@ mod tests {
         assert!(with_listen.is_err(), "два источника одновременно");
     }
 
+    /// Фильтр по адресу входа (FR-8): один IP, только с `--proxy`.
+    #[test]
+    fn capture_takes_one_allowed_address() {
+        let parsed = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--proxy",
+            "0.0.0.0:50025",
+            "--to",
+            "10.0.0.5:5000",
+            "--role",
+            "analyzer-client",
+            "--allow-from",
+            "192.168.1.51",
+        ])
+        .expect("адрес разбирается");
+        let Command::Capture(args) = parsed.command else {
+            panic!("ожидался capture");
+        };
+        assert_eq!(
+            args.allow_from,
+            Some("192.168.1.51".parse::<IpAddr>().unwrap())
+        );
+        let config = SessionConfig::proxy(
+            "0.0.0.0:50025".parse().unwrap(),
+            "10.0.0.5:5000".to_owned(),
+            ProxyRole::AnalyzerClient,
+            PROXY_RETRY,
+        )
+        .with_allow_from(args.allow_from);
+        assert_eq!(
+            config.source,
+            Source::Proxy {
+                listen: "0.0.0.0:50025".parse().unwrap(),
+                target: "10.0.0.5:5000".into(),
+                role: ProxyRole::AnalyzerClient,
+                retry: PROXY_RETRY,
+                allow_from: Some("192.168.1.51".parse().unwrap()),
+            }
+        );
+
+        for bad in ["192.168.1.51:5000", "192.168.1", "", "lis"] {
+            let parsed = Cli::try_parse_from([
+                "bytetap-cli",
+                "capture",
+                "--proxy",
+                "0.0.0.0:50025",
+                "--to",
+                "10.0.0.5:5000",
+                "--role",
+                "analyzer-client",
+                "--allow-from",
+                bad,
+            ]);
+            assert!(parsed.is_err(), "`{bad}` — не IP-адрес");
+        }
+
+        // Без `--proxy` фильтру нечего фильтровать.
+        let with_listen = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--listen",
+            "0.0.0.0:5000",
+            "--allow-from",
+            "192.168.1.51",
+        ]);
+        assert!(with_listen.is_err(), "--allow-from только с --proxy");
+    }
+
     #[test]
     fn the_proxy_flags_are_described_in_help() {
         let capture = Cli::command()
@@ -1194,7 +1275,7 @@ mod tests {
             .expect("команда capture")
             .render_help()
             .to_string();
-        for flag in ["--proxy", "--to", "--role"] {
+        for flag in ["--proxy", "--to", "--role", "--allow-from"] {
             assert!(capture.contains(flag), "в справке нет {flag}: {capture}");
         }
     }

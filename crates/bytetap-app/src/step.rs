@@ -816,8 +816,12 @@ impl BytetapApp {
                 self.interface_field(ui, p, error);
                 ui.add_space(SPACE_3);
             }
-            // В прокси интерфейс стоит рядом с портом: в «Дополнительно» его нет.
-            SessionMode::Proxy => {}
+            // В прокси интерфейс стоит рядом с портом: в «Дополнительно» его нет,
+            // зато здесь фильтр по адресу входящего (FR-8).
+            SessionMode::Proxy => {
+                self.allow_from_field(ui, p);
+                ui.add_space(SPACE_3);
+            }
             SessionMode::TcpClient => {
                 self.row(
                     ui,
@@ -970,6 +974,45 @@ impl BytetapApp {
                 self.settings_mut().config.listen_host = hosts[index].clone();
             }
         });
+    }
+
+    /// Фильтр по адресу входящего: пусто — принимать с любого (FR-8).
+    ///
+    /// Без фильтра любой узел сети, достучавшийся до порта, говорит с ЛИС от имени
+    /// анализатора, поэтому поле стоит в «Дополнительно» и подсказкой называет, чей
+    /// адрес вписывать в каждой топологии.
+    fn allow_from_field(&mut self, ui: &mut Ui, p: &Palette) {
+        let error = self.error_text(ErrorField::AllowFrom);
+        field(
+            ui,
+            p,
+            t!("form.allowFrom"),
+            error.as_deref(),
+            |ui, label| {
+                let look = FieldLook {
+                    mono: true,
+                    error: error.is_some(),
+                    ..FieldLook::default()
+                };
+                let response = widgets::text_input(
+                    ui,
+                    p,
+                    Id::unique("bt-allow-from"),
+                    &mut self.form.proxy_allow_from,
+                    label,
+                    t!("form.allowFromPlaceholder"),
+                    look,
+                );
+                if response.changed() {
+                    self.form.touched.allow_from = true;
+                    self.settings_mut().config.proxy_allow_from =
+                        self.form.proxy_allow_from.trim().to_owned();
+                }
+            },
+        );
+        if error.is_none() {
+            widgets::hint(ui, p, t!("form.allowFromHint"));
+        }
     }
 
     /// Папка журналов только для чтения и «Выбрать»; ниже — ошибка или предупреждение.

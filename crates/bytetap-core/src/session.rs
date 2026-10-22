@@ -31,7 +31,7 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -53,7 +53,7 @@ use crate::journal::{
 use crate::responder::{Action, ControlIdSource, Now, Responder, ResponderEvent, ResponderKind};
 use crate::transport::{
     Connection, ConnectionSource, Link, Next, ProxyRole, ResetSocket, Source, Stage, Transport,
-    is_proxy_target_is_self,
+    is_proxy_peer_rejected, is_proxy_target_is_self,
 };
 
 /// Сколько событий держат каналы подписчиков.
@@ -251,6 +251,7 @@ impl SessionConfig {
                 target: target.into(),
                 role,
                 retry,
+                allow_from: None,
             },
             responder: Autoresponder::None,
             astm_nak_on_bad_checksum: false,
@@ -264,6 +265,21 @@ impl SessionConfig {
     #[must_use]
     pub fn with_source(mut self, source: Source) -> Self {
         self.source = source;
+        self
+    }
+
+    /// Прокси принимает входящие только с адреса `allow_from`; `None` — с любого (FR-8).
+    ///
+    /// Действует только на прокси: у других источников такого поля нет, и вызов ничего
+    /// не меняет. Входящее с чужого адреса закрывается до подключения к цели.
+    #[must_use]
+    pub fn with_allow_from(mut self, allow_from: Option<IpAddr>) -> Self {
+        if let Source::Proxy {
+            allow_from: field, ..
+        } = &mut self.source
+        {
+            *field = allow_from;
+        }
         self
     }
 
@@ -986,6 +1002,11 @@ fn after_failure(mode: Mode) -> &'static str {
 fn source_failure_code(mode: Mode, code: &'static str, error: &io::Error) -> &'static str {
     if is_proxy_target_is_self(error) {
         return "proxy_target_is_self";
+    }
+    // Входящее с неразрешённого адреса — не сломанный приём: слушатель в порядке,
+    // а отказано тому, кто пришёл (FR-8).
+    if is_proxy_peer_rejected(error) {
+        return "proxy_peer_rejected";
     }
     match (mode, error.kind()) {
         (Mode::Proxy, io::ErrorKind::TimedOut) => "proxy_connect_timeout",

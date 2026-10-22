@@ -5,7 +5,7 @@
 //! и в мосте Tauri (`app/src-tauri/src/bridge.rs`, `into_bridge`): ядро получает только
 //! поля выбранного режима, а неверные значения отвергаются до создания журнала.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -84,6 +84,40 @@ pub fn check_baud(text: &str) -> Option<u32> {
 /// Интервал переподключения из поля: не число — 0, как `Number(value) || 0` в Vue.
 pub fn parse_reconnect(text: &str) -> u32 {
     text.trim().parse().unwrap_or(0)
+}
+
+/// Что не так с адресом фильтра прокси.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressProblem {
+    /// Ни IPv4, ни IPv6.
+    Format,
+}
+
+impl AddressProblem {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Format => t!("errors.allow_from_invalid"),
+        }
+    }
+}
+
+/// Адрес, с которого прокси принимает входящие (FR-8).
+///
+/// Пустая строка — фильтра нет, `Ok(None)`: так поле и открывается у нового профиля.
+/// Принимается IPv4 и IPv6 без порта: порт входящего выбирает клиент, и задавать его
+/// в настройке бессмысленно.
+///
+/// # Errors
+///
+/// Строка не разбирается как IP-адрес.
+pub fn check_allow_from(text: &str) -> Result<Option<IpAddr>, AddressProblem> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<IpAddr>()
+        .map(Some)
+        .map_err(|_| AddressProblem::Format)
 }
 
 fn parity_letter(parity: Parity) -> char {
@@ -173,6 +207,8 @@ pub struct Touched {
     pub serial: bool,
     /// Порт цели прокси: своё поле — своя ошибка.
     pub target_port: bool,
+    /// Фильтр по адресу: своё поле — своя ошибка.
+    pub allow_from: bool,
 }
 
 /// Текст полей формы: то, что набрано, а не то, что уже принято в настройки.
@@ -186,6 +222,8 @@ pub struct FormState {
     pub proxy_host: String,
     /// Порт цели прокси.
     pub proxy_port_text: String,
+    /// Адрес, с которого прокси принимает входящие; пусто — с любого (FR-8).
+    pub proxy_allow_from: String,
     /// Адреса этого компьютера: интерфейсы и loopback. По ним проверяется, что порт цели
     /// не указывает на собственный порт bytetap — иначе bytetap подключится сам к себе.
     pub own_addresses: Vec<String>,
@@ -213,6 +251,7 @@ impl FormState {
             connect_port_text: String::new(),
             proxy_host: String::new(),
             proxy_port_text: String::new(),
+            proxy_allow_from: String::new(),
             own_addresses: Vec::new(),
             reconnect_text: String::new(),
             baud_text: String::new(),
@@ -239,6 +278,7 @@ impl FormState {
         } else {
             cfg.proxy_port.to_string()
         };
+        self.proxy_allow_from = cfg.proxy_allow_from.clone();
         self.reconnect_text = cfg.reconnect_sec.to_string();
         self.baud_text = cfg.serial.baud.to_string();
         self.baud_other = !BAUD_RATES.contains(&cfg.serial.baud);
@@ -288,6 +328,7 @@ impl FormState {
                 ErrorField::Port => self.touched.port,
                 ErrorField::Address => self.touched.address,
                 ErrorField::TargetPort => self.touched.target_port,
+                ErrorField::AllowFrom => self.touched.allow_from,
                 ErrorField::Serial => self.touched.serial,
                 // Ошибка интерфейса приходит только от старта; своя проверка не нужна.
                 ErrorField::Interface | ErrorField::LogDir | ErrorField::Start => false,
@@ -327,6 +368,9 @@ impl FormState {
                     .target_is_own_port(cfg)
                     .then(|| t!("form.targetPortOwn")),
             },
+            ErrorField::AllowFrom => check_allow_from(&self.proxy_allow_from)
+                .err()
+                .map(AddressProblem::text),
             ErrorField::Serial => {
                 if Self::serial_port_missing(cfg) {
                     Some(t!("form.serialRequired"))
@@ -351,6 +395,7 @@ impl FormState {
                 check_port(&self.port_text).is_ok()
                     && check_port(&self.proxy_port_text).is_ok()
                     && !self.proxy_host.trim().is_empty()
+                    && check_allow_from(&self.proxy_allow_from).is_ok()
                     && !self.target_is_own_port(cfg)
             }
             SessionMode::Serial => {
@@ -372,6 +417,7 @@ impl FormState {
         }
         cfg.connect_host = self.connect_host.trim().to_owned();
         cfg.proxy_host = self.proxy_host.trim().to_owned();
+        cfg.proxy_allow_from = self.proxy_allow_from.trim().to_owned();
         cfg.reconnect_sec = parse_reconnect(&self.reconnect_text);
         if let Some(baud) = self.baud_value(cfg) {
             cfg.serial.baud = baud;
@@ -520,12 +566,23 @@ pub fn session_config(
         ),
         // Прокси — четвёртый источник (FR-5): слушать одну сторону и подключаться к
         // другой. Автоответчика в нём нет, `with_responder` ниже на прокси не действует.
-        SessionMode::Proxy => SessionConfig::proxy(
-            listen_addr(&cfg.listen_host, cfg.listen_port)?,
-            connect_addr(&cfg.proxy_host, cfg.proxy_port)?,
-            proxy_role(cfg.proxy_role),
-            PROXY_RETRY,
-        ),
+        SessionMode::Proxy => {
+            // Форма не пустит «Старт» с неразборчивым адресом; здесь — тот же разбор
+            // для настроек, пришедших из файла.
+            let allow_from = check_allow_from(&cfg.proxy_allow_from).map_err(|_| {
+                StartError::new(
+                    ErrorCode::AddressInvalid,
+                    "the peer filter is not an IP address",
+                )
+            })?;
+            SessionConfig::proxy(
+                listen_addr(&cfg.listen_host, cfg.listen_port)?,
+                connect_addr(&cfg.proxy_host, cfg.proxy_port)?,
+                proxy_role(cfg.proxy_role),
+                PROXY_RETRY,
+            )
+            .with_allow_from(allow_from)
+        }
     }
     .with_responder(responder(cfg.responder))
     .with_astm_nak(cfg.astm_nak_on_bad_checksum);
@@ -758,6 +815,7 @@ mod tests {
                 target: "10.0.0.5:5000".into(),
                 role: ProxyRole::AnalyzerClient,
                 retry: PROXY_RETRY,
+                allow_from: None,
             }
         );
         // Автоответчика в прокси нет всегда, какой бы профиль ни стоял в настройках:
@@ -776,6 +834,7 @@ mod tests {
                 target: "192.168.1.51:5000".into(),
                 role: ProxyRole::AnalyzerServer,
                 retry: PROXY_RETRY,
+                allow_from: None,
             }
         );
 
@@ -795,6 +854,69 @@ mod tests {
         let error = session_config(&cfg, None).expect_err("пробел в адресе");
         assert_eq!(error.code, ErrorCode::AddressInvalid);
         assert_eq!(error.field(cfg.mode), ErrorField::Address);
+    }
+
+    /// Фильтр по адресу (FR-8): пусто — принимать с любого, неразборчивый адрес — своя
+    /// ошибка у своего поля, а не у цели или интерфейса.
+    #[test]
+    fn the_peer_filter_takes_one_ip_address() {
+        let mut cfg = config(SessionMode::Proxy);
+        cfg.proxy_host = "10.0.0.5".into();
+        cfg.proxy_port = 5000;
+        let mut form = FormState::new(&cfg);
+        // Пустое поле — фильтра нет, «Старт» не ждёт адреса.
+        assert_eq!(check_allow_from(""), Ok(None));
+        assert_eq!(check_allow_from("  "), Ok(None));
+        assert!(form.valid(&cfg));
+        assert_eq!(form.local_error(&cfg, ErrorField::AllowFrom), None);
+
+        // Порт в фильтре не принимается: порт входящего выбирает клиент.
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::AllowFrom),
+            None,
+            "ошибка молчит, пока поле не трогали"
+        );
+        form.proxy_allow_from = "192.168.1.51:5000".into();
+        form.touched.allow_from = true;
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::AllowFrom),
+            Some("Адрес — IPv4 или IPv6 без порта, например 192.168.1.51.")
+        );
+        assert!(
+            !form.valid(&cfg),
+            "с таким адресом «Старт» не собирает сессию"
+        );
+
+        form.proxy_allow_from = " 192.168.1.51 ".into();
+        assert_eq!(form.local_error(&cfg, ErrorField::AllowFrom), None);
+        assert!(form.valid(&cfg));
+
+        // Найдено в настройки и в конфигурацию ядра — тем же адресом.
+        form.commit(&mut cfg);
+        assert_eq!(cfg.proxy_allow_from, "192.168.1.51");
+        let core = session_config(&cfg, None).expect("прокси с фильтром");
+        assert_eq!(
+            core.source,
+            Source::Proxy {
+                listen: "0.0.0.0:5000".parse().unwrap(),
+                target: "10.0.0.5:5000".into(),
+                role: ProxyRole::AnalyzerClient,
+                retry: PROXY_RETRY,
+                allow_from: Some("192.168.1.51".parse().unwrap()),
+            }
+        );
+
+        // IPv6 годится как есть, без скобок: это адрес, а не HOST:PORT.
+        form.proxy_allow_from = "fe80::1".into();
+        form.commit(&mut cfg);
+        let core = session_config(&cfg, None).expect("прокси с IPv6");
+        assert!(matches!(
+            &core.source,
+            Source::Proxy {
+                allow_from: Some(IpAddr::V6(_)),
+                ..
+            }
+        ));
     }
 
     /// Поля прокси: порт прослушивания, адрес цели и порт цели — каждое со своей
