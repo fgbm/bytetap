@@ -31,7 +31,7 @@ use crate::settings::{LoadWarning, SessionMode, Settings, Store, ThemeMode, Wind
 use crate::theme::tokens::{SPACE_2, SPACE_3, SPACE_5, TEXT_XS};
 use crate::theme::{self, Palette, mix};
 use crate::viewing::JournalView;
-use crate::{diag, t, titlebar, widgets};
+use crate::{diag, hooks, t, titlebar, widgets};
 
 /// Сколько последних записей показывает стартовый экран.
 pub const RECENT_SHOWN: usize = 3;
@@ -57,7 +57,12 @@ pub fn take_close_notice() -> Option<String> {
 }
 
 /// Тестовый хук смоука записи (CI): `tcp_server:127.0.0.1:0` — запись стартует сразу.
+/// Читается только вместе с [`HOOKS_ENV`], как и остальные тестовые ключи.
 pub const AUTOSTART_ENV: &str = "BYTETAP_TEST_AUTOSTART";
+
+/// Тестовый хук паники первого кадра (CI, NFR-3): окно о сбое и запись в журнал
+/// запуска. Читается только вместе с [`HOOKS_ENV`].
+pub const PANIC_ENV: &str = "BYTETAP_TEST_PANIC";
 
 /// Тестовый хук снимков для согласования (CI, U1-AC21): экран и тема снимка,
 /// `BYTETAP_TEST_SCREEN=recording-hex-dark`. Читается только вместе с
@@ -69,6 +74,7 @@ pub const SCREEN_ENV: &str = "BYTETAP_TEST_SCREEN";
 pub const HOOKS_ENV: &str = "BYTETAP_TEST_HOOKS";
 
 /// Журнал для снимка просмотра: файл, который откроется на экране просмотра.
+/// Читается только вместе с [`HOOKS_ENV`], как и остальные тестовые ключи.
 pub const JOURNAL_ENV: &str = "BYTETAP_TEST_JOURNAL";
 
 /// Промежуток между кадрами, который ещё считается кадром, а не паузой: свёрнутое или
@@ -268,15 +274,17 @@ pub struct BytetapApp {
     /// Кадров нарисовано с начала записи: итог уходит в журнал запуска при остановке
     /// (NFR-5: сколько кадров стоила сессия).
     frames: u64,
-    /// Скользящее среднее цены кадра записи: по нему окно выбирает период следующего
+    /// Цена кадра записи и её сглаживание: по ней окно выбирает период следующего
     /// (`live::next_period`). Меряется только во время записи: в простое окно спит по
     /// своему таймеру, и промежуток между кадрами — не цена кадра.
-    frame_cost: Duration,
+    frame_cost: live::FrameBudget,
     /// Промежуток, который окно попросило в прошлом кадре: без него не отделить
     /// ожидание по таймеру от работы над кадром.
     frame_delay: Option<Duration>,
     /// Когда начался прошлый кадр — по часам, а не по `unstable_dt` egui.
     frame_started: Option<Instant>,
+    /// Сколько длился прошлый кадр: от начала `ui` до её конца, то есть работа окна.
+    frame_work: Duration,
 }
 
 impl BytetapApp {
@@ -353,9 +361,10 @@ impl BytetapApp {
             frame_applied: false,
             hook_menu: None,
             frames: 0,
-            frame_cost: Duration::ZERO,
+            frame_cost: live::FrameBudget::default(),
             frame_delay: None,
             frame_started: None,
+            frame_work: Duration::ZERO,
         };
         app.preselect_last_card();
         app.interfaces = Loaded::Loading(Task::spawn(ctx, background::list_interfaces));
@@ -1255,6 +1264,10 @@ impl BytetapApp {
         }
         self.phase = live::reduce(self.phase, Action::StartRequested);
         self.frames = 0;
+        self.frame_cost.reset();
+        self.frame_delay = None;
+        self.frame_started = None;
+        self.frame_work = Duration::ZERO;
         self.journal_failure = None;
         diag::info(format!("старт записи: {}", describe(&config.source)));
         let repaint = ctx.clone();
@@ -1383,10 +1396,10 @@ impl BytetapApp {
                     self.frames as f64 / seconds
                 ));
                 // Цена кадра и период: по ним видно, почему кадров столько (NFR-5).
-                let period = live::next_period(crate::gpu::software(), self.frame_cost);
+                let period = live::next_period(crate::gpu::software(), self.frame_cost.cost());
                 diag::info(format!(
                     "цена кадра записи: {} мс, период запроса кадра {} мс",
-                    self.frame_cost.as_millis(),
+                    self.frame_cost.cost().as_millis(),
                     period.as_millis()
                 ));
             }
@@ -1693,14 +1706,20 @@ impl BytetapApp {
             if self.live.is_some() {
                 // Период кадра выбирается по цене прошлых кадров: аппаратный растр
                 // держит 30 кадров в секунду, WARP — 10 и реже (NFR-5, U1-AC24).
-                let period = live::next_period(crate::gpu::software(), self.frame_cost);
+                let period = self.frame_period();
                 live::set_repaint_period(period);
                 // Новые строки — по периоду кадра. Без новых событий трассу и ленту
-                // перерисовывать незачем: раз в секунду идут таймер и пульс «Стоп».
+                // перерисовывать незачем: кадр идёт к смене секунды таймера, и он же
+                // несёт пульс «Стоп» (U1-AC24). Кадр к целой секунде не даёт подписи
+                // перескакивать: `elapsed` показан ровно раз на секунду.
                 let delay = if added > 0 {
                     period
                 } else {
-                    live::FRAME_SLOWEST
+                    let elapsed = self
+                        .rec
+                        .as_ref()
+                        .map_or(Duration::ZERO, |rec| rec.elapsed());
+                    live::next_second(elapsed).max(live::FRAME)
                 };
                 self.frame_delay = Some(delay);
                 ctx.request_repaint_after(delay);
@@ -1833,36 +1852,38 @@ impl BytetapApp {
         }
     }
 
-    /// Цена кадра записи: промежуток между кадрами минус то, что окно просило подождать.
+    /// Период кадра записи: потолок по адаптеру и по цене прошлых кадров.
+    pub(crate) fn frame_period(&self) -> Duration {
+        live::next_period(crate::gpu::software(), self.frame_cost.cost())
+    }
+
+    /// Цена кадра записи: время самого кадра — работа окна плюс ожидание презентации.
     ///
-    /// Меряется по часам, а не по `unstable_dt` egui: в тестах и на первом кадре он
-    /// равен предсказанному, а не прожитому. Когда окно не успевает за своим периодом,
-    /// промежуток и есть цена кадра.
-    fn measure_frame_cost(&mut self) {
-        let now = Instant::now();
-        let last = self.frame_started.replace(now);
-        let (Some(last), Some(delay)) = (last, self.frame_delay) else {
-            return;
-        };
+    /// Промежуток между кадрами годится для этого, только когда окно выждало свой
+    /// период целиком: раннее пробуждение (фрагмент ленты, ответ задачи) говорит о
+    /// событии, а не о кадре, и в цену не идёт (см. [`live::present_wait`]). Работа
+    /// меряется по часам, а не по `unstable_dt` egui: в тестах и на первом кадре он
+    /// равен предсказанному, а не прожитому. `started` — начало кадра, `work` — его
+    /// длительность.
+    fn measure_frame_cost(&mut self, started: Instant, work: Duration) {
+        let spacing = self
+            .frame_started
+            .replace(started)
+            .map(|last| started.saturating_duration_since(last));
         // Только запись: в простое окно спит по своему таймеру, и промежуток между
         // кадрами — не цена кадра.
         if self.live.is_none() {
+            self.frame_cost.reset();
+            self.frame_work = work;
             return;
         }
-        let spacing = now.saturating_duration_since(last);
         // Свёрнутое окно кадров не рисует: промежуток в секунды — не цена кадра.
-        if spacing > delay + MAX_GAP {
-            return;
-        }
-        let cost = live::frame_cost(spacing, delay);
-        // Вверх — сразу, вниз — медленно: медленный кадр виден по первому же замеру, и
-        // окно не тратит секунды, догоняя среднее; быстрый кадр после одного медленного
-        // (загрузка шрифтов, первый показ) режим не переключает.
-        self.frame_cost = if cost >= self.frame_cost {
-            cost
-        } else {
-            self.frame_cost.mul_f32(0.875) + cost.mul_f32(0.125)
-        };
+        let spacing = spacing.filter(|spacing| {
+            self.frame_delay
+                .is_none_or(|delay| *spacing <= delay + MAX_GAP)
+        });
+        self.frame_cost.sample(spacing, self.frame_delay, work);
+        self.frame_work = work;
     }
 }
 
@@ -1912,7 +1933,7 @@ impl eframe::App for BytetapApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let probe = crate::probe::frame_start();
-        self.measure_frame_cost();
+        let frame_started = Instant::now();
         if !self.ready
             && let Some(state) = frame.wgpu_render_state()
         {
@@ -1923,8 +1944,8 @@ impl eframe::App for BytetapApp {
             ));
         }
         // Смоук окна о сбое в CI (NFR-3): паника главного потока в первом кадре.
-        if !self.ready && std::env::var_os("BYTETAP_TEST_PANIC").is_some_and(|v| v == "1") {
-            panic!("BYTETAP_TEST_PANIC=1: test panic in the first frame");
+        if !self.ready && hooks::flag(crate::app::PANIC_ENV) {
+            panic!("{}: test panic in the first frame", crate::app::PANIC_ENV);
         }
         self.follow_system_theme(&ctx);
         if self.ready {
@@ -1962,6 +1983,9 @@ impl eframe::App for BytetapApp {
             self.ready = true;
             diag::info("интерфейс готов");
         }
+        // Работа над кадром — время до `frame_end`: она и есть та часть цены кадра,
+        // которую окно знает про себя (остальное — ожидание презентации).
+        self.measure_frame_cost(frame_started, frame_started.elapsed());
         crate::probe::frame_end(&ctx, frame, probe);
     }
 

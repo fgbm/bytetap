@@ -11,7 +11,8 @@
 //! (`BYTETAP_TEST_PROBE_MODE`: `full`, `empty`, `no-icons`), режим представления
 //! (`BYTETAP_TEST_PROBE_PRESENT`), число сэмплов MSAA (`BYTETAP_TEST_PROBE_MSAA`),
 //! желаемую задержку кадров (`BYTETAP_TEST_PROBE_LATENCY`) и размер окна
-//! (`BYTETAP_TEST_PROBE_SIZE=ШxВ`). Без `BYTETAP_TEST_PROBE` они не читаются.
+//! (`BYTETAP_TEST_PROBE_SIZE=ШxВ`). Все ключи, включая саму пробу, читаются только
+//! вместе с `BYTETAP_TEST_HOOKS=1` (`hooks.rs`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,8 +71,12 @@ static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
 
 /// Прочитанный ключ окружения и запись режима в журнал запуска — до создания окна.
 pub fn start() {
-    MODE.set(std::env::var(MODE_ENV).unwrap_or_else(|_| FULL.into()))
-        .ok();
+    MODE.set(
+        crate::hooks::var(MODE_ENV)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| FULL.into()),
+    )
+    .ok();
     let seconds = seconds();
     ON.store(true, Ordering::Relaxed);
     *PROBE.lock().unwrap_or_else(PoisonError::into_inner) = Some(Probe::new(seconds));
@@ -110,8 +115,7 @@ pub fn mode() -> &'static str {
 /// Сколько секунд мерить: из `BYTETAP_TEST_PROBE`, по умолчанию [`DEFAULT_SECONDS`].
 #[must_use]
 pub fn seconds() -> u64 {
-    std::env::var(ENV)
-        .ok()
+    crate::hooks::var(ENV)
         .and_then(|value| value.trim().parse().ok())
         .filter(|seconds| *seconds > 0)
         .unwrap_or(DEFAULT_SECONDS)
@@ -120,7 +124,7 @@ pub fn seconds() -> u64 {
 /// Размер окна для замера из [`SIZE_ENV`]: `640x480`.
 #[must_use]
 pub fn size() -> Option<[f32; 2]> {
-    parse_size(&std::env::var(SIZE_ENV).ok()?)
+    parse_size(&crate::hooks::var(SIZE_ENV)?)
 }
 
 /// Размер окна из строки вида `640x480` (латинская или русская «х»).
@@ -132,17 +136,19 @@ fn parse_size(value: &str) -> Option<[f32; 2]> {
 /// Период кадра пробы из [`PERIOD_ENV`]: `None` — кадр просится сразу.
 #[must_use]
 pub fn period() -> Option<Duration> {
-    std::env::var(PERIOD_ENV)
-        .ok()
+    crate::hooks::var(PERIOD_ENV)
         .and_then(|value| value.trim().parse().ok())
         .filter(|millis: &u64| *millis > 0)
         .map(Duration::from_millis)
 }
 
 /// Ждать ли GPU в начале кадра: [`POLL_ENV`] `0` выключает ожидание.
+///
+/// По умолчанию ожидание включено: ожидание GPU в начале кадра — часть цены кадра, и
+/// проба без него мерила бы не то, что видит окно.
 #[must_use]
 pub fn polling() -> bool {
-    std::env::var(POLL_ENV).is_ok_and(|value| value.trim() != "0")
+    crate::hooks::var(POLL_ENV).is_none_or(|value| value.trim() != "0")
 }
 
 /// Начало кадра пробы: `None`, когда проба выключена.
@@ -369,5 +375,15 @@ mod tests {
         assert_eq!(parse_size(" 800х600 "), Some([800.0, 600.0]));
         assert_eq!(parse_size("800"), None);
         assert_eq!(parse_size("широкоxвысоко"), None);
+    }
+
+    /// Ожидание GPU в начале кадра включено по умолчанию: ключ только выключает его.
+    /// Без ожидания проба мерила бы не то, что видит окно (находка ревью шага 5).
+    #[test]
+    fn the_gpu_polling_is_on_by_default() {
+        assert!(
+            polling(),
+            "без BYTETAP_TEST_PROBE_POLL проба ждёт GPU в начале кадра"
+        );
     }
 }

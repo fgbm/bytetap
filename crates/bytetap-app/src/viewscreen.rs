@@ -14,7 +14,9 @@ use eframe::egui::{
 use bytetap_core::journal::view::DENSITY_BUCKETS;
 
 use crate::app::BytetapApp;
-use crate::feedrows::{HEX_ROW_HEIGHT, TEXT_ROW_HEIGHT, error_row, hex_row, pending_row, text_row};
+use crate::feedrows::{
+    HEX_ROW_HEIGHT, TEXT_ROW_HEIGHT, error_row, hex_row, pending_row, text_row, truncated,
+};
 use crate::icons::{self, Icon};
 use crate::settings::{Encoding, FeedView};
 use crate::theme::tokens::{RADIUS_CHIP, SPACE_2, SPACE_3, TEXT_2XS, TEXT_XS};
@@ -67,22 +69,49 @@ pub fn title_bar(app: &mut BytetapApp, ui: &mut Ui) {
             if widgets::icon_button(ui, &p, Icon::X, 16.0, t!("journal.close")).clicked() {
                 app.close_journal();
             }
-            // Имя файла моноширинным, метаданные — приглушённым.
-            let mut job = egui::text::LayoutJob::simple_singleline(
-                name.clone(),
-                theme::mono(TEXT_XS),
-                p.text,
-            );
-            job.wrap = egui::text::TextWrapping::truncate_at_width(320.0);
-            let galley = ui.painter().layout_job(job);
-            let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
+            // Имя файла моноширинным, метаданные — приглушённым. Оба обрезаются «…» по
+            // остатку шапки: длинный анализатор в узком окне не выталкивает кнопки окна
+            // за край (находка ревью шага 5). Полный текст — в подсказке и AccessKit.
+            let name_font = theme::mono(TEXT_XS);
+            let meta_font = theme::sans(TEXT_XS);
+            let meta_text = format!("· {meta}");
+            let full_name = ui
+                .painter()
+                .layout_no_wrap(name.clone(), name_font.clone(), p.text);
+            let full_meta =
+                ui.painter()
+                    .layout_no_wrap(meta_text.clone(), meta_font.clone(), p.text_muted);
+            let available = ui.available_width().max(0.0);
+            // Имя файла и метаданные делят остаток: имя — не больше половины, чтобы
+            // длинный анализатор не оставлял от имени одно «…». Имя журнала — одно
+            // длинное слово без пробелов, поэтому и «…» по остатку ширины.
+            let name_fits = full_name.size().x + full_meta.size().x + SPACE_2 <= available;
+            let name_width = if name_fits {
+                full_name.size().x
+            } else {
+                available * 0.45
+            };
+            let job = egui::text::LayoutJob::simple_singleline(name.clone(), name_font, p.text);
+            let name_galley = truncated(ui, job, name_width);
+            let (rect, response) = ui.allocate_exact_size(name_galley.size(), Sense::hover());
             response.widget_info(|| WidgetInfo::labeled(Role::Label, true, &name));
-            ui.painter().galley(rect.min, galley, p.text);
-            ui.label(
-                egui::RichText::new(format!("· {meta}"))
-                    .size(TEXT_XS)
-                    .color(p.text_muted),
+            if full_name.size().x > name_width {
+                response.on_hover_text(&name);
+            }
+            ui.painter().galley(rect.min, name_galley, p.text);
+            let meta_width = (available - name_width - SPACE_2).max(0.0);
+            let job = egui::text::LayoutJob::simple_singleline(
+                meta_text.clone(),
+                meta_font,
+                p.text_muted,
             );
+            let meta_galley = truncated(ui, job, meta_width);
+            let (rect, response) = ui.allocate_exact_size(meta_galley.size(), Sense::hover());
+            response.widget_info(|| WidgetInfo::labeled(Role::Label, true, &meta));
+            if full_meta.size().x > meta_width {
+                response.on_hover_text(&meta_text);
+            }
+            ui.painter().galley(rect.min, meta_galley, p.text_muted);
         },
         |app, ui| {
             let p = app.pal();

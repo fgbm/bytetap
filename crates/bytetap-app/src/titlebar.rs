@@ -16,6 +16,10 @@ use crate::widgets;
 /// Ширина кнопки окна, как у системных кнопок Windows 11.
 pub const WINDOW_BUTTON_WIDTH: f32 = 46.0;
 
+/// Наименьшая полоса перетаскивания между левой частью шапки и правой группой: в узком
+/// окне левая часть обрезается, а за пустое место окно всё равно тащат.
+const DRAG_MIN: f32 = 24.0;
+
 /// Полоса по периметру окна, за которую меняется размер.
 const RESIZE_EDGE: f32 = 5.0;
 
@@ -57,19 +61,31 @@ impl BytetapApp {
             Stroke::new(1.0, p.border),
         );
 
+        // Правая группа стоит от правого края всегда — ширина её известна экрану.
+        // Привязка к концу левой части уводила кнопки окна за край в узком окне или при
+        // длинной подписи слева (находка ревью шага 5).
+        let width = right_width + SPACE_2 + buttons_width();
+        let right_start = (bar.right() - width).max(bar.left());
+        // Левая часть — до полосы перетаскивания: её содержимое обрезается по остатку,
+        // а не выталкивает кнопки окна.
+        let left_right = (right_start - SPACE_2 - DRAG_MIN).max(bar.left() + SPACE_3);
         let mut left_ui = ui.new_child(
             UiBuilder::new()
-                .max_rect(bar.with_min_x(bar.left() + SPACE_3))
+                .max_rect(Rect::from_min_max(
+                    pos2(bar.left() + SPACE_3, bar.top()),
+                    pos2(left_right, bar.bottom()),
+                ))
                 .layout(Layout::left_to_right(Align::Center)),
         );
         left_ui.spacing_mut().item_spacing.x = SPACE_2;
         left(self, &mut left_ui);
-        let left_end = left_ui.min_rect().right().max(bar.left() + SPACE_3);
+        let left_end = left_ui
+            .min_rect()
+            .right()
+            .clamp(bar.left() + SPACE_3, left_right);
 
         // Правая группа — одной полосой слева направо: сначала свои виджеты экрана,
         // затем кнопки окна. Ширина складывется из тех же величин, что и рисуются.
-        let width = right_width + SPACE_2 + buttons_width();
-        let right_start = (bar.right() - width).max(left_end);
         let right_rect = Rect::from_min_max(
             pos2(right_start, bar.top()),
             pos2(bar.right(), bar.bottom()),
@@ -86,9 +102,8 @@ impl BytetapApp {
         right_ui.spacing_mut().item_spacing.x = SPACE_2;
         self.window_buttons(&mut right_ui);
 
-        if right_start > left_end + 2.0 * SPACE_2 {
-            let drag =
-                Rect::from_x_y_ranges(left_end + SPACE_2..=right_start - SPACE_2, bar.y_range());
+        let drag = Rect::from_x_y_ranges(left_end + SPACE_2..=right_start - SPACE_2, bar.y_range());
+        if drag.width() > 0.0 {
             // Без фокуса: это не виджет, а полоса перетаскивания — в Tab ей делать
             // нечего (U1-AC25).
             let response = ui.interact(

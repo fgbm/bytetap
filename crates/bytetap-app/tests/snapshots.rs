@@ -140,6 +140,190 @@ fn snapshot(name: &str, screen: Screen, dark: bool, size: (f32, f32)) {
 const TITLE_BAR: (f32, f32) = (1200.0, 44.0);
 const WINDOW: (f32, f32) = (1200.0, 800.0);
 
+/// Наименьшее окно приложения (U1-AC3) и типичный ноутбук: шапка не должна выталкивать
+/// кнопки окна за край.
+const NARROW: (f32, f32) = (720.0, 560.0);
+const LAPTOP: (f32, f32) = (1366.0, 768.0);
+
+/// Анализатор в 200 символов: длинные метаданные просмотра журнала.
+fn long_analyzer() -> String {
+    let mut name = "ANALYZER-IMPORT-".to_owned();
+    while name.len() < 200 {
+        name.push_str("LONG-NAME-0123456789");
+    }
+    name.truncate(200);
+    assert_eq!(name.chars().count(), 200, "ровно 200 символов");
+    name
+}
+
+/// Журнал с длинным именем анализатора: шапка просмотра в узком окне.
+///
+/// Файл лежит во временной папке, а страница 0 прочитана заранее — снимок и проверка
+/// раскладки видят шапку и первую страницу, как настоящее открытие журнала.
+fn long_journal_view() -> bytetap_app::viewing::JournalView {
+    use bytetap_app::journal::{JournalCache, JournalOpen};
+
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("bytetap-20261019101500-tcp_server.jsonl");
+    let mut header = bytetap_core::journal::Session::new(
+        bytetap_core::journal::Mode::TcpServer,
+        bytetap_core::journal::Autoresponder::Hl7Mllp,
+        serde_json::json!({ "listen": "127.0.0.1:5000" }),
+        bytetap_core::journal::Host {
+            os: "Windows 11 23H2".to_owned(),
+        },
+    );
+    header.analyzer = Some(long_analyzer());
+    let mut text =
+        serde_json::to_string(&bytetap_core::journal::Event::Session(header)).expect("заголовок");
+    text.push('\n');
+    let data = bytetap_core::journal::Event::Data(bytetap_core::journal::Data::new(
+        "2026-10-19T10:15:01.000+03:00",
+        1_000_000,
+        1,
+        bytetap_core::journal::Dir::AnalyzerToLis,
+        false,
+        b"\x0bMSH|^~\\&|ANALYZER|LAB|LIS||20261019101500||ORU^R01|MSG1|P|2.3.1\r\x1c\r",
+    ));
+    text.push_str(&serde_json::to_string(&data).expect("событие"));
+    text.push('\n');
+    std::fs::write(&path, text).expect("журнал");
+    let cache = JournalCache::default();
+    let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
+    let mut view = bytetap_app::viewing::JournalView::new(
+        opened.path.clone(),
+        opened.summary.clone(),
+        opened.lengths.clone(),
+        opened.first_event.clone(),
+    );
+    let events = cache
+        .read(&opened.path, 0, bytetap_app::journal::PAGE_SIZE)
+        .expect("страница");
+    let generation = view.source.request_page(0);
+    view.source.store_page(0, generation, events);
+    // Временная папка удалится: в шапке — настоящее имя файла.
+    view.path = format!(r"{LOG_DIR}\bytetap-20261019101500-tcp_server.jsonl").into();
+    view
+}
+
+/// Просмотр журнала с длинным анализатором в окне `size`.
+fn long_analyzer_viewing(size: (f32, f32)) -> Harness<'static, BytetapApp> {
+    let mut harness = Harness::builder()
+        .with_size(size)
+        .with_theme(Theme::Light)
+        .wgpu()
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings(false), None, None)
+                .with_fixtures(fixtures())
+                .with_journal_fixture(long_journal_view())
+        });
+    harness.run_steps(8);
+    harness
+}
+
+/// Запись TCP-клиентом: длинная сводка режима и большие счётчики — шапка `size`.
+fn long_summary_recording(size: (f32, f32)) -> Harness<'static, BytetapApp> {
+    use bytetap_app::settings::Responder;
+    use bytetap_core::journal::Stats;
+
+    let mut settings = settings(false);
+    settings.config.mode = SessionMode::TcpClient;
+    settings.config.connect_host = "analizator-import.lab.example.internal".into();
+    settings.config.connect_port = 5000;
+    settings.config.responder = Responder::Hl7;
+    let fixture = RecordingFixture {
+        events: recording_fixture(0).events,
+        // Гигабайты и сотни соединений: счётчики шапки шире обычных.
+        stats: Stats {
+            connections: 128,
+            bytes_analyzer_to_lis: 999_999_999,
+            bytes_lis_to_analyzer: 888_888_888,
+        },
+        elapsed: std::time::Duration::from_secs(3_599),
+        local_addr: String::new(),
+        journal_path: Some(format!(r"{LOG_DIR}\bytetap-20261019232710-tcp_client.jsonl").into()),
+        dropped: 0,
+    };
+    let mut harness = Harness::builder()
+        .with_size(size)
+        .with_theme(Theme::Light)
+        .wgpu()
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings, None, None)
+                .with_fixtures(fixtures())
+                .with_recording_fixture(fixture)
+        });
+    harness.run_steps(8);
+    harness
+}
+
+/// Узкое окно: кнопки окна внутри экрана, шапка не налезает сама на себя (находка
+/// ревью шага 5).
+///
+/// Слева — длинные подписи (анализатор в 200 символов, сводка TCP-клиента со
+/// счётчиками в гигабайтах): раньше правая группа вставала за концом левой части и
+/// «Закрыть» уезжало за край окна.
+#[test]
+fn the_header_fits_a_narrow_window() {
+    for (size, label) in [(NARROW, "720×560"), (LAPTOP, "1366×768")] {
+        for (name, harness) in [
+            ("viewing-text", long_analyzer_viewing(size)),
+            ("recording-text", long_summary_recording(size)),
+        ] {
+            assert_header_fits(&harness, size, &format!("{name} на {label}"));
+        }
+    }
+}
+
+/// Шапка экрана в окне `size`: «Закрыть» внутри окна, свои виджеты шапки не налезают
+/// друг на друга, длинные подписи обрезаны, а не вытолкнуты за край.
+fn assert_header_fits(harness: &Harness<'static, BytetapApp>, size: (f32, f32), screen: &str) {
+    use egui_kittest::kittest::NodeT as _;
+
+    harness.check_accessibility();
+    let header = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(size.0, 44.0));
+    let mut found = Vec::new();
+    for node in harness.root().children_recursive() {
+        let accesskit = node.accesskit_node();
+        if accesskit.is_hidden() || !INTERACTIVE.contains(&accesskit.role()) {
+            continue;
+        }
+        let rect = node.rect();
+        if !rect.intersects(header) {
+            continue;
+        }
+        let label = accesskit
+            .label()
+            .or_else(|| accesskit.value())
+            .unwrap_or_default();
+        assert!(
+            rect.left() >= -1.0 && rect.right() <= size.0 + 1.0 && rect.bottom() <= 44.0 + 1.0,
+            "{screen}: {label:?} за краем шапки: {rect:?}"
+        );
+        found.push((label, rect));
+    }
+    let close = found
+        .iter()
+        .find(|(label, _)| label == "Закрыть")
+        .unwrap_or_else(|| panic!("{screen}: в шапке нет «Закрыть»: {found:?}"));
+    assert!(
+        (close.1.right() - size.0).abs() <= 1.0,
+        "{screen}: «Закрыть» не у правого края: {:?}",
+        close.1
+    );
+    // Наложений нет: каждый виджет шапки стоит на своём месте.
+    for (index, (label, rect)) in found.iter().enumerate() {
+        for (other, other_rect) in &found[index + 1..] {
+            let overlap = rect.intersect(*other_rect);
+            assert!(
+                overlap.width() <= 0.5 || overlap.height() <= 0.5,
+                "{screen}: «{label}» {:?} налезает на «{other}» {other_rect:?}",
+                rect
+            );
+        }
+    }
+}
+
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn title_bar_light() {
@@ -1171,6 +1355,36 @@ fn recording_new_rows_dark() {
     scrolled_up(&mut harness);
     harness.get_by_label("5 новых");
     harness.snapshot_options("recording-new-rows-dark", &options());
+}
+
+/// Узкое окно и ноутбук: шапка с длинной сводкой и счётчиками (находка ревью шага 5).
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_text_at_720() {
+    let _gpu = gpu();
+    long_summary_recording(NARROW).snapshot_options("recording-text-720-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_text_at_1366() {
+    let _gpu = gpu();
+    long_summary_recording(LAPTOP).snapshot_options("recording-text-1366-light", &options());
+}
+
+/// Просмотр журнала с анализатором в 200 символов: шапка не уводит кнопки за край.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn viewing_text_at_720() {
+    let _gpu = gpu();
+    long_analyzer_viewing(NARROW).snapshot_options("viewing-text-720-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn viewing_text_at_1366() {
+    let _gpu = gpu();
+    long_analyzer_viewing(LAPTOP).snapshot_options("viewing-text-1366-light", &options());
 }
 
 #[test]

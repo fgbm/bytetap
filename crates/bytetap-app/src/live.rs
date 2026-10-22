@@ -44,27 +44,96 @@ pub const FRAME_SOFTWARE: Duration = Duration::from_millis(100);
 /// глаз, хотя данные и не теряются: их держит буфер.
 pub const FRAME_SLOWEST: Duration = Duration::from_secs(1);
 
+/// Ожидание до следующей целой секунды записи: `1 с − subsec(elapsed)`.
+///
+/// Таймер шапки показывает `elapsed` целыми секундами. Кадр к границе секунды приходит
+/// тогда, когда подпись действительно меняется: иначе кадр без событий опаздывает на
+/// доли секунды и на загруженном окне перескакивает через секунду — «00:07» сменяется
+/// «00:09». Пульс «Стоп» идёт тем же кадром.
+#[must_use]
+pub fn next_second(elapsed: Duration) -> Duration {
+    FRAME_SLOWEST.saturating_sub(Duration::from_micros(u64::from(elapsed.subsec_micros())))
+}
+
 /// Период кадров записи: потолок по адаптеру и по цене прошлых кадров.
 ///
-/// `cost` — скользящее среднее цены кадра (см. [`frame_cost`]). Кадр стоит столько,
-/// сколько он рисуется, поэтому ждать между кадрами надо заметно больше: три бюджета
-/// кадра на кадр оставляют окну четверть ядра, а лента всё равно догоняет буфером.
-/// Замер на WARP: кадр 206 мс при ожидании 620 мс — это 97 % одного ядра вместо 306 %
-/// при 30 запросах кадра в секунду.
+/// `cost` — цена кадра (см. [`FrameBudget`]). Кадр стоит столько, сколько он рисуется,
+/// поэтому ждать между кадрами надо заметно больше: три бюджета кадра на кадр
+/// оставляют окну четверть ядра, а лента всё равно догоняет буфером. Замер на WARP:
+/// кадр 206 мс при ожидании 620 мс — это 97 % одного ядра вместо 306 % при 30 запросах
+/// кадра в секунду.
 #[must_use]
 pub fn next_period(software: bool, cost: Duration) -> Duration {
     let floor = if software { FRAME_SOFTWARE } else { FRAME };
     cost.saturating_mul(3).clamp(floor, FRAME_SLOWEST)
 }
 
-/// Цена кадра по промежутку между кадрами: пока окно ждёт по таймеру, кадр стоит
-/// `spacing − delay`, а когда не успевает за своим периодом — весь промежуток.
+/// Ожидание презентации по замеру кадра: промежуток между кадрами минус то, что окно
+/// просило подождать, минус работа над кадром.
+///
+/// `None` — кадр пришёл раньше, чем окно просило (`spacing < delay`): это пробуждение
+/// по событию (фрагмент ленты, ответ задачи), а не цена кадра. Такой замер в цену не
+/// идёт: после кадра без событий (ожидание [`FRAME_SLOWEST`]) событие через 500 мс
+/// записалось бы кадром в 500 мс, и период ушёл бы в секунду.
 #[must_use]
-pub fn frame_cost(spacing: Duration, delay: Duration) -> Duration {
-    if spacing >= delay {
-        spacing - delay
-    } else {
-        spacing
+pub fn present_wait(spacing: Duration, delay: Duration, work: Duration) -> Option<Duration> {
+    (spacing >= delay).then(|| spacing.saturating_sub(delay).saturating_sub(work))
+}
+
+/// Цена кадра записи: работа над кадром плюс ожидание презентации, со сглаживанием.
+///
+/// Цена кадра — это время самого кадра: сколько окно рисует и сколько ждёт презентацию.
+/// Промежуток между кадрами годится для этого, только когда окно выждало свой период
+/// целиком; в остальных случаях он говорит о событии, а не о кадре (см.
+/// [`present_wait`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameBudget {
+    /// Сколько заняла работа над только что нарисованным кадром.
+    work: Duration,
+    /// Ожидание презентации: растр, отправка и представление кадра.
+    present: Duration,
+    /// Сглаженная цена кадра: по ней окно выбирает период.
+    cost: Duration,
+}
+
+impl FrameBudget {
+    /// Цена кадра для [`next_period`].
+    #[must_use]
+    pub fn cost(&self) -> Duration {
+        self.cost
+    }
+
+    /// Забыть замеры: новая запись, окно было свёрнуто.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Учесть кадр: `spacing` — промежуток от прошлого кадра (`None` — кадр первый или
+    /// после паузы, промежуток ценой не считается), `delay` — ожидание, которое окно
+    /// просило в прошлом кадре (`None` — прошлый кадр прошёл без таймера), `work` —
+    /// сколько заняла работа над только что нарисованным кадром.
+    pub fn sample(&mut self, spacing: Option<Duration>, delay: Option<Duration>, work: Duration) {
+        if let (Some(spacing), Some(delay)) = (spacing, delay)
+            && let Some(present) = present_wait(spacing, delay, self.work)
+        {
+            // Ожидание презентации — медленно меняющаяся часть цены: кадр растра и
+            // дисплея. Среднее сглаживает разброс между кадрами.
+            self.present = if present >= self.present {
+                present
+            } else {
+                (self.present + present) / 2
+            };
+        }
+        self.work = work;
+        let cost = self.work + self.present;
+        // Вверх — сразу, вниз — медленно: медленный кадр виден по первому же замеру, и
+        // окно не тратит секунды, догоняя среднее; быстрый кадр после одного медленного
+        // (загрузка шрифтов, первый показ) режим не переключает.
+        self.cost = if cost >= self.cost {
+            cost
+        } else {
+            self.cost.mul_f32(0.875) + cost.mul_f32(0.125)
+        };
     }
 }
 
@@ -471,16 +540,6 @@ mod tests {
         );
         // Медленнее предела — ждать не дольше секунды: лента должна идти.
         assert_eq!(next_period(true, Duration::from_secs(1)), FRAME_SLOWEST);
-        // Цена кадра — промежуток минус ожидание, а в нехватке времени — весь промежуток.
-        assert_eq!(
-            frame_cost(Duration::from_millis(193), FRAME),
-            Duration::from_millis(160)
-        );
-        // Не успевает за своим периодом — промежуток и есть цена кадра.
-        assert_eq!(
-            frame_cost(Duration::from_millis(20), FRAME),
-            Duration::from_millis(20)
-        );
         // Кадр без новых событий — тот же предел: раз в секунду.
         assert_eq!(next_period(true, Duration::from_secs(10)), FRAME_SLOWEST);
         // Приёмник будит окно тем же периодом, который поставило окно.
@@ -488,6 +547,99 @@ mod tests {
         assert_eq!(repaint_period(), FRAME_SOFTWARE);
         set_repaint_period(FRAME);
         assert_eq!(repaint_period(), FRAME);
+    }
+
+    /// Цена кадра — время самого кадра: работа плюс ожидание презентации. Кадр WARP
+    /// стоит 160 мс, хотя работа над ним — 0.5 мс.
+    #[test]
+    fn the_cost_of_a_frame_is_the_time_of_the_frame_itself() {
+        let work = Duration::from_micros(500);
+        let mut budget = FrameBudget::default();
+        // Первый кадр: промежутка нет, цены тоже.
+        budget.sample(None, None, work);
+        assert_eq!(budget.cost(), work);
+        // Окно просило 30 мс, кадр пришёл через 193 мс: 160 мс — цена кадра.
+        budget.sample(Some(Duration::from_millis(193)), Some(FRAME), work);
+        assert_eq!(
+            budget.cost(),
+            Duration::from_millis(193) - FRAME,
+            "цена кадра — промежуток минус ожидание"
+        );
+        assert_eq!(
+            present_wait(Duration::from_millis(193), FRAME, work),
+            Some(Duration::from_millis(160) - Duration::from_micros(500))
+        );
+        // Пауза (свёрнутое окно) в цену кадра не идёт вовсе.
+        budget.sample(None, Some(FRAME), work);
+        assert_eq!(budget.cost(), Duration::from_millis(160));
+    }
+
+    /// Раннее пробуждение не становится ценой кадра (находка ревью шага 5).
+    ///
+    /// Запись без событий: окно просит кадр раз в секунду, кадр быстрый. Событие через
+    /// 500 мс будит окно раньше срока; если записать этот промежуток в цену кадра,
+    /// период уйдёт в секунду, и лента будет отставать на секунду даже на GPU.
+    #[test]
+    fn an_early_frame_does_not_become_the_cost_of_a_frame() {
+        let work = Duration::from_micros(300);
+        let mut budget = FrameBudget::default();
+        budget.sample(None, None, work);
+        // Кадр без событий: спали секунду, кадр быстрый — цена кадра мала.
+        budget.sample(
+            Some(FRAME_SLOWEST + Duration::from_millis(8)),
+            Some(FRAME_SLOWEST),
+            work,
+        );
+        assert!(
+            budget.cost() <= Duration::from_millis(20),
+            "кадр быстрого растра: {:?}",
+            budget.cost()
+        );
+        assert_eq!(next_period(false, budget.cost()), FRAME);
+        // Событие через 500 мс: окно проснулось раньше своего периода.
+        budget.sample(Some(Duration::from_millis(500)), Some(FRAME_SLOWEST), work);
+        assert!(
+            budget.cost() <= Duration::from_millis(20),
+            "раннее пробуждение — не цена кадра: {:?}",
+            budget.cost()
+        );
+        assert_eq!(
+            next_period(false, budget.cost()),
+            FRAME,
+            "следующий период — 33 мс, а не секунда"
+        );
+        // И дальше: период остаётся прежним, пока события идут чаще секунды.
+        for _ in 0..5 {
+            budget.sample(Some(FRAME + Duration::from_millis(1)), Some(FRAME), work);
+        }
+        assert_eq!(next_period(false, budget.cost()), FRAME);
+    }
+
+    /// Ожидание до следующей целой секунды записи: таймер шапки показывает `elapsed`
+    /// целыми секундами, и кадр к границе не даёт подписи перескакивать.
+    #[test]
+    fn the_quiet_frame_waits_for_the_next_whole_second() {
+        assert_eq!(next_second(Duration::ZERO), FRAME_SLOWEST);
+        assert_eq!(
+            next_second(Duration::from_millis(1500)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_second(Duration::from_millis(39_990)),
+            Duration::from_millis(10)
+        );
+        // Секунды идут подряд, без пропусков и повторов: кадр к границе секунды.
+        let mut elapsed = Duration::from_millis(200);
+        let mut shown = vec![elapsed.as_secs()];
+        for _ in 0..20 {
+            elapsed += next_second(elapsed);
+            shown.push(elapsed.as_secs());
+        }
+        assert_eq!(
+            shown,
+            (0..=20).collect::<Vec<_>>(),
+            "каждая секунда показана ровно раз"
+        );
     }
 
     #[test]

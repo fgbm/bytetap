@@ -8,12 +8,9 @@ on:
   push:
     tags:
       - "v*"
+  # Ручной запуск — только сборка: тега нет, и job `publish` в нём не идёт. Входов
+  # поэтому нет: любое значение входа пришлось бы либо игнорировать, либо проверять.
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Только собрать артефакты: релиз создаётся по тегу, не по ручному запуску"
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -45,8 +42,10 @@ jobs:
 
       # Кеша нет намеренно: релиз собирается редко и публикует артефакты, а кеш cargo
       # в публикующем workflow — путь подмены артефакта (zizmor: cache-poisoning).
+      # `--locked`: релиз собирается ровно по `Cargo.lock` из тега, без обновления
+      # зависимостей на сборочной машине.
       - name: cargo build --release
-        run: cargo build --release -p bytetap-app --bin bytetap
+        run: cargo build --release --locked -p bytetap-app --bin bytetap
 
       # NFR-7 и U1-AC1: exe релиза — тот же, что в CI (`native-windows`), поэтому те же
       # проверки перед упаковкой: размер и зависимости только из System32.
@@ -114,9 +113,10 @@ jobs:
   publish:
     name: publish
     needs: build
-    # Черновик релиза — только по тегу. Ручной запуск (в том числе `dry_run: false`)
-    # публиковать нечего: тега нет, и проверка сборки остаётся проверкой.
-    if: startsWith(github.ref, 'refs/tags/')
+    # Черновик релиза — только по тегу, то есть только на push. Ручной запуск
+    # (`workflow_dispatch`) публиковать нечего: тега нет, и проверка сборки остаётся
+    # проверкой, даже если запущена с `--ref` тега.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -38,6 +38,13 @@ const BAR_HEIGHT: f32 = 32.0;
 /// Период пульса точки «Стоп» (`--bt-pulse-duration`).
 const PULSE_PERIOD: f64 = 1.6;
 
+/// Период кадра, после которого пульс точки «Стоп» не рисуется.
+///
+/// Программный растр (WARP) рисует кадр сотни миллисекунд, а окно просит его реже
+/// секунды: фаза пульса к каждому кадру случайна, и кольцо мигает вместо того, чтобы
+/// расходиться. Тогда точка стоит статично — отступление от UI v2.
+const PULSE_MAX_PERIOD: Duration = Duration::from_millis(200);
+
 /// Индекс строк ленты: номер события и номер его первой строки.
 ///
 /// Номера строк сквозные с начала индекса: вытеснение старых событий снимает записи
@@ -444,18 +451,36 @@ impl BytetapApp {
             |app, ui| {
                 app.brand(ui);
                 let p = app.pal();
-                if stop_pill(ui, &p, &feed::format_duration(elapsed)).clicked() {
+                if stop_pill(
+                    ui,
+                    &p,
+                    &feed::format_duration(elapsed),
+                    app.frame_period() <= PULSE_MAX_PERIOD,
+                )
+                .clicked()
+                {
                     let ctx = ui.ctx().clone();
                     app.stop_recording(&ctx);
                 }
-                let width = (ui.ctx().content_rect().width() * 0.42).min(ui.available_width());
+                let width = ui.available_width().max(0.0);
                 let job = LayoutJob::single_section(
                     summary.clone(),
                     text_format(theme::sans(TEXT_DATA), p.text_muted),
                 );
+                // Сводка обрезается «…» по остатку шапки: в узком окне она не должна
+                // выталкивать счётчики и кнопки окна за край (находка ревью шага 5).
+                let full = ui.painter().layout_no_wrap(
+                    summary.clone(),
+                    theme::sans(TEXT_DATA),
+                    p.text_muted,
+                );
                 let galley = truncated(ui, job, width);
                 let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
                 response.widget_info(|| WidgetInfo::labeled(Role::Label, true, &summary));
+                // Полный текст — во всплывающей подсказке: обрезанная строка его теряет.
+                if full.size().x > width {
+                    response.on_hover_text(&summary);
+                }
                 ui.painter().galley(rect.min, galley, p.text_muted);
             },
             |app, ui| {
@@ -755,8 +780,12 @@ fn text_action(ui: &mut Ui, p: &Palette, text: &str, enabled: bool) -> egui::Res
     }
 }
 
-/// Пилюля «Стоп»: пульсирующая точка, слово и таймер, 28px.
-fn stop_pill(ui: &mut Ui, p: &Palette, timer: &str) -> egui::Response {
+/// Пилюля «Стоп»: точка, слово и таймер, 28px.
+///
+/// `pulse` — рисовать ли пульс точки: на программном растре кадр идёт реже, чем за
+/// [`PULSE_MAX_PERIOD`], и кольцо пульса скакало бы по случайной фазе — тогда точка
+/// стоит статично (отступление от UI v2, `docs/dev/design.md`).
+fn stop_pill(ui: &mut Ui, p: &Palette, timer: &str, pulse: bool) -> egui::Response {
     let label = ui.painter().layout_no_wrap(
         t!("record.stop").to_owned(),
         theme::sans_semibold(TEXT_XS),
@@ -785,10 +814,11 @@ fn stop_pill(ui: &mut Ui, p: &Palette, timer: &str) -> egui::Response {
         );
     }
     let center = pos2(rect.left() + 8.0 + 4.5, rect.center().y);
-    // Пульс как `bt-pulse`: кольцо растёт до 7px и гаснет за 70% периода.
+    // Пульс как `bt-pulse`: кольцо растёт до 7px и гаснет за 70% периода. На редком
+    // кадре (программный растр) фаза успевает перескочить, поэтому пульса нет.
     let phase = (ui.input(|i| i.time) % PULSE_PERIOD / PULSE_PERIOD) as f32;
     let grow = (phase / 0.7).min(1.0);
-    if grow < 1.0 {
+    if pulse && grow < 1.0 {
         ui.painter().circle_filled(
             center,
             4.5 + 7.0 * grow,

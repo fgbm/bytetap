@@ -19,7 +19,7 @@ on:
         type: boolean
         default: false
       soak-minutes:
-        description: "native-soak: длительность записи, минут"
+        description: "native-soak: длительность записи, минут (4…40)"
         type: number
         default: 25
       soak-rate:
@@ -28,7 +28,8 @@ on:
         default: 200
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Имя события в группе: ручные probe/soak не отменяют и не ждут push.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -332,6 +333,7 @@ jobs:
 
           # Паника в первом кадре: системное окно bytetap поверх всех и запись в журнале.
           Remove-Item $log -ErrorAction SilentlyContinue
+          $env:BYTETAP_TEST_HOOKS = '1'
           $env:BYTETAP_TEST_PANIC = '1'
           $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
           $null = $p.Handle
@@ -341,6 +343,7 @@ jobs:
             $dialog = [Win]::HasDialog([uint32]$p.Id, 'bytetap')
           }
           $env:BYTETAP_TEST_PANIC = ''
+          $env:BYTETAP_TEST_HOOKS = ''
           Write-Host "panic: окно о сбое $(if ($dialog) { 'показано' } else { 'не найдено' })"
           if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } else { Write-Host "panic: bytetap.exe завершился, код $($p.ExitCode)" }
           Start-Sleep -Seconds 1
@@ -540,10 +543,12 @@ jobs:
           $out = New-Item -ItemType Directory -Force -Path smoke
           $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
           Remove-Item $log -ErrorAction SilentlyContinue
+          $env:BYTETAP_TEST_HOOKS = '1'
           $env:BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0'
           $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
           $null = $p.Handle
           $env:BYTETAP_TEST_AUTOSTART = ''
+          $env:BYTETAP_TEST_HOOKS = ''
           $failed = $false
           $addr = $null
           $journal = $null
@@ -687,10 +692,12 @@ jobs:
           # Запись: клиент шлёт 10 сообщений HL7 каждые 100 мс — поток 100 фрагментов/с,
           # лента и трасса перерисовываются на каждый кадр.
           Remove-Item $log -ErrorAction SilentlyContinue
+          $env:BYTETAP_TEST_HOOKS = '1'
           $env:BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0'
           $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
           $null = $p.Handle
           $env:BYTETAP_TEST_AUTOSTART = ''
+          $env:BYTETAP_TEST_HOOKS = ''
           $addr = $null
           for ($i = 0; $i -lt 60 -and -not $addr; $i++) {
             Start-Sleep -Milliseconds 500
@@ -1148,14 +1155,20 @@ jobs:
           $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
           $minutes = [int]$env:MINUTES
           $rate = [int]$env:RATE
+          # Длительность и таймаут job согласованы: сборка, прогрев и минутный запас
+          # потока укладываются в timeout-minutes: 60 только до 40 минут записи.
+          if ($minutes -lt 4 -or $minutes -gt 40) { throw "soak-minutes: от 4 до 40 минут, а не $minutes" }
+          if ($rate -lt 1) { throw "soak-rate: фрагментов в секунду больше нуля, а не $rate" }
           $out = New-Item -ItemType Directory -Force -Path soak
           Write-Host "длительность записи: $minutes мин, поток $rate фрагментов/с"
 
           Remove-Item $log -ErrorAction SilentlyContinue
+          $env:BYTETAP_TEST_HOOKS = '1'
           $env:BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0'
           $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
           $null = $p.Handle
           $env:BYTETAP_TEST_AUTOSTART = ''
+          $env:BYTETAP_TEST_HOOKS = ''
 
           $addr = $null
           $journal = $null
@@ -1201,10 +1214,11 @@ jobs:
             Write-Output "отправлено фрагментов: $frame"
           } -ArgumentList $port, $rate, ($minutes * 60 + 60)
 
-          # Прогрев (10 минут) входит в кривую: за первые минуты приложение занимает
-          # память под кеши шрифтов и растра, и критерий считается по участку после
-          # него. Меньший прогрев ловил разовый рост на 6–7-й минуте как «утечку».
-          $warmup = 10
+          # Прогрев входит в кривую: за первые минуты приложение занимает память под
+          # кеши шрифтов и растра, и критерий считается по участку после него. Меньший
+          # прогрев ловил разовый рост на 6–7-й минуте как «утечку». Прогрев — 10 минут,
+          # а на коротком прогоне — половина записи: иначе сравнивать было бы нечего.
+          $warmup = [Math]::Min(10, [Math]::Max(1, [int][Math]::Floor($minutes / 2)))
           $rows = @('| минута | WorkingSet, МБ | PrivateBytes, МБ | журнал, МБ |', '| --- | --- | --- | --- |')
           $ws = @()
           $pv = @()

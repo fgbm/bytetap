@@ -9,6 +9,7 @@ pub mod feedrows;
 pub mod feedscroll;
 pub mod form;
 pub mod gpu;
+pub mod hooks;
 pub mod i18n;
 pub mod icons;
 pub mod journal;
@@ -29,7 +30,7 @@ pub mod window;
 
 pub use app::{
     AUTOSTART_ENV, BytetapApp, CLOSE_NOTICE, FORCED_EXIT, Fixtures, HOOKS_ENV, JOURNAL_ENV,
-    SCREEN_ENV, Screen, resolve_dark, take_close_notice,
+    PANIC_ENV, SCREEN_ENV, Screen, resolve_dark, take_close_notice,
 };
 
 /// Размер окна при первом запуске (U1-AC3).

@@ -3,8 +3,8 @@
 
 use bytetap_app::settings::{Settings, Store, WindowState};
 use bytetap_app::{
-    AUTOSTART_ENV, BytetapApp, FORCED_EXIT, HOOKS_ENV, SCREEN_ENV, WINDOW_MIN_SIZE, WINDOW_SIZE,
-    diag, gpu, placement, probe, t,
+    AUTOSTART_ENV, BytetapApp, FORCED_EXIT, SCREEN_ENV, WINDOW_MIN_SIZE, WINDOW_SIZE, diag, gpu,
+    hooks, placement, probe, t,
 };
 use eframe::egui;
 
@@ -64,14 +64,14 @@ fn main() {
         Err(err) => diag::fatal(&t!("diag.startFailed", reason = err)),
     };
     let handle = runtime.handle().clone();
-    let autostart = std::env::var(AUTOSTART_ENV).ok();
+    // Тестовые ключи читаются только вместе с `BYTETAP_TEST_HOOKS=1` (`hooks.rs`):
+    // поставляемый exe не должен начинать запись от одной переменной окружения.
+    let autostart = hooks::var(AUTOSTART_ENV);
     // Снимки для согласования (CI, U1-AC21): экран по имени, только вместе с ключом
     // хуков. Переменная окружения сама по себе приложение не переключает.
-    let screen = hooks_enabled()
-        .then(|| std::env::var(SCREEN_ENV).ok())
-        .flatten();
+    let screen = hooks::var(SCREEN_ENV);
     // Цена кадра на CI (U1-AC24): проба меряет живые кадры и сама завершает процесс.
-    let probe = hooks_enabled() && std::env::var_os(crate::probe::ENV).is_some();
+    let probe = hooks::enabled() && hooks::var(crate::probe::ENV).is_some();
     if probe {
         crate::probe::start();
     }
@@ -132,13 +132,6 @@ fn main() {
         }
         diag::fatal(&t!("diag.startFailed", reason = err));
     }
-}
-
-/// Тестовые хуки включены: `BYTETAP_TEST_HOOKS=1`. Без этого ключа
-/// `BYTETAP_TEST_SCREEN` не читается: снимок экрана в чужой оболочке не должен
-/// менять поведение приложения.
-fn hooks_enabled() -> bool {
-    std::env::var(HOOKS_ENV).is_ok_and(|value| value == "1")
 }
 
 /// Перезапуск себя с WARP: тот же exe и аргументы, `WGPU_ADAPTER_NAME=basic render` и

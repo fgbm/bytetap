@@ -24,8 +24,9 @@ pub const WARP_ADAPTER: &str = "basic render";
 
 /// Диагностика цены кадра (`probe.rs`): режим представления, MSAA и задержка кадров.
 ///
-/// Ключи читаются только вместе с `BYTETAP_TEST_PROBE`: без пробы окно берёт
-/// [`egui_wgpu::SurfaceConfig::LOW_LATENCY`] и MSAA 0, как и раньше.
+/// Ключи читаются только вместе с `BYTETAP_TEST_PROBE` и `BYTETAP_TEST_HOOKS=1`
+/// (`hooks.rs`): без пробы окно берёт [`egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT`] и
+/// MSAA 0, как и раньше.
 pub const PRESENT_ENV: &str = "BYTETAP_TEST_PROBE_PRESENT";
 pub const MSAA_ENV: &str = "BYTETAP_TEST_PROBE_MSAA";
 pub const LATENCY_ENV: &str = "BYTETAP_TEST_PROBE_LATENCY";
@@ -35,13 +36,13 @@ pub const LATENCY_ENV: &str = "BYTETAP_TEST_PROBE_LATENCY";
 pub fn diagnostics() -> bool {
     [PRESENT_ENV, MSAA_ENV, LATENCY_ENV]
         .iter()
-        .any(|key| std::env::var_os(key).is_some())
+        .any(|key| crate::hooks::var(key).is_some())
 }
 
 /// Режим представления из [`PRESENT_ENV`]: `fifo`, `immediate`, `novsync`, `mailbox`.
 #[must_use]
 pub fn present() -> Option<wgpu::PresentMode> {
-    let value = std::env::var(PRESENT_ENV).ok()?;
+    let value = crate::hooks::var(PRESENT_ENV)?;
     Some(match value.trim().to_lowercase().as_str() {
         "fifo" | "vsync" => wgpu::PresentMode::Fifo,
         "immediate" => wgpu::PresentMode::Immediate,
@@ -56,15 +57,14 @@ pub fn present() -> Option<wgpu::PresentMode> {
 pub fn present_name() -> String {
     match present() {
         Some(mode) => format!("{mode:?}"),
-        None => "LOW_LATENCY".into(),
+        None => "HIGH_THROUGHPUT".into(),
     }
 }
 
 /// Число сэмплов MSAA из [`MSAA_ENV`].
 #[must_use]
 pub fn msaa() -> u16 {
-    std::env::var(MSAA_ENV)
-        .ok()
+    crate::hooks::var(MSAA_ENV)
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(0)
 }
@@ -72,9 +72,7 @@ pub fn msaa() -> u16 {
 /// Желаемая задержка кадров из [`LATENCY_ENV`].
 #[must_use]
 pub fn latency() -> Option<u32> {
-    std::env::var(LATENCY_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
+    crate::hooks::var(LATENCY_ENV).and_then(|value| value.trim().parse().ok())
 }
 
 /// Метка перезапуска с WARP: второй сбой графики уже не перезапускает процесс.
