@@ -31,13 +31,15 @@ cargo build --release -p bytetap-app --bin bytetap
 
 Готовый файл — `target\release\bytetap.exe`. Тяжёлый нагрузочный тест NFR-5/NFR-6 помечен `#[ignore]` и в обычный прогон не входит.
 
-Сборка с тестовыми хуками — та, которой пользуются смоуки CI (`BYTETAP_TEST_*`, проба цены кадра):
+Сборка с тестовыми хуками — та, которой пользуются смоуки CI (`BYTETAP_TEST_*`, проба цены кадра). Собирается она в отдельный каталог `target/hooks`, чтобы не подменить релизный `target\release\bytetap.exe`, который потом запускают руками и упаковывают:
 
 ```powershell
-cargo build --release -p bytetap-app --bin bytetap --features test-hooks
+cargo build --release -p bytetap-app --bin bytetap --features test-hooks --target-dir target/hooks
 ```
 
-Feature `test-hooks` добавляет в exe `crates/bytetap-app/src/hooks.rs` (ключи `BYTETAP_TEST_HOOKS`, `BYTETAP_TEST_AUTOSTART`, `BYTETAP_TEST_PANIC`, `BYTETAP_TEST_SCREEN`, `BYTETAP_TEST_JOURNAL`), `probe.rs` (`BYTETAP_TEST_PROBE*`) и переключатели отрисовки в `gpu.rs`; заодно включаются хуки ядра (`bytetap-core/test-hooks`). Без feature этого кода в exe нет вовсе, и переменные `BYTETAP_TEST_*` не читаются: `cargo build --release` и `release.yml` собирают без неё, а `release.yml` проверяет, что строк `BYTETAP_TEST` в бинарнике нет. `cargo test` включает feature сама — dev-dependency `bytetap-app` на себя, — поэтому отдельный флаг тестам не нужен.
+Готовый файл — `target\hooks\release\bytetap.exe`.
+
+Feature `test-hooks` добавляет в exe `crates/bytetap-app/src/hooks.rs` (ключи `BYTETAP_TEST_HOOKS`, `BYTETAP_TEST_AUTOSTART`, `BYTETAP_TEST_PANIC`, `BYTETAP_TEST_SCREEN`, `BYTETAP_TEST_JOURNAL`), `probe.rs` (`BYTETAP_TEST_PROBE*`) и переключатели отрисовки в `gpu.rs`; заодно включаются хуки ядра (`bytetap-core/test-hooks`). Без feature этого кода в exe нет вовсе, и переменные `BYTETAP_TEST_*` не читаются: `cargo build --release` и `release.yml` собирают без неё, а `release.yml` проверяет, что строк с префиксом `BYTETAP_TEST` в бинарнике нет. Так устроены сборки начиная со следующей версии после v0.2.0: в самом v0.2.0 хуки в exe есть, но включаются только вместе с `BYTETAP_TEST_HOOKS=1`, и одиночная переменная окружения поведение не меняет. `cargo test` включает feature сама — dev-dependency `bytetap-app` на себя, — поэтому отдельный флаг тестам не нужен.
 
 CI на GitHub Actions повторяет это на Ubuntu и Windows (`ci.yml`), включая `actionlint` и `zizmor`, и складывает `bytetap.exe` в артефакт `bytetap-native-windows-x64`.
 
@@ -48,11 +50,14 @@ CI на GitHub Actions повторяет это на Ubuntu и Windows (`ci.yml
 - `cargo test -p bytetap-app` — unit-тесты (настройки, i18n, лента, кодировки, индекс журнала, перевод времени в событие) и интеграционные: `tests/snapshots.rs` (снимки всех экранов в обеих темах, наименьшего окна 720×560 и ноутбука 1366×768, роли и подписи AccessKit, порядок Tab, Escape, раскладка на 100/125/150 %, кнопки окна внутри шапки при длинных подписях), `tests/journal.rs` (просмотр, страницы, карта сессии, комментарий), `tests/journal_failure.rs`, `tests/recording.rs`, `tests/input.rs` (кириллица, IME, вставка) и `tests/performance.rs` (кадры в простое и при записи);
 - снимки сравниваются только на Linux, где сняты эталоны (программный Vulkan, `mesa-vulkan-drivers`); переснять — `UPDATE_SNAPSHOTS=1 cargo test -p bytetap-app --test snapshots`;
 - `cargo clippy -p bytetap-core -p bytetap-app --all-targets --target x86_64-pc-windows-gnu -- -D warnings` — Windows-ветки кода (`windows-sys`, DWM) под линтом;
+- `cargo clippy -p bytetap-app --lib --bins -- -D warnings` — приложение в той конфигурации, что уходит в релиз, то есть без feature `test-hooks`: в общей команде `--all-targets` тянет dev-dependency приложения на себя с этой feature, и код под `cfg(not(feature = "test-hooks"))` не собирается вовсе. В CI этот шаг идёт на ubuntu;
 - `node scripts/licenses.mjs --check` — `THIRD-PARTY-LICENSES.md` соответствует графу зависимостей для платформы поставки (`x86_64-pc-windows-msvc`) и содержит полные тексты лицензий: одинаковые тексты собраны в группы со списком пакетов, для пакета без файла лицензии взят стандартный текст SPDX из `scripts/license-texts/`; пересобрать — `node scripts/licenses.mjs`.
 
-Job `native-windows` в `ci.yml` собирает `bytetap.exe` из `crates/bytetap-app` и проверяет на `windows-latest`. Сборок две, обе из одного кеша зависимостей: сначала exe с `--features test-hooks` (на нём идут смоуки), в конце — exe без feature, тот же, что уходит в релиз, и на нём проверяются размер, DLL, иконка и версия. Проверки:
+Job `native-windows` в `ci.yml` собирает `bytetap.exe` из `crates/bytetap-app` и проверяет на `windows-latest`. Сборок две, обе из одного кеша зависимостей: сначала exe с `--features test-hooks` (на нём идут смоуки), в конце — exe без feature, тот же, что уходит в релиз: на нём проверяются запуск без хуков, размер, DLL, иконка, версия и отсутствие строк хуков в байтах. Проверки:
 
 - размер exe ≤ 25 МБ (U1-AC22) и зависимости только из System32 (U1-AC1);
+- запуск exe релиза, то есть без хуков, с аппаратным адаптером и с WARP: процесс жив через 15 с, в журнале запуска «интерфейс готов», а на WARP ещё и выбранный `Microsoft Basic Render Driver` (U1-AC2); журналы этих запусков лежат в `smoke/`;
+- в байтах exe нет ни одного вхождения префикса `BYTETAP_TEST`, и это не пустой поиск: положительный контроль — строка `BYTETAP_WARP_RETRY` (`gpu::RETRY_ENV`) — обязан находиться, иначе шаг падает. Тот же шаг, что в `release.yml`;
 - запуск с аппаратным адаптером и с WARP: процесс жив, в журнале запуска «интерфейс готов» и выбранный адаптер (U1-AC2);
 - смоук паники: системное окно о сбое и запись `паника` в журнале (U1-AC8);
 - иконка и версия exe: `FileVersionInfo` отдаёт ProductName `bytetap` и версию из `CARGO_PKG_VERSION` (CompanyName пуст), а `ExtractAssociatedIcon` — иконку, совпадающую с `crates/bytetap-app/assets/icon.ico` (U1-AC1);

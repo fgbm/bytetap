@@ -111,30 +111,37 @@ jobs:
           Write-Host "иконка exe $($got.Width)x$($got.Height): расхождений с assets/icon.ico $different из $total"
           if ($different -gt [int]($total * 0.2)) { throw 'иконка exe не совпадает с иконкой проекта (стандартная иконка?)' }
 
-      # Тестовые хуки (`BYTETAP_TEST_HOOKS`, `BYTETAP_TEST_AUTOSTART`, `BYTETAP_TEST_PROBE*`)
-      # в релизный exe не компилируются: они за feature `test-hooks` (`Cargo.toml`), и
-      # `cargo build --release` её не включает. Проверка по байтам: бинарник читается
-      # один к одному (ISO-8859-1) и в нём не должно быть ни одного ключа хуков —
-      # все они начинаются с `BYTETAP_TEST`.
+      # Тестовые хуки (`BYTETAP_TEST_HOOKS`, `BYTETAP_TEST_AUTOSTART`, `BYTETAP_TEST_PANIC`,
+      # `BYTETAP_TEST_SCREEN`, `BYTETAP_TEST_JOURNAL`, `BYTETAP_TEST_PROBE*`) в релизный exe
+      # не компилируются: они за feature `test-hooks` (`Cargo.toml`), и `cargo build
+      # --release` её не включает. Проверка по байтам: бинарник декодируется один к одному
+      # (ISO-8859-1), и в нём не должно быть ни одного вхождения префикса `BYTETAP_TEST` —
+      # все ключи хуков начинаются с него. Поиск идёт ordinal (IndexOf с текущей культурой
+      # на другой локали раннера вернул бы другое число), и его проверяет положительный
+      # контроль: `BYTETAP_WARP_RETRY` — метка перезапуска с WARP (`gpu::RETRY_ENV`),
+      # которая в exe есть всегда. Не нашлась — сломан поиск, а не хуки.
       - name: В exe нет тестовых хуков
         shell: pwsh
         run: |
           $path = (Resolve-Path 'target\release\bytetap.exe').Path
           $text = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($path))
-          $found = @{}
-          foreach ($pattern in @('BYTETAP_TEST', 'BYTETAP_TEST_HOOKS')) {
+          function Count-Ordinal([string] $haystack, [string] $needle) {
             $count = 0
-            $index = $text.IndexOf($pattern)
+            $index = $haystack.IndexOf($needle, [StringComparison]::Ordinal)
             while ($index -ge 0) {
               $count++
-              $index = $text.IndexOf($pattern, $index + 1)
+              $index = $haystack.IndexOf($needle, $index + 1, [StringComparison]::Ordinal)
             }
-            $found[$pattern] = $count
-            Write-Host "вхождений '$pattern' в bytetap.exe: $count"
+            return $count
           }
-          if ($found['BYTETAP_TEST'] -gt 0 -or $found['BYTETAP_TEST_HOOKS'] -gt 0) {
-            throw 'в exe есть строки тестовых хуков — хуки попали в релиз'
-          }
+          $control = 'BYTETAP_WARP_RETRY'
+          $controlCount = Count-Ordinal $text $control
+          Write-Host "положительный контроль '$control' в bytetap.exe: $controlCount"
+          if ($controlCount -eq 0) { throw "поиск по байтам не работает: '$control' в bytetap.exe не найдена" }
+          $prefix = 'BYTETAP_TEST'
+          $count = Count-Ordinal $text $prefix
+          Write-Host "вхождений '$prefix' в bytetap.exe: $count"
+          if ($count -gt 0) { throw 'в exe есть строки тестовых хуков — хуки попали в релиз' }
 
       # Лицензии встроенных шрифтов, иконок и сторонних crate едут в архиве рядом с exe.
       - name: Сторонние лицензии актуальны
