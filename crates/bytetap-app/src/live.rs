@@ -108,7 +108,30 @@ const COST_DECAY: f32 = 0.875;
 ///
 /// Выброс (своп, сборка мусора, чужой процесс на том же ядре) не должен уводить период
 /// в секунду с одного замера: настоящая медлительность подтвердится следующими кадрами.
+/// Тот же предел держит и пол оценки: кадр, выждавший ожидание целиком, не возвращает
+/// цену к прежней одним кадром.
 const COST_GROWTH: f32 = 2.0;
+
+/// Через сколько подтверждённая цена кадра стареет: раз в столько её проверяет пробная
+/// пара кадров.
+///
+/// Кадры идут своим периодом и выжидают его целиком, поэтому замер цены им недоступен:
+/// уложившийся в ожидание кадр говорит только, что цена не больше ожидания. Без проверки
+/// подтверждённая цена становится храповиком — пара медленных кадров (нагрузка CPU на
+/// пару секунд, своп) поднимает её, и период стоит у секунды до «Стоп» (находка
+/// контрольного ревью шага 5: на WARP после нагрузки 2–3 с период оставался секундой).
+pub const COST_PROBE_EVERY: Duration = Duration::from_secs(5);
+
+/// Ожидание пробного кадра: минимальный период WARP.
+///
+/// Пробная пара идёт с этим ожиданием. Кадр, который рисуется дольше, его перерастает —
+/// и ожидание презентации видно замером; кадр, который уложился, ограничивает цену
+/// сверху. В обоих случаях подтверждённая цена заменяется, а не усредняется: она замер,
+/// а не среднее.
+pub const COST_PROBE_DELAY: Duration = FRAME_SOFTWARE;
+
+/// Сколько кадров подряд идёт проверка цены: цена подтверждается парой замеров.
+const COST_PROBE_FRAMES: u8 = 2;
 
 /// Допуск на пробуждение по таймеру: система будит окно на десятки миллисекунд позже
 /// запрошенного, и этот разброс — не остаток кадра.
@@ -145,8 +168,10 @@ pub fn present_wait(spacing: Duration, delay: Duration, requested: Duration) -> 
 /// ([`next_period`]). Цена подтверждается парой замеров подряд, растёт не больше чем
 /// вдвое за кадр ([`COST_GROWTH`]) и тает на кадрах, выждавших своё ожидание целиком, но
 /// не ниже подтверждённой цены ([`COST_DECAY`]): так одна задержка не залипает в
-/// периоде, а тройной запас периода над ценой кадра остаётся. Сбрасывается оценка после
-/// разворота, восстановления и свёртывания окна: [`reset`](Self::reset).
+/// периоде, а тройной запас периода над ценой кадра остаётся. Подтверждённая цена стареет:
+/// раз в [`COST_PROBE_EVERY`] её проверяет пробная пара кадров с ожиданием
+/// [`COST_PROBE_DELAY`], и результат заменяет её. Сбрасывается оценка после разворота,
+/// восстановления и свёртывания окна: [`reset`](Self::reset).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameBudget {
     /// Сколько заняла работа над только что нарисованным кадром.
@@ -160,6 +185,10 @@ pub struct FrameBudget {
     /// Разовую задержку (своп, пауза свёрнутого или перетаскиваемого окна) подтвердить
     /// нечем: следующий кадр после неё укладывается в щедрое ожидание и замера не даёт.
     pending: Option<Duration>,
+    /// Время записи с прошлой проверки подтверждённой цены.
+    since_probe: Duration,
+    /// Сколько пробных кадров осталось запросить у окна.
+    probes_left: u8,
 }
 
 impl FrameBudget {
@@ -195,15 +224,31 @@ impl FrameBudget {
     ///
     /// Кадр после смены размера рисует другую раскладку, а кадр после свёрнутого окна
     /// приходит через секунды: прежняя оценка к ним не относится. Подтверждённая цена
-    /// кадра остаётся — с неё окно начинает заново и не тратит кадры на догадку.
+    /// кадра остаётся — с неё окно начинает заново и не тратит кадры на догадку, — и её
+    /// проверка тоже начинается заново.
     pub fn reset(&mut self) {
         self.cost = Duration::ZERO;
         self.pending = None;
+        self.since_probe = Duration::ZERO;
+        self.probes_left = 0;
     }
 
     /// Забыть всё: новая запись. Прежняя цена кадра к новой сессии не относится.
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    /// Пробный кадр: цена стареет, и раз в [`COST_PROBE_EVERY`] её проверяет пара кадров
+    /// с ожиданием [`COST_PROBE_DELAY`].
+    ///
+    /// Зовёт окно перед каждым кадром записи: `true` — ждать [`COST_PROBE_DELAY`], а
+    /// [`sample`](Self::sample) заменит подтверждённую цену замером или верхней оценкой.
+    pub fn take_probe(&mut self) -> bool {
+        if self.probes_left == 0 {
+            return false;
+        }
+        self.probes_left -= 1;
+        true
     }
 
     /// Учесть кадр: `spacing` — промежуток от прошлого кадра (`None` — кадр первый или
@@ -219,6 +264,14 @@ impl FrameBudget {
         work: Duration,
     ) {
         self.work = work;
+        // Возраст подтверждённой цены: раз в несколько секунд её проверяет пробная пара.
+        if let Some(spacing) = spacing {
+            self.since_probe += spacing;
+        }
+        if self.since_probe >= COST_PROBE_EVERY {
+            self.since_probe = Duration::ZERO;
+            self.probes_left = COST_PROBE_FRAMES;
+        }
         let measured = match (spacing, delay, requested) {
             (Some(spacing), Some(delay), Some(requested)) => {
                 present_wait(spacing, delay, requested)
@@ -233,14 +286,11 @@ impl FrameBudget {
                 self.pending = Some(present);
                 return;
             };
-            let present = previous.min(present);
-            // Ожидание презентации — медленно меняющаяся часть цены: кадр растра и
-            // дисплея. Среднее сглаживает разброс между кадрами.
-            self.present = if present >= self.present {
-                present
-            } else {
-                (self.present + present) / 2
-            };
+            // Подтверждённая цена — замер, а не среднее: прежняя цена после медленной пары
+            // заменяется следующей подтверждённой, иначе среднее тянет за собой старое
+            // значение, и период остаётся у предела до «Стоп» (находка контрольного
+            // ревью шага 5).
+            self.present = previous.min(present);
             let cost = self.measured();
             // Первый замер после сброса — сразу настоящая цена; дальше вверх не больше
             // чем вдвое за кадр, а вниз — медленно: медленный кадр виден по первому же
@@ -255,12 +305,19 @@ impl FrameBudget {
             };
             return;
         }
-        // Кадр уложился в своё ожидание: ждущий замер не подтвердился, а оценка тает к
-        // подтверждённой цене. Не ниже неё: кадр, уложившийся в щедрое ожидание, не
-        // говорит, что он дешевле, а период держит тройной запас над ценой кадра.
+        // Кадр уложился в своё ожидание: ждущий замер не подтвердился, а цена кадра не
+        // больше ожидания — пробный кадр с минимальным периодом ограничивает её сверху,
+        // когда она упала.
         self.pending = None;
         if waited_fully(spacing, delay, requested) {
-            self.cost = self.cost.mul_f32(COST_DECAY).max(self.measured());
+            if let Some(delay) = delay {
+                self.present = self.present.min(delay.saturating_add(PRESENT_SLACK));
+            }
+            // Оценка тает к подтверждённой цене, но пол ограничен пределом роста: старая
+            // цена не возвращает её к себе одним кадром, иначе период держится у предела
+            // до «Стоп».
+            let floor = self.measured().min(self.cost.mul_f32(COST_GROWTH));
+            self.cost = self.cost.mul_f32(COST_DECAY).max(floor);
         }
     }
 }
@@ -839,6 +896,112 @@ mod tests {
         assert!(
             periods.iter().all(|period| *period == FRAME),
             "установившийся период на GPU — {FRAME:?}: {periods:?}"
+        );
+    }
+
+    /// Пара медленных кадров не держит период до «Стоп»: цена кадра стареет.
+    ///
+    /// На WARP подтверждённая цена становилась храповиком: после пары кадров по секунде
+    /// (нагрузка CPU на пару секунд, своп) период стоял у предела, потому что кадры,
+    /// выждавшие свой период целиком, цены не уточняют, а пол оценки не давал ей
+    /// опуститься ниже подтверждённой. Теперь раз в [`COST_PROBE_EVERY`] цену проверяет
+    /// пара кадров с ожиданием [`COST_PROBE_DELAY`], и замер заменяет её (находка
+    /// контрольного ревью шага 5).
+    #[test]
+    fn a_pair_of_slow_frames_does_not_stick_the_frame_period() {
+        let work = Duration::from_micros(500);
+        let requested = Duration::from_millis(2);
+        let price = Duration::from_millis(200);
+        let mut budget = FrameBudget::default();
+        budget.sample(None, None, None, work);
+        // Пара кадров по секунде: подтверждённая цена кадра — секунда.
+        for _ in 0..2 {
+            budget.sample(
+                Some(requested + FRAME_SLOWEST),
+                Some(FRAME_SOFTWARE),
+                Some(requested),
+                work,
+            );
+        }
+        assert_eq!(budget.measured(), FRAME_SLOWEST + work);
+        assert_eq!(next_period(true, budget.cost()), FRAME_SLOWEST);
+        // Дальше минута кадров по 200 мс: кадр либо укладывается в ожидание, либо
+        // перерастает его. Пробные кадры окно запрашивает так же, как приложение.
+        let mut elapsed = Duration::ZERO;
+        while elapsed < Duration::from_secs(60) {
+            let delay = if budget.take_probe() {
+                COST_PROBE_DELAY
+            } else {
+                next_period(true, budget.cost())
+            };
+            let spacing = requested + price.max(delay);
+            budget.sample(Some(spacing), Some(delay), Some(requested), work);
+            elapsed += spacing;
+        }
+        let period = next_period(true, budget.cost());
+        assert!(
+            period <= price.mul_f32(3.0) + FRAME,
+            "период {period:?} не вернулся к трём ценам кадра: цена {:?}",
+            budget.measured()
+        );
+        assert_eq!(
+            budget.measured(),
+            price + work,
+            "цена кадра — настоящая, а не прежняя"
+        );
+    }
+
+    /// Пол оценки цены кадра не обходит предел роста.
+    ///
+    /// Кадр, выждавший своё ожидание целиком, не уточняет цену — он только не выше её, — и
+    /// прежний пол возвращал оценку к подтверждённой цене одним кадром, хотя замеров
+    /// вверх не больше чем вдвое за кадр ([`COST_GROWTH`]). С таким полом пара кадров по
+    /// три секунды снова держала период у предела.
+    #[test]
+    fn the_floor_of_the_cost_respects_the_growth_limit() {
+        let work = Duration::from_micros(500);
+        let requested = Duration::from_millis(2);
+        let price = Duration::from_millis(200);
+        let mut budget = FrameBudget::default();
+        // Цена 200 мс установилась парой замеров.
+        for _ in 0..2 {
+            budget.sample(
+                Some(requested + price),
+                Some(COST_PROBE_DELAY),
+                Some(requested),
+                work,
+            );
+        }
+        assert_eq!(budget.cost(), price + work);
+        // Пара кадров по три секунды: и цена, и оценка растут не больше чем вдвое за кадр.
+        let mut previous = budget.cost();
+        for _ in 0..2 {
+            budget.sample(
+                Some(requested + Duration::from_secs(3)),
+                Some(COST_PROBE_DELAY),
+                Some(requested),
+                work,
+            );
+            assert!(
+                budget.cost() <= previous.mul_f32(COST_GROWTH),
+                "цена {:?} после {:?} выросла больше чем вдвое",
+                budget.cost(),
+                previous
+            );
+            previous = budget.cost();
+        }
+        assert_eq!(budget.measured(), Duration::from_secs(3) + work);
+        // Кадр, выждавший ожидание целиком, не возвращает оценку к цене одним кадром.
+        budget.sample(
+            Some(requested + Duration::from_secs(3)),
+            Some(Duration::from_secs(3)),
+            Some(requested),
+            work,
+        );
+        assert!(
+            budget.cost() <= previous.mul_f32(COST_GROWTH),
+            "пол вернул цену с {previous:?} к {:?}",
+            budget.cost()
         );
     }
 

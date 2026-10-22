@@ -1729,10 +1729,17 @@ impl BytetapApp {
                 // CSS-анимация в UI v2: на аппаратном растре кадр всё равно приходит раз
                 // в [`live::FRAME`] (пульс и таймер), а на WARP — к смене секунды
                 // таймера, и там пульса нет (U1-AC24).
-                let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-                let delay = if added > 0 {
+                //
+                // Свёрнутого окна здесь нет: eframe 0.37 у свёрнутого окна зовёт только
+                // `logic`, кадра не строит, и эта ветка до него не доходит (находка
+                // контрольного ревью шага 5).
+                let delay = if self.frame_cost.take_probe() {
+                    // Пробная пара: цена кадра стареет, и раз в несколько секунд её
+                    // проверяет кадр с ожиданием минимального периода.
+                    live::COST_PROBE_DELAY
+                } else if added > 0 {
                     period
-                } else if crate::gpu::software() || minimized {
+                } else if crate::gpu::software() {
                     let elapsed = self
                         .rec
                         .as_ref()
