@@ -70,6 +70,15 @@ pub const DWM_CORNER_RADIUS: f32 = 8.0;
 /// DWM скругляет углы этого окна: своя рамка рисуется со скруглением того же радиуса.
 static DWM_ROUNDED: AtomicBool = AtomicBool::new(false);
 
+/// DWM принял атрибут угла: `DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE)`
+/// вернул 0 — и для `DWMWCP_ROUND`, и для `DWMWCP_DONOTROUND`.
+///
+/// Скругления флаг не обещает (на Windows 10 атрибута нет), но говорит, что настройка
+/// DWM дошла до окна: по нему кадровый цикл решает, подтверждать ли состояние DWM при
+/// смене активности окна. `DwmSetup::applied` для этого не годится: на Windows 10 он
+/// истинен из-за `DwmExtendFrameIntoClientArea`.
+static DWM_CORNER_ACCEPTED: AtomicBool = AtomicBool::new(false);
+
 /// Результат настройки окна средствами DWM: что именно удалось и что нет.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DwmSetup {
@@ -147,17 +156,29 @@ pub fn setup_dwm(handle: RawWindowHandle, border: Color32, software: bool) -> Dw
     let mut setup = DwmSetup::NONE;
 
     // Скругление: DWM рисует углы сам, своя рамка повторяет их радиус. На Windows 10
-    // атрибута нет — вызов вернёт ошибку.
+    // атрибута нет — вызов вернёт ошибку, и это штатный отказ, а не сбой: уровень
+    // строки журнала зависит от того, ждали ли здесь скругления (`dwm_expected`).
     let corner = set_corner_preference(hwnd, software);
     if corner != 0 {
-        diag::error(format!(
-            "рамка окна: DWM не принял {}: HRESULT {corner:#x} — рамку рисует приложение с квадратными углами",
-            if software {
-                "DWMWCP_DONOTROUND"
-            } else {
-                "DWMWCP_ROUND"
-            }
-        ));
+        if dwm_expected() {
+            diag::error(format!(
+                "рамка окна: DWM не принял {}: HRESULT {corner:#x} — рамку рисует приложение с квадратными углами",
+                if software {
+                    "DWMWCP_DONOTROUND"
+                } else {
+                    "DWMWCP_ROUND"
+                }
+            ));
+        } else {
+            diag::info(format!(
+                "рамка окна: DWM не принял {}: HRESULT {corner:#x} — на этой Windows атрибута угла нет, рамку рисует приложение с квадратными углами",
+                if software {
+                    "DWMWCP_DONOTROUND"
+                } else {
+                    "DWMWCP_ROUND"
+                }
+            ));
+        }
     } else if software {
         setup.applied = true;
         diag::info(
@@ -263,6 +284,9 @@ fn hwnd(handle: RawWindowHandle) -> Option<windows_sys::Win32::Foundation::HWND>
 ///
 /// `software` — кадр рисует программный растр: углы заказываются квадратными, чтобы
 /// линия своей рамки совпадала с углом окна.
+///
+/// Итог вызова записывается в [`DWM_CORNER_ACCEPTED`]: по нему кадровый цикл решает,
+/// подтверждать ли состояние DWM при смене активности окна.
 #[cfg(windows)]
 fn set_corner_preference(hwnd: windows_sys::Win32::Foundation::HWND, software: bool) -> i32 {
     use windows_sys::Win32::Graphics::Dwm::{
@@ -275,14 +299,17 @@ fn set_corner_preference(hwnd: windows_sys::Win32::Foundation::HWND, software: b
         DWMWCP_ROUND
     };
     // SAFETY: атрибут — целое число, размер совпадает с типом.
-    unsafe {
+    let result = unsafe {
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE as u32,
             &corner as *const i32 as *const std::ffi::c_void,
             u32::try_from(std::mem::size_of::<i32>()).unwrap_or_default(),
         )
-    }
+    };
+    // Флаг общий для обоих значений атрибута: важно, что DWM его принял, а не как.
+    DWM_CORNER_ACCEPTED.store(result == 0, Ordering::Relaxed);
+    result
 }
 
 /// Рамку рисует приложение: DWM получает `DWMWA_COLOR_NONE` — своей рамки он не рисует.
@@ -312,6 +339,17 @@ fn hide_dwm_border(hwnd: windows_sys::Win32::Foundation::HWND) -> i32 {
 #[must_use]
 pub fn dwm_rounded() -> bool {
     DWM_ROUNDED.load(Ordering::Relaxed)
+}
+
+/// Принял ли DWM атрибут угла этого окна, любое из двух его значений.
+///
+/// Флаг взводится при настройке окна и при каждом повторе ([`reapply_dwm`]) по HRESULT
+/// `DwmSetWindowAttribute`. Кадровый цикл по нему решает, повторять ли настройку DWM при
+/// смене активности окна: там, где атрибута нет (Windows 10), повторять нечего, и строки
+/// о подтверждении состояния DWM в журнале запуска не будет.
+#[must_use]
+pub fn dwm_corner_accepted() -> bool {
+    DWM_CORNER_ACCEPTED.load(Ordering::Relaxed)
 }
 
 /// Скругляет ли своя рамка углы: только когда DWM скруглил углы именно этого окна, оно

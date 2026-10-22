@@ -35,7 +35,7 @@ BEGIN
             VALUE "FileDescription", "bytetap"
             VALUE "FileVersion", BT_VERSION
             VALUE "InternalName", "bytetap"
-            VALUE "LegalCopyright", "MIT"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Vladislav Chmelyuk"
             VALUE "OriginalFilename", "bytetap.exe"
             VALUE "ProductName", "bytetap"
             VALUE "ProductVersion", BT_VERSION

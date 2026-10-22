@@ -4,7 +4,7 @@
 
 Основной формат поставки — переносимый `bytetap.exe`: его копируют на ноутбук инженера и запускают без установки. С v0.2.0 exe собирается из `crates/bytetap-app` — нативное приложение на egui и wgpu, без WebView2, .NET и Visual C++ Redistributable. Установщик (NSIS/MSI) пока не собирается.
 
-В zip релиза входят `bytetap.exe`, `README.md`, `LICENSE`, `THIRD-PARTY-LICENSES.md` и `SHA256SUMS`. Имя архива — `bytetap-v<версия>-windows-x64.zip`, имя exe внутри архива — `bytetap.exe`.
+В zip релиза входят `bytetap.exe`, `README.md`, `LICENSE` и `THIRD-PARTY-LICENSES.md`, рядом с архивом лежит `SHA256SUMS`. Имя архива — `bytetap-v<версия>-windows-x64.zip`, имя exe внутри архива — `bytetap.exe`.
 
 WebView2 в поставке больше нет: в v0.1.0 это был системный компонент, который Tauri-версия брала из Windows, а на офлайн-ноутбуках он бывал слишком старым. Нативная версия рисует окно сама, зависимость exe — только системные DLL Windows (проверяется в CI по `dumpbin /dependents`).
 

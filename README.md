@@ -16,7 +16,7 @@ bytetap — настольное приложение для записи «сы
 
 ## Скачать
 
-Готовые сборки и контрольные суммы — на странице [Releases](https://github.com/fgbm/bytetap/releases). В архив входят `bytetap.exe`, `README.md`, `LICENSE`, `THIRD-PARTY-LICENSES.md` и `SHA256SUMS`.
+Готовые сборки и контрольные суммы — на странице [Releases](https://github.com/fgbm/bytetap/releases). В архив входят `bytetap.exe`, `README.md`, `LICENSE` и `THIRD-PARTY-LICENSES.md`; файл `SHA256SUMS` лежит в релизе рядом с архивом.
 
 ## Документация
 

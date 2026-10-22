@@ -603,6 +603,21 @@ jobs:
                   $failed = $true
                 }
                 if (-not (Check-Frame (Measure-Frame $hwnd 'inactive') 'окно без фокуса')) { $failed = $true }
+                # Смену активности видно и в журнале запуска: строка о первой потере
+                # фокуса за запуск (`track_window_activation`, `window.rs`). Окно теряет
+                # фокус асинхронно, поэтому строка ищется с ожиданием.
+                $confirmed = $false
+                for ($i = 0; $i -lt 20 -and -not $confirmed; $i++) {
+                  if (Test-Path $log) {
+                    $confirmed = Select-String -Path $log -Pattern 'рамка окна: окно неактивно' -Quiet -Encoding utf8
+                  }
+                  if (-not $confirmed) { Start-Sleep -Milliseconds 250 }
+                }
+                Write-Host "окно без фокуса: журнал подтвердил смену активности $confirmed"
+                if (-not $confirmed) {
+                  Write-Host 'окно без фокуса: в журнале запуска нет строки «рамка окна: окно неактивно»'
+                  $failed = $true
+                }
                 Stop-Process -Id $note.Id -Force -ErrorAction SilentlyContinue
               }
             } catch { Write-Host "экран записи: $_"; $failed = $true }

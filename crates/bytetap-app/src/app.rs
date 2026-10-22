@@ -269,6 +269,9 @@ pub struct BytetapApp {
     window_focused: Option<bool>,
     /// Что о смене активности уже записано в журнал запуска: `[потеря, возвращение]`.
     activation_logged: [bool; 2],
+    /// Отказ повторной настройки DWM уже записан в журнал запуска: окно переключается
+    /// часто, и строка на каждое переключение забивала бы журнал.
+    reapply_refusal_logged: bool,
     /// Скругляет ли своя рамка углы в этом кадре: DWM скруглил их у этого окна, окно не
     /// развёрнуто и не прижато к краю, кадр рисует не программный растр (`window.rs`).
     frame_rounded: bool,
@@ -372,6 +375,7 @@ impl BytetapApp {
             frame_applied: false,
             window_focused: None,
             activation_logged: [false; 2],
+            reapply_refusal_logged: false,
             frame_rounded: false,
             hook_menu: None,
             frames: 0,
@@ -1647,10 +1651,10 @@ impl BytetapApp {
     ///
     /// По документации `DWMWA_BORDER_COLOR` цвет рамки на смену состояния выставляет
     /// приложение, а `DWMWA_COLOR_NONE` подавляет отрисовку рамки DWM всегда. Своя рамка
-    /// от активности не зависит, но состояние DWM подтверждается повторно; в журнал
-    /// запуска идут первая потеря и первое возвращение фокуса за запуск и отказы
-    /// HRESULT: окно переключается часто, и строка на каждое переключение забивала бы
-    /// журнал запуска.
+    /// от активности не зависит, но состояние DWM подтверждается повторно там, где DWM
+    /// принял атрибут угла (`window::dwm_corner_accepted`); в журнал запуска идут первая
+    /// потеря и первое возвращение фокуса за запуск и первый отказ HRESULT: окно
+    /// переключается часто, и строка на каждое переключение забивала бы журнал запуска.
     fn track_window_activation(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|i| i.viewport().focused);
         let previous = self.window_focused;
@@ -1659,7 +1663,9 @@ impl BytetapApp {
         }
         self.window_focused = focused;
         // Первое наблюдение состояния DWM не трогает: настройка идёт после первого кадра.
-        if previous.is_none() || !self.frame_applied || !crate::window::dwm_rounded() {
+        // Повторять настройку есть что только там, где DWM принял атрибут угла: на
+        // Windows 10 атрибута нет, и скругления не появится ни от какого повтора.
+        if previous.is_none() || !self.frame_applied || !crate::window::dwm_corner_accepted() {
             return;
         }
         let Some(focused) = focused else {
@@ -1668,7 +1674,10 @@ impl BytetapApp {
         let Some(handle) = self.window_handle else {
             return;
         };
-        if let Some(code) = crate::window::reapply_dwm(handle, crate::gpu::software()) {
+        if let Some(code) = crate::window::reapply_dwm(handle, crate::gpu::software())
+            && !self.reapply_refusal_logged
+        {
+            self.reapply_refusal_logged = true;
             diag::error(format!(
                 "рамка окна: повторная настройка DWM: HRESULT {code:#x}"
             ));

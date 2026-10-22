@@ -6,7 +6,7 @@
 
 ## [0.2.0] - 2026-10-22
 
-Второй релиз: нативный интерфейс вместо Tauri и Vue. Поставляется тот же переносимый `bytetap.exe` без установщика и подписи, и с этой версии он собирается из `crates/bytetap-app`: окно рисует само приложение на egui, eframe и wgpu, а зависимости exe — только системные DLL Windows (WebView2, .NET и Visual C++ Redistributable больше не нужны). В zip релиза входят `bytetap.exe`, `README.md`, `LICENSE`, `THIRD-PARTY-LICENSES.md` и `SHA256SUMS`; имя архива — `bytetap-v0.2.0-windows-x64.zip`. Порядок выпуска: тег `v0.2.0` на коммит релиза, по тегу собирается zip и создаётся черновик релиза, владелец проходит ручной смоук на черновике по `docs/dev/testing.md`, затем нажимает «Publish release».
+Второй релиз: нативный интерфейс вместо Tauri и Vue. Поставляется тот же переносимый `bytetap.exe` без установщика и подписи, и с этой версии он собирается из `crates/bytetap-app`: окно рисует само приложение на egui, eframe и wgpu, а зависимости exe — только системные DLL Windows (WebView2, .NET и Visual C++ Redistributable больше не нужны). В zip релиза входят `bytetap.exe`, `README.md`, `LICENSE` и `THIRD-PARTY-LICENSES.md`, а рядом с архивом лежит `SHA256SUMS`; имя архива — `bytetap-v0.2.0-windows-x64.zip`. Порядок выпуска: тег `v0.2.0` на коммит релиза, по тегу собирается zip и создаётся черновик релиза, владелец проходит ручной смоук на черновике по `docs/dev/testing.md`, затем нажимает «Publish release».
 
 ### Добавлено
 

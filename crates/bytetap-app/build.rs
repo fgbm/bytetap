@@ -147,9 +147,11 @@ fn windows_resource() {
     println!("cargo:rerun-if-changed=assets/bytetap.rc");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     let version = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
-    // VERSIONINFO хранит версию четырьмя числами: предварительные метки (`-rc1`) сюда
-    // не входят, хватает числовых частей.
-    let mut parts: Vec<u16> = version
+    // VERSIONINFO хранит версию четырьмя числами: предварительная метка (`-rc1`) и
+    // метаданные сборки (`+build`) сюда не входят, поэтому до деления на части версия
+    // обрезается по первому из них.
+    let numeric_version = version.split(['-', '+']).next().unwrap_or(version.as_str());
+    let mut parts: Vec<u16> = numeric_version
         .split('.')
         .map(|part| part.parse().unwrap_or(0))
         .collect();
@@ -169,7 +171,9 @@ fn windows_resource() {
             &["assets"],
         ),
     )
-    .manifest_optional()
+    // Ресурс обязателен: без него в свойствах exe нет версии, а в проводнике — иконки
+    // bytetap, и молча собранный без ресурса exe прошёл бы проверки CI на msvc.
+    .manifest_required()
     .expect("ресурс bytetap.exe (assets/bytetap.rc)");
 }
 

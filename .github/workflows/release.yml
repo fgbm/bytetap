@@ -65,6 +65,52 @@ jobs:
           $extra = $dlls | Where-Object { $_ -notmatch '^api-ms-win-' -and -not (Test-Path (Join-Path $system32 $_)) }
           if ($extra) { throw "exe зависит от DLL не из System32: $($extra -join ', ')" }
 
+      # U1-AC1 (NFR-7): у exe есть иконка приложения и VERSIONINFO из ресурса. Ресурс
+      # (`crates/bytetap-app/assets/bytetap.rc`) собирает `build.rs`, и в релизе он
+      # обязателен: проверка та же, что в CI (`native-windows`), — без неё в свойствах
+      # файла и на панели задач оказался бы exe без иконки и версии.
+      - name: Иконка и версия exe
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $exe = (Get-Item target\release\bytetap.exe).FullName
+          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "в корневом Cargo.toml не найдена версия [workspace.package]" }
+          $version = $match.Matches[0].Groups[1].Value
+          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+          Write-Host "exe: ProductName '$($info.ProductName)', версия '$($info.ProductVersion)', файл '$($info.FileVersion)'"
+          if ($info.ProductName -ne 'bytetap') { throw "ProductName exe: '$($info.ProductName)'" }
+          if (-not ($info.ProductVersion -eq $version -or $info.ProductVersion -eq "$version.0")) {
+            throw "ProductVersion exe '$($info.ProductVersion)' не $version"
+          }
+          if ($info.CompanyName) { throw "CompanyName в свойствах exe: '$($info.CompanyName)'" }
+
+          $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
+          if ($null -eq $icon) { throw 'у exe нет иконки' }
+          $stream = [System.IO.File]::OpenRead((Resolve-Path 'crates\bytetap-app\assets\icon.ico'))
+          $expected = New-Object System.Drawing.Icon($stream, 32, 32)
+          $got = $icon.ToBitmap()
+          $want = $expected.ToBitmap()
+          $stream.Dispose()
+          if ($got.Width -ne $want.Width -or $got.Height -ne $want.Height) {
+            # Размер иконки выбирает оболочка; сверяем картинку в её размере.
+            $scaled = New-Object System.Drawing.Bitmap $got.Width, $got.Height
+            $g = [System.Drawing.Graphics]::FromImage($scaled)
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.DrawImage($want, 0, 0, $got.Width, $got.Height)
+            $g.Dispose()
+            $want = $scaled
+          }
+          $different = 0
+          for ($y = 0; $y -lt $got.Height; $y++) {
+            for ($x = 0; $x -lt $got.Width; $x++) {
+              if ($got.GetPixel($x, $y).ToArgb() -ne $want.GetPixel($x, $y).ToArgb()) { $different++ }
+            }
+          }
+          $total = $got.Width * $got.Height
+          Write-Host "иконка exe $($got.Width)x$($got.Height): расхождений с assets/icon.ico $different из $total"
+          if ($different -gt [int]($total * 0.2)) { throw 'иконка exe не совпадает с иконкой проекта (стандартная иконка?)' }
+
       # Лицензии встроенных шрифтов, иконок и сторонних crate едут в архиве рядом с exe.
       - name: Сторонние лицензии актуальны
         run: node scripts/licenses.mjs --check
