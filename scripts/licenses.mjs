@@ -64,7 +64,10 @@ function crates() {
 
 /** Лицензия встроенного ресурса целиком: заголовок и текст файла. */
 function asset(title, file) {
-  const text = readFileSync(join(root, file), "utf8").trim();
+  // Окончания строк приводятся к `\n`: файлы в репозитории лежат с разными (OFL.txt
+  // с CRLF, LICENSE иконок с LF), а checkout на Windows с `core.autocrlf` переписывает
+  // их на CRLF — иначе `--check` на windows-latest расходился бы с файлом из ubuntu.
+  const text = readFileSync(join(root, file), "utf8").replace(/\r\n/g, "\n").trim();
   return `### ${title}\n\n\`${file}\`\n\n\`\`\`text\n${text}\n\`\`\`\n`;
 }
 
@@ -95,9 +98,19 @@ lines.push("");
 
 const text = lines.join("\n");
 if (check) {
-  const current = existsSync(outPath) ? readFileSync(outPath, "utf8") : "";
+  const current = existsSync(outPath) ? readFileSync(outPath, "utf8").replace(/\r\n/g, "\n") : "";
   if (current !== text) {
     console.error("THIRD-PARTY-LICENSES.md устарел: запустите `node scripts/licenses.mjs`");
+    const fresh = text.split("\n");
+    const have = current.split("\n");
+    for (let i = 0; i < Math.max(fresh.length, have.length); i++) {
+      if (fresh[i] !== have[i]) {
+        console.error(`первое расхождение, строка ${i + 1}:`);
+        console.error(`  в файле:     ${JSON.stringify(have[i])}`);
+        console.error(`  по графу:    ${JSON.stringify(fresh[i])}`);
+        break;
+      }
+    }
     process.exit(1);
   }
   console.log("THIRD-PARTY-LICENSES.md актуален");
