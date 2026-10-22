@@ -441,8 +441,9 @@ impl RecordingView {
         };
     }
 
-    /// Локальный адрес исходящего сокета к цели из первого `open`: с него вторая
-    /// сторона видит bytetap (FR-8).
+    /// Локальный адрес исходящего сокета к цели из первого `open`: с него цель видит
+    /// bytetap (FR-8 — топология «анализатор подключается к ЛИС», где этот адрес и
+    /// вписывают в ЛИС).
     pub fn outgoing_local(&self) -> Option<&str> {
         self.outgoing_local.as_deref()
     }
@@ -614,8 +615,14 @@ pub fn failure_reason(code: JournalFailureCode) -> &'static str {
 }
 
 /// Текст события `error`/`info` по коду; неизвестный код — английский `message` журнала.
-pub fn event_text(code: Option<&str>, message: &str, pair: Pair, repeats: Option<u32>) -> String {
-    feedrows::event_text(code, message, pair, repeats)
+pub fn event_text(
+    code: Option<&str>,
+    message: &str,
+    pair: Pair,
+    repeats: Option<u32>,
+    peer: Option<&str>,
+) -> String {
+    feedrows::event_text(code, message, pair, repeats, peer)
 }
 
 fn encoding_label(encoding: Encoding) -> &'static str {
@@ -1545,14 +1552,23 @@ mod tests {
     #[test]
     fn codes_have_texts() {
         assert_eq!(
-            event_text(Some("connect_failed"), "x", Pair::None, None),
+            event_text(Some("connect_failed"), "x", Pair::None, None, None),
             "Не удалось подключиться к анализатору — повторяю."
         );
-        assert_eq!(event_text(Some("unknown"), "raw", Pair::None, None), "raw");
-        assert_eq!(event_text(None, "raw", Pair::None, None), "raw");
+        assert_eq!(
+            event_text(Some("unknown"), "raw", Pair::None, None, None),
+            "raw"
+        );
+        assert_eq!(event_text(None, "raw", Pair::None, None, None), "raw");
         // Недоступная цель прокси названа второй стороной пары (M4-AC6).
         assert_eq!(
-            event_text(Some("proxy_connect_failed"), "x", Pair::TargetLis, None),
+            event_text(
+                Some("proxy_connect_failed"),
+                "x",
+                Pair::TargetLis,
+                None,
+                None
+            ),
             "Не удалось подключиться к ЛИС — соединение закрыто, жду следующее."
         );
         assert_eq!(
@@ -1560,13 +1576,20 @@ mod tests {
                 Some("proxy_connect_timeout"),
                 "x",
                 Pair::TargetAnalyzer,
+                None,
                 None
             ),
             "Анализатор не ответил за отведённое время — соединение закрыто, жду следующее."
         );
         // Замечания о серии ошибок источника несут число повторов (формат `/2`).
         assert_eq!(
-            event_text(Some("source_recovered"), "x", Pair::TargetLis, Some(3)),
+            event_text(
+                Some("source_recovered"),
+                "x",
+                Pair::TargetLis,
+                Some(3),
+                None
+            ),
             "Связь восстановилась; повторов ошибки подряд было: 3."
         );
         assert_eq!(

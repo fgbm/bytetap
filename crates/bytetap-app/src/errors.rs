@@ -22,6 +22,8 @@ pub enum ErrorCode {
     AddressInvalid,
     /// Цель прокси совпадает с адресом прослушивания (M4-AC6).
     ProxyTargetSelf,
+    /// Адрес в фильтре прокси не разбирается (FR-8).
+    AllowFromInvalid,
     /// Нет прав: защищённый порт, чужая папка.
     PermissionDenied,
     /// Папка журналов недоступна.
@@ -45,11 +47,12 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::PortInUse,
         Self::AddressUnavailable,
         Self::AddressInvalid,
         Self::ProxyTargetSelf,
+        Self::AllowFromInvalid,
         Self::PermissionDenied,
         Self::LogDir,
         Self::AlreadyRunning,
@@ -69,6 +72,7 @@ impl ErrorCode {
             Self::AddressUnavailable => t!("errors.address_unavailable"),
             Self::AddressInvalid => t!("errors.address_invalid"),
             Self::ProxyTargetSelf => t!("errors.proxy_target_is_self"),
+            Self::AllowFromInvalid => t!("errors.allow_from_invalid"),
             Self::PermissionDenied => t!("errors.permission_denied"),
             Self::LogDir => t!("errors.log_dir"),
             Self::AlreadyRunning => t!("errors.already_running"),
@@ -127,6 +131,8 @@ pub fn error_field(code: ErrorCode, mode: SessionMode) -> ErrorField {
         // Петля на себя — про настройку цели, а не интерфейса: у прокси это порт цели,
         // который совпал с портом прослушивания на этом же адресе (M4-AC6).
         ErrorCode::ProxyTargetSelf => ErrorField::TargetPort,
+        // Отказ фильтра — под полем фильтра, а не под адресом цели (FR-8).
+        ErrorCode::AllowFromInvalid => ErrorField::AllowFrom,
         ErrorCode::PortNotFound
         | ErrorCode::PortBusy
         | ErrorCode::PortSettings
@@ -228,6 +234,8 @@ mod tests {
             (AddressInvalid, Proxy, ErrorField::Address),
             // Петля на себя — про порт цели, а не про интерфейс прослушивания.
             (ProxyTargetSelf, Proxy, ErrorField::TargetPort),
+            // Отказ фильтра по адресу входящего — своё поле в «Дополнительно».
+            (AllowFromInvalid, Proxy, ErrorField::AllowFrom),
             (PortNotFound, Com, ErrorField::Serial),
             (PortBusy, Com, ErrorField::Serial),
             (PortSettings, Com, ErrorField::Serial),

@@ -321,6 +321,47 @@ impl FormState {
                 .any(|own| own.trim().eq_ignore_ascii_case(&host))
     }
 
+    /// Что не так с адресом цели прокси (FR-5, FR-8).
+    ///
+    /// Пустой адрес просит его вписать; двоеточие, которое не делает строку IPv6-литералом,
+    /// означает порт внутри адреса — для порта у формы своё поле, и без этой проверки цель
+    /// стала бы `10.0.0.5:5000:5000`.
+    fn target_problem(&self, cfg: &AppConfig) -> Option<&'static str> {
+        let host = self.proxy_host.trim();
+        if host.is_empty() {
+            return Some(match cfg.proxy_role {
+                ProxyMode::AnalyzerClient => t!("form.proxyLisRequired"),
+                ProxyMode::AnalyzerServer => t!("form.proxyAnalyzerRequired"),
+            });
+        }
+        let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+        (host.contains(':') && unbracketed.parse::<Ipv6Addr>().is_err())
+            .then(|| t!("form.targetPortInside"))
+    }
+
+    /// Что не так с фильтром по адресу входящего (FR-8).
+    ///
+    /// Неразборчивый адрес просит адрес без порта; IPv6 при IPv4-слушателе не совпадёт ни
+    /// с одним входящим — входящее приходит с адресом того семейства, на котором слушает
+    /// bytetap.
+    fn allow_from_problem(&self, cfg: &AppConfig) -> Option<&'static str> {
+        match check_allow_from(&self.proxy_allow_from) {
+            Err(problem) => Some(problem.text()),
+            Ok(Some(IpAddr::V6(_))) if !Self::listen_is_ipv6(cfg) => {
+                Some(t!("errors.allow_from_ipv4_listener"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Слушатель прокси — IPv6-адрес. Форма выбирает интерфейс из IPv4-адресов машины,
+    /// поэтому IPv6 приходит только из файла настроек.
+    fn listen_is_ipv6(cfg: &AppConfig) -> bool {
+        let host = cfg.listen_host.trim();
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host.parse::<Ipv6Addr>().is_ok()
+    }
+
     /// Своя проверка поля: текст ошибки или `None`.
     pub fn local_error(&self, cfg: &AppConfig, field: ErrorField) -> Option<&'static str> {
         let shown = self.attempted
@@ -347,14 +388,7 @@ impl FormState {
             }
             ErrorField::Address => {
                 if cfg.mode == SessionMode::Proxy {
-                    if self.proxy_host.trim().is_empty() {
-                        Some(match cfg.proxy_role {
-                            ProxyMode::AnalyzerClient => t!("form.proxyLisRequired"),
-                            ProxyMode::AnalyzerServer => t!("form.proxyAnalyzerRequired"),
-                        })
-                    } else {
-                        None
-                    }
+                    self.target_problem(cfg)
                 } else {
                     self.connect_host
                         .trim()
@@ -368,9 +402,7 @@ impl FormState {
                     .target_is_own_port(cfg)
                     .then(|| t!("form.targetPortOwn")),
             },
-            ErrorField::AllowFrom => check_allow_from(&self.proxy_allow_from)
-                .err()
-                .map(AddressProblem::text),
+            ErrorField::AllowFrom => self.allow_from_problem(cfg),
             ErrorField::Serial => {
                 if Self::serial_port_missing(cfg) {
                     Some(t!("form.serialRequired"))
@@ -394,8 +426,8 @@ impl FormState {
             SessionMode::Proxy => {
                 check_port(&self.port_text).is_ok()
                     && check_port(&self.proxy_port_text).is_ok()
-                    && !self.proxy_host.trim().is_empty()
-                    && check_allow_from(&self.proxy_allow_from).is_ok()
+                    && self.target_problem(cfg).is_none()
+                    && self.allow_from_problem(cfg).is_none()
                     && !self.target_is_own_port(cfg)
             }
             SessionMode::Serial => {
@@ -487,6 +519,15 @@ fn connect_addr(host: &str, port: u16) -> Result<String, StartError> {
     }
 }
 
+/// Ключ цели прокси «адрес:порт»: пустой адрес и ненабранный порт ключа не дают.
+///
+/// По ключу адреса из записи и из фоновой пробы привязаны к цели: к другой цели они не
+/// относятся (FR-8).
+pub fn target_key(host: &str, port: u16) -> Option<String> {
+    let host = host.trim();
+    (!host.is_empty() && port != 0).then(|| format!("{host}:{port}"))
+}
+
 /// Настройки COM-порта ядра; поля проверяются до открытия порта (FR-11).
 fn serial_settings(serial: &SerialSettings) -> Result<CoreSerial, StartError> {
     let settings_error = |message: String| {
@@ -569,10 +610,11 @@ pub fn session_config(
         SessionMode::Proxy => {
             // Форма не пустит «Старт» с неразборчивым адресом; здесь — тот же разбор
             // для настроек, пришедших из файла.
+            // Отказ фильтра встаёт под своим полем, а не под адресом цели (FR-8).
             let allow_from = check_allow_from(&cfg.proxy_allow_from).map_err(|_| {
                 StartError::new(
-                    ErrorCode::AddressInvalid,
-                    "the peer filter is not an IP address",
+                    ErrorCode::AllowFromInvalid,
+                    "the peer filter is not an IP address without a port",
                 )
             })?;
             SessionConfig::proxy(
@@ -968,6 +1010,66 @@ mod tests {
         assert_eq!(cfg.proxy_host, "192.168.1.51");
         assert_eq!(cfg.proxy_port, 5000);
         assert_eq!(cfg.listen_port, 50025);
+    }
+
+    /// Порт в адресе цели — своя ошибка у поля адреса: для порта есть отдельное поле, а
+    /// цель `10.0.0.5:5000:5000` ядро не разобрало бы (M4-AC13).
+    #[test]
+    fn a_port_inside_the_target_address_is_refused() {
+        let cfg = config(SessionMode::Proxy);
+        let mut form = FormState::new(&cfg);
+        form.proxy_port_text = "5000".into();
+        form.attempted = true;
+        form.proxy_host = "10.0.0.5:5000".into();
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::Address),
+            Some(
+                "Порт — в отдельном поле: в адресе цели только адрес, например 10.0.0.5, а порт впишите в «Порт цели»."
+            )
+        );
+        assert!(!form.valid(&cfg), "с портом в адресе сессия не собирается");
+        // Имя узла с двоеточием — тоже порт в адресе.
+        form.proxy_host = "lis.example:5000".into();
+        assert!(form.local_error(&cfg, ErrorField::Address).is_some());
+
+        // IPv6-литерал — адрес, а не порт: со скобками и без.
+        form.proxy_host = "fe80::1".into();
+        assert_eq!(form.local_error(&cfg, ErrorField::Address), None);
+        assert!(form.valid(&cfg));
+        form.proxy_host = "[fe80::1]".into();
+        assert_eq!(form.local_error(&cfg, ErrorField::Address), None);
+        assert!(form.valid(&cfg));
+    }
+
+    /// IPv6-адрес в фильтре при IPv4-слушателе не пропустит никого: входящее приходит с
+    /// адресом того семейства, на котором слушает bytetap (FR-8).
+    #[test]
+    fn an_ipv6_filter_under_an_ipv4_listener_is_an_error() {
+        let mut cfg = config(SessionMode::Proxy);
+        cfg.proxy_host = "10.0.0.5".into();
+        cfg.proxy_port = 5000;
+        let mut form = FormState::new(&cfg);
+        form.attempted = true;
+        form.proxy_allow_from = "fe80::1".into();
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::AllowFrom),
+            Some(
+                "Слушатель bytetap — IPv4, поэтому IPv6-адрес в фильтре не совпадёт ни с кем. Укажите IPv4 того, кто подключается."
+            )
+        );
+        assert!(!form.valid(&cfg), "с таким фильтром сессия не собирается");
+
+        // IPv4 в фильтре при том же слушателе — норма.
+        form.proxy_allow_from = "192.168.1.51".into();
+        assert_eq!(form.local_error(&cfg, ErrorField::AllowFrom), None);
+        assert!(form.valid(&cfg));
+
+        // IPv6-слушатель из файла настроек: семейства совпадают.
+        form.proxy_allow_from = "fe80::1".into();
+        let mut ipv6 = cfg.clone();
+        ipv6.listen_host = "::".into();
+        assert_eq!(form.local_error(&ipv6, ErrorField::AllowFrom), None);
+        assert!(form.valid(&ipv6));
     }
 
     /// Цель прокси ведёт на собственный порт bytetap: адрес второй стороны — этот же

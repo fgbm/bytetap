@@ -30,9 +30,6 @@ pub const DEFAULT_CONNECT_HOST: &str = "192.168.1.50";
 /// Цель прокси по умолчанию пуста: адрес второй стороны знает только человек, а
 /// подставленный чужой узел отправил бы к нему живой обмен (FR-5, M4-AC13).
 pub const DEFAULT_PROXY_HOST: &str = "";
-/// Цель по умолчанию прежней сборки ветки M4 — `10.0.0.5:5000`. В релиз она не
-/// попадала, но сохранённые ею настройки очищаются, как и пустые (M4-AC13).
-const LEGACY_PROXY_HOST: &str = "10.0.0.5";
 pub const DEFAULT_BAUD: u32 = 9600;
 pub const DEFAULT_RECONNECT_SEC: u32 = 5;
 
@@ -372,11 +369,11 @@ pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig 
     }
 }
 
-/// Цель прокси из файла: пустая по умолчанию и прежняя цель ветки `10.0.0.5:5000`
-/// очищаются — форма просит вписать адрес второй стороны, а не подставляет чужой узел
-/// (M4-AC13).
+/// Цель прокси из файла: пустой адрес очищается вместе с портом — форма просит вписать
+/// адрес второй стороны, а не подставляет чужой узел (M4-AC13). Всё, что набрано,
+/// читается как есть: чистки прежних значений по адресу нет.
 fn proxy_target(host: String, port: u16) -> (String, u16) {
-    if host.trim().is_empty() || (host.trim() == LEGACY_PROXY_HOST && port == DEFAULT_PORT) {
+    if host.trim().is_empty() {
         (String::new(), 0)
     } else {
         (host, port)
@@ -1017,14 +1014,27 @@ mod tests {
         assert_eq!(settings.config.proxy_port, 0, "порт цели не набран");
         assert_eq!(settings.config.proxy_host, DEFAULT_PROXY_HOST);
 
-        // Цель по умолчанию прежней сборки ветки `10.0.0.5:5000` очищается: форма
-        // просит вписать адрес второй стороны, а не отправляет обмен на чужой узел.
+        // Набранная цель переживает повторное чтение: чистки прежних значений ветки нет,
+        // а профиль с целью `10.0.0.5:5000` читается тем же адресом и портом.
         let raw = json!({ "config": {
             "mode": "proxy", "proxyHost": "10.0.0.5", "proxyPort": 5000
         }});
+        let first = normalize(&raw, "");
+        assert_eq!(first.config.proxy_host, "10.0.0.5");
+        assert_eq!(first.config.proxy_port, 5000);
+        let second = normalize(&raw, "");
+        assert_eq!(second.config.proxy_host, first.config.proxy_host);
+        assert_eq!(second.config.proxy_port, first.config.proxy_port);
+        let raw = json!({
+            "config": { "mode": "proxy" },
+            "profiles": [{ "name": "Прокси", "config": {
+                "mode": "proxy", "proxyHost": "10.0.0.5", "proxyPort": 5000
+            }}]
+        });
         let settings = normalize(&raw, "");
-        assert_eq!(settings.config.proxy_host, "");
-        assert_eq!(settings.config.proxy_port, 0);
+        let profile = &settings.profiles[0].config;
+        assert_eq!(profile.proxy_host, "10.0.0.5", "цель профиля сохраняется");
+        assert_eq!(profile.proxy_port, 5000);
 
         // Профиль прокси хранит обе стороны и топологию: выбор профиля вернёт их.
         let raw = json!({

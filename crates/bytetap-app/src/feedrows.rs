@@ -146,9 +146,13 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
             };
             (RowClass::Service, text)
         }
-        FeedKind::Error { code, message } => (
+        FeedKind::Error {
+            code,
+            peer,
+            message,
+        } => (
             RowClass::Error,
-            event_text(code.as_deref(), message, pair, None),
+            event_text(code.as_deref(), message, pair, None, peer.as_deref()),
         ),
         FeedKind::Info {
             code,
@@ -162,7 +166,10 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
             } else {
                 RowClass::Event
             };
-            (class, event_text(code.as_deref(), message, pair, *repeats))
+            (
+                class,
+                event_text(code.as_deref(), message, pair, *repeats, None),
+            )
         }
         FeedKind::Note { text } => (RowClass::Event, text.clone()),
     }
@@ -179,11 +186,24 @@ pub fn closed_by(by: ClosedBy) -> &'static str {
 
 /// Текст события `error`/`info` по коду; неизвестный код — английский `message` журнала.
 ///
-/// `repeats` — число схлопнутых повторов из поля `info` (формат `/2`); свои фразы с ним
-/// есть у замечаний о серии ошибок источника, остальные его не читают.
-pub fn event_text(code: Option<&str>, message: &str, pair: Pair, repeats: Option<u32>) -> String {
+/// `repeats` — число схлопнутых повторов из поля `info`, `peer` — адрес отвергнутой
+/// стороны из поля `error` (оба — формат `/2`); свои фразы с ними есть у замечаний о
+/// серии ошибок источника и у отказа по фильтру, остальные их не читают.
+pub fn event_text(
+    code: Option<&str>,
+    message: &str,
+    pair: Pair,
+    repeats: Option<u32>,
+    peer: Option<&str>,
+) -> String {
     if let Some(text) = repeating_text(code, repeats) {
         return text;
+    }
+    // Адрес отвергнутого — из поля события, а не из английского `message` (FR-8).
+    if code == Some("proxy_peer_rejected")
+        && let Some(addr) = peer
+    {
+        return t!("events.proxy_peer_rejected_addr", addr = addr);
     }
     let text = match code {
         Some("accept_failed") => t!("events.accept_failed"),
@@ -657,6 +677,7 @@ mod tests {
         let error = |code: &str| {
             event(FeedKind::Error {
                 code: Some(code.into()),
+                peer: None,
                 message: "connect failed".into(),
             })
         };
@@ -699,6 +720,7 @@ mod tests {
         let error = |code: &str| {
             event(FeedKind::Error {
                 code: Some(code.into()),
+                peer: None,
                 message: "core text".into(),
             })
         };
@@ -710,12 +732,24 @@ mod tests {
         assert_eq!(class, RowClass::Error);
         assert_eq!(text, "Не удалось принять соединение — повторяю.");
 
-        // Отказ по адресу — не сломанный приём: строка называет именно причину.
+        // Отказ по адресу — не сломанный приём: строка называет именно причину, а адрес
+        // отвергнутого берёт из поля события, а не из английского `message` (FR-8).
         let (class, text) = row_text(&error("proxy_peer_rejected"), Pair::TargetLis);
         assert_eq!(class, RowClass::Error);
         assert_eq!(
             text,
             "Соединение с неразрешённого адреса закрыто — жду следующее."
+        );
+        let rejected = event(FeedKind::Error {
+            code: Some("proxy_peer_rejected".into()),
+            peer: Some("192.0.2.7".into()),
+            message: "proxy peer 192.0.2.7 is not allowed: only 192.168.1.51 may connect".into(),
+        });
+        let (class, text) = row_text(&rejected, Pair::TargetLis);
+        assert_eq!(class, RowClass::Error);
+        assert_eq!(
+            text,
+            "Соединение с неразрешённого адреса 192.0.2.7 закрыто — жду следующее."
         );
 
         let warning = event(FeedKind::Info {

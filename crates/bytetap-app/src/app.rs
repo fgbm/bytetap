@@ -191,6 +191,10 @@ pub struct NoteDialog {
     pub request: u64,
 }
 
+/// Проба адреса источника FR-8: адрес цели и порт → локальный адрес исходящего
+/// соединения. В работе — [`background::source_addr`], в тестах — своя.
+pub(crate) type SourceProbe = Arc<dyn Fn(&str, u16) -> Option<String> + Send + Sync>;
+
 pub struct BytetapApp {
     pub screen: Screen,
     pub(crate) settings: Settings,
@@ -207,11 +211,15 @@ pub struct BytetapApp {
     pub(crate) start_error: Option<StartError>,
     pub(crate) interfaces: Loaded<Vec<Interface>>,
     /// Адрес источника исходящего соединения к цели, увиденный в первом `open` записи
-    /// (`link.local`): его показывает строка FR-8, когда к шагу вернулись (M4-AC7).
-    pub(crate) proxy_source: Option<String>,
-    /// Тот же адрес, посчитанный в фоне до старта по цели из формы (FR-8): ключ
-    /// «адрес:порт» и результат.
+    /// (`link.local`), и цель «адрес:порт», к которой он относится: строка FR-8 берёт его,
+    /// только пока цель в форме та же (M4-AC7).
+    pub(crate) proxy_source: Option<(String, String)>,
+    /// Тот же адрес, посчитанный в фоне по цели из формы (FR-8): ключ «адрес:порт» и
+    /// результат.
     pub(crate) proxy_probe: Option<(String, Loaded<Option<String>>)>,
+    /// Подмена фоновой пробы адреса в тестах: в работе `None` — адрес считает
+    /// [`background::source_addr`], а тест подставляет свою, чтобы не ходить в сеть.
+    pub(crate) proxy_probe_hook: Option<SourceProbe>,
     pub(crate) ports: Loaded<Vec<PortInfo>>,
     pub(crate) recents: Loaded<Vec<RecentJournal>>,
     /// Предупреждение о папке журналов и папка, для которой оно посчитано.
@@ -353,6 +361,7 @@ impl BytetapApp {
             interfaces: Loaded::Idle,
             proxy_source: None,
             proxy_probe: None,
+            proxy_probe_hook: None,
             ports: Loaded::Idle,
             recents: Loaded::Idle,
             log_dir_warning: None,
@@ -819,9 +828,14 @@ impl BytetapApp {
             probe.poll();
         }
         // Адрес, с которого вторая сторона видит bytetap (FR-8): известен из первого
-        // `open` записи — `link.local` исходящего сокета к цели.
-        if let Some(addr) = self.rec.as_ref().and_then(RecordingView::outgoing_local) {
-            self.proxy_source = Some(addr.to_owned());
+        // `open` записи — `link.local` исходящего сокета к цели. Помнится вместе с целью
+        // записи: к другой цели этот адрес не относится.
+        if let Some(rec) = &self.rec
+            && let Some(addr) = rec.outgoing_local()
+            && let Some(key) =
+                crate::form::target_key(&rec.config.proxy_host, rec.config.proxy_port)
+        {
+            self.proxy_source = Some((key, addr.to_owned()));
         }
         if let Some((dir, task)) = &mut self.log_dir_warning_task
             && let Some(kind) = task.poll()
@@ -1297,8 +1311,10 @@ impl BytetapApp {
         self.stop_error = None;
         self.stop_stats = None;
         self.copied_until = None;
-        // Адрес цели мог смениться, пока шага не было: пробу FR-8 считаем заново.
+        // Адрес цели мог смениться, пока шага не было: пробу FR-8 и адрес из прошлой
+        // записи считаем заново.
         self.proxy_probe = None;
+        self.proxy_source = None;
         self.screen = Screen::Step(mode);
         self.save_settings();
     }
@@ -1322,6 +1338,16 @@ impl BytetapApp {
         self.form.attempted = true;
         self.start_error = None;
         let cfg = &self.settings.config;
+        // Ошибка фильтра по адресу живёт в свёрнутом «Дополнительно»: «Старт» раскрывает
+        // блок, иначе текст ошибки некуда поставить (FR-8).
+        if cfg.mode == SessionMode::Proxy
+            && self
+                .form
+                .local_error(cfg, crate::errors::ErrorField::AllowFrom)
+                .is_some()
+        {
+            self.form.more = true;
+        }
         if !self.form.valid(cfg) {
             return;
         }
@@ -1350,7 +1376,10 @@ impl BytetapApp {
         ));
         let mode = self.settings.config.mode;
         let field = error.field(mode);
+        // Ошибка поля, которое живёт в свёрнутом «Дополнительно», раскрывает блок: иначе
+        // текст ошибки некуда поставить, и «Старт» выглядит молчащим.
         if field == crate::errors::ErrorField::LogDir
+            || field == crate::errors::ErrorField::AllowFrom
             || (field == crate::errors::ErrorField::Interface && mode == SessionMode::TcpServer)
         {
             self.form.more = true;

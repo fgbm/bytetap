@@ -14,7 +14,9 @@ use eframe::egui::{
 use crate::app::{BytetapApp, Screen, centered};
 use crate::background::{self, Loaded, Task};
 use crate::errors::ErrorField;
-use crate::form::{FORMATS, apply_format, check_baud, check_port, parse_reconnect, serial_format};
+use crate::form::{
+    self, FORMATS, apply_format, check_baud, check_port, parse_reconnect, serial_format,
+};
 use crate::icons::{self, Icon};
 use crate::scenarios::mode_title;
 use crate::settings::{
@@ -116,6 +118,28 @@ fn chip_width(ui: &Ui, text: &str) -> f32 {
         .size()
         .x
         + 20.0
+}
+
+/// Адрес строки FR-8 по топологии (M4-AC7).
+///
+/// «Анализатор подключается к ЛИС»: ЛИС определяет анализатор по адресу, с которого
+/// bytetap выходит к ней, — его и вписывают в ЛИС. Без пробы и записи остаётся IP
+/// прослушивания: порт исходящего соединения случаен и для ЛИС ничего не значит, а порт
+/// прослушивания — не тот, с которого bytetap приходит к ней.
+///
+/// «ЛИС подключается к анализатору»: ЛИС сама идёт на порт прослушивания, и в ней должен
+/// стоять адрес прослушивания вместе с портом (он же `open.local` в записи), а не
+/// источник исходящего соединения к анализатору.
+fn fr8_address(
+    role: ProxyMode,
+    listen_host: &str,
+    listen_addr: &str,
+    source: Option<String>,
+) -> String {
+    match role {
+        ProxyMode::AnalyzerClient => source.unwrap_or_else(|| listen_host.to_owned()),
+        ProxyMode::AnalyzerServer => listen_addr.to_owned(),
+    }
 }
 
 /// Прокрутка к виджету, получившему фокус: Tab уводит к полям ниже края окна, а
@@ -506,16 +530,14 @@ impl BytetapApp {
             widgets::hint(ui, p, t!("form.noInterfaces"));
         }
         if let Some(role) = proxy {
-            // FR-8: ЛИС (или анализатор) определяет собеседника по IP — значит, там должен
-            // стоять адрес ноутбука, а не прежний адрес второй стороны. Это адрес
-            // источника исходящего соединения к цели, а не адрес прослушивания: у
-            // ноутбука с двумя сетями они разные (M4-AC7). Пока запись не дала пары,
-            // адрес считается в фоне; нет и его — остаётся адрес прослушивания.
+            // FR-8: вторая сторона определяет собеседника по IP, и адрес строки зависит
+            // от топологии (M4-AC7): куда смотреть — в `fr8_address`.
             let ctx = ui.ctx().clone();
-            let source = self.source_address(&ctx).unwrap_or_else(|| host.clone());
+            let source = self.source_address(&ctx);
+            let shown = fr8_address(role, &host, &address, source);
             let text = match role {
-                ProxyMode::AnalyzerClient => t!("form.proxyWarning", addr = source),
-                ProxyMode::AnalyzerServer => t!("form.proxyWarningServer", addr = source),
+                ProxyMode::AnalyzerClient => t!("form.proxyWarning", addr = shown),
+                ProxyMode::AnalyzerServer => t!("form.proxyWarningServer", addr = shown),
             };
             hint_with_info(ui, p, &text, t!("form.proxyWarningHint"));
         }
@@ -745,38 +767,47 @@ impl BytetapApp {
         self.responder_field(ui, p);
     }
 
-    /// Адрес, с которого вторая сторона увидит bytetap (FR-8).
+    /// Адрес, с которого bytetap выходит к цели (FR-8).
     ///
     /// Сначала — фактический адрес из первого `open` записи (`link.local` исходящего
-    /// сокета к цели): точнее него не бывает. Затем — посчитанный в фоне до старта по
-    /// цели из формы: соединение UDP не отправляет пакетов, но выбирает локальный адрес
-    /// по таблице маршрутов. `None` — адрес неизвестен; строка FR-8 покажет тогда адрес
-    /// прослушивания, как в остальных режимах.
+    /// сокета к цели): точнее него не бывает, и он помнится вместе с целью, к которой
+    /// записан, — к другой цели он не относится. Затем — посчитанный в фоне по цели,
+    /// набранной в форме (а не принятой в настройки: цель могли сменить и не нажать
+    /// «Старт»): соединение UDP не отправляет пакетов, но выбирает локальный адрес по
+    /// таблице маршрутов. `None` — адрес неизвестен.
+    ///
+    /// В топологии «ЛИС подключается к анализатору» проба не нужна: ЛИС идёт на порт
+    /// прослушивания, а исходящее соединение к анализатору в строке FR-8 не участвует.
     fn source_address(&mut self, ctx: &egui::Context) -> Option<String> {
-        if let Some(addr) = &self.proxy_source {
-            return Some(addr.clone());
-        }
-        let cfg = &self.settings.config;
-        let host = cfg.proxy_host.trim().to_owned();
-        let port = cfg.proxy_port;
-        if host.is_empty() || port == 0 {
+        if self.settings.config.proxy_role == ProxyMode::AnalyzerServer {
             return None;
+        }
+        let host = self.form.proxy_host.trim().to_owned();
+        let port = check_port(&self.form.proxy_port_text).unwrap_or(0);
+        let key = form::target_key(&host, port)?;
+        if let Some((for_target, addr)) = &self.proxy_source {
+            if *for_target == key {
+                return Some(addr.clone());
+            }
+            // Цель сменилась: адрес прошлой записи к новой не относится.
+            self.proxy_source = None;
         }
         // Снимки и тесты: окружение синтетическое, в сеть не ходим.
         if self.fixtures {
             return None;
         }
-        let key = format!("{host}:{port}");
         if self
             .proxy_probe
             .as_ref()
             .is_none_or(|(probed, _)| *probed != key)
         {
             let probe_host = host;
+            let hook = self.proxy_probe_hook.clone();
             self.proxy_probe = Some((
                 key,
-                Loaded::Loading(Task::spawn(ctx, move || {
-                    background::source_addr(&probe_host, port)
+                Loaded::Loading(Task::spawn(ctx, move || match hook {
+                    Some(probe) => probe(&probe_host, port),
+                    None => background::source_addr(&probe_host, port),
                 })),
             ));
         }
@@ -1237,6 +1268,114 @@ impl BytetapApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Адрес строки FR-8 выбирается по топологии (M4-AC7): «анализатор — клиент» —
+    /// источник исходящего соединения к ЛИС (без него — адрес прослушивания), «ЛИС
+    /// подключается к анализатору» — всегда адрес прослушивания, к которому идёт ЛИС.
+    #[test]
+    fn the_fr8_address_depends_on_the_topology() {
+        assert_eq!(
+            fr8_address(
+                ProxyMode::AnalyzerClient,
+                "192.168.1.10",
+                "192.168.1.10:50025",
+                Some("192.168.1.77".to_owned())
+            ),
+            "192.168.1.77",
+            "в ЛИС вписывают адрес, с которого bytetap выходит к ней"
+        );
+        assert_eq!(
+            fr8_address(
+                ProxyMode::AnalyzerClient,
+                "192.168.1.10",
+                "192.168.1.10:50025",
+                None
+            ),
+            "192.168.1.10",
+            "без пробы и записи остаётся IP прослушивания, но не порт"
+        );
+        assert_eq!(
+            fr8_address(
+                ProxyMode::AnalyzerServer,
+                "192.168.1.10",
+                "192.168.1.10:5000",
+                Some("192.168.1.77".to_owned())
+            ),
+            "192.168.1.10:5000",
+            "ЛИС подключается к адресу прослушивания, а не к источнику соединения"
+        );
+    }
+
+    /// Проба FR-8 спрашивает набранную в форме цель, а не принятую в настройки, и адрес
+    /// прошлой записи помнится с ключом цели (M4-AC7).
+    #[test]
+    fn the_fr8_probe_asks_about_the_typed_target() {
+        use std::sync::{Arc, Mutex};
+
+        let ctx = egui::Context::default();
+        let mut settings = crate::settings::Settings::with_log_dir("C:/logs");
+        settings.config.mode = SessionMode::Proxy;
+        settings.config.proxy_role = ProxyMode::AnalyzerClient;
+        // Настройки говорят одно, форма — другое: цель набрали и «Старт» не нажимали.
+        settings.config.proxy_host = "10.0.0.9".into();
+        settings.config.proxy_port = 5001;
+        let mut app = BytetapApp::new(&ctx, settings, None, None);
+        app.form.proxy_host = "10.0.0.5".into();
+        app.form.proxy_port_text = "5000".into();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        app.proxy_probe_hook = Some(Arc::new(move |host: &str, port: u16| {
+            seen.lock().expect("список").push(format!("{host}:{port}"));
+            Some("192.168.1.10".to_owned())
+        }));
+
+        assert_eq!(app.source_address(&ctx), None, "проба идёт в фоне");
+        let probed = wait_for_probe(&mut app, &ctx);
+        assert_eq!(probed.as_deref(), Some("192.168.1.10"));
+        assert_eq!(
+            asked.lock().expect("список").as_slice(),
+            ["10.0.0.5:5000"],
+            "проба спросила набранную цель"
+        );
+
+        // Цель сменили: адрес прошлой записи к ней не относится, проба идёт заново.
+        app.proxy_source = Some(("10.0.0.5:5000".to_owned(), "192.168.1.99".to_owned()));
+        app.form.proxy_host = "10.0.0.6".into();
+        assert_eq!(
+            app.source_address(&ctx),
+            None,
+            "адрес другой цели не показывается"
+        );
+        assert!(app.proxy_source.is_none(), "адрес прошлой цели забыт");
+        wait_for_probe(&mut app, &ctx);
+        assert_eq!(
+            asked.lock().expect("список").last().map(String::as_str),
+            Some("10.0.0.6:5000"),
+            "проба спросила новую цель"
+        );
+
+        // Та же цель, что в записи: её адрес точнее пробы.
+        app.proxy_source = Some(("10.0.0.6:5000".to_owned(), "192.168.1.98".to_owned()));
+        assert_eq!(
+            app.source_address(&ctx).as_deref(),
+            Some("192.168.1.98"),
+            "адрес из записи относится к этой цели"
+        );
+    }
+
+    /// Ждёт результат фоновой пробы FR-8: поток отдаёт его через канал.
+    fn wait_for_probe(app: &mut BytetapApp, ctx: &egui::Context) -> Option<String> {
+        for _ in 0..400 {
+            if let Some((_, probe)) = &mut app.proxy_probe {
+                probe.poll();
+            }
+            if let Some(addr) = app.source_address(ctx) {
+                return Some(addr);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("проба не ответила");
+    }
 
     #[test]
     fn an_error_of_a_hidden_field_goes_under_start() {

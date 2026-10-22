@@ -791,7 +791,9 @@ fn the_proxy_address_errors_keep_their_own_fields() {
         Some(ErrorField::Address),
         "неразборчивая цель — поле адреса цели"
     );
-    harness.get_by_label("Адрес цели указан неверно: нужен IPv4-адрес или имя.");
+    harness.get_by_label(
+        "Адрес цели указан неверно: нужен адрес (IPv4 или IPv6) или имя узла, а порт — в отдельном поле.",
+    );
 }
 
 /// Фильтр по адресу входа в «Дополнительно» шага прокси: поле, подсказка и разбор
@@ -922,7 +924,7 @@ fn the_proxy_step_shows_the_address_and_the_warnings() {
     harness.get_by_label("Впишите в ЛИС");
     harness.get_by_label("192.168.1.10:5000");
     harness.get_by_label(
-        "В ЛИС анализатор теперь виден с адреса ноутбука: если ЛИС определяет его по IP, укажите там адрес — 192.168.1.10.",
+        "ЛИС сверяет адрес анализатора: в ней должен стоять адрес прослушивания bytetap, на который она подключается — 192.168.1.10:5000.",
     );
 }
 
@@ -1975,6 +1977,7 @@ fn proxy_recording_fixture(error: bool) -> RecordingFixture {
             mono_us: 0,
             conn: None,
             code: Some("proxy_connect_failed".into()),
+            peer: None,
             message: "connect failed".into(),
         }));
     }

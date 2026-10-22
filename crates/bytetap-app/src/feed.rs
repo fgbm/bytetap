@@ -260,6 +260,9 @@ pub enum FeedKind {
     },
     Error {
         code: Option<String>,
+        /// Адрес отвергнутой входящей стороны (формат `/2`): есть только у отказа по
+        /// фильтру прокси, чтобы строка ленты назвала адрес без разбора `message`.
+        peer: Option<String>,
         message: String,
     },
     Info {
@@ -323,6 +326,7 @@ impl FeedEvent {
                 error.conn,
                 FeedKind::Error {
                     code: error.code.clone(),
+                    peer: error.peer.clone(),
                     message: error.message.clone(),
                 },
             ),

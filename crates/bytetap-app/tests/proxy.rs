@@ -14,6 +14,7 @@ use bytetap_app::{BytetapApp, Screen};
 use bytetap_core::journal::Dir;
 use bytetap_testkit::emulator::{AnalyzerEmulator, frame};
 use bytetap_testkit::lis::{LisBehaviour, LisEmulator};
+use eframe::egui::{self, accesskit::Role};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable as _;
 
@@ -70,13 +71,8 @@ fn journal_types(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Шаг прокси в харнессе: поля из настроек, «Старт» нажимается тестом.
-fn proxy_harness(
-    log_dir: &str,
-    listen_port: u16,
-    lis: SocketAddr,
-    handle: tokio::runtime::Handle,
-) -> Harness<'static, BytetapApp> {
+/// Настройки шага прокси на loopback: порт прослушивания и цель — вторая сторона.
+fn proxy_settings(log_dir: &str, listen_port: u16, lis: SocketAddr) -> Settings {
     let mut settings = Settings::with_log_dir(log_dir);
     settings.config.mode = SessionMode::Proxy;
     settings.config.listen_host = "127.0.0.1".into();
@@ -84,6 +80,24 @@ fn proxy_harness(
     settings.config.proxy_role = ProxyMode::AnalyzerClient;
     settings.config.proxy_host = lis.ip().to_string();
     settings.config.proxy_port = lis.port();
+    settings
+}
+
+/// Шаг прокси в харнессе: поля из настроек, «Старт» нажимается тестом.
+fn proxy_harness(
+    log_dir: &str,
+    listen_port: u16,
+    lis: SocketAddr,
+    handle: tokio::runtime::Handle,
+) -> Harness<'static, BytetapApp> {
+    proxy_harness_with(proxy_settings(log_dir, listen_port, lis), handle)
+}
+
+/// Шаг прокси с готовыми настройками: тесту нужны и неверные поля.
+fn proxy_harness_with(
+    settings: Settings,
+    handle: tokio::runtime::Handle,
+) -> Harness<'static, BytetapApp> {
     let mut harness = Harness::builder()
         .with_size((1200.0, 800.0))
         .build_eframe(move |cc| {
@@ -239,4 +253,123 @@ fn a_busy_proxy_port_is_reported_under_the_port_field() {
         "журнала нет"
     );
     drop(busy);
+}
+
+/// Отказ фильтра по адресу на «Старт» раскрывает «Дополнительно»: ошибка живёт внутри
+/// блока, и за свёрнутым блоком «Старт» выглядел бы молчащим (FR-8, M4-AC18).
+#[test]
+fn a_peer_filter_error_on_start_opens_the_more_block() {
+    use egui::accesskit::Toggled;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let handle = rt.handle().clone();
+    let lis_addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut settings = proxy_settings(&dir.path().to_string_lossy(), free_port(), lis_addr);
+    // Порт в фильтре: порт входящего выбирает клиент, у поля своя ошибка.
+    settings.config.proxy_allow_from = "192.168.1.51:5000".into();
+    let mut harness = proxy_harness_with(settings, handle);
+
+    {
+        use egui_kittest::kittest::NodeT as _;
+        let more = harness.get_by_role_and_label(Role::Button, "Дополнительно");
+        assert_eq!(
+            more.accesskit_node().toggled(),
+            Some(Toggled::False),
+            "«Дополнительно» свёрнуто до «Старт»"
+        );
+    }
+    assert!(
+        harness
+            .query_by_role_and_label(Role::TextInput, "Принимать только с адреса")
+            .is_none(),
+        "поля фильтра на экране нет"
+    );
+
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    {
+        use egui_kittest::kittest::NodeT as _;
+        let more = harness.get_by_role_and_label(Role::Button, "Дополнительно");
+        assert_eq!(
+            more.accesskit_node().toggled(),
+            Some(Toggled::True),
+            "ошибка поля раскрыла блок"
+        );
+    }
+    harness.get_by_role_and_label(Role::TextInput, "Принимать только с адреса");
+    harness.get_by_label("Адрес — IPv4 или IPv6 без порта, например 192.168.1.51.");
+    assert!(
+        harness.state().pending_session().is_none(),
+        "с неверным фильтром сессия не собирается"
+    );
+}
+
+/// IPv6-адрес в фильтре при IPv4-слушателе — ошибка у поля фильтра: входящее придёт с
+/// IPv4, и такой фильтр не пропустит никого (FR-8).
+#[test]
+fn an_ipv6_peer_filter_under_an_ipv4_listener_is_an_error_at_the_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let handle = rt.handle().clone();
+    let lis_addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut settings = proxy_settings(&dir.path().to_string_lossy(), free_port(), lis_addr);
+    settings.config.proxy_allow_from = "fe80::1".into();
+    let mut harness = harness_more(settings, handle);
+    harness.get_by_role_and_label(Role::TextInput, "Принимать только с адреса");
+    // Ошибка появляется после «Старт»: до него поле не краснеет.
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    harness.get_by_label(
+        "Слушатель bytetap — IPv4, поэтому IPv6-адрес в фильтре не совпадёт ни с кем. Укажите IPv4 того, кто подключается.",
+    );
+    assert!(
+        harness.state().pending_session().is_none(),
+        "с таким фильтром сессия не собирается"
+    );
+}
+
+/// Шаг прокси с раскрытым «Дополнительно»: окно выше обычного, чтобы «Старт» был на
+/// виду вместе с раскрытым блоком.
+fn harness_more(
+    settings: Settings,
+    handle: tokio::runtime::Handle,
+) -> Harness<'static, BytetapApp> {
+    let mut harness = Harness::builder()
+        .with_size((1200.0, 1400.0))
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings, None, None)
+                .with_runtime(handle)
+                .with_screen(Screen::Step(SessionMode::Proxy))
+                .with_more()
+        });
+    harness.run_steps(2);
+    harness
+}
+
+/// Порт в адресе цели — ошибка у поля адреса: у порта своё поле, а цель
+/// `10.0.0.5:5000:5000` ядро не разобрало бы (M4-AC13).
+#[test]
+fn a_port_inside_the_target_address_is_an_error_at_the_address_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let handle = rt.handle().clone();
+    let lis_addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let mut settings = proxy_settings(&dir.path().to_string_lossy(), free_port(), lis_addr);
+    settings.config.proxy_host = "10.0.0.5:5000".into();
+    let mut harness = proxy_harness_with(settings, handle);
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    harness.get_by_label(
+        "Порт — в отдельном поле: в адресе цели только адрес, например 10.0.0.5, а порт впишите в «Порт цели».",
+    );
+    assert!(
+        harness.state().pending_session().is_none(),
+        "с портом в адресе сессия не собирается"
+    );
+    assert_eq!(
+        harness.state().screen,
+        Screen::Step(SessionMode::Proxy),
+        "шаг остаётся на экране"
+    );
 }
