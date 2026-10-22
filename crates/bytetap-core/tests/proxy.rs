@@ -781,15 +781,24 @@ async fn an_unreachable_target_is_an_error_and_the_session_keeps_listening() {
             .lines
             .iter()
             .filter_map(|line| match &line.event {
-                Event::Info(info) => Some(info.message.clone()),
+                Event::Info(info) => Some(info),
                 _ => None,
             })
             .collect();
+        let recovered = infos
+            .iter()
+            .find(|info| info.code.as_deref() == Some("source_recovered"))
+            .unwrap_or_else(|| panic!("{role}: восстановление сообщено: {infos:?}"));
+        assert_eq!(
+            recovered.repeats,
+            Some(2),
+            "{role}: число повторов отдельным полем"
+        );
         assert!(
-            infos
-                .iter()
-                .any(|info| info.contains("recovered after 2 repeated failures")),
-            "{role}: восстановление сообщено: {infos:?}"
+            recovered
+                .message
+                .contains("recovered after 2 repeated failures"),
+            "{role}: {recovered:?}"
         );
         let opens = outcome
             .lines

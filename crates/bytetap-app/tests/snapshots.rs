@@ -1758,6 +1758,7 @@ fn recording_fixture(extra: usize) -> RecordingFixture {
             mono_us: 3_500_000,
             conn: None,
             code: None,
+            repeats: None,
             message: "Autoresponder: ACK sent".into(),
         }),
     ];

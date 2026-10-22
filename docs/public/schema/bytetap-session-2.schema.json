@@ -193,6 +193,11 @@
         "mono_us": { "$ref": "#/$defs/mono_us" },
         "conn": { "$ref": "#/$defs/conn" },
         "code": { "$ref": "#/$defs/code" },
+        "repeats": {
+          "description": "Сколько одинаковых ошибок источника схлопнулось в это замечание: есть только у кодов source_retry_repeats, source_recovered и source_failing_at_stop",
+          "type": "integer",
+          "minimum": 1
+        },
         "message": { "type": "string" }
       },
       "additionalProperties": false

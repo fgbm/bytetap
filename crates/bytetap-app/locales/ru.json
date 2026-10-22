@@ -200,7 +200,7 @@
     "closedPairLis": "#{conn} ЛИС закрыла соединение",
     "closedPairAnalyzer": "#{conn} анализатор закрыл соединение",
     "closedPairApp": "#{conn} bytetap закрыл соединение",
-    "closedPairAppTimeout": "#{conn} bytetap закрыл соединение: вторая сторона не ответила за 5 с",
+    "closedPairAppTimeout": "#{conn} bytetap закрыл соединение: вторая сторона не ответила за {seconds} с",
     "closedPairAppReset": "#{conn} bytetap закрыл соединение: сброс другой стороной"
   },
   "events": {
@@ -219,7 +219,10 @@
     "proxy_connect_timeout_lis": "ЛИС не ответила за отведённое время — соединение закрыто, жду следующее.",
     "proxy_connect_timeout_analyzer": "Анализатор не ответил за отведённое время — соединение закрыто, жду следующее.",
     "proxy_target_is_self": "Цель указывает на сам bytetap — соединение закрыто.",
-    "journal_backlog_warning": "Журнал отстаёт: очередь записи дошла до половины предела. Запись продолжается, данные копятся в памяти."
+    "journal_backlog_warning": "Журнал отстаёт: очередь записи дошла до половины предела. Запись продолжается, данные копятся в памяти.",
+    "source_retry_repeats": "Ошибка источника сменилась на другую; подряд было повторов: {repeats}.",
+    "source_recovered": "Связь восстановилась; повторов ошибки подряд было: {repeats}.",
+    "source_failing_at_stop": "Запись остановлена при той же ошибке источника; повторов подряд было: {repeats}."
   },
   "banner": {
     "journalFailureTitleWith": "Запись в журнал прервана: {reason}",

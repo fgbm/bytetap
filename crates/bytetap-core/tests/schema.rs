@@ -78,7 +78,16 @@ fn events() -> Vec<Event> {
             mono_us: 9_200_000,
             conn: Some(1),
             code: None,
+            repeats: None,
             message: "4 bytes outside the MLLP frame ignored".to_owned(),
+        }),
+        Event::Info(InfoEvent {
+            t: bytetap_core::journal::now_rfc3339(),
+            mono_us: 9_250_000,
+            conn: None,
+            code: Some("source_recovered".to_owned()),
+            repeats: Some(3),
+            message: "accept recovered after 3 repeated failures: accept failed".to_owned(),
         }),
         Event::Note(Note {
             t: bytetap_core::journal::now_rfc3339(),

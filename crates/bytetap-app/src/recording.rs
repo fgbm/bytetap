@@ -614,8 +614,8 @@ pub fn failure_reason(code: JournalFailureCode) -> &'static str {
 }
 
 /// Текст события `error`/`info` по коду; неизвестный код — английский `message` журнала.
-pub fn event_text(code: Option<&str>, message: &str, pair: Pair) -> String {
-    feedrows::event_text(code, message, pair)
+pub fn event_text(code: Option<&str>, message: &str, pair: Pair, repeats: Option<u32>) -> String {
+    feedrows::event_text(code, message, pair, repeats)
 }
 
 fn encoding_label(encoding: Encoding) -> &'static str {
@@ -1545,19 +1545,29 @@ mod tests {
     #[test]
     fn codes_have_texts() {
         assert_eq!(
-            event_text(Some("connect_failed"), "x", Pair::None),
+            event_text(Some("connect_failed"), "x", Pair::None, None),
             "Не удалось подключиться к анализатору — повторяю."
         );
-        assert_eq!(event_text(Some("unknown"), "raw", Pair::None), "raw");
-        assert_eq!(event_text(None, "raw", Pair::None), "raw");
+        assert_eq!(event_text(Some("unknown"), "raw", Pair::None, None), "raw");
+        assert_eq!(event_text(None, "raw", Pair::None, None), "raw");
         // Недоступная цель прокси названа второй стороной пары (M4-AC6).
         assert_eq!(
-            event_text(Some("proxy_connect_failed"), "x", Pair::TargetLis),
+            event_text(Some("proxy_connect_failed"), "x", Pair::TargetLis, None),
             "Не удалось подключиться к ЛИС — соединение закрыто, жду следующее."
         );
         assert_eq!(
-            event_text(Some("proxy_connect_timeout"), "x", Pair::TargetAnalyzer),
+            event_text(
+                Some("proxy_connect_timeout"),
+                "x",
+                Pair::TargetAnalyzer,
+                None
+            ),
             "Анализатор не ответил за отведённое время — соединение закрыто, жду следующее."
+        );
+        // Замечания о серии ошибок источника несут число повторов (формат `/2`).
+        assert_eq!(
+            event_text(Some("source_recovered"), "x", Pair::TargetLis, Some(3)),
+            "Связь восстановилась; повторов ошибки подряд было: 3."
         );
         assert_eq!(
             failure_reason(JournalFailureCode::DiskFull),

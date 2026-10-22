@@ -490,6 +490,13 @@ pub struct InfoEvent {
     /// Код замечания для интерфейса; список — в `docs/reference/session-format.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// Сколько одинаковых ошибок источника схлопнулось в это замечание (формат `/2`).
+    ///
+    /// Есть только у замечаний о повторах, восстановлении и серии, не закончившейся
+    /// к остановке: интерфейс подставляет число в фразу каталога. У прочих `info`
+    /// поля нет, и журналы без него читаются как раньше.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeats: Option<u32>,
     /// Описание для инженера.
     pub message: String,
 }
@@ -750,6 +757,7 @@ mod tests {
             mono_us: 9_100_000,
             conn: None,
             code: None,
+            repeats: None,
             message: "4 bytes outside the MLLP frame ignored".to_owned(),
         });
         assert_eq!(
@@ -761,6 +769,33 @@ mod tests {
                 "message": "4 bytes outside the MLLP frame ignored"
             })
         );
+    }
+
+    /// Замечание о серии ошибок источника несёт число повторов (формат `/2`), а прочие
+    /// `info` этого поля не пишут — журнал `/2` с ним читается, без него тоже.
+    #[test]
+    fn a_repeating_info_carries_the_repeat_count() {
+        let info = Event::Info(InfoEvent {
+            t: "2026-10-19T10:15:09.100000+03:00".to_owned(),
+            mono_us: 9_100_000,
+            conn: None,
+            code: Some("source_recovered".to_owned()),
+            repeats: Some(4),
+            message: "accept recovered after 4 repeated failures: accept failed".to_owned(),
+        });
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["code"], "source_recovered");
+        assert_eq!(value["repeats"], 4);
+
+        // Старая строка без поля читается с `None`.
+        let old: Event = serde_json::from_value(json!({
+            "type": "info",
+            "t": "2026-10-19T10:15:09.100000+03:00",
+            "mono_us": 9_100_000,
+            "message": "4 bytes outside the MLLP frame ignored"
+        }))
+        .unwrap();
+        assert!(matches!(old, Event::Info(info) if info.repeats.is_none()));
     }
 
     #[test]
@@ -808,6 +843,7 @@ mod tests {
                 mono_us: 5,
                 conn: Some(1),
                 code: Some("protocol_undetected".to_owned()),
+                repeats: None,
                 message: "incoming ACK is not acknowledged".to_owned(),
             }),
             Event::Note(Note {

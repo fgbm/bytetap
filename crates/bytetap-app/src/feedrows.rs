@@ -130,7 +130,13 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
                     // Причина видна, когда закрыл сам bytetap: срок ожидания и сброс —
                     // не его решение, а то, что сделала вторая сторона.
                     ClosedBy::Bytetap => match reason.as_str() {
-                        "timeout" => t!("feed.closedPairAppTimeout", conn = conn),
+                        // Срок дожития берётся из ядра: второй копии числа в
+                        // интерфейсе быть не должно (FR-7).
+                        "timeout" => t!(
+                            "feed.closedPairAppTimeout",
+                            conn = conn,
+                            seconds = bytetap_core::session::PROXY_LINGER.as_secs()
+                        ),
                         "reset" => t!("feed.closedPairAppReset", conn = conn),
                         _ => t!("feed.closedPairApp", conn = conn),
                     },
@@ -140,10 +146,15 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
             };
             (RowClass::Service, text)
         }
-        FeedKind::Error { code, message } => {
-            (RowClass::Error, event_text(code.as_deref(), message, pair))
-        }
-        FeedKind::Info { code, message } => {
+        FeedKind::Error { code, message } => (
+            RowClass::Error,
+            event_text(code.as_deref(), message, pair, None),
+        ),
+        FeedKind::Info {
+            code,
+            message,
+            repeats,
+        } => {
             // Переполнение очереди писателя — не ошибка обмена, но и не спокойная строка:
             // инженеру стоит знать, что журнал отстаёт (M4-AC12).
             let class = if code.as_deref() == Some("journal_backlog_warning") {
@@ -151,7 +162,7 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
             } else {
                 RowClass::Event
             };
-            (class, event_text(code.as_deref(), message, pair))
+            (class, event_text(code.as_deref(), message, pair, *repeats))
         }
         FeedKind::Note { text } => (RowClass::Event, text.clone()),
     }
@@ -167,7 +178,13 @@ pub fn closed_by(by: ClosedBy) -> &'static str {
 }
 
 /// Текст события `error`/`info` по коду; неизвестный код — английский `message` журнала.
-pub fn event_text(code: Option<&str>, message: &str, pair: Pair) -> String {
+///
+/// `repeats` — число схлопнутых повторов из поля `info` (формат `/2`); свои фразы с ним
+/// есть у замечаний о серии ошибок источника, остальные его не читают.
+pub fn event_text(code: Option<&str>, message: &str, pair: Pair, repeats: Option<u32>) -> String {
+    if let Some(text) = repeating_text(code, repeats) {
+        return text;
+    }
     let text = match code {
         Some("accept_failed") => t!("events.accept_failed"),
         Some("connect_failed") => t!("events.connect_failed"),
@@ -187,6 +204,20 @@ pub fn event_text(code: Option<&str>, message: &str, pair: Pair) -> String {
         _ => message,
     };
     text.to_owned()
+}
+
+/// Фраза о серии ошибок источника с числом повторов: своя у каждого из трёх кодов.
+///
+/// Число в каталоге стоит в конце фразы — «повторов подряд было: 2», — чтобы русское
+/// склонение не зависело от количества.
+fn repeating_text(code: Option<&str>, repeats: Option<u32>) -> Option<String> {
+    let repeats = repeats?;
+    Some(match code {
+        Some("source_retry_repeats") => t!("events.source_retry_repeats", repeats = repeats),
+        Some("source_recovered") => t!("events.source_recovered", repeats = repeats),
+        Some("source_failing_at_stop") => t!("events.source_failing_at_stop", repeats = repeats),
+        _ => return None,
+    })
 }
 
 /// Недоступная цель прокси: в строке названа вторая сторона — ЛИС или анализатор
@@ -681,6 +712,7 @@ mod tests {
         let warning = event(FeedKind::Info {
             code: Some("journal_backlog_warning".into()),
             message: "journal writer backlog".into(),
+            repeats: None,
         });
         let (class, text) = row_text(&warning, Pair::TargetLis);
         assert_eq!(class, RowClass::Warning);
@@ -694,6 +726,7 @@ mod tests {
         let unknown = event(FeedKind::Info {
             code: Some("other_code".into()),
             message: "core text".into(),
+            repeats: None,
         });
         assert_eq!(
             row_text(&unknown, Pair::None),

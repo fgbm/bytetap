@@ -77,7 +77,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Протоколы, где сторона полузакрывается после запроса и ждёт ответа, не должны рваться
 /// там, где без прокси работали: обратное направление доживает до своего `FIN`, но не
 /// дольше пяти секунд — иначе зависшая сторона держала бы пару вечно (M4-В7).
-const PROXY_LINGER: Duration = Duration::from_secs(5);
+///
+/// Открыт наружу: интерфейс называет тот же срок в строке закрытия
+/// (`feed.closedPairAppTimeout`), а второй копии числа быть не должно.
+pub const PROXY_LINGER: Duration = Duration::from_secs(5);
 
 /// Сколько `run` ждёт задачи соединений после остановки, прежде чем прервать их.
 ///
@@ -705,16 +708,32 @@ impl Shared {
         }));
     }
 
-    fn info(&self, conn: Option<u32>, message: impl Into<String>) {
-        self.info_with_code(conn, None, message);
-    }
-
     fn info_with_code(&self, conn: Option<u32>, code: Option<&str>, message: impl Into<String>) {
         self.publish(Event::Info(InfoEvent {
             t: now_rfc3339(),
             mono_us: self.clock.now_us(),
             conn,
             code: code.map(str::to_owned),
+            repeats: None,
+            message: message.into(),
+        }));
+    }
+
+    /// Замечание о серии ошибок источника: код и число схлопнутых повторов отдельным
+    /// полем, чтобы интерфейс подставил число в свою фразу (формат `/2`).
+    fn info_repeating(
+        &self,
+        conn: Option<u32>,
+        code: &'static str,
+        repeats: u32,
+        message: impl Into<String>,
+    ) {
+        self.publish(Event::Info(InfoEvent {
+            t: now_rfc3339(),
+            mono_us: self.clock.now_us(),
+            conn,
+            code: Some(code.to_owned()),
+            repeats: Some(repeats),
             message: message.into(),
         }));
     }
@@ -890,13 +909,15 @@ impl SourceErrors {
     }
 
     /// Приём восстановился: отчёт о схлопнутых повторах, если они были.
-    fn recovered(&mut self) -> Option<String> {
+    fn recovered(&mut self) -> Option<SourceNote> {
         self.current.take().and_then(|series| {
-            (series.repeats > 0).then(|| {
-                format!(
+            (series.repeats > 0).then(|| SourceNote {
+                code: "source_recovered",
+                repeats: series.repeats,
+                text: format!(
                     "{} recovered after {} repeated failures: {}",
                     series.prefix, series.repeats, series.message
-                )
+                ),
             })
         })
     }
@@ -905,16 +926,30 @@ impl SourceErrors {
     ///
     /// Без него последняя серия ошибок выглядела бы в журнале одной ошибкой:
     /// повторы схлопнуты, а восстановления, о котором сообщает `info`, уже не будет.
-    fn stopped(&mut self) -> Option<String> {
+    fn stopped(&mut self) -> Option<SourceNote> {
         self.current.take().and_then(|series| {
-            (series.repeats > 0).then(|| {
-                format!(
+            (series.repeats > 0).then(|| SourceNote {
+                code: "source_failing_at_stop",
+                repeats: series.repeats,
+                text: format!(
                     "{} still failing after {} repeated failures at the stop: {}",
                     series.prefix, series.repeats, series.message
-                )
+                ),
             })
         })
     }
+}
+
+/// Замечание о серии ошибок источника: код для интерфейса, число повторов и текст.
+///
+/// Число повторов уходит в отдельном поле события `info` (формат `/2`), поэтому
+/// интерфейс подставляет его в свою фразу, а не выковыривает из английского текста
+/// журнала.
+#[derive(Debug, PartialEq, Eq)]
+struct SourceNote {
+    code: &'static str,
+    repeats: u32,
+    text: String,
 }
 
 /// Как назвать ошибку источника в журнале и какой код дать интерфейсу.
@@ -1034,7 +1069,7 @@ async fn run(
             next = source.next(), if !sequential || tasks.is_empty() => match next {
                 Next::Connected(connection) => {
                     if let Some(note) = source_errors.recovered() {
-                        shared.info(None, note);
+                        shared.info_repeating(None, note.code, note.repeats, note.text);
                     }
                     let conn = shared.counters.next_conn();
                     if let Ok(mut open) = shared.open.lock() {
@@ -1111,8 +1146,10 @@ async fn run(
                             shared.error_with_code(None, Some(code), message);
                         }
                         SourceReport::Changed { previous, repeats, message } => {
-                            shared.info(
+                            shared.info_repeating(
                                 None,
+                                "source_retry_repeats",
+                                repeats,
                                 format!(
                                     "source error changed after {repeats} repeats of the previous one: {previous}"
                                 ),
@@ -1182,7 +1219,7 @@ async fn run(
     // Серия ошибок источника, не закончившаяся к остановке: повторы не должны пропасть
     // из журнала только потому, что восстановления не было (NFR-5).
     if let Some(note) = source_errors.stopped() {
-        shared.info(None, note);
+        shared.info_repeating(None, note.code, note.repeats, note.text);
     }
     // Комментарий, отправленный перед «Стоп», не теряется: очередь дочитывается
     // до `session_end` (FR-23). Без этого `note` мог остаться в канале и пропасть.
@@ -1707,6 +1744,7 @@ async fn apply(
                         mono_us,
                         conn: Some(conn),
                         code: code.map(|code| code.as_str().to_owned()),
+                        repeats: None,
                         message,
                     }),
                 };
@@ -2138,8 +2176,12 @@ mod tests {
             SourceReport::Repeated
         ));
         assert_eq!(
-            errors.recovered().as_deref(),
-            Some("accept recovered after 2 repeated failures: accept failed: нет мест")
+            errors.recovered(),
+            Some(SourceNote {
+                code: "source_recovered",
+                repeats: 2,
+                text: "accept recovered after 2 repeated failures: accept failed: нет мест".into(),
+            })
         );
         assert_eq!(
             errors.recovered(),
@@ -2156,10 +2198,12 @@ mod tests {
 
         // Серия не восстановилась до остановки: счётчик повторов не теряется.
         assert_eq!(
-            errors.stopped().as_deref(),
-            Some(
-                "accept still failing after 1 repeated failures at the stop: accept failed: port taken"
-            )
+            errors.stopped(),
+            Some(SourceNote {
+                code: "source_failing_at_stop",
+                repeats: 1,
+                text: "accept still failing after 1 repeated failures at the stop: accept failed: port taken".into(),
+            })
         );
         assert_eq!(errors.stopped(), None, "серия сообщается один раз");
 

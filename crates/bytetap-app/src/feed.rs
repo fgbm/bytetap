@@ -265,6 +265,8 @@ pub enum FeedKind {
     Info {
         code: Option<String>,
         message: String,
+        /// Сколько одинаковых ошибок источника схлопнулось в это замечание (формат `/2`).
+        repeats: Option<u32>,
     },
     Note {
         text: String,
@@ -331,6 +333,7 @@ impl FeedEvent {
                 FeedKind::Info {
                     code: info.code.clone(),
                     message: info.message.clone(),
+                    repeats: info.repeats,
                 },
             ),
             Event::Note(note) => (
