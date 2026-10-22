@@ -325,10 +325,15 @@ pub fn is_proxy_peer_rejected(err: &io::Error) -> bool {
 /// Ошибка «входящее с неразрешённого адреса» в обёртке [`io::Error`].
 ///
 /// Вид ошибки — `PermissionDenied`: отказ в доступе по настройке, а не сбой сокета.
+/// Адрес отвергнутого — без IPv4-mapped префикса: двойной стек отдаёт так входящие IPv4,
+/// а в журнале и в ленте должен стоять тот `a.b.c.d`, который знает инженер (FR-8).
 fn peer_rejected_error(peer: Option<IpAddr>, allowed: IpAddr) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        ProxyPeerRejected { peer, allowed },
+        ProxyPeerRejected {
+            peer: peer.map(unmapped_ip),
+            allowed,
+        },
     )
 }
 
@@ -337,15 +342,37 @@ fn peer_ip(peer: &str) -> Option<IpAddr> {
     peer.parse::<SocketAddr>().ok().map(|addr| addr.ip())
 }
 
+/// Адрес без IPv4-mapped префикса: `::ffff:192.168.1.51` — это `192.168.1.51`.
+///
+/// Двойной стек отдаёт входящие IPv4 в виде IPv6, и без нормализации ни фильтр, ни
+/// журнал не увидели бы в них тот IPv4-адрес, который знает инженер (FR-8).
+#[must_use]
+pub fn unmapped_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
 /// Один и тот же адрес без IPv4-mapped префикса.
 fn same_ip(a: IpAddr, b: IpAddr) -> bool {
-    fn plain(ip: IpAddr) -> IpAddr {
-        match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
-            IpAddr::V4(_) => ip,
-        }
+    unmapped_ip(a) == unmapped_ip(b)
+}
+
+/// Совпадёт ли входящее с адреса `peer` с настроенным адресом `allowed` на слушателе
+/// `listen` (FR-8).
+///
+/// Слушатель на `[::]` держит двойной стек и принимает оба семейства, поэтому отказ
+/// IPv4-адресу был бы ложным. Слушатель на одном IPv4 принимает только IPv4 — в том
+/// числе записанный как `::ffff:a.b.c.d`: это тот же адрес. Спрашивают форму и CLI,
+/// иначе фильтр другого семейства молча не совпал бы ни с одним входящим.
+#[must_use]
+pub fn peer_fits_listener(listen: SocketAddr, allowed: IpAddr) -> bool {
+    match listen {
+        SocketAddr::V6(addr) if addr.ip().is_unspecified() => true,
+        SocketAddr::V6(_) => unmapped_ip(allowed).is_ipv6(),
+        SocketAddr::V4(_) => unmapped_ip(allowed).is_ipv4(),
     }
-    plain(a) == plain(b)
 }
 
 /// Источник соединений сессии.
@@ -1220,6 +1247,56 @@ mod tests {
         assert_eq!(peer_ip("192.168.1.51:49152"), Some(v4));
         assert_eq!(peer_ip("[::ffff:192.168.1.51]:49152"), Some(mapped));
         assert_eq!(peer_ip("192.168.1.51"), None, "журнал всегда с портом");
+    }
+
+    /// Отказ фильтра называет адрес без IPv4-mapped префикса: двойной стек отдаёт входящие
+    /// IPv4 как `::ffff:a.b.c.d`, а журнал и лента должны знать `a.b.c.d` (FR-8).
+    #[test]
+    fn a_rejection_names_the_peer_without_the_mapped_prefix() {
+        let error = peer_rejected_error(
+            Some("::ffff:127.0.0.2".parse().unwrap()),
+            "127.0.0.1".parse().unwrap(),
+        );
+        assert_eq!(
+            rejected_peer(&error),
+            Some("127.0.0.2".parse().unwrap()),
+            "адрес отвергнутого — IPv4"
+        );
+        assert!(
+            error.to_string().contains("proxy peer 127.0.0.2 "),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("::ffff:"), "{error}");
+    }
+
+    /// Фильтр другого семейства не совпадёт ни с одним входящим: `[::]` на двойном
+    /// стеке принимает оба семейства, а `::ffff:a.b.c.d` — тот же IPv4 (FR-8).
+    #[test]
+    fn the_peer_filter_family_follows_the_listener() {
+        let v4: IpAddr = "192.168.1.51".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.168.1.51".parse().unwrap();
+        let v6: IpAddr = "fe80::1".parse().unwrap();
+        assert_eq!(unmapped_ip(mapped), v4, "mapped — это тот же IPv4");
+
+        let any4: SocketAddr = "0.0.0.0:5000".parse().unwrap();
+        let any6: SocketAddr = "[::]:5000".parse().unwrap();
+        let one6: SocketAddr = "[fe80::1]:5000".parse().unwrap();
+        assert!(peer_fits_listener(any4, v4));
+        assert!(peer_fits_listener(any4, mapped));
+        assert!(
+            !peer_fits_listener(any4, v6),
+            "IPv4-слушатель не примет IPv6"
+        );
+        assert!(
+            peer_fits_listener(any6, v4),
+            "двойной стек принимает и IPv4"
+        );
+        assert!(peer_fits_listener(any6, v6));
+        assert!(peer_fits_listener(one6, v6));
+        assert!(
+            !peer_fits_listener(one6, v4),
+            "к одному IPv6-адресу IPv4-клиент не придёт"
+        );
     }
 
     /// Чужой вход перед разрешённым: отказ приходит без паузы, и следующее входящее с

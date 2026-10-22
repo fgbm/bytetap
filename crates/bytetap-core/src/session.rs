@@ -893,6 +893,8 @@ struct SourceErrors {
 #[derive(Debug)]
 struct SourceSeries {
     prefix: &'static str,
+    /// Серия отказов фильтра адресов: считается по коду, а не по тексту (FR-8).
+    by_code: bool,
     message: String,
     repeats: u32,
 }
@@ -916,9 +918,27 @@ enum SourceReport {
 impl SourceErrors {
     /// Учитывает ошибку и говорит, что о ней писать.
     fn failed(&mut self, prefix: &'static str, message: String) -> SourceReport {
+        self.record(prefix, message, false)
+    }
+
+    /// Учитывает отказ фильтра адресов (`proxy_peer_rejected`): одна серия на код.
+    ///
+    /// Текст отказа называет адрес отвергнутого, поэтому по тексту каждый чужой адрес
+    /// начинал бы новую серию, и перебор адресов забил бы ленту и журнал (FR-8). Серия
+    /// считается по коду, а `message` обновляется на последний отказ: адрес последнего
+    /// отвергнутого называет замечание о серии.
+    fn rejected(&mut self, prefix: &'static str, message: String) -> SourceReport {
+        self.record(prefix, message, true)
+    }
+
+    /// Учитывает ошибку: `by_code` — сравнивать серию по коду, а не по тексту.
+    fn record(&mut self, prefix: &'static str, message: String, by_code: bool) -> SourceReport {
+        let same = |series: &SourceSeries| (by_code && series.by_code) || series.message == message;
         match self.current.take() {
-            Some(series) if series.message == message => {
+            Some(series) if same(&series) => {
                 self.current = Some(SourceSeries {
+                    // Последний отказ серии: его адрес называет замечание о ней.
+                    message,
                     repeats: series.repeats.saturating_add(1),
                     ..series
                 });
@@ -927,6 +947,7 @@ impl SourceErrors {
             Some(series) => {
                 self.current = Some(SourceSeries {
                     prefix,
+                    by_code,
                     message: message.clone(),
                     repeats: 0,
                 });
@@ -939,6 +960,7 @@ impl SourceErrors {
             None => {
                 self.current = Some(SourceSeries {
                     prefix,
+                    by_code,
                     message: message.clone(),
                     repeats: 0,
                 });
@@ -1202,7 +1224,15 @@ async fn run(
                     // Отвергнутая сторона остаётся в событии адресом: интерфейс называет
                     // его в ленте, а не разбирает английский текст журнала (FR-8).
                     let peer = rejected_peer(&error).map(|ip| ip.to_string());
-                    match source_errors.failed(prefix, message) {
+                    // Отказ фильтра схлопывается по коду, а не по тексту: текст несёт
+                    // адрес отвергнутого, и по тексту каждый чужой адрес начинал бы
+                    // новую серию (FR-8).
+                    let report = if is_proxy_peer_rejected(&error) {
+                        source_errors.rejected(prefix, message)
+                    } else {
+                        source_errors.failed(prefix, message)
+                    };
+                    match report {
                         SourceReport::Repeated => {}
                         SourceReport::First(message) => {
                             shared.error_with_peer(Some(code), peer, message);
@@ -2246,6 +2276,58 @@ mod tests {
             None,
             "восстановление сообщается один раз"
         );
+    }
+
+    /// Отказы фильтра адресов схлопываются по коду: адрес в тексте не начинает новую
+    /// серию, а замечание о ней называет последний отвергнутый адрес (FR-8).
+    #[test]
+    fn rejections_of_different_peers_are_one_series() {
+        let mut errors = SourceErrors::default();
+        match errors.rejected(
+            "accept",
+            "accept failed: peer 192.0.2.7 is not allowed".to_owned(),
+        ) {
+            SourceReport::First(message) => assert!(message.contains("192.0.2.7"), "{message}"),
+            other => panic!("первый отказ должен попасть в журнал: {other:?}"),
+        }
+        assert!(
+            matches!(
+                errors.rejected(
+                    "accept",
+                    "accept failed: peer 192.0.2.8 is not allowed".to_owned()
+                ),
+                SourceReport::Repeated
+            ),
+            "другой адрес продолжает серию, а не начинает новую"
+        );
+        assert_eq!(
+            errors.stopped(),
+            Some(SourceNote {
+                code: "source_failing_at_stop",
+                repeats: 1,
+                text: "accept still failing after 1 repeated failures at the stop: accept failed: peer 192.0.2.8 is not allowed".into(),
+            }),
+            "замечание называет последний отвергнутый адрес"
+        );
+    }
+
+    /// Обычные ошибки по-прежнему сравниваются по тексту: другой текст — новая серия.
+    #[test]
+    fn ordinary_errors_with_different_text_are_a_new_series() {
+        let mut errors = SourceErrors::default();
+        let _ = errors.failed("accept", "accept failed: first".to_owned());
+        assert!(matches!(
+            errors.failed("accept", "accept failed: second".to_owned()),
+            SourceReport::Changed { repeats: 0, .. }
+        ));
+        // Отказ фильтра в серии с обычной ошибкой приёма — тоже смена.
+        assert!(matches!(
+            errors.rejected(
+                "accept",
+                "accept failed: peer 192.0.2.7 is not allowed".to_owned()
+            ),
+            SourceReport::Changed { .. }
+        ));
     }
 
     #[test]
