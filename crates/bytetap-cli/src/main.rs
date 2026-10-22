@@ -18,7 +18,9 @@ use bytetap_core::journal::{
 };
 use bytetap_core::session::{Session as CaptureSession, SessionConfig, journal_failure_reason};
 use bytetap_core::transport::serial::{Flow, SerialFormat, SerialSettings};
-use bytetap_core::transport::{ProxyRole, is_proxy_target_is_self};
+use bytetap_core::transport::{
+    ProxyRole, is_proxy_target_is_self, peer_fits_listener, unmapped_ip,
+};
 use chrono::DateTime;
 use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::{Value, json};
@@ -238,6 +240,20 @@ fn parse_target(value: &str) -> Result<String, String> {
     }
 }
 
+/// Ошибка аргументов: `--allow-from` другого семейства, чем `--proxy` (FR-8).
+///
+/// Входящее приходит с адресом того семейства, на котором слушает bytetap, поэтому фильтр
+/// другого семейства молча не совпал бы ни с кем. `[::]` держит двойной стек и принимает
+/// оба семейства, а `::ffff:a.b.c.d` — тот же IPv4 (его приводит [`unmapped_ip`]).
+fn allow_from_family_problem(proxy: SocketAddr, allow_from: Option<IpAddr>) -> Option<String> {
+    let allowed = allow_from?;
+    (!peer_fits_listener(proxy, allowed)).then(|| {
+        format!(
+            "ошибка: --allow-from {allowed} другого семейства, чем --proxy {proxy} — входящее с этого адреса не совпадёт ни с кем. Укажите адрес того же семейства, что и слушатель."
+        )
+    })
+}
+
 /// `on`/`off` для DTR и RTS.
 fn parse_switch(value: &str) -> Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -322,14 +338,21 @@ fn capture(args: CaptureArgs) -> ExitCode {
                 ProxyRole::AnalyzerServer => "анализатор — сервер",
             };
             // Фильтр по адресу (FR-8): без него любой узел сети, достучавшийся до порта,
-            // говорит с ЛИС от имени анализатора.
-            let filter = match args.allow_from {
+            // говорит с ЛИС от имени анализатора. Адрес другого семейства, чем слушатель,
+            // не совпадёт ни с одним входящим, поэтому это ошибка аргументов, а не
+            // открытый порт.
+            let allow_from = args.allow_from.map(unmapped_ip);
+            if let Some(problem) = allow_from_family_problem(*proxy, allow_from) {
+                warn!("{problem}");
+                return ExitCode::FAILURE;
+            }
+            let filter = match allow_from {
                 Some(allowed) => format!(", только с {allowed}"),
                 None => String::new(),
             };
             (
                 SessionConfig::proxy(*proxy, to.clone(), role, PROXY_RETRY)
-                    .with_allow_from(args.allow_from),
+                    .with_allow_from(allow_from),
                 format!("Слушаю {proxy} → {to} ({title}){filter}"),
             )
         }
@@ -1266,6 +1289,38 @@ mod tests {
             "192.168.1.51",
         ]);
         assert!(with_listen.is_err(), "--allow-from только с --proxy");
+    }
+
+    /// Фильтр другого семейства, чем слушатель, — ошибка аргументов: такое входящее не
+    /// совпадёт ни с кем. `[::]` держит двойной стек, а `::ffff:a.b.c.d` — тот же IPv4
+    /// (FR-8).
+    #[test]
+    fn a_filter_of_another_family_is_an_argument_error() {
+        let any4: SocketAddr = "0.0.0.0:50025".parse().unwrap();
+        let any6: SocketAddr = "[::]:50025".parse().unwrap();
+        let one6: SocketAddr = "[fe80::1]:50025".parse().unwrap();
+        let v4: IpAddr = "192.168.1.51".parse().unwrap();
+        let v6: IpAddr = "fe80::1".parse().unwrap();
+
+        assert_eq!(allow_from_family_problem(any4, None), None, "фильтра нет");
+        assert_eq!(allow_from_family_problem(any4, Some(v4)), None);
+        assert_eq!(
+            allow_from_family_problem(any6, Some(v4)),
+            None,
+            "двойной стек принимает и IPv4"
+        );
+        assert_eq!(allow_from_family_problem(any6, Some(v6)), None);
+        assert_eq!(
+            allow_from_family_problem(
+                any4,
+                Some(unmapped_ip("::ffff:192.168.1.51".parse().unwrap()))
+            ),
+            None,
+            "mapped-запись приведена к IPv4"
+        );
+        let problem = allow_from_family_problem(any4, Some(v6)).expect("IPv6 на IPv4-слушателе");
+        assert!(problem.contains("--allow-from"), "{problem}");
+        assert!(allow_from_family_problem(one6, Some(v4)).is_some());
     }
 
     #[test]
