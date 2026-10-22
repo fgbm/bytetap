@@ -470,6 +470,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -639,7 +645,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 name = "bytetap-app"
 version = "0.2.0"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "bytetap-app",
  "bytetap-core",
  "bytetap-testkit",
@@ -664,7 +670,7 @@ dependencies = [
 name = "bytetap-cli"
 version = "0.2.0"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "bytetap-core",
  "bytetap-testkit",
  "chrono",
@@ -680,7 +686,7 @@ dependencies = [
 name = "bytetap-core"
 version = "0.2.0"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "bytetap-core",
  "bytetap-testkit",
  "chrono",
@@ -4425,7 +4431,7 @@ version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80be9b06fbae3b8b303400ab20778c80bbaf338f563afe567cf3c9eea17b47ef"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "data-url",
  "flate2",
  "imagesize",
