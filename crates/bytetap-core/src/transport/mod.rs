@@ -21,8 +21,10 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 #[cfg(feature = "test-hooks")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -101,17 +103,26 @@ pub struct Link {
 /// половины пары выгружаются, и собеседник получает сброс сразу, а не ждёт закрытия
 /// полуоткрытого соединения. Ошибка копирования дескриптора пару не роняет: без ручки
 /// сторона закроется обычным `FIN`.
+///
+/// Дескриптор не отдаётся реактору: `SO_LINGER` — настройка сокета, а не ввод-вывод.
+/// Копия нужна только на закрытии пары, а `Connection` и `Link` едут на каждом
+/// соединении, поэтому лишняя регистрация в реакторе была бы платой ни за что.
 #[derive(Debug)]
-pub struct ResetSocket(Box<TcpStream>);
+pub struct ResetSocket(ResetHandle);
+
+/// Платформенная ручка второго дескриптора: владеющая, но не зарегистрированная.
+#[cfg(unix)]
+type ResetHandle = std::os::fd::OwnedFd;
+#[cfg(windows)]
+type ResetHandle = std::os::windows::io::OwnedSocket;
+#[cfg(not(any(unix, windows)))]
+type ResetHandle = std::net::TcpStream;
 
 impl ResetSocket {
     /// Второй дескриптор того же сокета; `None` — копия не получилась.
-    ///
-    /// Дескриптор лежит в [`Box`]: он нужен только на закрытии пары, а `Connection`
-    /// и `Link` передаются на каждом соединении и должны оставаться маленькими.
     #[must_use]
     pub fn of(stream: &TcpStream) -> Option<Self> {
-        duplicate(stream).ok().map(|copy| Self(Box::new(copy)))
+        duplicate(stream).ok().map(Self)
     }
 
     /// Дальнейшие закрытия этого сокета уходят сбросом, а не `FIN`.
@@ -119,31 +130,47 @@ impl ResetSocket {
     /// Ошибка не обрабатывается: без `SO_LINGER` сторона просто закроется `FIN`, и это
     /// не повод терять уже принятое решение о закрытии пары.
     pub fn reset(&self) {
-        let _ = self.0.set_zero_linger();
+        let _ = zero_linger(&self.0);
     }
 }
 
 /// Копия дескриптора сокета: второй дескриптор того же соединения.
 ///
-/// Платформенная ручка берётся у tokio-сокета и заворачивается обратно в `TcpStream`:
-/// `set_zero_linger` живёт в tokio, а стабильный `std` его не даёт.
-fn duplicate(stream: &TcpStream) -> io::Result<TcpStream> {
+/// Платформенная ручка берётся у tokio-сокета как владеющая копия и не заворачивается
+/// обратно в [`TcpStream`]: `from_std` зарегистрировал бы её в реакторе.
+#[cfg(any(unix, windows))]
+fn duplicate(stream: &TcpStream) -> io::Result<ResetHandle> {
     #[cfg(unix)]
-    let copy = {
+    {
         use std::os::fd::AsFd as _;
 
-        stream.as_fd().try_clone_to_owned().map(Into::into)
-    };
+        stream.as_fd().try_clone_to_owned()
+    }
     #[cfg(windows)]
-    let copy = {
+    {
         use std::os::windows::io::AsSocket as _;
 
-        stream.as_socket().try_clone_to_owned().map(Into::into)
-    };
-    #[cfg(not(any(unix, windows)))]
-    let copy: io::Result<std::net::TcpStream> =
-        Err(io::Error::other("копия сокета не поддерживается"));
-    TcpStream::from_std(copy?)
+        stream.as_socket().try_clone_to_owned()
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn duplicate(_stream: &TcpStream) -> io::Result<ResetHandle> {
+    Err(io::Error::other("копия сокета не поддерживается"))
+}
+
+/// `SO_LINGER 0` на второй ручке: закрытие уходит сбросом (FR-7).
+///
+/// Настройка сокета, а не ввод-вывод: `socket2::SockRef` берёт дескриптор на время
+/// вызова и обратно его не отдаёт.
+#[cfg(any(unix, windows))]
+fn zero_linger(handle: &ResetHandle) -> io::Result<()> {
+    socket2::SockRef::from(handle).set_linger(Some(Duration::ZERO))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn zero_linger(_handle: &ResetHandle) -> io::Result<()> {
+    Err(io::Error::other("SO_LINGER не поддерживается"))
 }
 
 /// Топология прокси: кто из двух сторон подключается к bytetap (FR-5).
@@ -389,6 +416,8 @@ impl Source {
                         role: *role,
                         retry: *retry,
                         connecting: JoinSet::new(),
+                        listen: bound,
+                        self_loop: Arc::new(AtomicBool::new(false)),
                     }),
                     local,
                 })
@@ -451,6 +480,13 @@ impl Source {
 ///
 /// Слушатель ведёт [`TcpServerSource`]: ошибка `accept` повторяется с той же растущей
 /// паузой, что у TCP-сервера, а `TCP_NODELAY` ставится на обоих сокетах пары (NFR-6).
+///
+/// Адрес прослушивания известен только после старта (порт `0` выбирает система), а цель
+/// приходит строкой — именем узла, чужим адресом или адресом прослушивания. Поэтому петля
+/// на себя ловится не настройкой, а после подключения: соединение с собственным
+/// слушателем узнаётся по адресам его концов. Найденная петля поднимает общий флаг,
+/// и следующие входящие закрываются без подключения — серия схлопывается в одно `error`
+/// (M4-AC6).
 struct ProxySource {
     accepted: TcpServerSource,
     target: String,
@@ -458,7 +494,19 @@ struct ProxySource {
     retry: Duration,
     /// Подключения к цели, которые уже идут, и их результаты для сессии.
     connecting: JoinSet<Next>,
+    /// Адрес прослушивания: по нему узнаётся петля на себя.
+    listen: SocketAddr,
+    /// Петля на себя уже найдена: пара не создаётся ни на одном следующем входящем.
+    self_loop: Arc<AtomicBool>,
 }
+
+/// Сколько подключений к цели идёт одновременно.
+///
+/// Входящие приходят быстрее, чем цель отвечает: без предела приём забирал бы их сотнями,
+/// а каждая задача держала бы принятый сокет и полный срок подключения. Предел
+/// останавливает приём, пока не освободится место, — очередь ждёт у слушателя, а не
+/// в памяти bytetap (M4-AC16).
+const MAX_CONNECTING: usize = 64;
 
 impl ProxySource {
     /// Запускает подключение к цели отдельной задачей.
@@ -468,8 +516,11 @@ impl ProxySource {
     fn spawn_connect(&mut self, accepted: Connection, after: Duration) {
         let target = self.target.clone();
         let role = self.role.target_role();
-        self.connecting
-            .spawn(async move { connect_target(accepted, target, role, after).await });
+        let listen = self.listen;
+        let self_loop = Arc::clone(&self.self_loop);
+        self.connecting.spawn(async move {
+            connect_target(accepted, target, role, listen, self_loop, after).await
+        });
     }
 }
 
@@ -497,23 +548,26 @@ impl ConnectionSource for ProxySource {
                             None => {}
                         }
                     }
-                    accepted = self.accepted.next() => match accepted {
-                        Next::Connected(connection) => {
-                            // Пара, замкнувшаяся сама на себя, отбрасывается до `open`:
-                            // обе её стороны — концы одного соединения (M4-AC6).
-                            if is_self_pair(
-                                &connection.peer,
-                                connection.link.as_ref().map(|link| link.local.as_str()),
-                            ) {
-                                drop(connection);
-                                continue;
+                    accepted = self.accepted.next(), if self.connecting.len() < MAX_CONNECTING => {
+                        match accepted {
+                            Next::Connected(connection) => {
+                                // Петля уже найдена: пара не создаётся, входящее
+                                // закрывается, а серия схлопывается в одно `error`.
+                                if self.self_loop.load(Ordering::Acquire) {
+                                    drop(connection);
+                                    return Next::Retry {
+                                        error: target_is_self_error(self.listen),
+                                        after,
+                                        stage: Stage::Connect,
+                                    };
+                                }
+                                self.spawn_connect(connection, after);
                             }
-                            self.spawn_connect(connection, after);
+                            Next::Retry { error, after, stage } => {
+                                return Next::Retry { error, after, stage };
+                            }
                         }
-                        Next::Retry { error, after, stage } => {
-                            return Next::Retry { error, after, stage };
-                        }
-                    },
+                    }
                 }
             }
         })
@@ -524,10 +578,17 @@ impl ConnectionSource for ProxySource {
 ///
 /// Срок подключения — [`PROXY_CONNECT_TIMEOUT`] вместе с тестовой задержкой: она в окне
 /// срока, потому что изображает цель, которая принимает `SYN` и не отвечает.
+///
+/// Успешное подключение ещё не пара: если цель оказалась адресом прослушивания самого
+/// bytetap, обе стороны были бы концами одного соединения. Такая петля поднимает флаг
+/// [`ProxySource::self_loop`] и возвращает отказ: принятый сокет выгружается, `open`
+/// не пишется (M4-AC6).
 async fn connect_target(
     accepted: Connection,
     target: String,
     role: LinkRole,
+    listen: SocketAddr,
+    self_loop: Arc<AtomicBool>,
     after: Duration,
 ) -> Next {
     let linked = timeout(proxy_connect_timeout(), async {
@@ -539,12 +600,22 @@ async fn connect_target(
         Ok(Ok(stream)) => {
             // Пересылка не должна ждать Nagle на обоих сокетах пары (NFR-6).
             let _ = stream.set_nodelay(true);
-            let link_peer = stream
-                .peer_addr()
-                .map_or_else(|_| target.clone(), |addr| addr.to_string());
-            let link_local = stream
-                .local_addr()
-                .map_or_else(|_| String::new(), |addr| addr.to_string());
+            let peer = stream.peer_addr();
+            let local = stream.local_addr();
+            if let (Ok(peer), Ok(local)) = (&peer, &local)
+                && connects_to_itself(listen, *peer, *local)
+            {
+                // Адрес в ошибке — адрес прослушивания: он же и петля, а одинаковый текст
+                // повтора нужен, чтобы серия схлопнулась в одно `error`.
+                self_loop.store(true, Ordering::Release);
+                return Next::Retry {
+                    error: target_is_self_error(listen),
+                    after,
+                    stage: Stage::Connect,
+                };
+            }
+            let link_peer = peer.map_or_else(|_| target.clone(), |addr| addr.to_string());
+            let link_local = local.map_or_else(|_| String::new(), |addr| addr.to_string());
             Next::Connected(Connection {
                 transport: accepted.transport,
                 peer: accepted.peer,
@@ -579,20 +650,50 @@ async fn connect_target(
     }
 }
 
-/// Пара, у которой оба конца — один и тот же сокет: прокси подключился к себе.
+/// Соединение с собственным слушателем: прокси подключился сам к себе.
 ///
-/// Проверка по адресам, а не по настройке: цель могла прийти именем узла и разрешиться
-/// в адрес прослушивания. `local` исходящего сокета и `peer` принятого совпадают только
-/// тогда, когда это два конца одного соединения.
-fn is_self_pair(peer: &str, link_local: Option<&str>) -> bool {
-    link_local.is_some_and(|local| !local.is_empty() && local == peer)
+/// Сравниваются адреса концов уже открытого соединения, а не настройка: цель могла прийти
+/// именем узла (`localhost`, имя машины) или портом, который выбрал вместо нуля сам
+/// источник. Признак петли — адрес цели совпал с локальным адресом исходящего сокета
+/// (подключение с машины на неё же идёт с того же адреса), порт цели — порт
+/// прослушивания, а слушатель этот адрес покрывает: `0.0.0.0` и `::` слушают все адреса
+/// машины.
+fn connects_to_itself(listen: SocketAddr, peer: SocketAddr, local: SocketAddr) -> bool {
+    let (listen, peer, local) = (unmap(listen), unmap(peer), unmap(local));
+    if listen.port() != peer.port() || peer.ip() != local.ip() {
+        return false;
+    }
+    match (listen, peer) {
+        // `::` на двойном стеке принимает и IPv4: семейства разные, а слушатель один.
+        (SocketAddr::V6(listen), _) if listen.ip().is_unspecified() => true,
+        (SocketAddr::V4(listen), SocketAddr::V4(peer)) => {
+            listen.ip().is_unspecified() || listen.ip() == peer.ip()
+        }
+        _ => false,
+    }
+}
+
+/// Адрес без IPv4-mapped префикса: `::ffff:127.0.0.1` — это `127.0.0.1`.
+///
+/// Двойной стек отдаёт адреса IPv4 в виде IPv6, и без нормализации сравнение не увидело
+/// бы петлю.
+fn unmap(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(addr) => match addr.ip().to_ipv4_mapped() {
+            Some(ip) => SocketAddr::new(ip.into(), addr.port()),
+            None => SocketAddr::V6(addr),
+        },
+        SocketAddr::V4(_) => addr,
+    }
 }
 
 /// Цель совпадает с адресом прослушивания: прокси замкнулся бы сам на себя.
 ///
-/// `0.0.0.0` и `::` слушают все адреса машины, поэтому петлёй считается и любой
-/// петлевой адрес (`127.0.0.0/8`, `::1`): до остальных своих адресов проверка не достаёт
-/// без перечисления интерфейсов, но их ловит [`is_self_pair`] по адресам сокетов.
+/// Проверка старта для цели, заданной адресом: порт `0` известен только после занятия
+/// порта, поэтому цель строкой здесь не разобрать — имя узла и чужой адрес ловит
+/// [`connects_to_itself`] после подключения. `0.0.0.0` и `::` слушают все адреса машины,
+/// поэтому петлёй считается и любой петлевой адрес (`127.0.0.0/8`, `::1`): до остальных
+/// своих адресов проверка не достаёт без перечисления интерфейсов.
 fn loops_on_itself(listen: SocketAddr, target: SocketAddr) -> bool {
     if listen.port() != target.port() {
         return false;
@@ -892,11 +993,137 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_whose_ends_are_one_socket_is_recognised() {
-        assert!(is_self_pair("127.0.0.1:50231", Some("127.0.0.1:50231")));
-        assert!(!is_self_pair("127.0.0.1:49152", Some("127.0.0.1:50231")));
-        assert!(!is_self_pair("127.0.0.1:49152", Some("")));
-        assert!(!is_self_pair("127.0.0.1:49152", None));
+    fn a_connection_to_its_own_listening_address_is_recognised() {
+        // Подключение с машины на неё же идёт с того же адреса: цель и локальный адрес
+        // исходящего сокета совпадают, а порт цели — порт прослушивания.
+        let listen: SocketAddr = "127.0.0.1:50025".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:50025".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:50231".parse().unwrap();
+        assert!(connects_to_itself(listen, peer, local));
+        // Слушатель на всех адресах покрывает и петлевой адрес, и адрес интерфейса.
+        let any: SocketAddr = "0.0.0.0:50025".parse().unwrap();
+        assert!(connects_to_itself(any, peer, local));
+        assert!(connects_to_itself(
+            any,
+            "192.168.1.10:50025".parse().unwrap(),
+            "192.168.1.10:50231".parse().unwrap()
+        ));
+        // Двойной стек: `::` принимает IPv4, а `::ffff:` — тот же адрес IPv4.
+        assert!(connects_to_itself(
+            "[::]:50025".parse().unwrap(),
+            peer,
+            local
+        ));
+        assert!(connects_to_itself(
+            "[::]:50025".parse().unwrap(),
+            "[::ffff:127.0.0.1]:50025".parse().unwrap(),
+            "[::ffff:127.0.0.1]:50231".parse().unwrap()
+        ));
+        // Чужая цель: другой адрес, другой порт или другой порт слушателя.
+        assert!(!connects_to_itself(
+            listen,
+            "192.168.1.10:50025".parse().unwrap(),
+            "192.168.1.10:50231".parse().unwrap()
+        ));
+        assert!(!connects_to_itself(
+            listen,
+            "127.0.0.1:5000".parse().unwrap(),
+            local
+        ));
+        // Исходящий сокет на другом адресе: цель — другой узел с тем же портом.
+        assert!(!connects_to_itself(
+            listen,
+            peer,
+            "192.168.1.10:50231".parse().unwrap()
+        ));
+        // Слушатель только на петлевом адресе не покрывает адрес интерфейса.
+        let loopback: SocketAddr = "127.0.0.1:50025".parse().unwrap();
+        assert!(!connects_to_itself(
+            loopback,
+            "192.168.1.10:50025".parse().unwrap(),
+            "192.168.1.10:50231".parse().unwrap()
+        ));
+    }
+
+    /// Источник прокси на уже занятом адресе: порт известен тесту.
+    async fn proxy_on(listen: SocketAddr) -> io::Result<(ProxySource, SocketAddr)> {
+        let server = TcpServer::bind(listen).await?;
+        let bound = server.local_addr()?;
+        Ok((
+            ProxySource {
+                accepted: TcpServerSource::new(server).with_reset(),
+                target: String::new(),
+                role: ProxyRole::AnalyzerClient,
+                retry: Duration::from_millis(100),
+                connecting: JoinSet::new(),
+                listen: bound,
+                self_loop: Arc::new(AtomicBool::new(false)),
+            },
+            bound,
+        ))
+    }
+
+    /// Одна петля: входящее закрывается, пара не создаётся, отказ — `proxy_target_is_self`.
+    async fn assert_one_loop(source: &mut ProxySource, come_to: SocketAddr, case: &str) {
+        let _first = TcpStream::connect(come_to)
+            .await
+            .unwrap_or_else(|error| panic!("{case}: сторона пришла: {error}"));
+        let error = match source.next().await {
+            Next::Retry { error, .. } => error,
+            Next::Connected(_) => panic!("{case}: петля создала пару"),
+        };
+        assert!(
+            is_proxy_target_is_self(&error),
+            "{case}: код петли виден снаружи: {error}"
+        );
+        assert!(
+            error.to_string().contains("connect to itself"),
+            "{case}: {error}"
+        );
+        // Флаг поднят: следующее входящее закрывается без подключения, а текст отказа
+        // тот же — иначе серия не схлопнулась бы в одно `error`.
+        let _second = TcpStream::connect(come_to)
+            .await
+            .unwrap_or_else(|error| panic!("{case}: вторая сторона пришла: {error}"));
+        match source.next().await {
+            Next::Retry { error: repeat, .. } => {
+                assert_eq!(repeat.to_string(), error.to_string(), "{case}");
+            }
+            Next::Connected(_) => panic!("{case}: петля создала вторую пару"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_proxy_catches_a_loop_to_its_own_listening_address() {
+        // Порт выбирает система, а цель приходит строкой: проверка старта такую петлю
+        // не видит, её ловит подключение (M4-AC6).
+        let (mut source, bound) = proxy_on("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("слушатель");
+        source.target = format!("localhost:{}", bound.port());
+        assert_one_loop(&mut source, bound, "localhost").await;
+
+        // Слушатель на всех адресах, цель — петлевой адрес.
+        let (mut source, bound) = proxy_on("0.0.0.0:0".parse().unwrap())
+            .await
+            .expect("слушатель");
+        source.target = format!("127.0.0.1:{}", bound.port());
+        let come_to = SocketAddr::new("127.0.0.1".parse().unwrap(), bound.port());
+        assert_one_loop(&mut source, come_to, "0.0.0.0").await;
+
+        // `::` на двойном стеке: слушатель один, а семейства адресов разные. Окружение
+        // без IPv6 или с выключенным двойным стеком случай пропускает.
+        let Ok((mut source, bound)) = proxy_on("[::]:0".parse().unwrap()).await else {
+            return;
+        };
+        source.target = format!("127.0.0.1:{}", bound.port());
+        let Ok(_first) = TcpStream::connect(("127.0.0.1", bound.port())).await else {
+            return;
+        };
+        match source.next().await {
+            Next::Retry { error, .. } => assert!(is_proxy_target_is_self(&error), "{error}"),
+            Next::Connected(_) => panic!("[::] и 127.0.0.1 — одна петля"),
+        }
     }
 
     #[tokio::test]

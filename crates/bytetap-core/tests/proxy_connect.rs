@@ -187,8 +187,9 @@ async fn a_silent_target_still_reports_the_connect_timeout() {
     TEST_PROXY_CONNECT_TIMEOUT_MS.store(200, Ordering::Relaxed);
     TEST_PROXY_CONNECT_DELAY_MS.store(2000, Ordering::Relaxed);
     let mut first = TcpStream::connect(listen).await.expect("первый анализатор");
-    // Вторая пара закрывается, пока подключение первой ещё идёт: отмена `next` не должна
-    // съесть ни ошибку первой пары, ни её саму.
+    // Второе входящее приходит, пока подключение первого ещё идёт: у источника две задачи
+    // подключения разом, а срок первой истекает раньше. Ошибка остаётся одна, а оба
+    // входящих закрываются без `open`.
     let mut second = TcpStream::connect(listen).await.expect("второй анализатор");
 
     let error = timeout(WAIT, async {
