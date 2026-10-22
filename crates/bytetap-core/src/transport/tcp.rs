@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{Connection, ConnectionSource, Next};
+use super::{Connection, ConnectionSource, Next, ResetSocket, Stage};
 
 /// Первая пауза после ошибки `accept`.
 pub(crate) const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
@@ -81,6 +81,8 @@ impl TcpServer {
 pub struct TcpServerSource {
     server: TcpServer,
     backoff: Duration,
+    /// Принятая сторона получит ручку закрытия сбросом (пара прокси, FR-7).
+    reset: bool,
 }
 
 impl TcpServerSource {
@@ -90,7 +92,15 @@ impl TcpServerSource {
         Self {
             server,
             backoff: ACCEPT_BACKOFF_MIN,
+            reset: false,
         }
+    }
+
+    /// Принятые соединения получают второй дескриптор сокета: пару закрывают сбросом.
+    #[must_use]
+    pub fn with_reset(mut self) -> Self {
+        self.reset = true;
+        self
     }
 }
 
@@ -102,17 +112,27 @@ impl ConnectionSource for TcpServerSource {
                     self.backoff = ACCEPT_BACKOFF_MIN;
                     let peer = connection.peer().to_string();
                     let local = connection.local().to_string();
+                    let reset = if self.reset {
+                        connection.reset_socket()
+                    } else {
+                        None
+                    };
                     Next::Connected(Connection {
                         transport: Box::new(connection),
                         peer,
                         local,
                         link: None,
+                        reset,
                     })
                 }
                 Err(error) => {
                     let after = self.backoff;
                     self.backoff = next_backoff(after);
-                    Next::Retry { error, after }
+                    Next::Retry {
+                        error,
+                        after,
+                        stage: Stage::Accept,
+                    }
                 }
             }
         })
@@ -138,6 +158,12 @@ impl TcpConnection {
     #[must_use]
     pub const fn local(&self) -> SocketAddr {
         self.local
+    }
+
+    /// Второй дескриптор этого сокета: пару прокси закрывают сбросом (FR-7).
+    #[must_use]
+    pub fn reset_socket(&self) -> Option<ResetSocket> {
+        ResetSocket::of(&self.stream)
     }
 }
 
