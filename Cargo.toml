@@ -5,7 +5,6 @@ members = [
     "crates/bytetap-cli",
     "crates/bytetap-testkit",
     "crates/bytetap-app",
-    "app/src-tauri",
 ]
 
 [workspace.package]

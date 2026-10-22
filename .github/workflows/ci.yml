@@ -56,19 +56,15 @@ jobs:
         with:
           persist-credentials: false
 
-      # mesa-vulkan-drivers — программный Vulkan (lavapipe) для снимков egui_kittest.
-      - name: Системные пакеты Tauri и Vulkan (Linux)
+      # mesa-vulkan-drivers — программный Vulkan (lavapipe) для снимков egui_kittest,
+      # socat — pty для COM-теста ядра. GTK и WebKit в сборке больше не нужны: диалоги
+      # выбора папки идут через портал рабочего стола (rfd, xdg-portal).
+      - name: Системные пакеты и Vulkan (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             mesa-vulkan-drivers \
-            libwebkit2gtk-4.1-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libgtk-3-dev \
-            libsoup-3.0-dev \
-            librsvg2-dev \
-            libayatana-appindicator3-dev \
             socat
 
       - name: Установить Rust из rust-toolchain.toml
@@ -104,33 +100,6 @@ jobs:
           path: crates/bytetap-app/tests/snapshots/
           if-no-files-found: error
 
-  frontend:
-    name: frontend
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 22
-          cache: npm
-
-      - run: npm ci
-
-      - name: Проверка дерева зависимостей
-        run: npm ls --all
-
-      - name: vue-tsc
-        run: npm run check --workspace app
-
-      - name: vitest
-        run: npm run test --workspace app
-
-      - name: Сборка фронтенда
-        run: npm run build --workspace app
-
   docs:
     name: docs
     runs-on: ubuntu-latest
@@ -158,54 +127,6 @@ jobs:
 
       - name: Сборка сайта
         run: npm run docs:build
-
-  windows-app:
-    name: windows-app
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Установить Rust из rust-toolchain.toml
-        run: |
-          rustup toolchain install
-          rustc -V
-
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.2
-        with:
-          shared-key: windows-app
-
-      - run: npm ci
-
-      - name: Сборка exe без установщика
-        run: npm run tauri build -- --no-bundle
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: bytetap-windows-x64
-          path: target/release/bytetap.exe
-          if-no-files-found: error
-
-      # NFR-3: окно не должно закрываться само. Процесс жив через 15 с, а журнал старта
-      # дошёл до «интерфейс готов»: живой процесс с системным окном об ошибке тоже «жив».
-      - name: Смоук — запуск exe
-        shell: pwsh
-        run: |
-          $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
-          $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
-          $null = $p.Handle
-          Start-Sleep -Seconds 15
-          $alive = -not $p.HasExited
-          if ($alive) { Stop-Process -Id $p.Id -Force } else { Write-Host "bytetap.exe завершился, код $($p.ExitCode)" }
-          if (Test-Path $log) { Get-Content -Encoding utf8 $log } else { Write-Host "журнала $log нет" }
-          $ready = (Test-Path $log) -and (Select-String -Path $log -Pattern 'интерфейс готов' -Quiet -Encoding utf8)
-          if (-not $alive -or -not $ready) { exit 1 }
 
   # U1: нативный bytetap.exe на egui (crates/bytetap-app). Проверяются размер (NFR-7),
   # зависимости от DLL (только системные, U1-AC1) и запуск: процесс жив через 15 с и

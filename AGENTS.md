@@ -20,8 +20,7 @@
 
 - Ядро захвата — Rust crate `crates/bytetap-core` без зависимости от интерфейса.
 - Интерфейс — нативное приложение на egui, eframe и wgpu: crate `crates/bytetap-app` (bin `bytetap`), ADR 0003. Строки — через `t!` и каталог `crates/bytetap-app/locales/ru.json`, цвета и размеры — из `design/tokens.css` через `build.rs`, снимки `egui_kittest` — `crates/bytetap-app/tests/snapshots/` (обновление: `UPDATE_SNAPSHOTS=1 cargo test -p bytetap-app --test snapshots` на Linux с lavapipe).
-- Tauri v2 и Vue 3 (`app/`) — уходящая реализация: правки только для паритета, удаляется в шаге 5 этапа U1.
-- Перед сдачей: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, сборка фронтенда (пока `app/` не удалён).
+- Перед сдачей: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`, сборка сайта документации (`npm ci && npm run docs:build`), сверка лицензий (`node scripts/licenses.mjs --check`); одним прогоном — `npm run check` и `npm run docs:build`.
 - Не коммитить журналы реальных сессий (`*.jsonl` с данными приборов): они могут содержать персональные данные пациентов. Тестовые журналы — только синтетические.
 
 ## Markdown
