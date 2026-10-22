@@ -735,9 +735,20 @@ async fn an_unreachable_target_is_an_error_and_the_session_keeps_listening() {
             "{role}: {error:?}"
         );
 
-        // Цель появляется: следующее соединение проходит, повторы схлопнуты.
+        // Цель появляется: следующее соединение проходит, повторы схлопнуты. Порт мог
+        // занять соседний тест между освобождением и занятием, поэтому занимаем его
+        // с повтором: флак чужого `bind` не должен ронять проверку прокси.
         drop(reserved);
-        let lis = LisEmulator::listen(target).await.expect("цель заняла порт");
+        let lis = timeout(WAIT, async {
+            loop {
+                if let Ok(lis) = LisEmulator::listen(target).await {
+                    break lis;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("{role}: порт цели не освободился");
         let lis_task = tokio::spawn(lis.run());
         let message = fixture("analyzer_oru_r01.hl7");
         let answer = exchange(listen, &message, Fragmentation::Whole).await;
@@ -1010,6 +1021,12 @@ async fn a_reset_during_the_linger_is_an_error_and_keeps_the_first_close() {
             error.code.as_deref(),
             Some("connection_read_failed"),
             "{role}: {error:?}"
+        );
+        // Сброс второй стороны во время дожития уходит и первой стороне сбросом, а не
+        // полуоткрытым `FIN`: собеседник пары уже не ждёт ответа (FR-7).
+        assert!(
+            drain_to_close(&mut accepted).await.1,
+            "{role}: принятая сторона увидела сброс"
         );
         handle.stop().await.expect("остановка");
     }

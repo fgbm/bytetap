@@ -1402,6 +1402,9 @@ async fn serve_proxy(
         // Насосов не осталось или задача упала: пары больше нет.
         None | Some(Err(_)) => (ClosedBy::Bytetap, "error", Duration::ZERO),
     };
+    // Первая закончившаяся сторона решает, как закрывается пара; сброс второй стороны
+    // во время дожития решается отдельно — `close` от него не меняется (FR-7).
+    let mut reset_pair = reason == "reset";
 
     if linger.is_zero() {
         // Вторая сторона закрывается сразу: `FIN` уже не пересылать, `RST`, «Стоп» или
@@ -1416,6 +1419,11 @@ async fn serve_proxy(
                 // Вторая сторона закончилась сама; её ошибка — тоже событие журнала,
                 // но `close` остаётся за первой (FR-7).
                 let _ = pair_end(&shared, conn, &outcome);
+                // Сброс во время дожития: собеседник второй стороны уже сбросил
+                // соединение, и ответа он не ждёт. Обе стороны закрываются `RST`,
+                // как при сбросе первой: иначе оставшаяся сторона увидела бы `FIN`
+                // там, где собеседник видел сброс.
+                reset_pair = reset_pair || is_reset_outcome(&outcome);
             }
             // Насосов не осталось или задача упала: закрывать уже нечего.
             Ok(_) => {}
@@ -1431,7 +1439,7 @@ async fn serve_proxy(
     // Сброс: вторая сторона тоже получает `RST`, а не `FIN`. Зависший собеседник иначе
     // ждал бы закрытия полуоткрытого соединения (FR-7). Ручек нет — стороны закроются
     // обычным `FIN`.
-    if reason == "reset" {
+    if reset_pair {
         if let Some(reset) = &accepted_reset {
             reset.reset();
         }
@@ -1592,20 +1600,32 @@ async fn wait_for_hangup(hangup: &mut watch::Receiver<bool>) {
     let _ = hangup.changed().await;
 }
 
+/// Сброс ли это: ошибка сокета, после которой пару закрывают `RST`, а не `FIN` (FR-7).
+fn is_reset_kind(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Сброс второй стороны пары во время дожития (FR-7).
+fn is_reset_outcome(outcome: &Pump) -> bool {
+    matches!(outcome, Pump::Broken { error, .. } if is_reset_kind(error))
+}
+
 /// Кто закрыл пару по ошибке сокета и почему.
 ///
 /// Ошибка чтения — сторону сбросила та сторона, из которой читали; ошибка записи — та,
 /// в которую писали, то есть противоположная. Всё остальное bytetap считает своей ошибкой.
 fn proxy_broken(role: LinkRole, error: &io::Error, writing: bool) -> (ClosedBy, &'static str) {
-    match error.kind() {
-        io::ErrorKind::ConnectionReset
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::BrokenPipe
-        | io::ErrorKind::UnexpectedEof => {
-            let closer = if writing { role.opposite() } else { role };
-            (closer.closed_by(), "reset")
-        }
-        _ => (ClosedBy::Bytetap, "error"),
+    if is_reset_kind(error) {
+        let closer = if writing { role.opposite() } else { role };
+        (closer.closed_by(), "reset")
+    } else {
+        (ClosedBy::Bytetap, "error")
     }
 }
 
