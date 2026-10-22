@@ -34,13 +34,14 @@
 | clipboard-win | 5.4.1 | BSL-1.0 | 29 |
 | codespan-reporting | 0.13.1 | Apache-2.0 | 30 |
 | color | 0.3.3 | Apache-2.0 OR MIT | 8, 31 |
-| crc32fast | 1.5.2 | MIT OR Apache-2.0 | 32, 33 |
-| cursor-icon | 1.2.0 | MIT OR Apache-2.0 OR Zlib | 34, 35, 36 |
-| data-url | 0.3.2 | MIT OR Apache-2.0 | 6, 37 |
-| dirs | 7.0.0 | MIT OR Apache-2.0 | 38, 39 |
-| dirs-sys | 0.5.0 | MIT OR Apache-2.0 | 38, 39 |
-| document-features | 0.2.12 | MIT OR Apache-2.0 | 40, 41 |
-| dpi | 0.1.2 | Apache-2.0 AND MIT | 32, 42 |
+| core_detect | 1.0.0 | MIT/Apache-2.0 | 6, 32 |
+| crc32fast | 1.5.2 | MIT OR Apache-2.0 | 33, 34 |
+| cursor-icon | 1.2.0 | MIT OR Apache-2.0 OR Zlib | 35, 36, 37 |
+| data-url | 0.3.2 | MIT OR Apache-2.0 | 6, 38 |
+| dirs | 7.0.0 | MIT OR Apache-2.0 | 39, 40 |
+| dirs-sys | 0.5.0 | MIT OR Apache-2.0 | 39, 40 |
+| document-features | 0.2.12 | MIT OR Apache-2.0 | 41, 42 |
+| dpi | 0.1.2 | Apache-2.0 AND MIT | 33, 43 |
 | ecolor | 0.37.0 | MIT OR Apache-2.0 | 1 |
 | eframe | 0.37.0 | MIT OR Apache-2.0 | 1 |
 | egui | 0.37.0 | MIT OR Apache-2.0 | 1 |
@@ -48,196 +49,199 @@
 | egui-winit | 0.37.0 | MIT OR Apache-2.0 | 1 |
 | egui_extras | 0.37.0 | MIT OR Apache-2.0 | 1 |
 | egui_glow | 0.37.0 | MIT OR Apache-2.0 | 1 |
-| either | 1.19.0 | MIT OR Apache-2.0 | 6, 43 |
+| either | 1.19.0 | MIT OR Apache-2.0 | 6, 44 |
 | emath | 0.37.0 | MIT OR Apache-2.0 | 1 |
-| embed-resource | 3.0.12 | MIT | 44 |
-| encoding_rs | 0.8.35 | (Apache-2.0 OR MIT) AND BSD-3-Clause | 30, 45, 46 |
+| embed-resource | 3.0.12 | MIT | 45 |
+| encoding_rs | 0.8.42 | (Apache-2.0 OR MIT) AND BSD-3-Clause | 30, 46, 47 |
 | enum-map | 3.1.0 | MIT OR Apache-2.0 | 1 |
 | enum-map-derive | 1.0.1 | MIT OR Apache-2.0 | 1 |
 | epaint | 0.37.0 | MIT OR Apache-2.0 | 1 |
-| equivalent | 1.0.3 | Apache-2.0 OR MIT | 6, 47 |
+| equivalent | 1.0.3 | Apache-2.0 OR MIT | 6, 48 |
 | error-code | 3.4.0 | BSL-1.0 | 29 |
-| euclid | 0.22.14 | MIT OR Apache-2.0 | 6, 48 |
-| fax | 0.2.7 | MIT | 49 |
-| fdeflate | 0.3.7 | MIT OR Apache-2.0 | 8, 50 |
-| fearless_simd | 0.4.1 | Apache-2.0 OR MIT | 8, 51 |
+| euclid | 0.22.14 | MIT OR Apache-2.0 | 6, 49 |
+| fax | 0.2.7 | MIT | 50 |
+| fdeflate | 0.3.7 | MIT OR Apache-2.0 | 8, 51 |
+| fearless_simd | 0.4.1 | Apache-2.0 OR MIT | 8, 52 |
 | find-msvc-tools | 0.1.15 | MIT OR Apache-2.0 | 6, 25 |
-| flate2 | 1.1.10 | MIT OR Apache-2.0 | 6, 52 |
-| float-cmp | 0.9.0 | MIT | 53 |
-| foldhash | 0.2.0 | Zlib | 54 |
-| font-types | 0.12.7 | MIT OR Apache-2.0 | 55, 56 |
-| getrandom | 0.3.4 | MIT OR Apache-2.0 | 57, 58 |
-| getrandom | 0.4.3 | MIT OR Apache-2.0 | 57, 59 |
+| flate2 | 1.1.10 | MIT OR Apache-2.0 | 6, 53 |
+| float-cmp | 0.9.0 | MIT | 54 |
+| foldhash | 0.2.0 | Zlib | 55 |
+| font-types | 0.12.7 | MIT OR Apache-2.0 | 56, 57 |
+| getrandom | 0.3.4 | MIT OR Apache-2.0 | 58, 59 |
+| getrandom | 0.4.3 | MIT OR Apache-2.0 | 58, 60 |
 | gl_generator | 0.14.0 | Apache-2.0 | 2 |
-| glifo | 0.3.0 | Apache-2.0 OR MIT | 2, 60 |
-| glow | 0.17.0 | MIT OR Apache-2.0 OR Zlib | 5, 6, 61 |
-| glutin | 0.32.3 | Apache-2.0 | 62 |
-| glutin-winit | 0.5.0 | MIT | 63 |
-| glutin_egl_sys | 0.7.1 | Apache-2.0 | 62 |
-| glutin_wgl_sys | 0.6.1 | Apache-2.0 | 62 |
-| gpu-allocator | 0.28.0 | MIT OR Apache-2.0 | 64, 65 |
-| guillotiere | 0.7.0 | MIT/Apache-2.0 | 66, 67 |
+| glifo | 0.3.0 | Apache-2.0 OR MIT | 2, 61 |
+| glow | 0.17.0 | MIT OR Apache-2.0 OR Zlib | 5, 6, 62 |
+| glutin | 0.32.3 | Apache-2.0 | 63 |
+| glutin-winit | 0.5.0 | MIT | 64 |
+| glutin_egl_sys | 0.7.1 | Apache-2.0 | 63 |
+| glutin_wgl_sys | 0.6.1 | Apache-2.0 | 63 |
+| gpu-allocator | 0.28.0 | MIT OR Apache-2.0 | 65, 66 |
+| guillotiere | 0.7.0 | MIT/Apache-2.0 | 67, 68 |
 | half | 2.7.1 | MIT OR Apache-2.0 | 8, 31 |
-| harfrust | 0.12.0 | MIT | 68 |
-| hashbrown | 0.16.1 | MIT OR Apache-2.0 | 6, 69 |
-| hashbrown | 0.17.1 | MIT OR Apache-2.0 | 6, 69 |
-| if-addrs | 0.15.0 | MIT OR BSD-3-Clause | 70, 71 |
-| image | 0.25.10 | MIT OR Apache-2.0 | 8, 50 |
-| imagesize | 0.13.0 | MIT | 72 |
-| indexmap | 2.14.2 | Apache-2.0 OR MIT | 6, 73 |
-| itertools | 0.15.0 | MIT OR Apache-2.0 | 6, 43 |
+| harfrust | 0.12.0 | MIT | 69 |
+| hashbrown | 0.16.1 | MIT OR Apache-2.0 | 6, 70 |
+| hashbrown | 0.17.1 | MIT OR Apache-2.0 | 6, 70 |
+| if-addrs | 0.15.0 | MIT OR BSD-3-Clause | 71, 72 |
+| image | 0.25.10 | MIT OR Apache-2.0 | 8, 51 |
+| imagesize | 0.13.0 | MIT | 73 |
+| indexmap | 2.14.2 | Apache-2.0 OR MIT | 6, 74 |
+| itertools | 0.15.0 | MIT OR Apache-2.0 | 6, 44 |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | 2, 5 |
 | jobserver | 0.1.35 | MIT OR Apache-2.0 | 6, 25 |
 | khronos-egl | 6.0.0 | MIT/Apache-2.0 | 5, 6 |
 | khronos_api | 3.1.0 | Apache-2.0 | 2 |
-| kurbo | 0.11.3 | Apache-2.0 OR MIT | 30, 51 |
-| kurbo | 0.13.1 | Apache-2.0 OR MIT | 30, 51 |
-| libc | 0.2.191 | MIT OR Apache-2.0 | 2, 74 |
-| libloading | 0.8.9 | ISC | 75 |
-| libm | 0.2.16 | MIT | 76 |
+| kurbo | 0.11.3 | Apache-2.0 OR MIT | 30, 52 |
+| kurbo | 0.13.1 | Apache-2.0 OR MIT | 30, 52 |
+| libc | 0.2.191 | MIT OR Apache-2.0 | 2, 75 |
+| libloading | 0.8.9 | ISC | 76 |
+| libm | 0.2.16 | MIT | 77 |
 | linebender_resource_handle | 0.1.1 | Apache-2.0 OR MIT | 8, 31 |
-| litrs | 1.0.1 | MIT OR Apache-2.0 | 2, 77 |
-| lock_api | 0.4.14 | MIT OR Apache-2.0 | 6, 78 |
+| litrs | 1.0.1 | MIT OR Apache-2.0 | 2, 78 |
+| lock_api | 0.4.14 | MIT OR Apache-2.0 | 6, 79 |
 | log | 0.4.34 | MIT OR Apache-2.0 | 6, 19 |
-| memchr | 2.8.3 | Unlicense OR MIT | 23, 79 |
-| mime | 0.3.17 | MIT OR Apache-2.0 | 6, 80 |
-| mime_guess2 | 2.3.1 | MIT | 81 |
-| miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | 8, 82, 83, 84 |
-| miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 | 8, 82, 83, 84 |
-| mio | 1.2.4 | MIT | 85 |
-| moxcms | 0.8.1 | BSD-3-Clause OR Apache-2.0 | 86, 87 |
-| naga | 30.0.1 | MIT OR Apache-2.0 | 8, 88 |
-| naga-types | 30.0.1 | MIT OR Apache-2.0 | 8, 88 |
-| nohash-hasher | 0.2.0 | Apache-2.0 OR MIT | 30, 89 |
+| memchr | 2.8.3 | Unlicense OR MIT | 23, 80 |
+| mime | 0.3.17 | MIT OR Apache-2.0 | 6, 81 |
+| mime_guess2 | 2.3.1 | MIT | 82 |
+| miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | 8, 83, 84, 85 |
+| miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 | 8, 83, 84, 85 |
+| mio | 1.2.4 | MIT | 86 |
+| moxcms | 0.8.1 | BSD-3-Clause OR Apache-2.0 | 87, 88 |
+| multiversion_no_op | 1.0.0 | Apache-2.0 OR MIT | 30, 46 |
+| naga | 30.0.1 | MIT OR Apache-2.0 | 8, 89 |
+| naga-types | 30.0.1 | MIT OR Apache-2.0 | 8, 89 |
+| nohash-hasher | 0.2.0 | Apache-2.0 OR MIT | 30, 90 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 | 6, 19 |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | 5, 6 |
-| option-ext | 0.2.0 | MPL-2.0 | 90 |
-| ordered-float | 5.5.0 | MIT | 91 |
-| os_info | 3.15.0 | MIT | 92 |
-| parking_lot | 0.12.5 | MIT OR Apache-2.0 | 6, 78 |
-| parking_lot_core | 0.9.12 | MIT OR Apache-2.0 | 6, 78 |
-| peniko | 0.6.1 | Apache-2.0 OR MIT | 30, 51 |
-| phf | 0.11.3 | MIT | 93 |
-| phf_generator | 0.11.3 | MIT | 93 |
-| phf_macros | 0.11.3 | MIT | 93 |
-| phf_shared | 0.11.3 | MIT | 93 |
-| pico-args | 0.5.0 | MIT | 94 |
+| option-ext | 0.2.0 | MPL-2.0 | 91 |
+| ordered-float | 5.5.0 | MIT | 92 |
+| os_info | 3.15.0 | MIT | 93 |
+| parking_lot | 0.12.5 | MIT OR Apache-2.0 | 6, 79 |
+| parking_lot_core | 0.9.12 | MIT OR Apache-2.0 | 6, 79 |
+| peniko | 0.6.1 | Apache-2.0 OR MIT | 30, 52 |
+| phf | 0.11.3 | MIT | 94 |
+| phf_generator | 0.11.3 | MIT | 94 |
+| phf_macros | 0.11.3 | MIT | 94 |
+| phf_shared | 0.11.3 | MIT | 94 |
+| pico-args | 0.5.0 | MIT | 95 |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT | 5, 8 |
 | pkg-config | 0.3.34 | MIT OR Apache-2.0 | 6, 25 |
-| png | 0.17.16 | MIT OR Apache-2.0 | 6, 95 |
-| png | 0.18.1 | MIT OR Apache-2.0 | 6, 95 |
-| pollster | 1.0.1 | Apache-2.0/MIT | 6, 96 |
-| polycool | 0.4.0 | MIT OR Apache-2.0 | 30, 51 |
-| presser | 0.3.1 | MIT OR Apache-2.0 | 16, 97 |
+| png | 0.17.16 | MIT OR Apache-2.0 | 6, 96 |
+| png | 0.18.1 | MIT OR Apache-2.0 | 6, 96 |
+| pollster | 1.0.1 | Apache-2.0/MIT | 6, 97 |
+| polycool | 0.4.0 | MIT OR Apache-2.0 | 30, 52 |
+| presser | 0.3.1 | MIT OR Apache-2.0 | 16, 98 |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 | 2, 5 |
 | profiling | 1.0.18 | MIT OR Apache-2.0 | 1 |
-| pxfm | 0.1.30 | BSD-3-Clause OR Apache-2.0 | 86, 87 |
-| quick-error | 2.0.1 | MIT/Apache-2.0 | 32, 98 |
+| pxfm | 0.1.30 | BSD-3-Clause OR Apache-2.0 | 87, 88 |
+| quick-error | 2.0.1 | MIT/Apache-2.0 | 33, 99 |
 | quote | 1.0.47 | MIT OR Apache-2.0 | 2, 5 |
-| rand | 0.8.8 | MIT OR Apache-2.0 | 99, 100 |
-| rand_core | 0.10.1 | MIT OR Apache-2.0 | 101, 102 |
-| rand_core | 0.6.4 | MIT OR Apache-2.0 | 100, 101 |
-| range-alloc | 0.1.5 | MIT OR Apache-2.0 | 8, 103 |
-| raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib | 8, 104, 105 |
-| read-fonts | 0.41.0 | MIT OR Apache-2.0 | 55, 56 |
-| renderdoc-sys | 1.1.0 | MIT OR Apache-2.0 | 6, 106 |
-| resvg | 0.45.1 | Apache-2.0 OR MIT | 8, 107 |
-| rfd | 0.16.0 | MIT | 108 |
-| rgb | 0.8.53 | MIT | 109 |
-| roxmltree | 0.20.0 | MIT OR Apache-2.0 | 6, 110 |
+| rand | 0.8.8 | MIT OR Apache-2.0 | 100, 101 |
+| rand_core | 0.10.1 | MIT OR Apache-2.0 | 102, 103 |
+| rand_core | 0.6.4 | MIT OR Apache-2.0 | 101, 102 |
+| range-alloc | 0.1.5 | MIT OR Apache-2.0 | 8, 104 |
+| raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib | 8, 105, 106 |
+| read-fonts | 0.41.0 | MIT OR Apache-2.0 | 56, 57 |
+| renderdoc-sys | 1.1.0 | MIT OR Apache-2.0 | 6, 107 |
+| resvg | 0.45.1 | Apache-2.0 OR MIT | 8, 108 |
+| rfd | 0.16.0 | MIT | 109 |
+| rgb | 0.8.53 | MIT | 110 |
+| roxmltree | 0.20.0 | MIT OR Apache-2.0 | 6, 111 |
 | rustc-hash | 1.1.0 | Apache-2.0/MIT | 5, 6 |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT | 2, 5 |
-| rustc_version | 0.4.1 | MIT OR Apache-2.0 | 6, 78 |
-| scopeguard | 1.2.0 | MIT OR Apache-2.0 | 6, 111 |
-| self_cell | 1.3.0 | Apache-2.0 OR GPL-2.0-only | 30, 112 |
+| rustc_version | 0.4.1 | MIT OR Apache-2.0 | 6, 79 |
+| rustversion | 1.0.23 | MIT OR Apache-2.0 | 2, 5 |
+| scopeguard | 1.2.0 | MIT OR Apache-2.0 | 6, 112 |
+| self_cell | 1.3.0 | Apache-2.0 OR GPL-2.0-only | 30, 113 |
 | semver | 1.0.28 | MIT OR Apache-2.0 | 2, 5 |
 | serde | 1.0.229 | MIT OR Apache-2.0 | 2, 5 |
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | 2, 5 |
 | serde_derive | 1.0.229 | MIT OR Apache-2.0 | 2, 5 |
 | serde_json | 1.0.154 | MIT OR Apache-2.0 | 2, 5 |
-| serde_spanned | 1.1.2 | MIT OR Apache-2.0 | 113, 114 |
-| serialport | 4.10.1 | MPL-2.0 | 90, 115 |
-| shlex | 2.0.1 | MIT OR Apache-2.0 | 116, 117 |
-| simd-adler32 | 0.3.10 | MIT | 118 |
-| simplecss | 0.2.2 | Apache-2.0 OR MIT | 6, 119 |
-| siphasher | 1.0.4 | MIT OR Apache-2.0 | 30, 120, 121 |
-| skrifa | 0.44.0 | MIT OR Apache-2.0 | 55, 56 |
-| smallvec | 1.16.3 | MIT OR Apache-2.0 | 6, 122 |
+| serde_spanned | 1.1.2 | MIT OR Apache-2.0 | 114, 115 |
+| serialport | 4.10.1 | MPL-2.0 | 91, 116 |
+| shlex | 2.0.1 | MIT OR Apache-2.0 | 117, 118 |
+| simd-adler32 | 0.3.10 | MIT | 119 |
+| simdutf8 | 0.1.5 | MIT OR Apache-2.0 | 8, 31 |
+| simplecss | 0.2.2 | Apache-2.0 OR MIT | 6, 120 |
+| siphasher | 1.0.4 | MIT OR Apache-2.0 | 30, 121, 122 |
+| skrifa | 0.44.0 | MIT OR Apache-2.0 | 56, 57 |
+| smallvec | 1.16.3 | MIT OR Apache-2.0 | 6, 123 |
 | smol_str | 0.2.2 | MIT OR Apache-2.0 | 5, 6 |
 | socket2 | 0.6.5 | MIT OR Apache-2.0 | 6, 25 |
 | spirv | 0.4.0+sdk-1.4.341.0 | Apache-2.0 | 2 |
-| static_assertions | 1.1.0 | MIT OR Apache-2.0 | 30, 123 |
-| strict-num | 0.1.1 | MIT | 124 |
-| svgtypes | 0.15.3 | Apache-2.0 OR MIT | 6, 125 |
+| static_assertions | 1.1.0 | MIT OR Apache-2.0 | 30, 124 |
+| strict-num | 0.1.1 | MIT | 125 |
+| svgtypes | 0.15.3 | Apache-2.0 OR MIT | 6, 126 |
 | syn | 2.0.119 | MIT OR Apache-2.0 | 2, 5 |
 | syn | 3.0.9 | MIT OR Apache-2.0 | 2, 5 |
-| termcolor | 1.4.1 | Unlicense OR MIT | 23, 79 |
+| termcolor | 1.4.1 | Unlicense OR MIT | 23, 80 |
 | thiserror | 2.0.21 | MIT OR Apache-2.0 | 2, 5 |
 | thiserror-impl | 2.0.21 | MIT OR Apache-2.0 | 2, 5 |
-| tiff | 0.11.3 | MIT | 126 |
-| tiny-skia | 0.11.4 | BSD-3-Clause | 127 |
-| tiny-skia-path | 0.11.4 | BSD-3-Clause | 127 |
-| tokio | 1.53.3 | MIT | 128 |
-| tokio-macros | 2.7.2 | MIT | 129 |
-| toml | 1.1.8+spec-1.1.0 | MIT OR Apache-2.0 | 113, 114 |
-| toml_datetime | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | 113, 114 |
-| toml_parser | 1.1.5+spec-1.1.0 | MIT OR Apache-2.0 | 113, 114 |
-| toml_writer | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 | 113, 114 |
-| tracing | 0.1.44 | MIT | 130 |
-| tracing-attributes | 0.1.31 | MIT | 130 |
-| tracing-core | 0.1.36 | MIT | 130 |
-| type-map | 0.5.1 | MIT/Apache-2.0 | 131, 132 |
-| unicase | 2.10.0 | MIT OR Apache-2.0 | 6, 133 |
-| unicode-general-category | 1.1.0 | Apache-2.0 | 32 |
-| unicode-ident | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 | 2, 5, 134 |
-| unicode-properties | 0.1.4 | MIT/Apache-2.0 | 6, 135 |
-| unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 | 6, 135 |
-| unicode-width | 0.2.2 | MIT OR Apache-2.0 | 6, 135 |
-| usvg | 0.45.1 | Apache-2.0 OR MIT | 8, 107 |
-| uuid | 1.28.0 | Apache-2.0 OR MIT | 6, 136 |
-| vello_common | 0.2.0 | Apache-2.0 OR MIT | 8, 137 |
-| vello_cpu | 0.2.0 | Apache-2.0 OR MIT | 8, 137 |
-| version_check | 0.9.5 | MIT/Apache-2.0 | 6, 138 |
-| vswhom | 0.1.0 | MIT | 139 |
-| vswhom-sys | 0.1.3 | MIT | 139 |
-| web-time | 1.1.0 | MIT OR Apache-2.0 | 140, 141 |
-| weezl | 0.1.12 | MIT OR Apache-2.0 | 6, 142 |
-| wgpu | 30.0.1 | MIT OR Apache-2.0 | 8, 88 |
-| wgpu-core | 30.0.1 | MIT OR Apache-2.0 | 8, 88 |
-| wgpu-core-deps-windows-linux-android | 30.0.1 | MIT OR Apache-2.0 | 8, 88 |
-| wgpu-hal | 30.0.1 | MIT OR Apache-2.0 | 8, 88 |
-| wgpu-naga-bridge | 30.0.1 | MIT OR Apache-2.0 | 8, 88 |
-| wgpu-types | 30.0.1 | MIT OR Apache-2.0 | 8, 88 |
-| winapi-util | 0.1.11 | Unlicense OR MIT | 79, 143 |
-| windows | 0.62.2 | MIT OR Apache-2.0 | 144, 145 |
-| windows-collections | 0.3.2 | MIT OR Apache-2.0 | 144, 145 |
-| windows-core | 0.62.2 | MIT OR Apache-2.0 | 144, 145 |
-| windows-future | 0.3.2 | MIT OR Apache-2.0 | 144, 145 |
-| windows-implement | 0.60.2 | MIT OR Apache-2.0 | 144, 145 |
-| windows-interface | 0.59.3 | MIT OR Apache-2.0 | 144, 145 |
-| windows-link | 0.2.1 | MIT OR Apache-2.0 | 144, 145 |
-| windows-numerics | 0.3.1 | MIT OR Apache-2.0 | 144, 145 |
-| windows-result | 0.4.1 | MIT OR Apache-2.0 | 144, 145 |
-| windows-strings | 0.5.1 | MIT OR Apache-2.0 | 144, 145 |
-| windows-sys | 0.52.0 | MIT OR Apache-2.0 | 144, 145 |
-| windows-sys | 0.60.2 | MIT OR Apache-2.0 | 144, 145 |
-| windows-sys | 0.61.2 | MIT OR Apache-2.0 | 144, 145 |
-| windows-targets | 0.52.6 | MIT OR Apache-2.0 | 144, 145 |
-| windows-targets | 0.53.5 | MIT OR Apache-2.0 | 144, 145 |
-| windows-threading | 0.2.1 | MIT OR Apache-2.0 | 144, 145 |
-| windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 | 144, 145 |
-| windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 | 144, 145 |
-| winit | 0.30.13 | Apache-2.0 | 32 |
-| winnow | 1.0.4 | MIT | 146 |
-| winreg | 0.56.0 | MIT | 147 |
-| xml-rs | 0.8.29 | MIT | 148 |
-| xmlwriter | 0.1.0 | MIT | 149 |
-| zerocopy | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT | 150, 151, 152 |
-| zerocopy-derive | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT | 150, 151, 152 |
-| zlib-rs | 0.6.8 | Zlib | 153 |
+| tiff | 0.11.3 | MIT | 127 |
+| tiny-skia | 0.11.4 | BSD-3-Clause | 128 |
+| tiny-skia-path | 0.11.4 | BSD-3-Clause | 128 |
+| tokio | 1.53.3 | MIT | 129 |
+| tokio-macros | 2.7.2 | MIT | 130 |
+| toml | 1.1.8+spec-1.1.0 | MIT OR Apache-2.0 | 114, 115 |
+| toml_datetime | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 | 114, 115 |
+| toml_parser | 1.1.5+spec-1.1.0 | MIT OR Apache-2.0 | 114, 115 |
+| toml_writer | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 | 114, 115 |
+| tracing | 0.1.44 | MIT | 131 |
+| tracing-attributes | 0.1.31 | MIT | 131 |
+| tracing-core | 0.1.36 | MIT | 131 |
+| type-map | 0.5.1 | MIT/Apache-2.0 | 132, 133 |
+| unicase | 2.10.0 | MIT OR Apache-2.0 | 6, 134 |
+| unicode-general-category | 1.1.0 | Apache-2.0 | 33 |
+| unicode-ident | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 | 2, 5, 135 |
+| unicode-properties | 0.1.4 | MIT/Apache-2.0 | 6, 136 |
+| unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 | 6, 136 |
+| unicode-width | 0.2.2 | MIT OR Apache-2.0 | 6, 136 |
+| usvg | 0.45.1 | Apache-2.0 OR MIT | 8, 108 |
+| uuid | 1.28.0 | Apache-2.0 OR MIT | 6, 137 |
+| vello_common | 0.2.0 | Apache-2.0 OR MIT | 8, 138 |
+| vello_cpu | 0.2.0 | Apache-2.0 OR MIT | 8, 138 |
+| version_check | 0.9.5 | MIT/Apache-2.0 | 6, 139 |
+| vswhom | 0.1.0 | MIT | 140 |
+| vswhom-sys | 0.1.3 | MIT | 140 |
+| web-time | 1.1.0 | MIT OR Apache-2.0 | 141, 142 |
+| weezl | 0.1.12 | MIT OR Apache-2.0 | 6, 143 |
+| wgpu | 30.0.1 | MIT OR Apache-2.0 | 8, 89 |
+| wgpu-core | 30.0.1 | MIT OR Apache-2.0 | 8, 89 |
+| wgpu-core-deps-windows-linux-android | 30.0.1 | MIT OR Apache-2.0 | 8, 89 |
+| wgpu-hal | 30.0.1 | MIT OR Apache-2.0 | 8, 89 |
+| wgpu-naga-bridge | 30.0.1 | MIT OR Apache-2.0 | 8, 89 |
+| wgpu-types | 30.0.1 | MIT OR Apache-2.0 | 8, 89 |
+| winapi-util | 0.1.11 | Unlicense OR MIT | 80, 144 |
+| windows | 0.62.2 | MIT OR Apache-2.0 | 145, 146 |
+| windows-collections | 0.3.2 | MIT OR Apache-2.0 | 145, 146 |
+| windows-core | 0.62.2 | MIT OR Apache-2.0 | 145, 146 |
+| windows-future | 0.3.2 | MIT OR Apache-2.0 | 145, 146 |
+| windows-implement | 0.60.2 | MIT OR Apache-2.0 | 145, 146 |
+| windows-interface | 0.59.3 | MIT OR Apache-2.0 | 145, 146 |
+| windows-link | 0.2.1 | MIT OR Apache-2.0 | 145, 146 |
+| windows-numerics | 0.3.1 | MIT OR Apache-2.0 | 145, 146 |
+| windows-result | 0.4.1 | MIT OR Apache-2.0 | 145, 146 |
+| windows-strings | 0.5.1 | MIT OR Apache-2.0 | 145, 146 |
+| windows-sys | 0.52.0 | MIT OR Apache-2.0 | 145, 146 |
+| windows-sys | 0.60.2 | MIT OR Apache-2.0 | 145, 146 |
+| windows-sys | 0.61.2 | MIT OR Apache-2.0 | 145, 146 |
+| windows-targets | 0.52.6 | MIT OR Apache-2.0 | 145, 146 |
+| windows-targets | 0.53.5 | MIT OR Apache-2.0 | 145, 146 |
+| windows-threading | 0.2.1 | MIT OR Apache-2.0 | 145, 146 |
+| windows_x86_64_msvc | 0.52.6 | MIT OR Apache-2.0 | 145, 146 |
+| windows_x86_64_msvc | 0.53.1 | MIT OR Apache-2.0 | 145, 146 |
+| winit | 0.30.13 | Apache-2.0 | 33 |
+| winnow | 1.0.4 | MIT | 147 |
+| winreg | 0.56.0 | MIT | 148 |
+| xml-rs | 0.8.29 | MIT | 149 |
+| xmlwriter | 0.1.0 | MIT | 150 |
+| zerocopy | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT | 151, 152, 153 |
+| zerocopy-derive | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT | 151, 152, 153 |
+| zlib-rs | 0.6.8 | Zlib | 154 |
 | zmij | 1.0.23 | MIT | 5 |
-| zune-core | 0.5.3 | MIT OR Apache-2.0 OR Zlib | 30, 154, 155 |
-| zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | 30, 154, 155 |
+| zune-core | 0.5.3 | MIT OR Apache-2.0 OR Zlib | 30, 155, 156 |
+| zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | 30, 155, 156 |
 
 ## Тексты лицензий
 
@@ -273,9 +277,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 2. (MIT OR Apache-2.0) AND Unicode-3.0, Apache-2.0, Apache-2.0 OR MIT, MIT OR Apache-2.0 — 22 пакета
+### 2. (MIT OR Apache-2.0) AND Unicode-3.0, Apache-2.0, Apache-2.0 OR MIT, MIT OR Apache-2.0 — 23 пакета
 
-Пакеты: accesskit_winit 0.34.1, allocator-api2 0.2.21, gl_generator 0.14.0, glifo 0.3.0, itoa 1.0.18, khronos_api 3.1.0, libc 0.2.191, litrs 1.0.1, proc-macro2 1.0.107, quote 1.0.47, rustc-hash 2.1.3, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, spirv 0.4.0+sdk-1.4.341.0, syn 2.0.119, syn 3.0.9, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.27.
+Пакеты: accesskit_winit 0.34.1, allocator-api2 0.2.21, gl_generator 0.14.0, glifo 0.3.0, itoa 1.0.18, khronos_api 3.1.0, libc 0.2.191, litrs 1.0.1, proc-macro2 1.0.107, quote 1.0.47, rustc-hash 2.1.3, rustversion 1.0.23, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, spirv 0.4.0+sdk-1.4.341.0, syn 2.0.119, syn 3.0.9, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.27.
 
 Стандартный текст SPDX из `scripts/license-texts/`: полного текста лицензии в пакете не было у accesskit_winit 0.34.1, gl_generator 0.14.0, khronos_api 3.1.0, spirv 0.4.0+sdk-1.4.341.0. Правообладатели и год — в метаданных пакета, исходники — https://github.com/AccessKit/accesskit, https://github.com/brendanzab/gl-rs/, https://github.com/gfx-rs/rspirv.
 
@@ -685,9 +689,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 5. (MIT OR Apache-2.0) AND Unicode-3.0, 0BSD OR MIT OR Apache-2.0, Apache-2.0 OR MIT, Apache-2.0/MIT, MIT, MIT OR Apache-2.0, MIT OR Apache-2.0 OR Zlib, MIT/Apache-2.0 — 23 пакета
+### 5. (MIT OR Apache-2.0) AND Unicode-3.0, 0BSD OR MIT OR Apache-2.0, Apache-2.0 OR MIT, Apache-2.0/MIT, MIT, MIT OR Apache-2.0, MIT OR Apache-2.0 OR Zlib, MIT/Apache-2.0 — 24 пакета
 
-Пакеты: adler2 2.0.1, allocator-api2 0.2.21, glow 0.17.0, itoa 1.0.18, khronos-egl 6.0.0, once_cell 1.21.4, pin-project-lite 0.2.17, proc-macro2 1.0.107, quote 1.0.47, rustc-hash 1.1.0, rustc-hash 2.1.3, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, smol_str 0.2.2, syn 2.0.119, syn 3.0.9, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.27, zmij 1.0.23.
+Пакеты: adler2 2.0.1, allocator-api2 0.2.21, glow 0.17.0, itoa 1.0.18, khronos-egl 6.0.0, once_cell 1.21.4, pin-project-lite 0.2.17, proc-macro2 1.0.107, quote 1.0.47, rustc-hash 1.1.0, rustc-hash 2.1.3, rustversion 1.0.23, semver 1.0.28, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, smol_str 0.2.2, syn 2.0.119, syn 3.0.9, thiserror 2.0.21, thiserror-impl 2.0.21, unicode-ident 1.0.27, zmij 1.0.23.
 
 ```text
 Permission is hereby granted, free of charge, to any
@@ -715,9 +719,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 6. Apache-2.0 OR MIT, Apache-2.0/MIT, MIT OR Apache-2.0, MIT OR Apache-2.0 OR Zlib, MIT/Apache-2.0 — 49 пакетов
+### 6. Apache-2.0 OR MIT, Apache-2.0/MIT, MIT OR Apache-2.0, MIT OR Apache-2.0 OR Zlib, MIT/Apache-2.0 — 50 пакетов
 
-Пакеты: ahash 0.8.12, arrayvec 0.7.8, autocfg 1.5.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.2, cc 1.9.0, cfg-if 1.0.5, data-url 0.3.2, either 1.19.0, equivalent 1.0.3, euclid 0.22.14, find-msvc-tools 0.1.15, flate2 1.1.10, glow 0.17.0, hashbrown 0.16.1, hashbrown 0.17.1, indexmap 2.14.2, itertools 0.15.0, jobserver 0.1.35, khronos-egl 6.0.0, lock_api 0.4.14, log 0.4.34, mime 0.3.17, num-traits 0.2.19, once_cell 1.21.4, parking_lot 0.12.5, parking_lot_core 0.9.12, pkg-config 0.3.34, png 0.17.16, png 0.18.1, pollster 1.0.1, renderdoc-sys 1.1.0, roxmltree 0.20.0, rustc-hash 1.1.0, rustc_version 0.4.1, scopeguard 1.2.0, simplecss 0.2.2, smallvec 1.16.3, smol_str 0.2.2, socket2 0.6.5, svgtypes 0.15.3, unicase 2.10.0, unicode-properties 0.1.4, unicode-segmentation 1.13.3, unicode-width 0.2.2, uuid 1.28.0, version_check 0.9.5, weezl 0.1.12.
+Пакеты: ahash 0.8.12, arrayvec 0.7.8, autocfg 1.5.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.2, cc 1.9.0, cfg-if 1.0.5, core_detect 1.0.0, data-url 0.3.2, either 1.19.0, equivalent 1.0.3, euclid 0.22.14, find-msvc-tools 0.1.15, flate2 1.1.10, glow 0.17.0, hashbrown 0.16.1, hashbrown 0.17.1, indexmap 2.14.2, itertools 0.15.0, jobserver 0.1.35, khronos-egl 6.0.0, lock_api 0.4.14, log 0.4.34, mime 0.3.17, num-traits 0.2.19, once_cell 1.21.4, parking_lot 0.12.5, parking_lot_core 0.9.12, pkg-config 0.3.34, png 0.17.16, png 0.18.1, pollster 1.0.1, renderdoc-sys 1.1.0, roxmltree 0.20.0, rustc-hash 1.1.0, rustc_version 0.4.1, scopeguard 1.2.0, simplecss 0.2.2, smallvec 1.16.3, smol_str 0.2.2, socket2 0.6.5, svgtypes 0.15.3, unicase 2.10.0, unicode-properties 0.1.4, unicode-segmentation 1.13.3, unicode-width 0.2.2, uuid 1.28.0, version_check 0.9.5, weezl 0.1.12.
 
 ```text
 Apache License
@@ -955,9 +959,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 8. Apache-2.0 OR MIT, MIT OR Apache-2.0, MIT OR Apache-2.0 OR Zlib, MIT OR Zlib OR Apache-2.0 — 24 пакета
+### 8. Apache-2.0 OR MIT, MIT OR Apache-2.0, MIT OR Apache-2.0 OR Zlib, MIT OR Zlib OR Apache-2.0 — 25 пакетов
 
-Пакеты: arboard 3.7.0, color 0.3.3, fdeflate 0.3.7, fearless_simd 0.4.1, half 2.7.1, image 0.25.10, linebender_resource_handle 0.1.1, miniz_oxide 0.8.9, miniz_oxide 0.9.1, naga 30.0.1, naga-types 30.0.1, pin-project-lite 0.2.17, range-alloc 0.1.5, raw-window-handle 0.6.2, resvg 0.45.1, usvg 0.45.1, vello_common 0.2.0, vello_cpu 0.2.0, wgpu 30.0.1, wgpu-core 30.0.1, wgpu-core-deps-windows-linux-android 30.0.1, wgpu-hal 30.0.1, wgpu-naga-bridge 30.0.1, wgpu-types 30.0.1.
+Пакеты: arboard 3.7.0, color 0.3.3, fdeflate 0.3.7, fearless_simd 0.4.1, half 2.7.1, image 0.25.10, linebender_resource_handle 0.1.1, miniz_oxide 0.8.9, miniz_oxide 0.9.1, naga 30.0.1, naga-types 30.0.1, pin-project-lite 0.2.17, range-alloc 0.1.5, raw-window-handle 0.6.2, resvg 0.45.1, simdutf8 0.1.5, usvg 0.45.1, vello_common 0.2.0, vello_cpu 0.2.0, wgpu 30.0.1, wgpu-core 30.0.1, wgpu-core-deps-windows-linux-android 30.0.1, wgpu-hal 30.0.1, wgpu-naga-bridge 30.0.1, wgpu-types 30.0.1.
 
 ```text
 Apache License
@@ -2222,9 +2226,9 @@ ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 30. (Apache-2.0 OR MIT) AND BSD-3-Clause, Apache-2.0, Apache-2.0 OR GPL-2.0-only, Apache-2.0 OR MIT, MIT OR Apache-2.0, MIT OR Apache-2.0 OR Zlib — 12 пакетов
+### 30. (Apache-2.0 OR MIT) AND BSD-3-Clause, Apache-2.0, Apache-2.0 OR GPL-2.0-only, Apache-2.0 OR MIT, MIT OR Apache-2.0, MIT OR Apache-2.0 OR Zlib — 13 пакетов
 
-Пакеты: codespan-reporting 0.13.1, encoding_rs 0.8.35, kurbo 0.11.3, kurbo 0.13.1, nohash-hasher 0.2.0, peniko 0.6.1, polycool 0.4.0, self_cell 1.3.0, siphasher 1.0.4, static_assertions 1.1.0, zune-core 0.5.3, zune-jpeg 0.5.15.
+Пакеты: codespan-reporting 0.13.1, encoding_rs 0.8.42, kurbo 0.11.3, kurbo 0.13.1, multiversion_no_op 1.0.0, nohash-hasher 0.2.0, peniko 0.6.1, polycool 0.4.0, self_cell 1.3.0, siphasher 1.0.4, static_assertions 1.1.0, zune-core 0.5.3, zune-jpeg 0.5.15.
 
 ```text
 Apache License
@@ -2430,9 +2434,9 @@ Apache License
    limitations under the License.
 ```
 
-### 31. Apache-2.0 OR MIT, MIT OR Apache-2.0 — 3 пакета
+### 31. Apache-2.0 OR MIT, MIT OR Apache-2.0 — 4 пакета
 
-Пакеты: color 0.3.3, half 2.7.1, linebender_resource_handle 0.1.1.
+Пакеты: color 0.3.3, half 2.7.1, linebender_resource_handle 0.1.1, simdutf8 0.1.5.
 
 ```text
 MIT License
@@ -2456,7 +2460,39 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 32. Apache-2.0, Apache-2.0 AND MIT, MIT OR Apache-2.0, MIT/Apache-2.0 — 5 пакетов
+### 32. MIT/Apache-2.0 — 1 пакет
+
+Пакеты: core_detect 1.0.0.
+
+```text
+Copyright (c) 2017-2020 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### 33. Apache-2.0, Apache-2.0 AND MIT, MIT OR Apache-2.0, MIT/Apache-2.0 — 5 пакетов
 
 Пакеты: crc32fast 1.5.2, dpi 0.1.2, quick-error 2.0.1, unicode-general-category 1.1.0, winit 0.30.13.
 
@@ -2664,7 +2700,7 @@ Apache License
    limitations under the License.
 ```
 
-### 33. MIT OR Apache-2.0 — 1 пакет
+### 34. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: crc32fast 1.5.2.
 
@@ -2692,7 +2728,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 34. MIT OR Apache-2.0 OR Zlib — 1 пакет
+### 35. MIT OR Apache-2.0 OR Zlib — 1 пакет
 
 Пакеты: cursor-icon 1.2.0.
 
@@ -2900,7 +2936,7 @@ Apache License
    limitations under the License.
 ```
 
-### 35. MIT OR Apache-2.0 OR Zlib — 1 пакет
+### 36. MIT OR Apache-2.0 OR Zlib — 1 пакет
 
 Пакеты: cursor-icon 1.2.0.
 
@@ -2926,7 +2962,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 36. MIT OR Apache-2.0 OR Zlib — 1 пакет
+### 37. MIT OR Apache-2.0 OR Zlib — 1 пакет
 
 Пакеты: cursor-icon 1.2.0.
 
@@ -2944,7 +2980,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 37. MIT OR Apache-2.0 — 1 пакет
+### 38. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: data-url 0.3.2.
 
@@ -2976,7 +3012,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 38. MIT OR Apache-2.0 — 2 пакета
+### 39. MIT OR Apache-2.0 — 2 пакета
 
 Пакеты: dirs 7.0.0, dirs-sys 0.5.0.
 
@@ -3157,7 +3193,7 @@ TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
    of your accepting any such warranty or additional liability.
 ```
 
-### 39. MIT OR Apache-2.0 — 2 пакета
+### 40. MIT OR Apache-2.0 — 2 пакета
 
 Пакеты: dirs 7.0.0, dirs-sys 0.5.0.
 
@@ -3183,7 +3219,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 40. MIT OR Apache-2.0 — 1 пакет
+### 41. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: document-features 0.2.12.
 
@@ -3263,7 +3299,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 41. MIT OR Apache-2.0 — 1 пакет
+### 42. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: document-features 0.2.12.
 
@@ -3289,7 +3325,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 42. Apache-2.0 AND MIT — 1 пакет
+### 43. Apache-2.0 AND MIT — 1 пакет
 
 Пакеты: dpi 0.1.2.
 
@@ -3347,7 +3383,7 @@ have been licensed under extremely permissive terms.
 ------------------------------------------------------------------------------
 ```
 
-### 43. MIT OR Apache-2.0 — 2 пакета
+### 44. MIT OR Apache-2.0 — 2 пакета
 
 Пакеты: either 1.19.0, itertools 0.15.0.
 
@@ -3379,7 +3415,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 44. MIT — 1 пакет
+### 45. MIT — 1 пакет
 
 Пакеты: embed-resource 3.0.12.
 
@@ -3407,9 +3443,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 45. (Apache-2.0 OR MIT) AND BSD-3-Clause — 1 пакет
+### 46. (Apache-2.0 OR MIT) AND BSD-3-Clause, Apache-2.0 OR MIT — 2 пакета
 
-Пакеты: encoding_rs 0.8.35.
+Пакеты: encoding_rs 0.8.42, multiversion_no_op 1.0.0.
 
 ```text
 Copyright Mozilla Foundation
@@ -3439,9 +3475,9 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 46. (Apache-2.0 OR MIT) AND BSD-3-Clause — 1 пакет
+### 47. (Apache-2.0 OR MIT) AND BSD-3-Clause — 1 пакет
 
-Пакеты: encoding_rs 0.8.35.
+Пакеты: encoding_rs 0.8.42.
 
 ```text
 Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
@@ -3472,7 +3508,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 47. Apache-2.0 OR MIT — 1 пакет
+### 48. Apache-2.0 OR MIT — 1 пакет
 
 Пакеты: equivalent 1.0.3.
 
@@ -3504,7 +3540,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 48. MIT OR Apache-2.0 — 1 пакет
+### 49. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: euclid 0.22.14.
 
@@ -3536,7 +3572,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 49. MIT — 1 пакет
+### 50. MIT — 1 пакет
 
 Пакеты: fax 0.2.7.
 
@@ -3550,7 +3586,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 50. MIT OR Apache-2.0 — 2 пакета
+### 51. MIT OR Apache-2.0 — 2 пакета
 
 Пакеты: fdeflate 0.3.7, image 0.25.10.
 
@@ -3582,7 +3618,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 51. Apache-2.0 OR MIT, MIT OR Apache-2.0 — 5 пакетов
+### 52. Apache-2.0 OR MIT, MIT OR Apache-2.0 — 5 пакетов
 
 Пакеты: fearless_simd 0.4.1, kurbo 0.11.3, kurbo 0.13.1, peniko 0.6.1, polycool 0.4.0.
 
@@ -3614,7 +3650,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 52. MIT OR Apache-2.0 — 1 пакет
+### 53. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: flate2 1.1.10.
 
@@ -3646,7 +3682,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 53. MIT — 1 пакет
+### 54. MIT — 1 пакет
 
 Пакеты: float-cmp 0.9.0.
 
@@ -3672,7 +3708,7 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
 ```
 
-### 54. Zlib — 1 пакет
+### 55. Zlib — 1 пакет
 
 Пакеты: foldhash 0.2.0.
 
@@ -3698,7 +3734,7 @@ the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 55. MIT OR Apache-2.0 — 3 пакета
+### 56. MIT OR Apache-2.0 — 3 пакета
 
 Пакеты: font-types 0.12.7, read-fonts 0.41.0, skrifa 0.44.0.
 
@@ -3772,7 +3808,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 56. MIT OR Apache-2.0 — 3 пакета
+### 57. MIT OR Apache-2.0 — 3 пакета
 
 Пакеты: font-types 0.12.7, read-fonts 0.41.0, skrifa 0.44.0.
 
@@ -3804,7 +3840,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 57. MIT OR Apache-2.0 — 2 пакета
+### 58. MIT OR Apache-2.0 — 2 пакета
 
 Пакеты: getrandom 0.3.4, getrandom 0.4.3.
 
@@ -4012,7 +4048,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 58. MIT OR Apache-2.0 — 1 пакет
+### 59. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: getrandom 0.3.4.
 
@@ -4045,7 +4081,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 59. MIT OR Apache-2.0 — 1 пакет
+### 60. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: getrandom 0.4.3.
 
@@ -4078,7 +4114,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 60. Apache-2.0 OR MIT — 1 пакет
+### 61. Apache-2.0 OR MIT — 1 пакет
 
 Пакеты: glifo 0.3.0.
 
@@ -4110,7 +4146,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 61. MIT OR Apache-2.0 OR Zlib — 1 пакет
+### 62. MIT OR Apache-2.0 OR Zlib — 1 пакет
 
 Пакеты: glow 0.17.0.
 
@@ -4132,7 +4168,7 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 62. Apache-2.0 — 3 пакета
+### 63. Apache-2.0 — 3 пакета
 
 Пакеты: glutin 0.32.3, glutin_egl_sys 0.7.1, glutin_wgl_sys 0.6.1.
 
@@ -4340,7 +4376,7 @@ Apache License
    limitations under the License.
 ```
 
-### 63. MIT — 1 пакет
+### 64. MIT — 1 пакет
 
 Пакеты: glutin-winit 0.5.0.
 
@@ -4366,7 +4402,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 64. MIT OR Apache-2.0 — 1 пакет
+### 65. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: gpu-allocator 0.28.0.
 
@@ -4574,7 +4610,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 65. MIT OR Apache-2.0 — 1 пакет
+### 66. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: gpu-allocator 0.28.0.
 
@@ -4588,11 +4624,11 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 66. MIT/Apache-2.0 — 1 пакет
+### 67. MIT/Apache-2.0 — 1 пакет
 
 Пакеты: guillotiere 0.7.0.
 
-Уведомление о лицензии, а не её текст — у guillotiere 0.7.0; полный текст — группа 67.
+Уведомление о лицензии, а не её текст — у guillotiere 0.7.0; полный текст — группа 68.
 
 ```text
 Copyright 2019 Nicolas Silva
@@ -4610,7 +4646,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 67. MIT/Apache-2.0 — 1 пакет
+### 68. MIT/Apache-2.0 — 1 пакет
 
 Пакеты: guillotiere 0.7.0.
 
@@ -4637,7 +4673,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 68. MIT — 1 пакет
+### 69. MIT — 1 пакет
 
 Пакеты: harfrust 0.12.0.
 
@@ -4666,7 +4702,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 69. MIT OR Apache-2.0 — 2 пакета
+### 70. MIT OR Apache-2.0 — 2 пакета
 
 Пакеты: hashbrown 0.16.1, hashbrown 0.17.1.
 
@@ -4698,7 +4734,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 70. MIT OR BSD-3-Clause — 1 пакет
+### 71. MIT OR BSD-3-Clause — 1 пакет
 
 Пакеты: if-addrs 0.15.0.
 
@@ -4717,7 +4753,7 @@ Redistribution and use in source and binary forms, with or without modification,
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 71. MIT OR BSD-3-Clause — 1 пакет
+### 72. MIT OR BSD-3-Clause — 1 пакет
 
 Пакеты: if-addrs 0.15.0.
 
@@ -4732,7 +4768,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 72. MIT — 1 пакет
+### 73. MIT — 1 пакет
 
 Пакеты: imagesize 0.13.0.
 
@@ -4760,7 +4796,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 73. Apache-2.0 OR MIT — 1 пакет
+### 74. Apache-2.0 OR MIT — 1 пакет
 
 Пакеты: indexmap 2.14.2.
 
@@ -4792,7 +4828,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 74. MIT OR Apache-2.0 — 1 пакет
+### 75. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: libc 0.2.191.
 
@@ -4824,7 +4860,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 75. ISC — 1 пакет
+### 76. ISC — 1 пакет
 
 Пакеты: libloading 0.8.9.
 
@@ -4843,7 +4879,7 @@ NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE US
 THIS SOFTWARE.
 ```
 
-### 76. MIT — 1 пакет
+### 77. MIT — 1 пакет
 
 Пакеты: libm 0.2.16.
 
@@ -5108,7 +5144,7 @@ have been licensed under extremely permissive terms.
 Copyright notices are retained in src/* files where relevant.
 ```
 
-### 77. MIT OR Apache-2.0 — 1 пакет
+### 78. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: litrs 1.0.1.
 
@@ -5140,7 +5176,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 78. MIT OR Apache-2.0 — 4 пакета
+### 79. MIT OR Apache-2.0 — 4 пакета
 
 Пакеты: lock_api 0.4.14, parking_lot 0.12.5, parking_lot_core 0.9.12, rustc_version 0.4.1.
 
@@ -5172,11 +5208,11 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 79. Unlicense OR MIT — 3 пакета
+### 80. Unlicense OR MIT — 3 пакета
 
 Пакеты: memchr 2.8.3, termcolor 1.4.1, winapi-util 0.1.11.
 
-Уведомление о лицензии, а не её текст — у memchr 2.8.3, termcolor 1.4.1, winapi-util 0.1.11; полный текст — группа 23, 143.
+Уведомление о лицензии, а не её текст — у memchr 2.8.3, termcolor 1.4.1, winapi-util 0.1.11; полный текст — группа 23, 144.
 
 ```text
 This project is dual-licensed under the Unlicense and MIT licenses.
@@ -5184,7 +5220,7 @@ This project is dual-licensed under the Unlicense and MIT licenses.
 You may use this code under the terms of either license.
 ```
 
-### 80. MIT OR Apache-2.0 — 1 пакет
+### 81. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: mime 0.3.17.
 
@@ -5210,7 +5246,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 81. MIT — 1 пакет
+### 82. MIT — 1 пакет
 
 Пакеты: mime_guess2 2.3.1.
 
@@ -5218,38 +5254,6 @@ THE SOFTWARE.
 The MIT License (MIT)
 
 Copyright (c) 2015 Austin Bonander
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-### 82. MIT OR Zlib OR Apache-2.0 — 2 пакета
-
-Пакеты: miniz_oxide 0.8.9, miniz_oxide 0.9.1.
-
-```text
-MIT License
-
-Copyright 2013-2014 RAD Game Tools and Valve Software
-Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
-Copyright (c) 2017 Frommi
-Copyright (c) 2017-2024 oyvindln
-
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -5282,6 +5286,7 @@ Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
 Copyright (c) 2017 Frommi
 Copyright (c) 2017-2024 oyvindln
 
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
@@ -5306,6 +5311,37 @@ SOFTWARE.
 Пакеты: miniz_oxide 0.8.9, miniz_oxide 0.9.1.
 
 ```text
+MIT License
+
+Copyright 2013-2014 RAD Game Tools and Valve Software
+Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+Copyright (c) 2017 Frommi
+Copyright (c) 2017-2024 oyvindln
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### 85. MIT OR Zlib OR Apache-2.0 — 2 пакета
+
+Пакеты: miniz_oxide 0.8.9, miniz_oxide 0.9.1.
+
+```text
 Copyright 2013-2014 RAD Game Tools and Valve Software
 Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
 Copyright (c) 2020 Frommi
@@ -5322,7 +5358,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 85. MIT — 1 пакет
+### 86. MIT — 1 пакет
 
 Пакеты: mio 1.2.4.
 
@@ -5348,7 +5384,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 86. BSD-3-Clause OR Apache-2.0 — 2 пакета
+### 87. BSD-3-Clause OR Apache-2.0 — 2 пакета
 
 Пакеты: moxcms 0.8.1, pxfm 0.1.30.
 
@@ -5556,7 +5592,7 @@ Apache License
    limitations under the License.
 ```
 
-### 87. BSD-3-Clause OR Apache-2.0 — 2 пакета
+### 88. BSD-3-Clause OR Apache-2.0 — 2 пакета
 
 Пакеты: moxcms 0.8.1, pxfm 0.1.30.
 
@@ -5589,7 +5625,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 88. MIT OR Apache-2.0 — 8 пакетов
+### 89. MIT OR Apache-2.0 — 8 пакетов
 
 Пакеты: naga 30.0.1, naga-types 30.0.1, wgpu 30.0.1, wgpu-core 30.0.1, wgpu-core-deps-windows-linux-android 30.0.1, wgpu-hal 30.0.1, wgpu-naga-bridge 30.0.1, wgpu-types 30.0.1.
 
@@ -5617,7 +5653,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 89. Apache-2.0 OR MIT — 1 пакет
+### 90. Apache-2.0 OR MIT — 1 пакет
 
 Пакеты: nohash-hasher 0.2.0.
 
@@ -5642,7 +5678,7 @@ WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 90. MPL-2.0 — 2 пакета
+### 91. MPL-2.0 — 2 пакета
 
 Пакеты: option-ext 0.2.0, serialport 4.10.1.
 
@@ -6026,7 +6062,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
   defined by the Mozilla Public License, v. 2.0.
 ```
 
-### 91. MIT — 1 пакет
+### 92. MIT — 1 пакет
 
 Пакеты: ordered-float 5.5.0.
 
@@ -6058,7 +6094,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 92. MIT — 1 пакет
+### 93. MIT — 1 пакет
 
 Пакеты: os_info 3.15.0.
 
@@ -6086,7 +6122,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 93. MIT — 4 пакета
+### 94. MIT — 4 пакета
 
 Пакеты: phf 0.11.3, phf_generator 0.11.3, phf_macros 0.11.3, phf_shared 0.11.3.
 
@@ -6113,7 +6149,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 94. MIT — 1 пакет
+### 95. MIT — 1 пакет
 
 Пакеты: pico-args 0.5.0.
 
@@ -6139,7 +6175,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 95. MIT OR Apache-2.0 — 2 пакета
+### 96. MIT OR Apache-2.0 — 2 пакета
 
 Пакеты: png 0.17.16, png 0.18.1.
 
@@ -6171,7 +6207,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 96. Apache-2.0/MIT — 1 пакет
+### 97. Apache-2.0/MIT — 1 пакет
 
 Пакеты: pollster 1.0.1.
 
@@ -6203,7 +6239,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 97. MIT OR Apache-2.0 — 1 пакет
+### 98. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: presser 0.3.1.
 
@@ -6235,7 +6271,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 98. MIT/Apache-2.0 — 1 пакет
+### 99. MIT/Apache-2.0 — 1 пакет
 
 Пакеты: quick-error 2.0.1.
 
@@ -6261,7 +6297,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 99. MIT OR Apache-2.0 — 1 пакет
+### 100. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: rand 0.8.8.
 
@@ -6444,7 +6480,7 @@ TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 END OF TERMS AND CONDITIONS
 ```
 
-### 100. MIT OR Apache-2.0 — 2 пакета
+### 101. MIT OR Apache-2.0 — 2 пакета
 
 Пакеты: rand 0.8.8, rand_core 0.6.4.
 
@@ -6477,7 +6513,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 101. MIT OR Apache-2.0 — 2 пакета
+### 102. MIT OR Apache-2.0 — 2 пакета
 
 Пакеты: rand_core 0.10.1, rand_core 0.6.4.
 
@@ -6671,7 +6707,7 @@ APPENDIX: How to apply the Apache License to your work.
    identification within third-party archives.
 ```
 
-### 102. MIT OR Apache-2.0 — 1 пакет
+### 103. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: rand_core 0.10.1.
 
@@ -6703,7 +6739,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 103. MIT OR Apache-2.0 — 1 пакет
+### 104. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: range-alloc 0.1.5.
 
@@ -6731,7 +6767,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 104. MIT OR Apache-2.0 OR Zlib — 1 пакет
+### 105. MIT OR Apache-2.0 OR Zlib — 1 пакет
 
 Пакеты: raw-window-handle 0.6.2.
 
@@ -6759,7 +6795,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 105. MIT OR Apache-2.0 OR Zlib — 1 пакет
+### 106. MIT OR Apache-2.0 OR Zlib — 1 пакет
 
 Пакеты: raw-window-handle 0.6.2.
 
@@ -6777,7 +6813,7 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 106. MIT OR Apache-2.0 — 1 пакет
+### 107. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: renderdoc-sys 1.1.0.
 
@@ -6809,7 +6845,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 107. Apache-2.0 OR MIT — 2 пакета
+### 108. Apache-2.0 OR MIT — 2 пакета
 
 Пакеты: resvg 0.45.1, usvg 0.45.1.
 
@@ -6841,7 +6877,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 108. MIT — 1 пакет
+### 109. MIT — 1 пакет
 
 Пакеты: rfd 0.16.0.
 
@@ -6869,7 +6905,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 109. MIT — 1 пакет
+### 110. MIT — 1 пакет
 
 Пакеты: rgb 0.8.53.
 
@@ -6897,7 +6933,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 110. MIT OR Apache-2.0 — 1 пакет
+### 111. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: roxmltree 0.20.0.
 
@@ -6925,7 +6961,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 111. MIT OR Apache-2.0 — 1 пакет
+### 112. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: scopeguard 1.2.0.
 
@@ -6957,7 +6993,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 112. Apache-2.0 OR GPL-2.0-only — 1 пакет
+### 113. Apache-2.0 OR GPL-2.0-only — 1 пакет
 
 Пакеты: self_cell 1.3.0.
 
@@ -7303,7 +7339,7 @@ library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.
 ```
 
-### 113. MIT OR Apache-2.0 — 5 пакетов
+### 114. MIT OR Apache-2.0 — 5 пакетов
 
 Пакеты: serde_spanned 1.1.2, toml 1.1.8+spec-1.1.0, toml_datetime 1.1.2+spec-1.1.0, toml_parser 1.1.5+spec-1.1.0, toml_writer 1.1.3+spec-1.1.0.
 
@@ -7511,7 +7547,7 @@ Apache License
    limitations under the License.
 ```
 
-### 114. MIT OR Apache-2.0 — 5 пакетов
+### 115. MIT OR Apache-2.0 — 5 пакетов
 
 Пакеты: serde_spanned 1.1.2, toml 1.1.8+spec-1.1.0, toml_datetime 1.1.2+spec-1.1.0, toml_parser 1.1.5+spec-1.1.0, toml_writer 1.1.3+spec-1.1.0.
 
@@ -7537,11 +7573,11 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 115. MPL-2.0 — 1 пакет
+### 116. MPL-2.0 — 1 пакет
 
 Пакеты: serialport 4.10.1.
 
-Уведомление о лицензии, а не её текст — у serialport 4.10.1; полный текст — группа 90.
+Уведомление о лицензии, а не её текст — у serialport 4.10.1; полный текст — группа 91.
 
 MPL-2.0: полный текст — https://mozilla.org/MPL/2.0/, исходники — https://github.com/serialport/serialport-rs.
 
@@ -7550,11 +7586,11 @@ This Source Code Form is subject to the terms of the Mozilla Public License, v. 
 the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
 ```
 
-### 116. MIT OR Apache-2.0 — 1 пакет
+### 117. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: shlex 2.0.1.
 
-Уведомление о лицензии, а не её текст — у shlex 2.0.1; полный текст — группа 117.
+Уведомление о лицензии, а не её текст — у shlex 2.0.1; полный текст — группа 118.
 
 ```text
 Copyright 2015 Nicholas Allegra (comex).
@@ -7572,7 +7608,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### 117. MIT OR Apache-2.0 — 1 пакет
+### 118. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: shlex 2.0.1.
 
@@ -7600,7 +7636,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 118. MIT — 1 пакет
+### 119. MIT — 1 пакет
 
 Пакеты: simd-adler32 0.3.10.
 
@@ -7628,7 +7664,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 119. Apache-2.0 OR MIT — 1 пакет
+### 120. Apache-2.0 OR MIT — 1 пакет
 
 Пакеты: simplecss 0.2.2.
 
@@ -7656,11 +7692,11 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 120. MIT OR Apache-2.0 — 1 пакет
+### 121. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: siphasher 1.0.4.
 
-Уведомление о лицензии, а не её текст — у siphasher 1.0.4; полный текст — группа 30, 121.
+Уведомление о лицензии, а не её текст — у siphasher 1.0.4; полный текст — группа 30, 122.
 
 ```text
 Copyright 2012-2016 The Rust Project Developers.
@@ -7672,7 +7708,7 @@ http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
 option.
 ```
 
-### 121. MIT OR Apache-2.0 — 1 пакет
+### 122. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: siphasher 1.0.4.
 
@@ -7696,7 +7732,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 122. MIT OR Apache-2.0 — 1 пакет
+### 123. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: smallvec 1.16.3.
 
@@ -7728,7 +7764,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 123. MIT OR Apache-2.0 — 1 пакет
+### 124. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: static_assertions 1.1.0.
 
@@ -7756,7 +7792,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 124. MIT — 1 пакет
+### 125. MIT — 1 пакет
 
 Пакеты: strict-num 0.1.1.
 
@@ -7782,7 +7818,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 125. Apache-2.0 OR MIT — 1 пакет
+### 126. Apache-2.0 OR MIT — 1 пакет
 
 Пакеты: svgtypes 0.15.3.
 
@@ -7808,7 +7844,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 126. MIT — 1 пакет
+### 127. MIT — 1 пакет
 
 Пакеты: tiff 0.11.3.
 
@@ -7836,7 +7872,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 127. BSD-3-Clause — 2 пакета
+### 128. BSD-3-Clause — 2 пакета
 
 Пакеты: tiny-skia 0.11.4, tiny-skia-path 0.11.4.
 
@@ -7873,7 +7909,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 128. MIT — 1 пакет
+### 129. MIT — 1 пакет
 
 Пакеты: tokio 1.53.3.
 
@@ -7901,7 +7937,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 129. MIT — 1 пакет
+### 130. MIT — 1 пакет
 
 Пакеты: tokio-macros 2.7.2.
 
@@ -7930,7 +7966,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 130. MIT — 3 пакета
+### 131. MIT — 3 пакета
 
 Пакеты: tracing 0.1.44, tracing-attributes 0.1.31, tracing-core 0.1.36.
 
@@ -7962,7 +7998,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 131. MIT/Apache-2.0 — 1 пакет
+### 132. MIT/Apache-2.0 — 1 пакет
 
 Пакеты: type-map 0.5.1.
 
@@ -8374,7 +8410,7 @@ limitations under the License.
    limitations under the License.
 ```
 
-### 132. MIT/Apache-2.0 — 1 пакет
+### 133. MIT/Apache-2.0 — 1 пакет
 
 Пакеты: type-map 0.5.1.
 
@@ -8460,7 +8496,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 133. MIT OR Apache-2.0 — 1 пакет
+### 134. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: unicase 2.10.0.
 
@@ -8486,7 +8522,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 134. (MIT OR Apache-2.0) AND Unicode-3.0 — 1 пакет
+### 135. (MIT OR Apache-2.0) AND Unicode-3.0 — 1 пакет
 
 Пакеты: unicode-ident 1.0.27.
 
@@ -8532,7 +8568,7 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
-### 135. MIT OR Apache-2.0, MIT/Apache-2.0 — 3 пакета
+### 136. MIT OR Apache-2.0, MIT/Apache-2.0 — 3 пакета
 
 Пакеты: unicode-properties 0.1.4, unicode-segmentation 1.13.3, unicode-width 0.2.2.
 
@@ -8564,7 +8600,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 136. Apache-2.0 OR MIT — 1 пакет
+### 137. Apache-2.0 OR MIT — 1 пакет
 
 Пакеты: uuid 1.28.0.
 
@@ -8597,7 +8633,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 137. Apache-2.0 OR MIT — 2 пакета
+### 138. Apache-2.0 OR MIT — 2 пакета
 
 Пакеты: vello_common 0.2.0, vello_cpu 0.2.0.
 
@@ -8629,7 +8665,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 138. MIT/Apache-2.0 — 1 пакет
+### 139. MIT/Apache-2.0 — 1 пакет
 
 Пакеты: version_check 0.9.5.
 
@@ -8655,7 +8691,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 139. MIT — 2 пакета
+### 140. MIT — 2 пакета
 
 Пакеты: vswhom 0.1.0, vswhom-sys 0.1.3.
 
@@ -8683,7 +8719,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 140. MIT OR Apache-2.0 — 1 пакет
+### 141. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: web-time 1.1.0.
 
@@ -8891,7 +8927,7 @@ Apache License
    limitations under the License.
 ```
 
-### 141. MIT OR Apache-2.0 — 1 пакет
+### 142. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: web-time 1.1.0.
 
@@ -8919,7 +8955,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 142. MIT OR Apache-2.0 — 1 пакет
+### 143. MIT OR Apache-2.0 — 1 пакет
 
 Пакеты: weezl 0.1.12.
 
@@ -8947,7 +8983,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 143. Unlicense OR MIT — 1 пакет
+### 144. Unlicense OR MIT — 1 пакет
 
 Пакеты: winapi-util 0.1.11.
 
@@ -8975,7 +9011,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 144. MIT OR Apache-2.0 — 18 пакетов
+### 145. MIT OR Apache-2.0 — 18 пакетов
 
 Пакеты: windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-implement 0.60.2, windows-interface 0.59.3, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.52.0, windows-sys 0.60.2, windows-sys 0.61.2, windows-targets 0.52.6, windows-targets 0.53.5, windows-threading 0.2.1, windows_x86_64_msvc 0.52.6, windows_x86_64_msvc 0.53.1.
 
@@ -9183,7 +9219,7 @@ Apache License
    limitations under the License.
 ```
 
-### 145. MIT OR Apache-2.0 — 18 пакетов
+### 146. MIT OR Apache-2.0 — 18 пакетов
 
 Пакеты: windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-implement 0.60.2, windows-interface 0.59.3, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.52.0, windows-sys 0.60.2, windows-sys 0.61.2, windows-targets 0.52.6, windows-targets 0.53.5, windows-threading 0.2.1, windows_x86_64_msvc 0.52.6, windows_x86_64_msvc 0.53.1.
 
@@ -9211,7 +9247,7 @@ MIT License
     SOFTWARE
 ```
 
-### 146. MIT — 1 пакет
+### 147. MIT — 1 пакет
 
 Пакеты: winnow 1.0.4.
 
@@ -9236,7 +9272,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### 147. MIT — 1 пакет
+### 148. MIT — 1 пакет
 
 Пакеты: winreg 0.56.0.
 
@@ -9262,7 +9298,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### 148. MIT — 1 пакет
+### 149. MIT — 1 пакет
 
 Пакеты: xml-rs 0.8.29.
 
@@ -9290,7 +9326,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 149. MIT — 1 пакет
+### 150. MIT — 1 пакет
 
 Пакеты: xmlwriter 0.1.0.
 
@@ -9318,7 +9354,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 150. BSD-2-Clause OR Apache-2.0 OR MIT — 2 пакета
+### 151. BSD-2-Clause OR Apache-2.0 OR MIT — 2 пакета
 
 Пакеты: zerocopy 0.8.63, zerocopy-derive 0.8.63.
 
@@ -9526,7 +9562,7 @@ Apache License
    limitations under the License.
 ```
 
-### 151. BSD-2-Clause OR Apache-2.0 OR MIT — 2 пакета
+### 152. BSD-2-Clause OR Apache-2.0 OR MIT — 2 пакета
 
 Пакеты: zerocopy 0.8.63, zerocopy-derive 0.8.63.
 
@@ -9557,7 +9593,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### 152. BSD-2-Clause OR Apache-2.0 OR MIT — 2 пакета
+### 153. BSD-2-Clause OR Apache-2.0 OR MIT — 2 пакета
 
 Пакеты: zerocopy 0.8.63, zerocopy-derive 0.8.63.
 
@@ -9589,7 +9625,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### 153. Zlib — 1 пакет
+### 154. Zlib — 1 пакет
 
 Пакеты: zlib-rs 0.6.8.
 
@@ -9615,7 +9651,7 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### 154. MIT OR Apache-2.0 OR Zlib — 2 пакета
+### 155. MIT OR Apache-2.0 OR Zlib — 2 пакета
 
 Пакеты: zune-core 0.5.3, zune-jpeg 0.5.15.
 
@@ -9643,7 +9679,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### 155. MIT OR Apache-2.0 OR Zlib — 2 пакета
+### 156. MIT OR Apache-2.0 OR Zlib — 2 пакета
 
 Пакеты: zune-core 0.5.3, zune-jpeg 0.5.15.
 
