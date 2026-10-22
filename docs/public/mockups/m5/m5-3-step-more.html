@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1240">
+<title>M5-3 · Шаг прослушки: «Дополнительно» раскрыто, порт ЛИС занят</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+:root{
+  --font-ui:'IBM Plex Sans','Segoe UI',system-ui,sans-serif;
+  --font-mono:'IBM Plex Mono','Cascadia Mono',Consolas,monospace;
+  --s0:#ffffff;--s1:#f6f7f9;--tr:#f6f7f9;--bd:#e2e5e9;--bf:#eef0f2;
+  --tx:#0f1418;--mu:#5f6873;--ft:#8a939c;--hv:#f1f3f5;
+  --a2l:#0a7d4f;--l2a:#b4530a;--ctrl:#2f3fbf;--danger:#c01f2f;
+  --rec:#ef3b2d;--recbg:#0f1418;--recfg:#ffffff;
+  --page:#e7e9ec;
+}
+html[data-theme="dark"]{
+  --s0:#0d1013;--s1:#13181d;--tr:#0a0d10;--bd:#252d36;--bf:#1a2027;
+  --tx:#dde4ea;--mu:#7d8995;--ft:#5a6570;--hv:#161c22;
+  --a2l:#3ee08f;--l2a:#ffb23e;--ctrl:#8fb4ff;--danger:#ff6464;
+  --rec:#ff4d4d;--recbg:#2a1416;--recfg:#ffc2c2;
+  --page:#23272c;
+}
+body{margin:0;padding:28px 16px 40px;background:var(--page);font-family:var(--font-ui);color:var(--tx);
+  display:flex;flex-direction:column;align-items:center;-webkit-font-smoothing:antialiased}
+.cap{width:1200px;font-size:12px;color:var(--mu);margin:0 0 10px;display:flex;gap:8px;align-items:baseline}
+.cap b{font-weight:600;color:var(--tx)}
+.window{width:1200px;height:800px;background:var(--s0);border:1px solid var(--bd);border-radius:8px;
+  overflow:hidden;display:flex;flex-direction:column;box-shadow:0 10px 34px rgba(15,20,24,.13)}
+.titlebar{height:44px;flex:none;display:flex;align-items:center;padding-left:14px;border-bottom:1px solid var(--bf);gap:0}
+.brand{display:inline-flex;align-items:center;font:500 13px/1 var(--font-mono);letter-spacing:-.2px;color:var(--tx)}
+.brand .dots{display:inline-flex;gap:3px;margin-right:6px}
+.brand .dots i{width:6px;height:6px;border-radius:50%;display:block}
+.jlink{display:inline-flex;align-items:center;gap:6px;margin-left:14px;font-size:13px;color:var(--mu)}
+.sp{flex:1}
+.theme{width:36px;height:44px;display:inline-flex;align-items:center;justify-content:center;color:var(--mu)}
+.wbtn{width:46px;height:44px;display:inline-flex;align-items:center;justify-content:center;color:var(--tx)}
+.wbtn .ic{stroke-width:1.2}
+.screen{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.ic{flex:none}
+
+/* стартовый экран */
+.start{display:flex;justify-content:center;padding-top:40px}
+.col{width:592px}
+.question{font-size:13px;color:var(--mu);margin:0 0 12px}
+.card{display:grid;grid-template-columns:44px 1fr 16px;column-gap:12px;align-items:center;
+  padding:11px 16px 11px 13px;border-radius:10px;border:1px solid transparent;margin-bottom:10px}
+.card.on{background:var(--s1);border-color:var(--bd)}
+.tile{width:44px;height:44px;border-radius:8px;background:var(--s1);display:flex;align-items:center;justify-content:center;color:var(--tx)}
+.card.on .tile{background:var(--s0)}
+.card h3{margin:0;font-size:14px;font-weight:600;line-height:1.3}
+.card p{margin:2px 0 0;font-size:12.5px;line-height:1.45;color:var(--mu)}
+.card p .last{white-space:nowrap}
+.chev{color:var(--ft);display:flex;justify-content:center}
+.recs{margin-top:22px}
+.recs h4{margin:0 0 10px;font-size:12px;font-weight:400;color:var(--mu)}
+.rec{display:block;margin-bottom:8px}
+.rec .nm{font:400 12.5px/1.25 var(--font-mono);color:var(--tx)}
+.rec .meta{font-size:11.5px;line-height:1.4;color:var(--ft);margin-top:2px}
+
+/* шаг сценария */
+.step{display:flex;justify-content:center;padding-top:14px;overflow:hidden}
+.form{width:512px}
+.back{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--mu)}
+.form h2{margin:8px 0 0;font-size:20px;font-weight:600;line-height:1.25}
+.label{font-size:12px;color:var(--mu);margin:10px 0 4px}
+.in{height:32px;border:1px solid var(--bd);border-radius:6px;background:var(--s0);color:var(--tx);
+  display:flex;align-items:center;padding:0 9px;font-size:13px}
+.in.mono{font-family:var(--font-mono);font-size:12.5px}
+.in.err{border-color:var(--danger)}
+.ferr{color:var(--danger);font-size:12px;line-height:1.4;margin-top:4px}
+.row{display:flex;gap:12px;align-items:flex-start}
+.row>*{flex:1}
+.row .mid{flex:0 0 248px}
+.muted{font-size:12px;line-height:1.4;color:var(--mu);margin:8px 0 0}
+.sep{height:1px;background:var(--bf);margin:10px 0 8px}
+.more{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--mu)}
+.startbtn{height:42px;border-radius:999px;background:var(--recbg);color:var(--recfg);
+  display:flex;align-items:center;justify-content:center;gap:8px;font-size:14px;font-weight:600;margin-top:10px}
+.startbtn i{width:8px;height:8px;border-radius:50%;background:var(--rec);display:block}
+.chip{height:26px;border:1px solid var(--bd);border-radius:6px;display:inline-flex;align-items:center;
+  padding:0 10px;font-size:12px;color:var(--mu)}
+.chip.on{border-color:var(--ctrl);color:var(--ctrl)}
+.pick{height:32px;border:1px solid var(--bd);border-radius:6px;display:flex;align-items:center;padding:0 9px;
+  font-size:12.5px;color:var(--tx);font-family:var(--font-mono)}
+.pick .cv{margin-left:auto;display:flex;color:var(--mu)}
+.iconbtn{width:32px;height:32px;flex:none;border:1px solid var(--bd);border-radius:6px;display:flex;
+  align-items:center;justify-content:center;color:var(--mu)}
+.portrow{display:flex;gap:8px;align-items:center}
+.portrow>*{flex:1}
+.portrow .iconbtn{flex:0 0 32px}
+
+/* запись */
+.stopbar{display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 15px 0 12px;border-radius:999px;
+  background:var(--recbg);color:var(--recfg);font-size:13.5px;font-weight:600;margin-left:14px}
+.stopbar .dot{width:8px;height:8px;border-radius:50%;background:var(--rec);display:block}
+.stopbar .t{font:500 13px/1 var(--font-mono)}
+.summary{display:inline-flex;align-items:center;gap:5px;margin-left:16px;font-size:12.5px;color:var(--mu);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:470px}
+.summary b{font:500 12.5px/1 var(--font-mono);color:var(--tx);letter-spacing:0}
+.summary .x{color:var(--ft);margin:0 1px}
+.counters{display:inline-flex;align-items:center;gap:9px;font:400 12.5px/1 var(--font-mono);color:var(--tx);white-space:nowrap;margin-left:18px;padding-left:2px}
+.counters .g{font-family:var(--font-ui);font-size:12px}
+.counters .a{color:var(--a2l)}
+.counters .l{color:var(--l2a)}
+.counters .u{color:var(--mu)}
+.trace{flex:none;background:var(--tr);border-bottom:1px solid var(--bf);padding:5px 12px 7px}
+.lane{height:26px;display:flex;align-items:center;gap:8px}
+.lane .gl{width:14px;display:flex;justify-content:center;font-size:12px;color:var(--mu);font-family:var(--font-ui)}
+.wave{flex:1;height:24px;display:flex;align-items:center;gap:2px;overflow:hidden}
+.wave i{display:block;width:2px;border-radius:1px;flex:none}
+.fbar{flex:none;height:34px;display:flex;align-items:center;gap:16px;padding:0 12px;border-bottom:1px solid var(--bf);font-size:12.5px;color:var(--mu)}
+.dd{display:inline-flex;align-items:center;gap:4px}
+.dd .ic{stroke-width:1.8}
+.chips{margin-left:auto;display:flex;gap:6px}
+.feed{flex:1;min-height:0;overflow:hidden;font:400 12.5px/1 var(--font-mono)}
+.r{height:28px;display:flex;align-items:center;gap:8px;padding:0 12px}
+.r .t{width:94px;flex:none;color:var(--ft)}
+.r .g{width:12px;flex:none;display:flex;justify-content:center;font-family:var(--font-ui);font-size:12px}
+.r .c{width:24px;flex:none;color:var(--ft);font-size:11px}
+.r .x{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.r.a2l .g{color:var(--a2l)}
+.r.l2a .g{color:var(--l2a)}
+.r.svc .x{display:flex;align-items:center;color:var(--mu)}
+.r.ev .x{color:var(--mu)}
+.r.err .x{color:var(--danger)}
+.r .line{flex:1;height:1px;background:var(--bf);margin-left:8px;min-width:12px}
+.cc{color:var(--ctrl);opacity:.55;font-size:11px}
+</style>
+</head>
+<body>
+<div class="cap"><b>M5-3</b><span>Раскрытые поток, линии, переподключение, анализатор, комментарий, папка и профиль; ошибка у поля второго порта</span></div>
+<div class="window">
+<div class="titlebar"><span class="brand"><span class="dots"><i style="background:var(--a2l)"></i><i style="background:var(--l2a)"></i></span>bytetap</span><span class="jlink"><svg class="ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>Журналы</span><span class="sp"></span><span class="theme"><svg class="ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg></span><span class="wbtn"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/></svg></span><span class="wbtn"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="5" y="5" rx="1"/></svg></span><span class="wbtn"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></span></div>
+<div class="screen">
+<div class="step"><div class="form"><div class="back"><svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>Сценарии</div><h2>Встать в разрыв COM-кабеля</h2><div class="label">Порт анализатора</div><div class="portrow"><div class="pick"><span>USB-SERIAL CH340 (COM3)</span><span class="cv"><svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span></div><span class="iconbtn"><svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg></span></div><div class="row" style="margin-top:6px"><div><div class="label">Скорость</div><div class="in mono">9600</div></div><div><div class="label">Формат</div><div class="in mono">8N1</div></div></div><div class="label">Порт ЛИС</div><div class="portrow"><div class="pick err"><span>USB-SERIAL FT232R (COM4)</span><span class="cv"><svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span></div><span class="iconbtn"><svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg></span></div><div class="ferr">Порт COM4 занят другой программой — закройте её и нажмите «Обновить».</div><div class="row" style="margin-top:6px"><div><div class="label">Скорость</div><div class="in mono">9600</div></div><div><div class="label">Формат</div><div class="in mono">8N1</div></div></div><div class="muted">Автоответ выключен: байты идут без изменений.</div><div class="muted">Порты занимает только bytetap: закройте ЛИС и программу анализатора.</div><div class="sep"></div><div class="more"><svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>Дополнительно</div><div class="row" style="margin-top:8px;align-items:flex-end"><div style="flex:1"><div class="label" style="margin-top:0">Поток и линии</div><div class="portrow"><div class="pick" style="flex:1"><span>none</span><span class="cv"><svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span></div><span class="chip on" style="flex:0 0 74px;justify-content:center;white-space:nowrap">DTR вкл</span><span class="chip on" style="flex:0 0 74px;justify-content:center;white-space:nowrap">RTS вкл</span></div></div><div style="flex:0 0 132px"><div class="label" style="margin-top:0">Переподключение, с</div><div class="in mono">5</div></div></div><div class="row" style="margin-top:8px"><div><div class="label">Анализатор</div><div class="in"><span style="color:var(--mu)">ANALYZER-3</span></div></div><div><div class="label">Комментарий</div><div class="in"><span style="color:var(--mu)">что прогоняете</span></div></div></div><div style="margin-top:8px"><div class="label">Папка журналов</div><div class="portrow"><div class="in mono" style="color:var(--mu)">C:\Users\operator\Documents\bytetap</div><span class="chip" style="flex:0 0 88px;justify-content:center">Выбрать</span></div></div><div style="margin-top:8px"><div class="label">Профиль</div><div class="portrow"><div class="pick"><span>последние настройки</span><span class="cv"><svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span></div><span class="chip" style="flex:0 0 84px;justify-content:center">Сохранить</span><span class="chip" style="flex:0 0 68px;justify-content:center">Удалить</span></div></div><div class="startbtn"><i></i>Старт</div></div></div>
+</div>
+</div>
+</body>
+</html>

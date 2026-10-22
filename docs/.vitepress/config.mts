@@ -79,6 +79,10 @@ export default defineConfig({
                   text: "M4 — прокси TCP",
                   link: "/dev/stages/M4",
                 },
+                {
+                  text: "M5 — прослушка двух COM-портов",
+                  link: "/dev/stages/M5",
+                },
               ],
             },
             { text: "Бэклог", link: "/dev/backlog" },
