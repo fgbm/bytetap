@@ -419,9 +419,9 @@ jobs:
             # DWMWA_EXTENDED_FRAME_BOUNDS = 9: границы окна без невидимой тени.
             [void][FrameWin]::DwmGetWindowAttribute($hwnd, 9, [ref]$rect, [System.Runtime.InteropServices.Marshal]::SizeOf($rect))
             $w = $rect.Right - $rect.Left; $h = $rect.Bottom - $rect.Top
-            Write-Host "$name: окно ${w}x${h}"
+            Write-Host "${name}: окно ${w}x${h}"
             if ($w -lt 100 -or $h -lt 100) {
-              Write-Host "$name: окно не найдено"
+              Write-Host "${name}: окно не найдено"
               return $null
             }
             # Скругление (33) — как его задало приложение. Цвет рамки (34) атрибут
