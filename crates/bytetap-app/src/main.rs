@@ -177,8 +177,24 @@ fn viewport(saved: Option<&WindowState>, probe_size: Option<[f32; 2]>) -> egui::
     egui::ViewportBuilder::default()
         .with_title("bytetap")
         .with_app_id("bytetap")
+        .with_icon(icon())
         .with_inner_size(size)
         .with_min_inner_size(WINDOW_MIN_SIZE)
         .with_decorations(false)
         .with_resizable(true)
+}
+
+/// Иконка окна и панели задач: та же, что в ресурсе exe (`assets/icon.ico`), — иконка
+/// проекта из v0.1.0, лицензия MIT. PNG разбирает `eframe::icon_data`, отдельного
+/// декодера и зависимостей не нужно.
+fn icon() -> egui::IconData {
+    match eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        Ok(icon) => icon,
+        // Иконка вшита в exe и проверена тестом ресурса: битый PNG — ошибка сборки, а не
+        // повод не открыть окно.
+        Err(err) => {
+            diag::error(format!("иконка assets/icon.png не разобрана: {err}"));
+            egui::IconData::default()
+        }
+    }
 }

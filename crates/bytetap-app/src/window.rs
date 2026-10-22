@@ -12,15 +12,20 @@
 //!   скругления оставила бы квадратные углы. Свою рамку поверх скругления DWM
 //!   не срезает — линия идёт по внутреннему краю окна и совпадает с его дугой.
 //!
-//! Рамку DWM (`DWMWA_BORDER_COLOR`) приложение не заказывает: DWM рисует её только у
-//! активного окна, а при смене активности сбрасывает цвет на системный — в документации
-//! так и написано: «приложение само отвечает за цвет рамки при смене состояния, например
-//! активности окна». У окна без системной рамки системный цвет на белом фоне почти не
-//! виден, и рамка «пропадала», как только фокус забирало чужое окно: диалог брандмауэра
-//! Windows при первом прослушивании порта в режиме TCP-сервера (жалоба владельца,
-//! Windows 11 22000). Поэтому цвет DWM получает `DWMWA_COLOR_NONE` — DWM рамку не
-//! рисует вовсе, а периметр всегда рисует приложение своим цветом. Атрибуты DWM
-//! подтверждаются повторно при смене активности окна, и это пишется в журнал запуска.
+//! Скругление бывает и не нужно: DWM не скругляет углы у развёрнутого и прижатого к
+//! краю окна, а на программном растре (`gpu::software()`, ВМ без видеодрайвера) его
+//! скругление не видно из-за цены кадра. Тогда приложение рисует квадратную рамку, а
+//! DWM на программном растре получает `DWMWCP_DONOTROUND`, чтобы линия и угол окна
+//! совпадали ([`rounded_frame`]).
+//!
+//! Рамку DWM (`DWMWA_BORDER_COLOR`) приложение не заказывает: по документации DWM не
+//! перекрашивает её сам при смене состояния окна — «это забота приложения», — и без
+//! своей настройки у окна без системной рамки остаётся системный цвет, почти невидимый
+//! на белом фоне. Поэтому DWM получает `DWMWA_COLOR_NONE`: этот атрибут подавляет
+//! отрисовку рамки DWM всегда, в любом состоянии окна, а периметр всегда рисует
+//! приложение своим цветом. Атрибуты DWM подтверждаются повторно при смене активности
+//! окна; в журнал запуска идут первая потеря и первое возвращение фокуса за запуск и
+//! отказы HRESULT ([`activation_to_log`]).
 //!
 //! Тень окна — системная: egui-winit включает тень для окна без декораций
 //! (`with_undecorated_shadow`). `DwmExtendFrameIntoClientArea` с полями в 1 px даёт
@@ -54,7 +59,9 @@ fn scale(pixels_per_point: f32) -> f32 {
     }
 }
 
-/// Радиус скругления углов, которое рисует DWM на Windows 11, в физических пикселях.
+/// Радиус скругления углов, которое рисует DWM на Windows 11, в физических пикселях
+/// при 96 DPI: DWM масштабирует его линейно, на 125 и 150 % это 10 и 12 физических
+/// пикселей.
 ///
 /// Своя рамка повторяет этот радиус: иначе линия легла бы по квадратному периметру, и
 /// углы окна выглядели бы квадратными. Радиус переводится в точки по масштабу экрана.
@@ -121,15 +128,19 @@ fn round_from_build(build: u32) -> bool {
 ///
 /// Вызывается после первого кадра, когда окно уже видимо: атрибуты, заданные до того,
 /// как окно показано, DWM теряет при первой отрисовке — рамка появлялась только после
-/// смены темы (U1-AC18). Результат пишется в журнал запуска: без него не понять,
-/// применились ли настройки на этой системе.
+/// смены темы (U1-AC18). Каждый вызов пишет в журнал запуска одну строку о своём
+/// результате: без неё не понять, применились ли настройки на этой системе.
+///
+/// `software` — кадр рисует программный растр ([`crate::gpu::software`]): скругления
+/// углов у такого окна не видно, поэтому DWM получает `DWMWCP_DONOTROUND`, а свою
+/// рамку приложение рисует квадратной — линия и угол окна совпадают.
 #[cfg(windows)]
-pub fn setup_dwm(handle: RawWindowHandle, border: Color32) -> DwmSetup {
+pub fn setup_dwm(handle: RawWindowHandle, border: Color32, software: bool) -> DwmSetup {
     use windows_sys::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
     use windows_sys::Win32::UI::Controls::MARGINS;
 
     let Some(hwnd) = hwnd(handle) else {
-        diag::info("рамка окна: обработчик окна не Win32 — DWM не вызывается");
+        diag::error("рамка окна: обработчик окна не Win32 — DWM не вызывается");
         return DwmSetup::NONE;
     };
 
@@ -137,15 +148,25 @@ pub fn setup_dwm(handle: RawWindowHandle, border: Color32) -> DwmSetup {
 
     // Скругление: DWM рисует углы сам, своя рамка повторяет их радиус. На Windows 10
     // атрибута нет — вызов вернёт ошибку.
-    let corner = set_corner_preference(hwnd);
-    if corner == 0 {
+    let corner = set_corner_preference(hwnd, software);
+    if corner != 0 {
+        diag::error(format!(
+            "рамка окна: DWM не принял {}: HRESULT {corner:#x} — рамку рисует приложение с квадратными углами",
+            if software {
+                "DWMWCP_DONOTROUND"
+            } else {
+                "DWMWCP_ROUND"
+            }
+        ));
+    } else if software {
+        setup.applied = true;
+        diag::info(
+            "рамка окна: программный растр — углы квадратные (DWMWCP_DONOTROUND), рамку рисует приложение",
+        );
+    } else {
         setup.applied = true;
         setup.rounded = true;
         diag::info("рамка окна: DWM скругляет углы (DWMWA_WINDOW_CORNER_PREFERENCE)");
-    } else {
-        diag::info(format!(
-            "рамка окна: DWM не скругляет углы (HRESULT {corner:#x}) — рамка приложения с квадратными углами"
-        ));
     }
 
     // Тень окна без декораций: рамка в 1 px в область клиента. Запасной путь: egui-winit
@@ -169,35 +190,64 @@ pub fn setup_dwm(handle: RawWindowHandle, border: Color32) -> DwmSetup {
 
     if setup.rounded {
         DWM_ROUNDED.store(true, Ordering::Relaxed);
-        hide_dwm_border(hwnd, border, true);
+    }
+    // Рамку рисует приложение, DWM — только скругление: `DWMWA_COLOR_NONE` подавляет
+    // рамку DWM в любом состоянии окна.
+    let hidden = hide_dwm_border(hwnd);
+    if hidden == 0 {
+        diag::info(format!(
+            "рамка окна: DWM-рамка скрыта (DWMWA_COLOR_NONE), свою рисует приложение цветом {}",
+            hex_color(border)
+        ));
+    } else {
+        diag::error(format!(
+            "рамка окна: DWM не принял DWMWA_COLOR_NONE: HRESULT {hidden:#x}"
+        ));
     }
     setup
 }
 
 #[cfg(not(windows))]
-pub fn setup_dwm(_handle: RawWindowHandle, _border: Color32) -> DwmSetup {
+pub fn setup_dwm(_handle: RawWindowHandle, _border: Color32, _software: bool) -> DwmSetup {
     DwmSetup::NONE
 }
 
 /// Повторная настройка окна после смены активности: скругление и скрытая рамка DWM.
 ///
-/// DWM за свои атрибуты при смене состояния окна не отвечает: цвет рамки на такое
-/// состояние выставляет приложение (документация `DWMWA_BORDER_COLOR`). Своя рамка от
-/// активности не зависит, но состояние DWM подтверждается повторно, и это видно в
-/// журнале запуска.
-pub fn reapply_dwm(handle: RawWindowHandle, border: Color32) {
+/// DWM за свои атрибуты при смене состояния окна не отвечает: по документации
+/// `DWMWA_BORDER_COLOR` цвет рамки на такое состояние выставляет приложение. Своя рамка
+/// от активности не зависит, но состояние DWM подтверждается повторно. В журнал запуска
+/// эта функция не пишет: что записать, решает кадровый цикл ([`activation_to_log`]) —
+/// смена активности случается часто, и журнал не должен расти с ней.
+///
+/// Возвращается первый HRESULT отказа, `None` — все вызовы прошли.
+pub fn reapply_dwm(handle: RawWindowHandle, software: bool) -> Option<i32> {
     #[cfg(windows)]
     {
-        let Some(hwnd) = hwnd(handle) else {
-            return;
-        };
-        let _ = set_corner_preference(hwnd);
-        hide_dwm_border(hwnd, border, true);
+        let hwnd = hwnd(handle)?;
+        let corner = set_corner_preference(hwnd, software);
+        let hidden = hide_dwm_border(hwnd);
+        [corner, hidden].into_iter().find(|code| *code != 0)
     }
     #[cfg(not(windows))]
     {
-        let _ = (handle, border);
+        let _ = (handle, software);
+        None
     }
+}
+
+/// Пора ли записать в журнал запуска смену активности окна: первая потеря фокуса и
+/// первое его возвращение за запуск. `logged` — что уже записано: `[потеря, возвращение]`.
+///
+/// Окно переключается часто (диалог брандмауэра, чужое окно, меню системы), и строка на
+/// каждое переключение забивала бы журнал запуска: по двум строкам видно, что окно
+/// теряло фокус и получило его обратно, и этого достаточно.
+#[must_use]
+pub fn activation_to_log(focused: bool, logged: &mut [bool; 2]) -> bool {
+    let index = usize::from(focused);
+    let first = !logged[index];
+    logged[index] = true;
+    first
 }
 
 /// Обработчик окна Win32; вне Windows и у чужого обработчика — `None`.
@@ -210,13 +260,20 @@ fn hwnd(handle: RawWindowHandle) -> Option<windows_sys::Win32::Foundation::HWND>
 }
 
 /// Скругление углов средствами DWM: 0 — принято, иначе HRESULT отказа.
+///
+/// `software` — кадр рисует программный растр: углы заказываются квадратными, чтобы
+/// линия своей рамки совпадала с углом окна.
 #[cfg(windows)]
-fn set_corner_preference(hwnd: windows_sys::Win32::Foundation::HWND) -> i32 {
+fn set_corner_preference(hwnd: windows_sys::Win32::Foundation::HWND, software: bool) -> i32 {
     use windows_sys::Win32::Graphics::Dwm::{
-        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmSetWindowAttribute,
     };
 
-    let corner = DWMWCP_ROUND;
+    let corner = if software {
+        DWMWCP_DONOTROUND
+    } else {
+        DWMWCP_ROUND
+    };
     // SAFETY: атрибут — целое число, размер совпадает с типом.
     unsafe {
         DwmSetWindowAttribute(
@@ -230,37 +287,24 @@ fn set_corner_preference(hwnd: windows_sys::Win32::Foundation::HWND) -> i32 {
 
 /// Рамку рисует приложение: DWM получает `DWMWA_COLOR_NONE` — своей рамки он не рисует.
 ///
-/// Так периметр не зависит от активности окна: рамку DWM видно только у активного окна,
-/// а после смены активности она получает системный цвет, почти невидимый на белом фоне
-/// (см. заголовок модуля). В журнал запуска идёт цвет, которым рамку рисует приложение.
+/// Так периметр не зависит от активности окна: `DWMWA_COLOR_NONE` подавляет отрисовку
+/// рамки DWM в любом состоянии окна (см. заголовок модуля). Возвращается HRESULT: 0 —
+/// принято, иначе отказ.
 #[cfg(windows)]
-fn hide_dwm_border(hwnd: windows_sys::Win32::Foundation::HWND, border: Color32, log: bool) {
+fn hide_dwm_border(hwnd: windows_sys::Win32::Foundation::HWND) -> i32 {
     use windows_sys::Win32::Graphics::Dwm::{
         DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DwmSetWindowAttribute,
     };
 
     let color = DWMWA_COLOR_NONE;
     // SAFETY: атрибут — целое число, размер совпадает с типом.
-    let ok = unsafe {
+    unsafe {
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_BORDER_COLOR as u32,
             &color as *const u32 as *const std::ffi::c_void,
             u32::try_from(std::mem::size_of::<u32>()).unwrap_or_default(),
         )
-    };
-    if !log {
-        return;
-    }
-    if ok == 0 {
-        diag::info(format!(
-            "рамка окна: DWM-рамка скрыта (DWMWA_COLOR_NONE), свою рисует приложение цветом {}",
-            hex_color(border)
-        ));
-    } else {
-        diag::error(format!(
-            "рамка окна: DWM не принял DWMWA_COLOR_NONE: HRESULT {ok:#x}"
-        ));
     }
 }
 
@@ -270,16 +314,27 @@ pub fn dwm_rounded() -> bool {
     DWM_ROUNDED.load(Ordering::Relaxed)
 }
 
-/// Углы окна скругляет DWM: Windows 11 сборки 22000 и новее, либо DWM уже настроен.
+/// Скругляет ли своя рамка углы: только когда DWM скруглил углы именно этого окна, оно
+/// не развёрнуто и не прижато к краю и кадр рисует не программный растр.
+///
+/// DWM не скругляет развёрнутое и прижатое к краю окно (`placement::arranged`): его углы
+/// квадратные, и своя скруглённая линия торчала бы из угла окна. На программном растре
+/// скругления не видно, поэтому там DWM получает `DWMWCP_DONOTROUND`, а линия идёт по
+/// квадратному углу.
 #[must_use]
-pub fn rounded_corners() -> bool {
-    dwm_rounded() || dwm_expected()
+pub fn rounded_frame(dwm_rounded: bool, arranged: bool, software: bool) -> bool {
+    dwm_rounded && !arranged && !software
 }
 
-/// Скругление своей рамки в точках: радиус DWM на масштабе экрана.
+/// Скругление своей рамки в точках: радиус DWM, переведённый в точки по масштабу окна.
+///
+/// DWM скругляет углы в физических пикселях от масштаба системы: 8 px при 96 DPI, 10 на
+/// 125 % и 12 на 150 %. `native_pixels_per_point` — масштаб окна без зума, поэтому без
+/// зума радиус — 8 точек, а при зуме 200 % — 4 точки: линия по-прежнему идёт по дуге
+/// окна, а не загибается внутрь.
 #[must_use]
-pub fn corner_radius(pixels_per_point: f32) -> CornerRadius {
-    let points = DWM_CORNER_RADIUS / scale(pixels_per_point);
+pub fn corner_radius(pixels_per_point: f32, native_pixels_per_point: f32) -> CornerRadius {
+    let points = DWM_CORNER_RADIUS * scale(native_pixels_per_point) / scale(pixels_per_point);
     // CornerRadius — целые точки; радиус меньше пикселя не скругляет ничего.
     CornerRadius::same(points.round().clamp(0.0, u8::MAX as f32) as u8)
 }
@@ -299,20 +354,25 @@ pub fn frame_color(p: &Palette) -> Color32 {
 /// Рисует рамку окна 1 px по периметру содержимого.
 ///
 /// Рамка идёт по внутреннему краю окна: линия в 1 px не съедает содержимое. `rounded` —
-/// углы окна скругляет DWM (Windows 11): своя рамка повторяет его радиус, иначе углы
-/// выглядели бы квадратными. Вызывается последней в кадре, поверх экрана: панели,
+/// углы окна скругляет DWM ([`rounded_frame`]): своя рамка повторяет его радиус, иначе
+/// углы выглядели бы квадратными. Вызывается последней в кадре, поверх экрана: панели,
 /// трасса и лента рамку не перекрывают.
 pub fn draw_frame(ui: &mut egui::Ui, p: &Palette, rounded: bool) {
     let rect = ui.max_rect();
+    let pixels_per_point = ui.pixels_per_point();
+    let native = ui
+        .ctx()
+        .native_pixels_per_point()
+        .unwrap_or(pixels_per_point);
     let radius = if rounded {
-        corner_radius(ui.pixels_per_point())
+        corner_radius(pixels_per_point, native)
     } else {
         CornerRadius::ZERO
     };
     ui.painter().rect_stroke(
         rect,
         radius,
-        Stroke::new(frame_width(ui.pixels_per_point()), frame_color(p)),
+        Stroke::new(frame_width(pixels_per_point), frame_color(p)),
         egui::StrokeKind::Inside,
     );
 }
@@ -350,19 +410,70 @@ mod tests {
         assert_eq!(frame_width(f32::NAN), 1.0);
     }
 
-    /// Радиус своей рамки — радиус скругления DWM: 8 физических пикселей на любом
-    /// масштабе, и на 150 % это 5 точек, а не 8.
+    /// Радиус своей рамки — радиус скругления DWM, а DWM масштабирует его линейно:
+    /// 8 физических пикселей при 96 DPI, 10 на 125 % и 12 на 150 %, то есть 8 точек на
+    /// любом масштабе без зума, а не 6.4 и 5.3 точки.
     #[test]
     fn the_frame_follows_the_dwm_corner_radius() {
-        for ppp in [1.0, 1.25, 1.5, 2.0] {
-            let points = f32::from(corner_radius(ppp).nw);
-            assert!(
-                (points * ppp - DWM_CORNER_RADIUS).abs() <= ppp,
-                "на {ppp} радиус {points} точки — {} физических пикселей",
-                points * ppp
+        for (native, physical) in [(1.0, 8.0), (1.25, 10.0), (1.5, 12.0), (2.0, 16.0)] {
+            let points = f32::from(corner_radius(native, native).nw);
+            assert_eq!(points, DWM_CORNER_RADIUS, "на {native} радиус не 8 точек");
+            assert_eq!(
+                points * native,
+                physical,
+                "на {native} радиус {points} точки — не {physical} физических пикселей"
             );
         }
-        assert_eq!(corner_radius(0.0).nw, DWM_CORNER_RADIUS as u8);
+        // Зум меняет масштаб кадра, но не масштаб окна: радиус в точках падает так, что
+        // физический остаётся радиусом DWM.
+        for zoom in [0.5, 1.0, 1.5, 2.0] {
+            let native = 1.25;
+            let points = f32::from(corner_radius(native * zoom, native).nw);
+            let physical = points * native * zoom;
+            assert!(
+                (physical - 10.0).abs() <= native * zoom,
+                "зум {zoom}: радиус {points} точки — {physical} физических пикселей"
+            );
+        }
+        // Масштаб от системы всегда положителен; нулевой даёт радиус в точках.
+        assert_eq!(corner_radius(0.0, 1.0).nw, DWM_CORNER_RADIUS as u8);
+        assert_eq!(
+            corner_radius(f32::NAN, f32::NAN).nw,
+            DWM_CORNER_RADIUS as u8
+        );
+    }
+
+    /// Скругляет своя рамка углы только там, где DWM скруглил их у этого окна: у
+    /// развёрнутого и прижатого к краю окна углы квадратные, как и на программном растре.
+    #[test]
+    fn the_frame_is_square_where_dwm_does_not_round() {
+        assert!(rounded_frame(true, false, false), "обычное окно на GPU");
+        assert!(!rounded_frame(false, false, false), "Windows 10 и старее");
+        assert!(
+            !rounded_frame(true, true, false),
+            "развернуть или прижать к краю"
+        );
+        assert!(!rounded_frame(true, false, true), "программный растр");
+        assert!(!rounded_frame(true, true, true));
+        assert!(!rounded_frame(false, true, true));
+    }
+
+    /// В журнал запуска идут только первая потеря фокуса и первое его возвращение:
+    /// окно переключается часто, и строка на каждое переключение забивала бы журнал.
+    #[test]
+    fn the_first_focus_change_each_way_is_logged_once() {
+        let mut logged = [false; 2];
+        assert!(
+            activation_to_log(false, &mut logged),
+            "первая потеря фокуса"
+        );
+        assert!(
+            activation_to_log(true, &mut logged),
+            "первое возвращение фокуса"
+        );
+        assert!(!activation_to_log(false, &mut logged), "повтор потери");
+        assert!(!activation_to_log(true, &mut logged), "повтор возвращения");
+        assert!(!activation_to_log(false, &mut logged));
     }
 
     /// Цвет рамки идёт в журнал запуска как `#RRGGBB`: по этой строке смоук CI видит,

@@ -6,6 +6,8 @@ on:
     paths:
       - "docs/**"
       - "design/**"
+      # Пример обмена на главной берёт модуль из `shared/` (`control-chips.ts`).
+      - "shared/**"
       - ".github/workflows/docs.yml"
       - "package.json"
       - "package-lock.json"

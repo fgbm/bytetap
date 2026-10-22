@@ -1,6 +1,6 @@
 //! Запись без моста: прямые вызовы `bytetap_core::session` (U1-AC13).
 //!
-//! Перенос логики моста Tauri-версии (`app/src-tauri/src/{bridge,batch,feed,error}.rs`)
+//! Перенос логики моста Tauri-версии (v0.1.0, `app/src-tauri/src/{bridge,batch,feed,error}.rs`)
 //! без IPC: старт сессии с кодами ошибок у полей формы, приёмник событий в кольцевой
 //! буфер ленты, комментарий, остановка с итогами и отказ журнала по коду.
 //!
@@ -626,7 +626,8 @@ impl LiveSession {
     /// Сессия ядра закончилась сама: отказ журнала, падение задачи или иное завершение.
     ///
     /// Окно замечает это и останавливает запись: слот освобождается без «Стоп», как в
-    /// UI v2 (слот занятой завершившейся сессии освобождается — `app/src-tauri/src/bridge.rs`).
+    /// UI v2 (слот занятой завершившейся сессии освобождается — v0.1.0,
+    /// `app/src-tauri/src/bridge.rs`).
     pub fn is_finished(&self) -> bool {
         self.handle.is_finished()
     }
@@ -676,7 +677,7 @@ impl LiveSession {
     }
 }
 
-/// Фаза записи — как `app/src/session/reducer.ts`.
+/// Фаза записи — как в v0.1.0 (`app/src/session/reducer.ts`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Phase {
     /// Записи нет.

@@ -16,6 +16,7 @@ const TOKENS: &str = "../../design/tokens.css";
 fn main() {
     println!("cargo:rerun-if-changed={TOKENS}");
     println!("cargo:rerun-if-changed=build.rs");
+    windows_resource();
     let css = std::fs::read_to_string(TOKENS).expect("design/tokens.css");
     let blocks = blocks(&strip_comments(&css));
 
@@ -126,6 +127,50 @@ fn main() {
 
 fn field(name: &str) -> String {
     name.replace('-', "_")
+}
+
+/// Ресурс `bytetap.exe`: иконка приложения и VERSIONINFO (U1-AC1, NFR-7).
+///
+/// Собирается только для Windows MSVC — им собираются релиз (`release.yml`) и CI
+/// (`native-windows`), и в exe оттуда видны версия в свойствах файла и иконка
+/// приложения. На кросс-цели `x86_64-pc-windows-gnu` ресурс компилирует `windres`,
+/// которого на сборочной машине нет, а линту Windows-ветвей кода хватает самой
+/// компиляции crate: ресурс в отчёт линта не входит. `CompanyName` в версии не пишется:
+/// проект личный, а не компания.
+fn windows_resource() {
+    // Цель сборки, а не хост build-скрипта: при кросс-сборке `cfg!` здесь — хост.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os != "windows" || target_env != "msvc" {
+        return;
+    }
+    println!("cargo:rerun-if-changed=assets/bytetap.rc");
+    println!("cargo:rerun-if-changed=assets/icon.ico");
+    let version = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
+    // VERSIONINFO хранит версию четырьмя числами: предварительные метки (`-rc1`) сюда
+    // не входят, хватает числовых частей.
+    let mut parts: Vec<u16> = version
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect();
+    parts.resize(4, 0);
+    let numeric = parts
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    embed_resource::compile(
+        "assets/bytetap.rc",
+        embed_resource::ParamsMacrosAndIncludeDirs(
+            &[
+                format!("BT_VERSION_COMMA={numeric}"),
+                format!("BT_VERSION=\"{version}\""),
+            ],
+            &["assets"],
+        ),
+    )
+    .manifest_optional()
+    .expect("ресурс bytetap.exe (assets/bytetap.rc)");
 }
 
 /// Тип и выражение константы по значению CSS.

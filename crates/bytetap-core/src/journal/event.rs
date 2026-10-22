@@ -479,7 +479,9 @@ mod tests {
             json!({
                 "type": "session",
                 "format": "bytetap-session/1",
-                "app_version": "0.1.0",
+                // Версия — та, что пишет `Session::new`: сверять заголовок с числом,
+                // зашитым в тест, значило бы править тест на каждом релизе.
+                "app_version": env!("CARGO_PKG_VERSION"),
                 "started_at": "2026-10-19T10:15:00.123456+03:00",
                 "mode": "tcp_server",
                 "autoresponder": "hl7_mllp",

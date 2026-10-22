@@ -16,7 +16,8 @@
     }
   },
   "scripts": {
-    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --no-fail-fast && node scripts/check-docs-links.mjs",
+    "check": "cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --no-fail-fast && node scripts/check-docs-links.mjs && node --test scripts/*.test.mjs",
+    "test": "node --test scripts/*.test.mjs",
     "docs:dev": "npm run dev --workspace docs",
     "docs:build": "node scripts/check-docs-links.mjs && npm run build --workspace docs"
   }

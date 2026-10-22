@@ -267,6 +267,11 @@ pub struct BytetapApp {
     frame_applied: bool,
     /// Активно ли окно в прошлом кадре: по смене активности DWM настраивается повторно.
     window_focused: Option<bool>,
+    /// Что о смене активности уже записано в журнал запуска: `[потеря, возвращение]`.
+    activation_logged: [bool; 2],
+    /// Скругляет ли своя рамка углы в этом кадре: DWM скруглил их у этого окна, окно не
+    /// развёрнуто и не прижато к краю, кадр рисует не программный растр (`window.rs`).
+    frame_rounded: bool,
     /// Тестовый хук снимков: меню, которое надо открыть на следующем кадре.
     hook_menu: Option<&'static str>,
     /// Кадров нарисовано с начала записи: итог уходит в журнал запуска при остановке
@@ -366,6 +371,8 @@ impl BytetapApp {
             window_handle: None,
             frame_applied: false,
             window_focused: None,
+            activation_logged: [false; 2],
+            frame_rounded: false,
             hook_menu: None,
             frames: 0,
             frame_cost: live::FrameBudget::default(),
@@ -1625,30 +1632,25 @@ impl BytetapApp {
         }
     }
 
-    /// Вызов DWM и запись итога в журнал запуска: по нему смоук CI видит, скругляет ли
-    /// система углы и каким цветом рисуется своя рамка.
+    /// Вызов DWM: одна строка на факт пишет сам `window::setup_dwm` — скругление,
+    /// запасной путь и скрытая рамка DWM, с HRESULT отказа. Итог по `DwmSetup` здесь не
+    /// повторяется: журнал запуска показывает, что DWM принял, а не что мы попросили.
     fn setup_window_frame(&mut self) {
         let Some(handle) = self.window_handle else {
+            diag::error("рамка окна: обработчик окна не получен — DWM не настроен");
             return;
         };
-        let setup = crate::window::setup_dwm(handle, self.pal().border);
-        diag::info(format!(
-            "рамка окна: DWM {}",
-            if setup.rounded {
-                "скругляет углы, рамку рисует приложение"
-            } else {
-                "недоступен — рамку рисует приложение с квадратными углами"
-            }
-        ));
+        let _ = crate::window::setup_dwm(handle, self.pal().border, crate::gpu::software());
     }
 
     /// Смена активности окна: DWM за свои атрибуты при таком состоянии не отвечает.
     ///
     /// По документации `DWMWA_BORDER_COLOR` цвет рамки на смену состояния выставляет
-    /// приложение, а рамку DWM видно только у активного окна. Своя рамка от активности
-    /// не зависит, но состояние DWM подтверждается повторно, а строка об этом идёт в
-    /// журнал запуска: по ней видно, что окно теряло фокус (например, диалог
-    /// брандмауэра Windows при первом прослушивании порта).
+    /// приложение, а `DWMWA_COLOR_NONE` подавляет отрисовку рамки DWM всегда. Своя рамка
+    /// от активности не зависит, но состояние DWM подтверждается повторно; в журнал
+    /// запуска идут первая потеря и первое возвращение фокуса за запуск и отказы
+    /// HRESULT: окно переключается часто, и строка на каждое переключение забивала бы
+    /// журнал запуска.
     fn track_window_activation(&mut self, ctx: &egui::Context) {
         let focused = ctx.input(|i| i.viewport().focused);
         let previous = self.window_focused;
@@ -1660,21 +1662,27 @@ impl BytetapApp {
         if previous.is_none() || !self.frame_applied || !crate::window::dwm_rounded() {
             return;
         }
-        if focused.is_none() {
+        let Some(focused) = focused else {
             return;
-        }
+        };
         let Some(handle) = self.window_handle else {
             return;
         };
-        crate::window::reapply_dwm(handle, self.pal().border);
-        diag::info(format!(
-            "рамка окна: окно {} — состояние DWM подтверждено повторно",
-            if focused == Some(true) {
-                "активно"
-            } else {
-                "неактивно"
-            }
-        ));
+        if let Some(code) = crate::window::reapply_dwm(handle, crate::gpu::software()) {
+            diag::error(format!(
+                "рамка окна: повторная настройка DWM: HRESULT {code:#x}"
+            ));
+        }
+        if crate::window::activation_to_log(focused, &mut self.activation_logged) {
+            diag::info(format!(
+                "рамка окна: окно {} — состояние DWM подтверждено повторно",
+                if focused {
+                    "активно"
+                } else {
+                    "неактивно"
+                }
+            ));
+        }
     }
 
     /// Размер и положение «обычного» окна: их окно получит при запуске. Развёрнутое
@@ -1805,11 +1813,11 @@ impl BytetapApp {
         self.note_dialog(&ctx);
         // Рамка окна — последней, поверх всего: иначе панели ленты перекрывали бы её.
         // Рисует её приложение на всех экранах и при любом состоянии окна: рамка DWM
-        // видна только у активного окна и после смены активности гаснет (см. window.rs).
+        // гасится сменой активности, поэтому DWM получает `DWMWA_COLOR_NONE` (см. window.rs).
         // Развёрнутое окно периметра не имеет — рамки нет.
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         if !maximized {
-            crate::window::draw_frame(ui, &p, crate::window::rounded_corners());
+            crate::window::draw_frame(ui, &p, self.frame_rounded);
         }
     }
 
@@ -2066,12 +2074,17 @@ impl eframe::App for BytetapApp {
             panic!("{}: test panic in the first frame", crate::app::PANIC_ENV);
         }
         self.follow_system_theme(&ctx);
-        if self.ready {
+        // Прижатое к краю и развёрнутое окно: DWM такие углы не скругляет, и своя рамка
+        // там квадратная (`window::rounded_frame`).
+        let arranged = if self.ready {
+            let arranged = crate::placement::arranged(frame);
             // В первом кадре окно ещё не встало на запомненное место.
-            self.track_window(&ctx, crate::placement::arranged(frame));
+            self.track_window(&ctx, arranged);
+            arranged
         } else {
             self.restore_window(&ctx);
-        }
+            false
+        };
         if self.window_handle.is_none() {
             self.capture_window_handle(frame);
         }
@@ -2079,6 +2092,13 @@ impl eframe::App for BytetapApp {
         // окно уже показано (иначе DWM теряет атрибуты).
         self.apply_window_frame(&ctx);
         self.track_window_activation(&ctx);
+        // Скругление своей рамки — по фактическому состоянию DWM: если настройка не
+        // применилась (Windows 10, отказ HRESULT, программный растр), углы квадратные.
+        self.frame_rounded = crate::window::rounded_frame(
+            crate::window::dwm_rounded(),
+            arranged,
+            crate::gpu::software(),
+        );
         // Проба цены кадра (`probe.rs`): в режиме `empty` рисуется только фон — столько
         // стоит кадр без интерфейса.
         if crate::probe::enabled() && crate::probe::mode() == crate::probe::EMPTY {

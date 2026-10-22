@@ -116,6 +116,16 @@ jobs:
 
       - run: npm ci
 
+      # Дерево зависимостей сайта сходится: `npm ci` ставит по lock-файлу, а `npm ls`
+      # ловит пакет, которого в дереве нет (например, забытый в `package.json`).
+      - name: Зависимости сайта
+        run: npm ls --all
+
+      # Общий модуль примера обмена (`shared/control-chips.ts`): node снимает типы
+      # сам, тест идёт без сборки.
+      - name: Тест модуля обмена
+        run: npm test
+
       - name: Установить Rust из rust-toolchain.toml
         run: |
           rustup toolchain install
@@ -170,6 +180,56 @@ jobs:
           $system32 = Join-Path $env:SystemRoot 'System32'
           $extra = $dlls | Where-Object { $_ -notmatch '^api-ms-win-' -and -not (Test-Path (Join-Path $system32 $_)) }
           if ($extra) { throw "exe зависит от DLL не из System32: $($extra -join ', ')" }
+
+      # U1-AC1 (NFR-7): у exe есть иконка приложения и VERSIONINFO из ресурса.
+      #
+      # Ресурс (`crates/bytetap-app/assets/bytetap.rc`) собирает `build.rs` для Windows
+      # MSVC: свойства файла — ProductName, версия из `CARGO_PKG_VERSION`, без CompanyName,
+      # — читает `FileVersionInfo`, иконку — `ExtractAssociatedIcon`. Иконку сверяем с
+      # `assets/icon.ico` (иконка проекта из v0.1.0, MIT): у exe без ресурса
+      # `ExtractAssociatedIcon` отдаёт стандартную иконку приложения, и пиксели с ней не
+      # совпадут.
+      - name: Иконка и версия exe
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $exe = (Get-Item target\release\bytetap.exe).FullName
+          $match = Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "в корневом Cargo.toml не найдена версия [workspace.package]" }
+          $version = $match.Matches[0].Groups[1].Value
+          $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+          Write-Host "exe: ProductName '$($info.ProductName)', версия '$($info.ProductVersion)', файл '$($info.FileVersion)'"
+          if ($info.ProductName -ne 'bytetap') { throw "ProductName exe: '$($info.ProductName)'" }
+          if (-not ($info.ProductVersion -eq $version -or $info.ProductVersion -eq "$version.0")) {
+            throw "ProductVersion exe '$($info.ProductVersion)' не $version"
+          }
+          if ($info.CompanyName) { throw "CompanyName в свойствах exe: '$($info.CompanyName)'" }
+
+          $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
+          if ($null -eq $icon) { throw 'у exe нет иконки' }
+          $stream = [System.IO.File]::OpenRead((Resolve-Path 'crates\bytetap-app\assets\icon.ico'))
+          $expected = New-Object System.Drawing.Icon($stream, 32, 32)
+          $got = $icon.ToBitmap()
+          $want = $expected.ToBitmap()
+          $stream.Dispose()
+          if ($got.Width -ne $want.Width -or $got.Height -ne $want.Height) {
+            # Размер иконки выбирает оболочка; сверяем картинку в её размере.
+            $scaled = New-Object System.Drawing.Bitmap $got.Width, $got.Height
+            $g = [System.Drawing.Graphics]::FromImage($scaled)
+            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g.DrawImage($want, 0, 0, $got.Width, $got.Height)
+            $g.Dispose()
+            $want = $scaled
+          }
+          $different = 0
+          for ($y = 0; $y -lt $got.Height; $y++) {
+            for ($x = 0; $x -lt $got.Width; $x++) {
+              if ($got.GetPixel($x, $y).ToArgb() -ne $want.GetPixel($x, $y).ToArgb()) { $different++ }
+            }
+          }
+          $total = $got.Width * $got.Height
+          Write-Host "иконка exe $($got.Width)x$($got.Height): расхождений с assets/icon.ico $different из $total"
+          if ($different -gt [int]($total * 0.2)) { throw 'иконка exe не совпадает с иконкой проекта (стандартная иконка?)' }
 
       - name: Смоук — запуск exe
         shell: pwsh
@@ -279,13 +339,17 @@ jobs:
       # U1-AC3: рамка окна 1 px видна на белом фоне и не пропадает.
       #
       # Рамку рисует приложение (`window::draw_frame`, последней в кадре), а DWM только
-      # скругляет углы: свою рамку DWM видно лишь у активного окна и после смены
-      # активности он гасит её, поэтому приложение заказывает ему `DWMWA_COLOR_NONE`.
-      # Смоук снимает окно на белом фоне трижды: стартовый экран, экран записи
-      # (`BYTETAP_TEST_AUTOSTART` поднимает TCP-сервер) и то же окно записи, когда фокус
-      # забрал другой процесс (блокнот) — именно так рамка пропадала у владельца на
-      # Windows 11 22000. Пиксели периметра сверяются с токеном `--bt-border` из
-      # `design/tokens.css`, контраст — с фоном в 3 px внутрь окна.
+      # скругляет углы. Свою рамку DWM приложение не заказывает: по документации
+      # `DWMWA_BORDER_COLOR` DWM не перекрашивает сам при смене состояния окна — это
+      # забота приложения, — а системный цвет на белом фоне почти не виден. Поэтому DWM
+      # получает `DWMWA_COLOR_NONE`: этот атрибут подавляет отрисовку рамки DWM всегда, и
+      # периметр рисует приложение своим цветом. Смоук снимает окно на белом фоне трижды:
+      # стартовый экран, экран записи (`BYTETAP_TEST_AUTOSTART` поднимает TCP-сервер) и то
+      # же окно записи, когда фокус забрал другой процесс (блокнот) — именно так рамка
+      # пропадала у владельца на Windows 11 22000. Пиксели периметра сверяются с токеном
+      # `--bt-border` из `design/tokens.css`, контраст — с фоном в 3 px внутрь окна, а
+      # журнал запуска — с фактическим скруглением окна (`DWMWCP_ROUND` — DWM скругляет
+      # углы, `DWMWCP_DONOTROUND` на программном растре — углы квадратные).
       - name: Смоук — рамка окна на белом фоне
         shell: pwsh
         run: |
@@ -420,9 +484,11 @@ jobs:
             return $true
           }
 
-          # Проверка журнала запуска: рамка, скругление и скрытая рамка DWM.
+          # Проверка журнала запуска: рамка, скругление и скрытая рамка DWM. Журнал
+          # должен говорить то же, что показывает окно: атрибут скругления (33) снимка
+          # сверяется с его строкой (`DWMWCP_ROUND` — 2, `DWMWCP_DONOTROUND` — 1).
           function Check-FrameLog {
-            param([string]$name)
+            param([string]$name, $measured)
             if (-not (Test-Path $log)) { Write-Host "$name : журнала нет"; return $false }
             Copy-Item $log (Join-Path $out "bytetap-frame-$name.log") -Force
             Get-Content -Encoding utf8 $log
@@ -434,23 +500,34 @@ jobs:
             $corner = Select-String -Path $log -Pattern 'DWM скругляет углы' -Quiet -Encoding utf8
             $hidden = Select-String -Path $log -Pattern 'DWM-рамка скрыта \(DWMWA_COLOR_NONE\), свою рисует приложение цветом #[0-9a-f]{6}' -Quiet -Encoding utf8
             $own = Select-String -Path $log -Pattern 'рамку рисует приложение' -Quiet -Encoding utf8
+            $software = Select-String -Path $log -Pattern 'программный растр — углы квадратные \(DWMWCP_DONOTROUND\)' -Quiet -Encoding utf8
             if ($corner) {
               Write-Host "$name : DWM скругляет углы, рамку рисует приложение"
               if (-not $hidden) {
                 Write-Host "$name : DWM не принял DWMWA_COLOR_NONE — рамку может нарисовать DWM"
                 $ok = $false
               }
+            } elseif ($software) {
+              Write-Host "$name : программный растр — углы квадратные (DWMWCP_DONOTROUND), рамку рисует приложение"
             } elseif ($own) {
               Write-Host "$name : DWM-скругления нет: рамку рисует приложение с квадратными углами"
             } else {
               Write-Host "$name : в журнале запуска нет ни DWM-скругления, ни своей рамки"
               $ok = $false
             }
+            # Скругление окна по снимку и строка журнала про одно и то же.
+            if ($null -ne $measured) {
+              $pref = [int]$measured.Corner
+              Write-Host "$name : скругление окна $pref, журнал $(if ($corner) { 'DWM скругляет' } elseif ($software) { 'программный растр' } else { 'без скругления' })"
+              if ($pref -eq 2 -and -not $corner) { Write-Host "$name : окно скруглено, а журнал этого не пишет"; $ok = $false }
+              if ($pref -eq 1 -and -not ($software -or $own)) { Write-Host "$name : окно без скругления, а журнал об этом молчит"; $ok = $false }
+            }
             return $ok
           }
 
           # 1. Стартовый экран: рамку видно без переключения темы и без записи.
           Remove-Item $log -ErrorAction SilentlyContinue
+          $startShot = $null
           $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
           $null = $p.Handle
           Start-Sleep -Seconds 15
@@ -464,11 +541,12 @@ jobs:
               [void][FrameWin]::SetForegroundWindow($hwnd)
               Place-Window $hwnd 8 8 720 560
               Start-Sleep -Milliseconds 900
-              if (-not (Check-Frame (Measure-Frame $hwnd 'start') 'стартовый экран')) { $failed = $true }
+              $startShot = Measure-Frame $hwnd 'start'
+              if (-not (Check-Frame $startShot 'стартовый экран')) { $failed = $true }
             } catch { Write-Host "стартовый экран: $_"; $failed = $true }
             Stop-Process -Id $p.Id -Force
           }
-          if (-not (Check-FrameLog 'start')) { $failed = $true }
+          if (-not (Check-FrameLog 'start' $startShot)) { $failed = $true }
 
           # 2. Экран записи: прослушивание уже идёт, шапка, трасса и лента нарисованы.
           Remove-Item $log -ErrorAction SilentlyContinue
@@ -479,6 +557,7 @@ jobs:
           $env:BYTETAP_TEST_AUTOSTART = ''
           $env:BYTETAP_TEST_HOOKS = ''
           $recording = $false
+          $recordingShot = $null
           for ($i = 0; $i -lt 60 -and -not $recording -and -not $p.HasExited; $i++) {
             Start-Sleep -Milliseconds 500
             if (Test-Path $log) {
@@ -497,7 +576,8 @@ jobs:
               [void][FrameWin]::SetForegroundWindow($hwnd)
               Place-Window $hwnd 8 8 720 560
               Start-Sleep -Milliseconds 900
-              if (-not (Check-Frame (Measure-Frame $hwnd 'recording') 'экран записи')) { $failed = $true }
+              $recordingShot = Measure-Frame $hwnd 'recording'
+              if (-not (Check-Frame $recordingShot 'экран записи')) { $failed = $true }
 
               # 3. То же окно записи без фокуса: рамка DWM гасится при смене
               # активности, своя — нет. Блокнот ставим рядом, чтобы не накрыть окно.
@@ -528,7 +608,7 @@ jobs:
             } catch { Write-Host "экран записи: $_"; $failed = $true }
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
           }
-          if (-not (Check-FrameLog 'recording')) { $failed = $true }
+          if (-not (Check-FrameLog 'recording' $recordingShot)) { $failed = $true }
           if ($failed) { exit 1 }
 
       - name: Смоук — запись HL7 и закрытие окна

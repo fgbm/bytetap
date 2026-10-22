@@ -1,9 +1,9 @@
 //! Логика шага сценария без отрисовки (FR-1, FR-2, FR-9, FR-11, U1-AC10, U1-AC11):
 //! проверка полей, ошибки у полей и сборка `SessionConfig` ядра.
 //!
-//! Правила — те же, что в Vue-версии (`ScenarioForm.vue`, `validation.ts`) и в мосте
-//! Tauri (`bridge.rs`, `into_bridge`): ядро получает только поля выбранного режима, а
-//! неверные значения отвергаются до создания журнала.
+//! Правила — те же, что в Vue-версии v0.1.0 (`app/src/**/ScenarioForm.vue`, `validation.ts`)
+//! и в мосте Tauri (`app/src-tauri/src/bridge.rs`, `into_bridge`): ядро получает только
+//! поля выбранного режима, а неверные значения отвергаются до создания журнала.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
