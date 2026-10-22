@@ -1405,10 +1405,12 @@ impl BytetapApp {
                     self.frames as f64 / seconds
                 ));
                 // Цена кадра и период: по ним видно, почему кадров столько (NFR-5).
+                // Цена — последний подтверждённый замер: сглаженная оценка к концу
+                // записи тает, когда кадры идут без событий.
                 let period = live::next_period(crate::gpu::software(), self.frame_cost.cost());
                 diag::info(format!(
                     "цена кадра записи: {} мс, период запроса кадра {} мс (работа {} мс, ожидание презентации {} мс)",
-                    self.frame_cost.cost().as_millis(),
+                    self.frame_cost.measured().as_millis(),
                     period.as_millis(),
                     self.frame_cost.work().as_millis(),
                     self.frame_cost.present().as_millis()
