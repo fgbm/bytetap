@@ -1201,8 +1201,10 @@ jobs:
             Write-Output "отправлено фрагментов: $frame"
           } -ArgumentList $port, $rate, ($minutes * 60 + 60)
 
-          # Прогрев (5 минут) входит в кривую: критерий считается по участку после него.
-          $warmup = 5
+          # Прогрев (10 минут) входит в кривую: за первые минуты приложение занимает
+          # память под кеши шрифтов и растра, и критерий считается по участку после
+          # него. Меньший прогрев ловил разовый рост на 6–7-й минуте как «утечку».
+          $warmup = 10
           $rows = @('| минута | WorkingSet, МБ | PrivateBytes, МБ | журнал, МБ |', '| --- | --- | --- | --- |')
           $ws = @()
           $pv = @()
@@ -1223,8 +1225,9 @@ jobs:
           # — итог кадров записи.
           $null = $p.CloseMainWindow()
           if (-not $p.WaitForExit(30000)) { Stop-Process -Id $p.Id -Force }
-          $sent = Receive-Job -Id $sender -Wait -AutoRemoveJob
-          Write-Host $sent
+          # Поток гасим отдельно: `Receive-Job -Id` принимает номер, а не задание.
+          $sent = $null
+          try { $sent = Receive-Job -Job $sender -Wait -AutoRemoveJob } catch { Write-Host "поток: $_" }
 
           $ready = [Math]::Min($warmup, $ws.Count - 1)
           $baseWs = ($ws[0..$ready] | Measure-Object -Maximum).Maximum
@@ -1237,6 +1240,7 @@ jobs:
           $growthPv = ($peakPv - $basePv) / $basePv * 100
           $line = "после прогрева ({0} мин): WorkingSet {1:N1} → {2:N1} МБ (пик {3:N1}), рост {4:N1} %; PrivateBytes {5:N1} → {6:N1} МБ (пик {7:N1}), рост {8:N1} %" -f $warmup, $baseWs, $endWs, $peakWs, $growthWs, $basePv, $endPv, $peakPv, $growthPv
           Write-Host $line
+          # Таблица пишется до проверок: если прогон упадёт, её всё равно видно в артефакте.
           $rows += ''
           $rows += $line
           if ($sent) { $rows += $sent }
