@@ -700,8 +700,10 @@ jobs:
             $listener.Stop()
             Write-Output 'ok'
           }
+          # Задание ЛИС — отдельный процесс PowerShell: на холодном раннере он
+          # поднимается дольше десяти секунд, поэтому ждём до тридцати.
           $port = $null
-          for ($i = 0; $i -lt 40 -and -not $port; $i++) {
+          for ($i = 0; $i -lt 120 -and -not $port; $i++) {
             Start-Sleep -Milliseconds 250
             if (Test-Path $portFile) { $port = (Get-Content $portFile -Raw).Trim() }
           }
