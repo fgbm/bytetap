@@ -992,6 +992,8 @@ mod tests {
         );
     }
 
+    /// Обрыв журнала обрывает файл без `session_end`, а иногда и посреди строки:
+    /// просмотр открывает то, что успело записаться (FR-29, NFR-5).
     #[test]
     fn a_partially_written_line_is_indexed_when_it_is_finished() {
         let dir = tempfile::tempdir().expect("временная папка");
@@ -1018,8 +1020,6 @@ mod tests {
         );
     }
 
-    /// Отказ журнала обрывает файл без `session_end`, а иногда и посреди строки:
-    /// просмотр открывает то, что успело записаться (FR-29, NFR-5).
     /// Журнал прокси формата `/2` открывается просмотром так же, как `/1` (M4-AC9).
     #[test]
     fn a_proxy_journal_of_the_second_format_opens() {

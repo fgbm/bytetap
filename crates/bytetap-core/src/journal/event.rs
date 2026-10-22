@@ -41,7 +41,31 @@ pub enum Event {
     SessionEnd(SessionEnd),
 }
 
+/// Сколько байт строки приходится на поля, кроме `b64` и `text`.
+///
+/// Оценка с запасом: `t`, `mono_us`, `conn`, `dir`, `synthetic`, `len` и имена полей
+/// укладываются в неё с головой.
+const LINE_OVERHEAD: usize = 256;
+
 impl Event {
+    /// Оценка длины строки журнала в байтах.
+    ///
+    /// Нужна пределу очереди писателя: точная длина вышла бы только сериализацией, а
+    /// `record` стоит на пути пересылки и второй `serde_json` там недопустим (NFR-6).
+    /// Для `data` оценка точна по объёму (`b64` и `text` — и есть строка), остальные
+    /// события укладываются в [`LINE_OVERHEAD`]; заголовок сессии несёт ещё настройки.
+    #[must_use]
+    pub fn approx_bytes(&self) -> usize {
+        match self {
+            Self::Data(data) => data.b64.len() + data.text.len() + LINE_OVERHEAD,
+            Self::Session(session) => session.settings.to_string().len() + LINE_OVERHEAD,
+            Self::Error(error) => error.message.len() + LINE_OVERHEAD,
+            Self::Info(info) => info.message.len() + LINE_OVERHEAD,
+            Self::Note(note) => note.text.len() + LINE_OVERHEAD,
+            Self::Open(_) | Self::Close(_) | Self::SessionEnd(_) => LINE_OVERHEAD,
+        }
+    }
+
     /// Имя события в поле `type`.
     #[must_use]
     pub const fn kind(&self) -> &'static str {

@@ -33,7 +33,7 @@ use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -43,6 +43,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
+use crate::journal::writer::max_pending_bytes;
 use crate::journal::{
     Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, Host, InfoEvent, Journal,
     JournalFailureReason, LinkRole, Mode, MonoClock, Note, Open, Session as SessionHeader,
@@ -50,7 +51,10 @@ use crate::journal::{
     session_file_name,
 };
 use crate::responder::{Action, ControlIdSource, Now, Responder, ResponderEvent, ResponderKind};
-use crate::transport::{Connection, ConnectionSource, Link, Next, ProxyRole, Source, Transport};
+use crate::transport::{
+    Connection, ConnectionSource, Link, Next, ProxyRole, ResetSocket, Source, Stage, Transport,
+    is_proxy_target_is_self,
+};
 
 /// Сколько событий держат каналы подписчиков.
 ///
@@ -406,6 +410,7 @@ impl Session {
         let (failure_tx, failure_rx) = watch::channel(None);
         let (notes_tx, notes_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
+            mode,
             responder: config.responder_kind(),
             journal,
             clock: MonoClock::new(),
@@ -414,6 +419,7 @@ impl Session {
             counters: Arc::new(Counters::default()),
             failure: failure_tx,
             open: Mutex::new(HashSet::new()),
+            backlog_warned: AtomicBool::new(false),
         });
         let task = tokio::spawn(run(
             opened.source,
@@ -631,6 +637,7 @@ pub fn journal_failure_reason(err: &io::Error) -> Option<&JournalFailureReason> 
 
 /// То, что нужно каждому соединению: журнал, часы, автоответчик, подписчики и счётчики.
 struct Shared {
+    mode: Mode,
     responder: ResponderKind,
     journal: Journal,
     clock: MonoClock,
@@ -641,6 +648,8 @@ struct Shared {
     failure: watch::Sender<Option<JournalFailureReason>>,
     /// Номера открытых соединений: `close` для них пишется даже после abort.
     open: Mutex<HashSet<u32>>,
+    /// Предупреждение о растущей очереди писателя уже отправлено (M4-AC12).
+    backlog_warned: AtomicBool,
 }
 
 impl Shared {
@@ -656,8 +665,29 @@ impl Shared {
         if !recorded {
             self.fail_journal();
         }
+        self.warn_backlog();
         #[cfg(feature = "test-hooks")]
         PUBLISHED_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Очередь писателя дошла до половины предела: одно `info` за сессию (M4-AC12).
+    ///
+    /// Предупреждение не останавливает запись: это ещё не отказ, а сигнал, что журнал
+    /// отстаёт от пересылки. Предел — [`max_pending_bytes`]; перейдя его, писатель
+    /// отказывает, и сессия останавливается уже как при сломанном диске.
+    fn warn_backlog(&self) {
+        let limit = max_pending_bytes();
+        let queued = self.journal.pending_bytes();
+        if queued < limit / 2 || self.backlog_warned.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.info_with_code(
+            None,
+            Some("journal_backlog_warning"),
+            format!(
+                "journal backlog: {queued} bytes are queued for the writer, half of the {limit}-byte limit; the journal is falling behind"
+            ),
+        );
     }
 
     /// Ошибка и замечание уровня сессии или соединения (NFR-5).
@@ -713,8 +743,8 @@ impl Shared {
             t: now_rfc3339(),
             mono_us: self.clock.now_us(),
             conn: None,
-            code: Some("journal_failure".to_owned()),
-            message: format!("journal write failed: {reason}; no ACKs are sent after the failure"),
+            code: Some(reason.code().unwrap_or("journal_failure").to_owned()),
+            message: format!("journal write failed: {reason}{}", after_failure(self.mode)),
         })));
     }
 
@@ -794,9 +824,20 @@ impl Counters {
 /// Одинаковые ошибки схлопываются: в журнал попадает одно событие `error`, а при
 /// восстановлении — одно `info` со счётчиком повторов. Иначе недоступный анализатор
 /// давал бы строку в журнал каждые несколько секунд на весь журнал (M3-AC1, M3-AC2).
+///
+/// Серия помнит свой шаг (`accept`, `connect`): у прокси отказ приёма и отказ цели —
+/// разные коды, и сообщение о восстановлении должно называть тот, что был в серии.
 #[derive(Debug, Default)]
 struct SourceErrors {
-    current: Option<(String, u32)>,
+    current: Option<SourceSeries>,
+}
+
+/// Серия одинаковых ошибок источника: шаг, текст последней и число повторов.
+#[derive(Debug)]
+struct SourceSeries {
+    prefix: &'static str,
+    message: String,
+    repeats: u32,
 }
 
 /// Что записать о новой ошибке источника.
@@ -816,32 +857,46 @@ enum SourceReport {
 
 impl SourceErrors {
     /// Учитывает ошибку и говорит, что о ней писать.
-    fn failed(&mut self, message: String) -> SourceReport {
+    fn failed(&mut self, prefix: &'static str, message: String) -> SourceReport {
         match self.current.take() {
-            Some((previous, repeats)) if previous == message => {
-                self.current = Some((previous, repeats.saturating_add(1)));
+            Some(series) if series.message == message => {
+                self.current = Some(SourceSeries {
+                    repeats: series.repeats.saturating_add(1),
+                    ..series
+                });
                 SourceReport::Repeated
             }
-            Some((previous, repeats)) => {
-                self.current = Some((message.clone(), 0));
+            Some(series) => {
+                self.current = Some(SourceSeries {
+                    prefix,
+                    message: message.clone(),
+                    repeats: 0,
+                });
                 SourceReport::Changed {
-                    previous,
-                    repeats,
+                    previous: series.message,
+                    repeats: series.repeats,
                     message,
                 }
             }
             None => {
-                self.current = Some((message.clone(), 0));
+                self.current = Some(SourceSeries {
+                    prefix,
+                    message: message.clone(),
+                    repeats: 0,
+                });
                 SourceReport::First(message)
             }
         }
     }
 
     /// Приём восстановился: отчёт о схлопнутых повторах, если они были.
-    fn recovered(&mut self, prefix: &str) -> Option<String> {
-        self.current.take().and_then(|(previous, repeats)| {
-            (repeats > 0).then(|| {
-                format!("{prefix} recovered after {repeats} repeated failures: {previous}")
+    fn recovered(&mut self) -> Option<String> {
+        self.current.take().and_then(|series| {
+            (series.repeats > 0).then(|| {
+                format!(
+                    "{} recovered after {} repeated failures: {}",
+                    series.prefix, series.repeats, series.message
+                )
             })
         })
     }
@@ -850,11 +905,12 @@ impl SourceErrors {
     ///
     /// Без него последняя серия ошибок выглядела бы в журнале одной ошибкой:
     /// повторы схлопнуты, а восстановления, о котором сообщает `info`, уже не будет.
-    fn stopped(&mut self, prefix: &str) -> Option<String> {
-        self.current.take().and_then(|(previous, repeats)| {
-            (repeats > 0).then(|| {
+    fn stopped(&mut self) -> Option<String> {
+        self.current.take().and_then(|series| {
+            (series.repeats > 0).then(|| {
                 format!(
-                    "{prefix} still failing after {repeats} repeated failures at the stop: {previous}"
+                    "{} still failing after {} repeated failures at the stop: {}",
+                    series.prefix, series.repeats, series.message
                 )
             })
         })
@@ -862,21 +918,40 @@ impl SourceErrors {
 }
 
 /// Как назвать ошибку источника в журнале и какой код дать интерфейсу.
-fn source_failure(mode: Mode) -> (&'static str, &'static str) {
-    match mode {
-        Mode::TcpServer => ("accept failed", "accept_failed"),
-        Mode::TcpClient => ("connect failed", "connect_failed"),
-        Mode::Serial => ("serial port open failed", "serial_open_failed"),
-        Mode::Proxy => ("connect failed", "proxy_connect_failed"),
-        Mode::ComMonitor | Mode::ComTcp => ("source failed", "source_failed"),
+///
+/// Название зависит от шага, а не только от режима: у прокси ошибка `accept` — это сбой
+/// приёма, а не недоступная цель, и попадать под код отказа подключения она не должна
+/// (M4-AC6).
+fn source_failure(mode: Mode, stage: Stage) -> (&'static str, &'static str) {
+    match (stage, mode) {
+        (Stage::Accept, _) => ("accept failed", "accept_failed"),
+        (Stage::Open, _) => ("serial port open failed", "serial_open_failed"),
+        (Stage::Connect, Mode::Proxy) => ("connect failed", "proxy_connect_failed"),
+        (Stage::Connect, _) => ("connect failed", "connect_failed"),
+    }
+}
+
+/// Что обмен получает после отказа журнала: у прокси автоответчика нет.
+///
+/// Текст события — английский, для журнала и поиска (`session-format.md`); русский
+/// остаётся интерфейсу.
+fn after_failure(mode: Mode) -> &'static str {
+    if mode == Mode::Proxy {
+        "; no bytes are forwarded after the failure"
+    } else {
+        "; no ACKs are sent after the failure"
     }
 }
 
 /// Код ошибки источника с поправкой на её вид.
 ///
-/// У прокси отказ цели и её молчание — разные коды (M4-AC6): инженеру важно отличить
-/// «ЛИС не отвечает» от «ЛИС отказала в соединении».
+/// У прокси отказ цели, её молчание и петля на адрес прослушивания — разные коды
+/// (M4-AC6): инженеру важно отличить «ЛИС не отвечает» от «ЛИС отказала в соединении»
+/// и от ошибки настройки.
 fn source_failure_code(mode: Mode, code: &'static str, error: &io::Error) -> &'static str {
+    if is_proxy_target_is_self(error) {
+        return "proxy_target_is_self";
+    }
     match (mode, error.kind()) {
         (Mode::Proxy, io::ErrorKind::TimedOut) => "proxy_connect_timeout",
         _ => code,
@@ -928,7 +1003,6 @@ async fn run(
     let mut tasks: JoinSet<()> = JoinSet::new();
     let mut source_errors = SourceErrors::default();
     let sequential = source.sequential();
-    let (prefix, code) = source_failure(mode);
     let mut wait_before_next = false;
     loop {
         // Тестовый хук: сессия заканчивается сама. Обычной сборки здесь нет — хук
@@ -959,7 +1033,7 @@ async fn run(
         tokio::select! {
             next = source.next(), if !sequential || tasks.is_empty() => match next {
                 Next::Connected(connection) => {
-                    if let Some(note) = source_errors.recovered(prefix) {
+                    if let Some(note) = source_errors.recovered() {
                         shared.info(None, note);
                     }
                     let conn = shared.counters.next_conn();
@@ -974,6 +1048,7 @@ async fn run(
                         peer,
                         local,
                         link,
+                        reset,
                     } = connection;
                     shared.publish(Event::Open(Open {
                         t: now_rfc3339(),
@@ -996,6 +1071,7 @@ async fn run(
                             Some(link) => {
                                 serve_proxy(
                                     transport,
+                                    reset,
                                     link,
                                     conn,
                                     shared,
@@ -1018,13 +1094,18 @@ async fn run(
                         }
                     });
                 }
-                Next::Retry { error, after } => {
+                Next::Retry {
+                    error,
+                    after,
+                    stage,
+                } => {
                     // Неудачное подключение не роняет сессию (NFR-5, M3-AC1, M3-AC2,
                     // M4-AC6): одно `error`, повторы схлопываются, ожидание прерывается
                     // «Стопом».
+                    let (prefix, base_code) = source_failure(mode, stage);
                     let message = format!("{prefix}: {}", io_message(&error));
-                    let code = source_failure_code(mode, code, &error);
-                    match source_errors.failed(message) {
+                    let code = source_failure_code(mode, base_code, &error);
+                    match source_errors.failed(prefix, message) {
                         SourceReport::Repeated => {}
                         SourceReport::First(message) => {
                             shared.error_with_code(None, Some(code), message);
@@ -1100,7 +1181,7 @@ async fn run(
 
     // Серия ошибок источника, не закончившаяся к остановке: повторы не должны пропасть
     // из журнала только потому, что восстановления не было (NFR-5).
-    if let Some(note) = source_errors.stopped(prefix) {
+    if let Some(note) = source_errors.stopped() {
         shared.info(None, note);
     }
     // Комментарий, отправленный перед «Стоп», не теряется: очередь дочитывается
@@ -1255,17 +1336,22 @@ enum Pump {
 /// Обслуживает пару прокси до закрытия (FR-5, FR-6, FR-7, M4-AC16).
 ///
 /// Пара — одно соединение журнала с одним `conn`: `open` уже написан сессией. Внутри два
-/// насоса, по одному на направление: каждый читает в свой буфер [`READ_BUFFER`], пишет
-/// прочитанное в другой сокет и только потом кладёт `data` в журнал — с фактически
-/// переданными байтами. Журнал в пути пересылки не стоит: `record` только кладёт событие
-/// в канал писателя (NFR-6, FR-20).
+/// насоса, по одному на направление: каждый читает в свой буфер [`READ_BUFFER`], собирает
+/// событие `data` по времени чтения, пишет прочитанное в другой сокет и потом кладёт
+/// событие в журнал — с фактически переданными байтами. Журнал в пути пересылки не стоит:
+/// `record` только кладёт событие в канал писателя (NFR-6, FR-20).
 ///
 /// Закрытие по FR-7: первая закончившаяся сторона задаёт `by` и `reason` одного `close`.
 /// `FIN` пересылается полузакрытием, и обратное направление доживает до своего `FIN`, но
 /// не дольше [`PROXY_LINGER`]; истёк срок — пара закрывается как `bytetap/timeout`.
 /// Сброс закрывает обе стороны сразу, «Стоп» и отказ журнала — тоже.
+///
+/// Второй насос останавливается сигналом, а не `abort`: прерванная запись теряла бы
+/// отправленные байты, а они уже дошли до адресата. Насос после сигнала дописывает
+/// отправленное в журнал и возвращается сам.
 async fn serve_proxy(
     accepted: Box<dyn Transport>,
+    accepted_reset: Option<ResetSocket>,
     link: Link,
     conn: u32,
     shared: Arc<Shared>,
@@ -1274,8 +1360,16 @@ async fn serve_proxy(
 ) {
     // Принятая сторона — противоположная роли дальнего конца пары (FR-5).
     let accepted_role = link.role.opposite();
+    let Link {
+        transport,
+        role,
+        peer: _,
+        local: _,
+        reset: link_reset,
+    } = link;
+    let (hangup, hangup_rx) = watch::channel(false);
     let (accepted_read, accepted_write) = tokio::io::split(accepted);
-    let (link_read, link_write) = tokio::io::split(link.transport);
+    let (link_read, link_write) = tokio::io::split(transport);
 
     let mut pumps: JoinSet<Pump> = JoinSet::new();
     pumps.spawn(pump(
@@ -1284,76 +1378,153 @@ async fn serve_proxy(
         accepted_role,
         conn,
         Arc::clone(&shared),
-        stop.clone(),
-        failure.clone(),
+        PumpSignals {
+            stop: stop.clone(),
+            failure: failure.clone(),
+            hangup: hangup_rx.clone(),
+        },
     ));
     pumps.spawn(pump(
         link_read,
         accepted_write,
-        link.role,
+        role,
         conn,
         Arc::clone(&shared),
-        stop.clone(),
-        failure.clone(),
+        PumpSignals {
+            stop: stop.clone(),
+            failure: failure.clone(),
+            hangup: hangup_rx,
+        },
     ));
 
     let (mut by, mut reason, linger) = match pumps.join_next().await {
-        Some(Ok(outcome)) => match outcome {
-            Pump::Eof(role) => (role.closed_by(), "eof", PROXY_LINGER),
-            Pump::Broken {
-                role,
-                error,
-                writing,
-            } => {
-                let (by, reason) = proxy_broken(role, &error, writing);
-                let (code, what) = if writing {
-                    ("connection_write_failed", "proxy write failed")
-                } else {
-                    ("connection_read_failed", "proxy read failed")
-                };
-                shared.error_with_code(
-                    Some(conn),
-                    Some(code),
-                    format!("{what}: {}", io_message(&error)),
-                );
-                (by, reason, Duration::ZERO)
-            }
-            Pump::Stopped => (ClosedBy::Bytetap, "stop", Duration::ZERO),
-        },
+        Some(Ok(outcome)) => pair_end(&shared, conn, &outcome),
         // Насосов не осталось или задача упала: пары больше нет.
         None | Some(Err(_)) => (ClosedBy::Bytetap, "error", Duration::ZERO),
     };
 
-    if !linger.is_zero() {
+    if linger.is_zero() {
+        // Вторая сторона закрывается сразу: `FIN` уже не пересылать, `RST`, «Стоп» или
+        // отказ журнала.
+        let _ = hangup.send(true);
+        settle(&shared, conn, &mut pumps).await;
+    } else {
         // `FIN` одной стороны: обратное направление доживает до своего `FIN`;
         // истёк срок — закрывает bytetap, иначе зависшая сторона держала бы пару вечно.
-        if timeout(linger, pumps.join_next()).await.is_err() {
-            by = ClosedBy::Bytetap;
-            reason = "timeout";
+        match timeout(linger, pumps.join_next()).await {
+            Ok(Some(Ok(outcome))) => {
+                // Вторая сторона закончилась сама; её ошибка — тоже событие журнала,
+                // но `close` остаётся за первой (FR-7).
+                let _ = pair_end(&shared, conn, &outcome);
+            }
+            // Насосов не осталось или задача упала: закрывать уже нечего.
+            Ok(_) => {}
+            Err(_elapsed) => {
+                by = ClosedBy::Bytetap;
+                reason = "timeout";
+                let _ = hangup.send(true);
+                settle(&shared, conn, &mut pumps).await;
+            }
         }
     }
-    // Оставшийся насос прерывается вместе с сокетами: пара закрыта.
-    pumps.shutdown().await;
+
+    // Сброс: вторая сторона тоже получает `RST`, а не `FIN`. Зависший собеседник иначе
+    // ждал бы закрытия полуоткрытого соединения (FR-7). Ручек нет — стороны закроются
+    // обычным `FIN`.
+    if reason == "reset" {
+        if let Some(reset) = &accepted_reset {
+            reset.reset();
+        }
+        if let Some(reset) = &link_reset {
+            reset.reset();
+        }
+    }
+    // Половинки сокетов уже выгружены насосами: закрытие уходит с выставленным `SO_LINGER`.
+    drop(pumps);
+    drop(accepted_reset);
+    drop(link_reset);
     shared.close_conn(conn, by, reason);
+}
+
+/// Итог насоса: кто закрыл пару, с какой причиной и сколько доживает обратное направление.
+///
+/// Ошибку сокета функция пишет в журнал: она относится к паре, а не к решению о закрытии,
+/// поэтому `close` от этого не меняется (FR-7).
+fn pair_end(shared: &Shared, conn: u32, outcome: &Pump) -> (ClosedBy, &'static str, Duration) {
+    match outcome {
+        Pump::Eof(role) => (role.closed_by(), "eof", PROXY_LINGER),
+        Pump::Broken {
+            role,
+            error,
+            writing,
+        } => {
+            let (by, reason) = proxy_broken(*role, error, *writing);
+            let (code, what) = if *writing {
+                ("connection_write_failed", "proxy write failed")
+            } else {
+                ("connection_read_failed", "proxy read failed")
+            };
+            shared.error_with_code(
+                Some(conn),
+                Some(code),
+                format!("{what}: {}", io_message(error)),
+            );
+            (by, reason, Duration::ZERO)
+        }
+        Pump::Stopped => (ClosedBy::Bytetap, "stop", Duration::ZERO),
+    }
+}
+
+/// Дожидается второго насоса после сигнала: он вернётся сам, записав отправленное.
+///
+/// `abort` здесь не годится: прерванная посреди записи задача не успела бы записать
+/// в журнал байты, которые адресат получил (M4-AC10). Предел — тот же, что у остановки
+/// сессии; дольше ждать незачем, и тогда задачи прерываются.
+async fn settle(shared: &Shared, conn: u32, pumps: &mut JoinSet<Pump>) {
+    match timeout(CONNECTIONS_SHUTDOWN_TIMEOUT, pumps.join_next()).await {
+        Ok(Some(Ok(outcome))) => {
+            let _ = pair_end(shared, conn, &outcome);
+        }
+        Ok(_) => {}
+        Err(_elapsed) => pumps.shutdown().await,
+    }
+}
+
+/// Что слушает насос пары: остановку сессии, отказ журнала и закрытие пары.
+struct PumpSignals {
+    /// «Стоп» сессии.
+    stop: watch::Receiver<bool>,
+    /// Отказ журнала: пересылка прекращается.
+    failure: watch::Receiver<Option<JournalFailureReason>>,
+    /// Сигнал пары: вторая сторона закрыла или истёк срок дожития.
+    hangup: watch::Receiver<bool>,
 }
 
 /// Один насос пары: читает из `from` и пишет прочитанное в `to` (FR-6, NFR-6).
 ///
-/// Отправленный фрагмент пишется в журнал после записи в сокет и с фактически переданными
-/// байтами: в журнале ровно то, что получил адресат, включая обрыв на середине.
+/// Событие `data` собирается до записи в сокет, а публикуется после неё: так `mono_us`
+/// относится к моменту чтения, и по журналу видно порядок направлений (FR-22). В журнал
+/// попадают фактически отправленные байты, включая обрыв на середине: их адресат получил.
+///
+/// Запись в сокет идёт в `select!` с остановкой, отказом журнала и сигналом пары: адресат,
+/// переставший читать, не держит пару, а отмена записи не теряет отправленный кусок.
 async fn pump(
     mut from: tokio::io::ReadHalf<Box<dyn Transport>>,
     mut to: tokio::io::WriteHalf<Box<dyn Transport>>,
     role: LinkRole,
     conn: u32,
     shared: Arc<Shared>,
-    mut stop: watch::Receiver<bool>,
-    mut failure: watch::Receiver<Option<JournalFailureReason>>,
+    signals: PumpSignals,
 ) -> Pump {
+    let PumpSignals {
+        mut stop,
+        mut failure,
+        mut hangup,
+    } = signals;
     let mut buffer = vec![0u8; READ_BUFFER];
     loop {
-        // Отказ журнала останавливает пересылку: байты, которых нет в журнале, дальше
-        // не идут, иначе ЛИС получила бы обмен, которого в записи нет (M4-AC10).
+        // Отказ журнала останавливает пересылку: обмен, которого нет в записи, дальше
+        // не идёт (M4-AC10).
         if failure.borrow().is_some() {
             return Pump::Stopped;
         }
@@ -1361,6 +1532,7 @@ async fn pump(
             biased;
             () = wait_for_stop(&mut stop) => return Pump::Stopped,
             () = wait_for_failure(&mut failure) => return Pump::Stopped,
+            () = wait_for_hangup(&mut hangup) => return Pump::Stopped,
             read = from.read(&mut buffer) => read,
         };
         match read {
@@ -1371,19 +1543,34 @@ async fn pump(
             }
             Ok(len) => {
                 let payload = &buffer[..len];
+                let (t, mono_us) = (timestamp().0, shared.clock.now_us());
                 let sent = AtomicUsize::new(0);
-                let written = write_counted(&mut to, payload, &sent).await;
+                let write = write_counted(&mut to, payload, &sent);
+                tokio::pin!(write);
+                let outcome = tokio::select! {
+                    biased;
+                    () = wait_for_stop(&mut stop) => None,
+                    () = wait_for_failure(&mut failure) => None,
+                    () = wait_for_hangup(&mut hangup) => None,
+                    result = &mut write => Some(result),
+                };
                 let sent = sent.load(Ordering::Relaxed).min(payload.len());
-                record_forwarded(&shared, conn, role.dir(), &payload[..sent]);
-                if let Err(error) = written {
-                    return Pump::Broken {
-                        role,
-                        error,
-                        writing: true,
-                    };
+                shared.counters.add(role.dir(), sent as u64);
+                let forwarded = Data::new(t, mono_us, conn, role.dir(), false, &payload[..sent]);
+                if sent > 0 {
+                    shared.publish(Event::Data(forwarded));
                 }
-                if failure.borrow().is_some() {
-                    return Pump::Stopped;
+                match outcome {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => {
+                        return Pump::Broken {
+                            role,
+                            error,
+                            writing: true,
+                        };
+                    }
+                    // Запись прервана: отправленное записано, пересылка кончается.
+                    None => return Pump::Stopped,
                 }
             }
             Err(error) => {
@@ -1395,6 +1582,14 @@ async fn pump(
             }
         }
     }
+}
+
+/// Ждёт сигнала пары о закрытии (или выгрузки отправителя).
+async fn wait_for_hangup(hangup: &mut watch::Receiver<bool>) {
+    if *hangup.borrow_and_update() {
+        return;
+    }
+    let _ = hangup.changed().await;
 }
 
 /// Кто закрыл пару по ошибке сокета и почему.
@@ -1412,24 +1607,6 @@ fn proxy_broken(role: LinkRole, error: &io::Error, writing: bool) -> (ClosedBy, 
         }
         _ => (ClosedBy::Bytetap, "error"),
     }
-}
-
-/// Записывает фактически пересланный фрагмент: байты, статистику и событие `data`.
-///
-/// Пустой фрагмент не пишется: байтов, которых не было, в журнале быть не должно.
-fn record_forwarded(shared: &Shared, conn: u32, dir: Dir, payload: &[u8]) {
-    if payload.is_empty() {
-        return;
-    }
-    shared.counters.add(dir, payload.len() as u64);
-    shared.publish(Event::Data(Data::new(
-        timestamp().0,
-        shared.clock.now_us(),
-        conn,
-        dir,
-        false,
-        payload,
-    )));
 }
 
 /// Выполняет действия автоответчика по порядку: ответ — в сокет, затем в журнал.
@@ -1809,22 +1986,59 @@ mod tests {
     }
 
     #[test]
-    fn accepts_and_connections_are_named_by_mode() {
+    fn accepts_and_connections_are_named_by_stage() {
         assert_eq!(
-            source_failure(Mode::TcpServer),
+            source_failure(Mode::TcpServer, Stage::Accept),
             ("accept failed", "accept_failed")
         );
         assert_eq!(
-            source_failure(Mode::TcpClient),
+            source_failure(Mode::TcpClient, Stage::Connect),
             ("connect failed", "connect_failed")
         );
         assert_eq!(
-            source_failure(Mode::Serial),
+            source_failure(Mode::Serial, Stage::Open),
             ("serial port open failed", "serial_open_failed")
         );
         assert_eq!(
-            source_failure(Mode::Proxy),
+            source_failure(Mode::Proxy, Stage::Connect),
             ("connect failed", "proxy_connect_failed")
+        );
+        // Отказ `accept` у прокси — не недоступная цель (M4-AC6).
+        assert_eq!(
+            source_failure(Mode::Proxy, Stage::Accept),
+            ("accept failed", "accept_failed")
+        );
+    }
+
+    #[test]
+    fn a_pair_looping_on_itself_gets_its_own_code() {
+        let error = io::Error::new(
+            io::ErrorKind::InvalidInput,
+            crate::transport::ProxyTargetIsSelf {
+                addr: "127.0.0.1:50025".parse().unwrap(),
+            },
+        );
+        assert!(is_proxy_target_is_self(&error));
+        assert_eq!(
+            source_failure_code(Mode::Proxy, "proxy_connect_failed", &error),
+            "proxy_target_is_self"
+        );
+        assert_eq!(
+            source_failure_code(Mode::Proxy, "proxy_connect_failed", &io::Error::other("x")),
+            "proxy_connect_failed",
+            "чужая ошибка `InvalidInput` кода петли не получает"
+        );
+    }
+
+    #[test]
+    fn the_failure_text_of_a_proxy_does_not_promise_acks() {
+        assert_eq!(
+            after_failure(Mode::TcpServer),
+            "; no ACKs are sent after the failure"
+        );
+        assert_eq!(
+            after_failure(Mode::Proxy),
+            "; no bytes are forwarded after the failure"
         );
     }
 
@@ -1888,27 +2102,27 @@ mod tests {
     #[test]
     fn identical_source_errors_collapse_into_one_event_and_a_counter() {
         let mut errors = SourceErrors::default();
-        match errors.failed("accept failed: нет мест".to_owned()) {
+        match errors.failed("accept", "accept failed: нет мест".to_owned()) {
             SourceReport::First(message) => assert!(message.contains("нет мест"), "{message}"),
             other => panic!("первая ошибка должна попасть в журнал: {other:?}"),
         }
         assert!(
             matches!(
-                errors.failed("accept failed: нет мест".to_owned()),
+                errors.failed("accept", "accept failed: нет мест".to_owned()),
                 SourceReport::Repeated
             ),
             "повтор не пишется"
         );
         assert!(matches!(
-            errors.failed("accept failed: нет мест".to_owned()),
+            errors.failed("accept", "accept failed: нет мест".to_owned()),
             SourceReport::Repeated
         ));
         assert_eq!(
-            errors.recovered("accept").as_deref(),
+            errors.recovered().as_deref(),
             Some("accept recovered after 2 repeated failures: accept failed: нет мест")
         );
         assert_eq!(
-            errors.recovered("accept"),
+            errors.recovered(),
             None,
             "восстановление сообщается один раз"
         );
@@ -1917,30 +2131,30 @@ mod tests {
     #[test]
     fn a_series_unfinished_at_the_stop_is_reported_with_its_count() {
         let mut errors = SourceErrors::default();
-        let _ = errors.failed("accept failed: port taken".to_owned());
-        let _ = errors.failed("accept failed: port taken".to_owned());
+        let _ = errors.failed("accept", "accept failed: port taken".to_owned());
+        let _ = errors.failed("accept", "accept failed: port taken".to_owned());
 
         // Серия не восстановилась до остановки: счётчик повторов не теряется.
         assert_eq!(
-            errors.stopped("accept").as_deref(),
+            errors.stopped().as_deref(),
             Some(
                 "accept still failing after 1 repeated failures at the stop: accept failed: port taken"
             )
         );
-        assert_eq!(errors.stopped("accept"), None, "серия сообщается один раз");
+        assert_eq!(errors.stopped(), None, "серия сообщается один раз");
 
         // Одиночная ошибка уже в журнале: отчёт о нуле повторов не нужен.
         let mut single = SourceErrors::default();
-        let _ = single.failed("accept failed: port taken".to_owned());
-        assert_eq!(single.stopped("accept"), None);
+        let _ = single.failed("accept", "accept failed: port taken".to_owned());
+        assert_eq!(single.stopped(), None);
     }
 
     #[test]
     fn a_different_source_error_is_reported_with_the_previous_count() {
         let mut errors = SourceErrors::default();
-        let _ = errors.failed("first".to_owned());
-        let _ = errors.failed("first".to_owned());
-        match errors.failed("second".to_owned()) {
+        let _ = errors.failed("accept", "first".to_owned());
+        let _ = errors.failed("accept", "first".to_owned());
+        match errors.failed("connect", "second".to_owned()) {
             SourceReport::Changed {
                 previous,
                 repeats,
@@ -1952,11 +2166,7 @@ mod tests {
             }
             other => panic!("смена ошибки не сообщена: {other:?}"),
         }
-        assert_eq!(
-            errors.recovered("accept"),
-            None,
-            "у новой ошибки повторов не было"
-        );
+        assert_eq!(errors.recovered(), None, "у новой ошибки повторов не было");
     }
 
     #[test]
