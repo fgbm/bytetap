@@ -248,8 +248,13 @@ async fn a_rejected_peer_is_recovered_by_the_allowed_one() {
         assert_eq!(read, 0, "чужое соединение закрывается без байтов");
     }
 
-    // Разрешённый адрес приходит следом и сразу получает пару.
-    let mut stream = TcpStream::connect(listen).await.expect("анализатор пришёл");
+    // Разрешённый адрес приходит следом и сразу получает пару. Порт слушателя занят на
+    // всех адресах, а подключаться надо к конкретному: `0.0.0.0` как адрес цели годится
+    // не везде.
+    let allowed = SocketAddr::from(([127, 0, 0, 1], listen.port()));
+    let mut stream = TcpStream::connect(allowed)
+        .await
+        .expect("анализатор пришёл");
     stream
         .write_all(b"MSH|^~\\&|A|L|LIS|LAB|20261022101500||ORU^R01|1|P|2.3.1\r")
         .await
