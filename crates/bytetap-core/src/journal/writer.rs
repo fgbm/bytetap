@@ -38,6 +38,14 @@ use crate::journal::event::{Event, Mode, Note, Session};
 /// остаток канала забирается следующей пачкой, потому что канал не теряет порядок.
 pub const MAX_BATCH_BYTES: usize = 256 * 1024;
 
+/// Предел очереди писателя по байтам: сколько событий сессия позволяет копить.
+///
+/// Канал неограниченный (ADR 0001): без предела быстрая пересылка при медленном диске
+/// съела бы память целиком. 64 МиБ — это минуты отставания журнала на обычной скорости
+/// обмена и заведомо больше любой пачки; перейдя предел, писатель отказывает, и сессия
+/// останавливается как при сломанном диске, а не теряет события молча (NFR-5, M4-AC12).
+pub const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+
 /// Сколько имён пробует [`Journal::create`], если файл с таким именем уже есть: `-2`…`-99`.
 const MAX_NAME_ATTEMPTS: u32 = 99;
 
@@ -55,6 +63,26 @@ pub static TEST_SYNC_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 /// того, когда планировщик разбудил задачу-писателя.
 #[cfg(feature = "test-hooks")]
 pub static TEST_SYNC_DELAYS: AtomicU64 = AtomicU64::new(0);
+
+/// Тестовый хук: предел очереди писателя в байтах вместо [`MAX_PENDING_BYTES`].
+///
+/// `0` — хук выключен. Предел в 64 МиБ не проверить потоком за разумное время теста:
+/// хук позволяет взять предел, который поток переходит за одну секунду.
+#[cfg(feature = "test-hooks")]
+pub static TEST_MAX_PENDING_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Предел очереди писателя с поправкой на тестовый хук.
+#[must_use]
+pub fn max_pending_bytes() -> usize {
+    #[cfg(feature = "test-hooks")]
+    {
+        let bytes = TEST_MAX_PENDING_BYTES.load(Ordering::Relaxed);
+        if bytes > 0 {
+            return usize::try_from(bytes).unwrap_or(MAX_PENDING_BYTES);
+        }
+    }
+    MAX_PENDING_BYTES
+}
 
 /// Тестовый хук: после стольких событий писатель отказывает, как сломанный диск.
 ///
@@ -124,6 +152,7 @@ pub struct Journal {
     path: Arc<PathBuf>,
     failure: watch::Sender<Option<JournalFailureReason>>,
     pending: Arc<AtomicUsize>,
+    pending_bytes: Arc<AtomicUsize>,
     task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -167,15 +196,17 @@ impl Journal {
         let (tx, rx) = mpsc::unbounded_channel();
         let (failure, _) = watch::channel(None);
         let pending = Arc::new(AtomicUsize::new(0));
+        let pending_bytes = Arc::new(AtomicUsize::new(0));
         let task = Arc::new(Mutex::new(None));
         let journal = Self {
             tx,
             path: Arc::new(path),
             failure: failure.clone(),
             pending: Arc::clone(&pending),
+            pending_bytes: Arc::clone(&pending_bytes),
             task: Arc::clone(&task),
         };
-        let handle = tokio::spawn(run(rx, file, failure, pending));
+        let handle = tokio::spawn(run(rx, file, failure, pending, pending_bytes));
         if let Ok(mut slot) = task.lock() {
             *slot = Some(handle);
         } else {
@@ -193,13 +224,40 @@ impl Journal {
 
     /// Кладёт событие в канал писателя. Никогда не ждёт диск.
     ///
-    /// Возвращает `false`, если писатель уже остановлен: событие потеряно.
+    /// Возвращает `false`, если писатель уже остановлен: событие потеряно. После первого
+    /// отказа не принимается ни одно событие: журнал остаётся чистым префиксом записи,
+    /// и строки, которой нет в файле, не появляется позже (NFR-5, M4-AC12).
+    ///
+    /// Очередь ограничена по байтам ([`MAX_PENDING_BYTES`]): перейдя предел, запись
+    /// отказывает так же, как сломанный диск, — причины не ждут следующего события,
+    /// а причина отказа становится [`JournalFailureReason::code`] `journal_backlog`.
     pub fn record(&self, event: Event) -> bool {
-        // Счётчик растёт до отправки, иначе писатель успел бы вычесть событие, ещё не
+        // Отказ уже случился: писатель мог остановиться, а событие — встать в очередь
+        // перед ним. Такая строка попала бы в файл после отказа, и запись перестала бы
+        // быть префиксом того, что принято.
+        if self.failure.borrow().is_some() {
+            return false;
+        }
+        // Счётчики растут до отправки, иначе писатель успел бы вычесть событие, ещё не
         // посчитанное здесь; при отказе отправки рост откатывается.
+        let size = event.approx_bytes();
+        let queued = self.pending_bytes.fetch_add(size, Ordering::Relaxed) + size;
+        if queued > max_pending_bytes() {
+            self.pending_bytes.fetch_sub(size, Ordering::Relaxed);
+            remember_reason(
+                &self.failure,
+                JournalFailureReason::from_message(format!(
+                    "journal backlog: {queued} bytes are queued for the writer, the limit is {}",
+                    max_pending_bytes()
+                ))
+                .with_code("journal_backlog"),
+            );
+            return false;
+        }
         self.pending.fetch_add(1, Ordering::Relaxed);
         if self.tx.send(Command::Record(event)).is_err() {
             self.pending.fetch_sub(1, Ordering::Relaxed);
+            self.pending_bytes.fetch_sub(size, Ordering::Relaxed);
             return false;
         }
         true
@@ -209,6 +267,15 @@ impl Journal {
     #[must_use]
     pub fn pending(&self) -> usize {
         self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Сколько байт ждёт записи — очередь по объёму, а не по числу событий.
+    ///
+    /// Считается по оценке [`Event::approx_bytes`]: точная длина строки вышла бы только
+    /// сериализацией на пути пересылки (NFR-6).
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes.load(Ordering::Relaxed)
     }
 
     /// Причина отказа писателя, если он уже остановился после ошибки записи.
@@ -602,6 +669,8 @@ fn write_header(file: &File, session: &Session) -> io::Result<()> {
 struct Batch {
     bytes: Vec<u8>,
     events: usize,
+    /// Оценка байт по [`Event::approx_bytes`]: ровно то, что прибавил `record`.
+    estimated_bytes: usize,
     waiters: Vec<oneshot::Sender<io::Result<()>>>,
     stop: bool,
     error: Option<io::Error>,
@@ -611,6 +680,9 @@ impl Batch {
     fn push(&mut self, command: Command) {
         match command {
             Command::Record(event) => {
+                // Та же оценка, что прибавил `record`: счётчик очереди не должен
+                // разъезжаться с фактом, иначе предел срабатывал бы сам собой.
+                self.estimated_bytes += event.approx_bytes();
                 let start = self.bytes.len();
                 match serde_json::to_writer(&mut self.bytes, &event) {
                     Ok(()) => {
@@ -640,6 +712,7 @@ async fn run(
     file: File,
     failure: watch::Sender<Option<JournalFailureReason>>,
     pending: Arc<AtomicUsize>,
+    pending_bytes: Arc<AtomicUsize>,
 ) {
     let mut file = Some(file);
     loop {
@@ -691,6 +764,7 @@ async fn run(
             }
         }
         pending.fetch_sub(events, Ordering::Relaxed);
+        pending_bytes.fetch_sub(batch.estimated_bytes, Ordering::Relaxed);
 
         if fatal || batch.stop {
             // Файл отпускается до ответа ожидающим: `flock` снимается вместе с дескриптором,
@@ -728,11 +802,19 @@ async fn append(mut file: File, bytes: Vec<u8>) -> io::Result<File> {
 ///
 /// Первая причина остаётся: последующие отказы — следствие того же сбоя.
 fn remember(failure: &watch::Sender<Option<JournalFailureReason>>, err: &io::Error) {
+    remember_reason(failure, JournalFailureReason::from_error(err));
+}
+
+/// Запоминает уже построенную причину отказа: первая причина остаётся.
+fn remember_reason(
+    failure: &watch::Sender<Option<JournalFailureReason>>,
+    reason: JournalFailureReason,
+) {
     failure.send_if_modified(|current| {
         if current.is_some() {
             false
         } else {
-            *current = Some(JournalFailureReason::from_error(err));
+            *current = Some(reason.clone());
             true
         }
     });

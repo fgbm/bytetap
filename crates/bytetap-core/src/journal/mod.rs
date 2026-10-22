@@ -24,7 +24,7 @@ pub use recent::{MAX_RECENT_JOURNALS, RecentJournal, recent};
 pub use view::{Density, JournalCache, JournalIndex, JournalSummary, ViewError, ViewErrorKind};
 pub use writer::{
     Journal, LogDirWarningKind, append_note, default_log_dir, log_dir_warning,
-    log_dir_warning_kind, session_file_name,
+    log_dir_warning_kind, max_pending_bytes, session_file_name,
 };
 
 /// Текущее время по системным часам: RFC 3339 с микросекундами и смещением (FR-22).
@@ -80,6 +80,7 @@ pub struct JournalFailureReason {
     kind: io::ErrorKind,
     raw_os_error: Option<i32>,
     os: OsFamily,
+    code: Option<&'static str>,
 }
 
 impl JournalFailureReason {
@@ -91,6 +92,7 @@ impl JournalFailureReason {
             kind: err.kind(),
             raw_os_error: err.raw_os_error(),
             os: OsFamily::current(),
+            code: None,
         }
     }
 
@@ -102,6 +104,7 @@ impl JournalFailureReason {
             kind: io::ErrorKind::Other,
             raw_os_error: None,
             os: OsFamily::current(),
+            code: None,
         }
     }
 
@@ -116,7 +119,23 @@ impl JournalFailureReason {
             kind,
             raw_os_error,
             os,
+            code: None,
         }
+    }
+
+    /// Код причины в событии ленты (`journal_backlog` у переполненной очереди писателя).
+    ///
+    /// `None` — у причины своего кода нет: лента покажет общий `journal_failure`.
+    #[must_use]
+    pub const fn code(&self) -> Option<&'static str> {
+        self.code
+    }
+
+    /// Причина с кодом для ленты.
+    #[must_use]
+    pub const fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 
     /// Текст причины для журнала и подробностей баннера.

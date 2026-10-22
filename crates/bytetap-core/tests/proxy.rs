@@ -4,13 +4,17 @@
 //! «анализатор — сервер» (приходит ЛИС). Проверяется, что байты доходят без изменений
 //! в обе стороны, что направление `data` считается по роли стороны, что `open` несёт обе
 //! стороны пары, что закрытие и недоступная цель не ломают сессию.
+//!
+//! Набор закрытия — общий для обеих топологий: тест перебирает [`ROLES`] и закрывает
+//! пару то принятой стороной, то целью. Для теста важна роль, а не то, кто из двух
+//! слушает: механика у сторон одна, различаются только `by`, `dir` и адреса (M4-AC5).
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use bytetap_core::journal::{Autoresponder, ClosedBy, Dir, Event, LinkRole, Mode, read_all};
+use bytetap_core::journal::{Autoresponder, Close, ClosedBy, Dir, Event, LinkRole, Mode, read_all};
 use bytetap_core::session::{Session, SessionConfig, SessionHandle};
 use bytetap_core::transport::ProxyRole;
 use bytetap_testkit::astm::{AstmEmulator, record_frames};
@@ -19,7 +23,7 @@ use bytetap_testkit::fixtures_dir;
 use bytetap_testkit::lis::{LisBehaviour, LisEmulator, hl7_ack};
 use bytetap_testkit::server::AnalyzerServer;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 
 /// Пауза прокси после неудачного подключения к цели.
@@ -27,6 +31,9 @@ const RETRY: Duration = Duration::from_millis(100);
 
 /// Сколько тест ждёт события или обмена.
 const WAIT: Duration = Duration::from_secs(10);
+
+/// Обе топологии: набор закрытия проходит по обеим (M4-AC5, M4-AC16).
+const ROLES: [ProxyRole; 2] = [ProxyRole::AnalyzerClient, ProxyRole::AnalyzerServer];
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = fixtures_dir().join("hl7").join(name);
@@ -115,6 +122,79 @@ async fn wait_for_closes(path: &Path, expected: usize) {
         sleep(Duration::from_millis(10)).await;
     }
     panic!("{expected} событий close не появились в журнале");
+}
+
+/// Цель пары: слушает адрес, к которому подключается прокси.
+async fn target_listener() -> (TcpListener, SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("цель слушает");
+    let addr = listener.local_addr().expect("адрес цели");
+    (listener, addr)
+}
+
+/// Роль принятой стороны: она приходит на порт bytetap, то есть противоположна цели.
+fn accepted_role(role: ProxyRole) -> LinkRole {
+    role.target_role().opposite()
+}
+
+/// Пара целиком: принятая сторона пришла, прокси подключился к цели.
+///
+/// Возвращает оба конца пары. Тесту всё равно, анализатор это или ЛИС: он закрывает
+/// сторону по её роли.
+async fn pair(listener: &TcpListener, listen: SocketAddr) -> (TcpStream, TcpStream) {
+    let accepted = TcpStream::connect(listen).await.expect("принятая сторона");
+    let (target, _) = timeout(WAIT, listener.accept())
+        .await
+        .expect("прокси подключился к цели")
+        .expect("приём цели");
+    (accepted, target)
+}
+
+/// Ждёт событие `close` пары и возвращает его.
+async fn wait_for_the_close(path: &Path) -> Close {
+    for _ in 0..500 {
+        let outcome = read_all(path).expect("журнал читается");
+        let closes: Vec<Close> = outcome
+            .lines
+            .iter()
+            .filter_map(|line| match &line.event {
+                Event::Close(close) => Some(close.clone()),
+                _ => None,
+            })
+            .collect();
+        if let Some(close) = closes.first() {
+            assert_eq!(closes.len(), 1, "close один раз на пару");
+            return close.clone();
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("close пары не появился в журнале");
+}
+
+/// Дочитывает сокет до конца: после закрытия пары в буфере ещё есть переданное.
+///
+/// Сброс на закрытии — тоже конец: сторона уже увидела всё, что успело дойти.
+async fn drain(stream: &mut TcpStream) -> Vec<u8> {
+    let (rest, _) = drain_to_close(stream).await;
+    rest
+}
+
+/// То же, но говорит, пришёл ли сброс (`RST`) вместо `FIN`.
+async fn drain_to_close(stream: &mut TcpStream) -> (Vec<u8>, bool) {
+    let mut rest = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match timeout(WAIT, stream.read(&mut buffer)).await {
+            Ok(Ok(0)) => return (rest, false),
+            Ok(Ok(read)) => rest.extend_from_slice(&buffer[..read]),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                return (rest, true);
+            }
+            Ok(Err(error)) => panic!("чтение остатка: {error}"),
+            Err(_) => panic!("сторона не увидела закрытие пары"),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -464,208 +544,260 @@ async fn any_fragmentation_reaches_the_other_side_without_changes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_half_close_lets_the_other_direction_finish() {
-    let dir = tempfile::tempdir().expect("временная папка");
+async fn the_other_side_answers_after_the_half_close() {
+    // Протокол «запрос — ответ»: сторона полузакрывается после запроса, а вторая отвечает
+    // только после `FIN`. Пара обязана донести ответ до закрытия (FR-7, M4-В7).
     let request = fixture("analyzer_qry_q02.hl7");
     let answer = fixture("lis_ack_aa.hl7");
-    // ЛИС отвечает не сразу: хвост приходит уже после `FIN` анализатора (M4-В7).
-    let lis = LisEmulator::listen("127.0.0.1:0".parse().unwrap())
-        .await
-        .expect("ЛИС слушает")
-        .with_behaviour(LisBehaviour::Hl7Ack);
-    let lis_addr = lis.local_addr().expect("адрес ЛИС");
-    let lis_task = tokio::spawn(lis.run());
+    for role in ROLES {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let (listener, target_addr) = target_listener().await;
+        let handle = start(dir.path(), target_addr, role).await;
+        let listen = listen_addr(&handle);
+        let path = handle.journal_path().to_path_buf();
 
-    let handle = start(dir.path(), lis_addr, ProxyRole::AnalyzerClient).await;
-    let listen = listen_addr(&handle);
-    let path = handle.journal_path().to_path_buf();
+        let (mut accepted, mut target) = pair(&listener, listen).await;
+        accepted.write_all(&request).await.expect("запрос");
+        accepted.shutdown().await.expect("FIN принятой стороны");
 
-    let mut stream = TcpStream::connect(listen).await.expect("анализатор");
-    stream.write_all(&request).await.expect("запрос");
-    stream.shutdown().await.expect("FIN анализатора");
-    // ACK уходит после полузакрытия: прокси обязан донести его до анализатора.
-    let mut tail = Vec::new();
-    timeout(WAIT, stream.read_to_end(&mut tail))
-        .await
-        .expect("хвост дошёл")
-        .expect("чтение хвоста");
-    assert_eq!(tail, hl7_ack(), "обратное направление дожило до своего FIN");
-    assert_ne!(tail, answer, "ЛИС отвечает своим ACK, а не фикстурой");
+        let mut received = Vec::new();
+        timeout(WAIT, target.read_to_end(&mut received))
+            .await
+            .expect("{role}: FIN дошёл до цели")
+            .expect("чтение цели");
+        assert_eq!(received, request, "{role}: запрос дошёл целиком");
+        target.write_all(&answer).await.expect("ответ после EOF");
+        target.shutdown().await.expect("FIN цели");
 
-    let lis_report = timeout(WAIT, lis_task)
-        .await
-        .expect("ЛИС закончила")
-        .expect("задача ЛИС")
-        .expect("обмен ЛИС");
-    assert_eq!(lis_report.all_received(), request);
+        let tail = drain(&mut accepted).await;
+        assert_eq!(tail, answer, "{role}: ответ дошёл после полузакрытия");
 
-    wait_for_closes(&path, 1).await;
-    handle.stop().await.expect("остановка");
-    let outcome = read_all(&path).expect("журнал читается");
-    let close = outcome
-        .lines
-        .iter()
-        .find_map(|line| match &line.event {
-            Event::Close(close) => Some(close),
-            _ => None,
-        })
-        .expect("close пары");
-    assert_eq!(close.by, ClosedBy::Analyzer);
-    assert_eq!(close.reason, "eof");
-    assert_eq!(recorded_bytes(&path, 1, Dir::LisToAnalyzer), hl7_ack());
+        wait_for_closes(&path, 1).await;
+        handle.stop().await.expect("остановка");
+        assert_eq!(
+            recorded_bytes(&path, 1, accepted_role(role).dir()),
+            request,
+            "{role}: запрос записан по роли принятой стороны"
+        );
+        assert_eq!(
+            recorded_bytes(&path, 1, role.target_role().dir()),
+            answer,
+            "{role}: ответ записан по роли цели"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_reset_closes_both_sides_at_once() {
-    let dir = tempfile::tempdir().expect("временная папка");
-    // ЛИС ждёт и запоминает, что соединение закрылось.
-    let lis = LisEmulator::listen("127.0.0.1:0".parse().unwrap())
-        .await
-        .expect("ЛИС слушает")
-        .with_timeout(WAIT);
-    let lis_addr = lis.local_addr().expect("адрес ЛИС");
-    let lis_task = tokio::spawn(lis.run());
+async fn either_side_closing_is_recorded_as_that_side() {
+    // `close` один раз на пару, `by` — сторона, закрывшая первой (M4-AC5).
+    for role in ROLES {
+        for by_target in [false, true] {
+            let dir = tempfile::tempdir().expect("временная папка");
+            let (listener, target_addr) = target_listener().await;
+            let handle = start(dir.path(), target_addr, role).await;
+            let listen = listen_addr(&handle);
+            let path = handle.journal_path().to_path_buf();
+            let (mut accepted, mut target) = pair(&listener, listen).await;
 
-    let handle = start(dir.path(), lis_addr, ProxyRole::AnalyzerClient).await;
-    let listen = listen_addr(&handle);
-    let path = handle.journal_path().to_path_buf();
+            let closer_role = if by_target {
+                role.target_role()
+            } else {
+                accepted_role(role)
+            };
+            if by_target {
+                target.write_all(b"bye").await.expect("фрагмент");
+                target.shutdown().await.expect("FIN цели");
+                assert_eq!(
+                    drain(&mut accepted).await,
+                    b"bye",
+                    "{role}: фрагмент переслан до закрытия пары"
+                );
+                accepted.shutdown().await.expect("FIN второй стороны");
+            } else {
+                accepted.write_all(b"bye").await.expect("фрагмент");
+                accepted.shutdown().await.expect("FIN принятой стороны");
+                assert_eq!(
+                    drain(&mut target).await,
+                    b"bye",
+                    "{role}: фрагмент переслан до закрытия пары"
+                );
+                target.shutdown().await.expect("FIN второй стороны");
+            }
+            let close = wait_for_the_close(&path).await;
+            assert_eq!(close.by, closer_role.closed_by(), "{role}");
+            assert_eq!(close.reason, "eof", "{role}");
+            handle.stop().await.expect("остановка");
+        }
+    }
+}
 
-    let mut stream = TcpStream::connect(listen).await.expect("анализатор");
-    // Нулевой `SO_LINGER`: закрытие сокета отправляет RST, а не FIN. Предупреждение
-    // о блокировке в `Drop` относится к ненулевому сроку, здесь он нулевой.
-    #[allow(deprecated)]
-    stream
-        .set_linger(Some(Duration::ZERO))
-        .expect("нулевой linger");
-    stream.write_all(b"ORU").await.expect("фрагмент");
-    drop(stream); // RST: сброс, а не FIN
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_closes_the_pair_as_the_resetting_side() {
+    // `RST` закрывает обе стороны сразу, а `close` называет сторону, сбросившую соединение.
+    for role in ROLES {
+        for by_target in [false, true] {
+            let dir = tempfile::tempdir().expect("временная папка");
+            let (listener, target_addr) = target_listener().await;
+            let handle = start(dir.path(), target_addr, role).await;
+            let listen = listen_addr(&handle);
+            let path = handle.journal_path().to_path_buf();
+            let (mut accepted, mut target) = pair(&listener, listen).await;
 
-    timeout(WAIT, lis_task)
-        .await
-        .expect("ЛИС увидела закрытие")
-        .expect("задача ЛИС")
-        .expect("сброс не ошибка ЛИС");
-    wait_for_closes(&path, 1).await;
-    handle.stop().await.expect("остановка");
+            let closer_role = if by_target {
+                role.target_role()
+            } else {
+                accepted_role(role)
+            };
+            // Нулевой `SO_LINGER`: закрытие уходит сбросом, а не `FIN`.
+            let reset_second = if by_target {
+                target.write_all(b"ORU").await.expect("фрагмент");
+                target.set_zero_linger().expect("нулевой linger");
+                drop(target);
+                drain_to_close(&mut accepted).await.1
+            } else {
+                accepted.write_all(b"ORU").await.expect("фрагмент");
+                accepted.set_zero_linger().expect("нулевой linger");
+                drop(accepted);
+                drain_to_close(&mut target).await.1
+            };
+            // Вторая сторона закрыта сбросом, а не `FIN`: сброс одной стороны пары
+            // пересылается второй (M4-AC5).
+            assert!(reset_second, "{role}: вторая сторона закрыта сбросом");
 
-    let outcome = read_all(&path).expect("журнал читается");
-    let close = outcome
-        .lines
-        .iter()
-        .find_map(|line| match &line.event {
-            Event::Close(close) => Some(close),
-            _ => None,
-        })
-        .expect("close пары");
-    assert_eq!(close.by, ClosedBy::Analyzer, "сбросил анализатор");
-    assert_eq!(close.reason, "reset");
-    // Пара закрыта: сессия продолжает слушать.
-    assert!(matches!(
-        outcome.lines.last().expect("последняя строка").event,
-        Event::SessionEnd(_)
-    ));
+            let close = wait_for_the_close(&path).await;
+            assert_eq!(close.by, closer_role.closed_by(), "{role}");
+            assert_eq!(close.reason, "reset", "{role}");
+            handle.stop().await.expect("остановка");
+            let outcome = read_all(&path).expect("журнал читается");
+            assert!(
+                matches!(
+                    outcome.lines.last().expect("последняя строка").event,
+                    Event::SessionEnd(_)
+                ),
+                "{role}: сессия закрылась штатно"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreachable_target_is_an_error_and_the_session_keeps_listening() {
-    let dir = tempfile::tempdir().expect("временная папка");
-    // Порт цели занят сокетом без `listen`: подключение откажет. Сокет держится, пока
-    // проверяется серия ошибок, и освобождается перед удачным соединением.
-    let reserved = tokio::net::TcpSocket::new_v4().expect("сокет");
-    reserved
-        .bind("127.0.0.1:0".parse().unwrap())
-        .expect("свободный порт");
-    let target = reserved.local_addr().expect("адрес цели");
+    for role in ROLES {
+        let dir = tempfile::tempdir().expect("временная папка");
+        // Порт цели занят сокетом без `listen`: подключение откажет. Сокет держится, пока
+        // проверяется серия ошибок, и освобождается перед удачным соединением.
+        let reserved = tokio::net::TcpSocket::new_v4().expect("сокет");
+        reserved
+            .bind("127.0.0.1:0".parse().unwrap())
+            .expect("свободный порт");
+        let target = reserved.local_addr().expect("адрес цели");
 
-    let (handle, mut feed) = Session::start_with_feed(
-        SessionConfig::proxy(
-            "127.0.0.1:0".parse().unwrap(),
-            target.to_string(),
-            ProxyRole::AnalyzerClient,
-            RETRY,
+        let (handle, mut feed) = Session::start_with_feed(
+            SessionConfig::proxy(
+                "127.0.0.1:0".parse().unwrap(),
+                target.to_string(),
+                role,
+                RETRY,
+            )
+            .with_log_dir(dir.path()),
         )
-        .with_log_dir(dir.path()),
-    )
-    .await
-    .expect("старт без доступной цели");
-    let listen = listen_addr(&handle);
-    let path = handle.journal_path().to_path_buf();
+        .await
+        .expect("старт без доступной цели");
+        let listen = listen_addr(&handle);
+        let path = handle.journal_path().to_path_buf();
 
-    // Три неудачных соединения подряд: ошибка схлопывается, `open` не пишется.
-    for _ in 0..3 {
-        let mut stream = TcpStream::connect(listen).await.expect("анализатор");
-        let mut buffer = [0u8; 8];
-        let read = timeout(WAIT, stream.read(&mut buffer))
-            .await
-            .expect("входящее закрылось")
-            .expect("чтение");
-        assert_eq!(read, 0, "без цели входящее соединение закрывается без open");
-    }
-    let error = timeout(WAIT, async {
-        loop {
-            let event = feed.recv().await.expect("лента жива");
-            if let Event::Error(error) = event.as_ref() {
-                break error.clone();
-            }
+        // Три неудачных соединения подряд: ошибка схлопывается, `open` не пишется.
+        for _ in 0..3 {
+            let mut stream = TcpStream::connect(listen).await.expect("сторона пришла");
+            let mut buffer = [0u8; 8];
+            let read = timeout(WAIT, stream.read(&mut buffer))
+                .await
+                .expect("входящее закрылось")
+                .expect("чтение");
+            assert_eq!(
+                read, 0,
+                "{role}: без цели входящее соединение закрывается без open"
+            );
         }
-    })
-    .await
-    .expect("ошибка подключения пришла");
-    assert_eq!(
-        error.code.as_deref(),
-        Some("proxy_connect_failed"),
-        "{error:?}"
-    );
-
-    // Цель появляется: следующее соединение проходит, повторы схлопнуты.
-    drop(reserved);
-    let lis = LisEmulator::listen(target)
-        .await
-        .expect("ЛИС заняла порт цели");
-    let lis_task = tokio::spawn(lis.run());
-    let message = fixture("analyzer_oru_r01.hl7");
-    let answer = exchange(listen, &message, Fragmentation::Whole).await;
-    assert_eq!(answer, message, "обмен через прокси прошёл");
-    timeout(WAIT, lis_task)
-        .await
-        .expect("ЛИС закончила")
-        .expect("задача ЛИС")
-        .expect("обмен ЛИС");
-
-    wait_for_closes(&path, 1).await;
-    handle.stop().await.expect("остановка");
-    let outcome = read_all(&path).expect("журнал читается");
-    let errors: Vec<_> = outcome
-        .lines
-        .iter()
-        .filter_map(|line| match &line.event {
-            Event::Error(error) => Some(error),
-            _ => None,
+        let error = timeout(WAIT, async {
+            loop {
+                let event = feed.recv().await.expect("лента жива");
+                if let Event::Error(error) = event.as_ref() {
+                    break error.clone();
+                }
+            }
         })
-        .collect();
-    assert_eq!(errors.len(), 1, "серия ошибок схлопнута: {errors:?}");
-    assert_eq!(errors[0].code.as_deref(), Some("proxy_connect_failed"));
-    assert!(errors[0].conn.is_none(), "ошибка уровня сессии");
-    let infos: Vec<_> = outcome
-        .lines
-        .iter()
-        .filter_map(|line| match &line.event {
-            Event::Info(info) => Some(info.message.clone()),
-            _ => None,
+        .await
+        .expect("{role}: ошибка подключения пришла");
+        assert_eq!(
+            error.code.as_deref(),
+            Some("proxy_connect_failed"),
+            "{role}: {error:?}"
+        );
+
+        // Цель появляется: следующее соединение проходит, повторы схлопнуты. Порт мог
+        // занять соседний тест между освобождением и занятием, поэтому занимаем его
+        // с повтором: флак чужого `bind` не должен ронять проверку прокси.
+        drop(reserved);
+        let lis = timeout(WAIT, async {
+            loop {
+                if let Ok(lis) = LisEmulator::listen(target).await {
+                    break lis;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
         })
-        .collect();
-    assert!(
-        infos
+        .await
+        .expect("{role}: порт цели не освободился");
+        let lis_task = tokio::spawn(lis.run());
+        let message = fixture("analyzer_oru_r01.hl7");
+        let answer = exchange(listen, &message, Fragmentation::Whole).await;
+        assert_eq!(answer, message, "{role}: обмен через прокси прошёл");
+        timeout(WAIT, lis_task)
+            .await
+            .expect("цель закончила")
+            .expect("задача цели")
+            .expect("обмен цели");
+
+        wait_for_closes(&path, 1).await;
+        handle.stop().await.expect("остановка");
+        let outcome = read_all(&path).expect("журнал читается");
+        let errors: Vec<_> = outcome
+            .lines
             .iter()
-            .any(|info| info.contains("recovered after 2 repeated failures")),
-        "восстановление сообщено: {infos:?}"
-    );
-    let opens = outcome
-        .lines
-        .iter()
-        .filter(|line| matches!(line.event, Event::Open(_)))
-        .count();
-    assert_eq!(opens, 1, "open только у удачной пары");
+            .filter_map(|line| match &line.event {
+                Event::Error(error) => Some(error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "{role}: серия ошибок схлопнута: {errors:?}"
+        );
+        assert_eq!(errors[0].code.as_deref(), Some("proxy_connect_failed"));
+        assert!(errors[0].conn.is_none(), "ошибка уровня сессии");
+        let infos: Vec<_> = outcome
+            .lines
+            .iter()
+            .filter_map(|line| match &line.event {
+                Event::Info(info) => Some(info.message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            infos
+                .iter()
+                .any(|info| info.contains("recovered after 2 repeated failures")),
+            "{role}: восстановление сообщено: {infos:?}"
+        );
+        let opens = outcome
+            .lines
+            .iter()
+            .filter(|line| matches!(line.event, Event::Open(_)))
+            .count();
+        assert_eq!(opens, 1, "{role}: open только у удачной пары");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -727,62 +859,175 @@ async fn two_pairs_run_in_parallel_with_their_own_numbers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_stop_closes_the_pair_as_bytetap() {
-    let dir = tempfile::tempdir().expect("временная папка");
-    let lis = LisEmulator::listen("127.0.0.1:0".parse().unwrap())
-        .await
-        .expect("ЛИС слушает")
-        .with_timeout(WAIT);
-    let lis_addr = lis.local_addr().expect("адрес ЛИС");
-    let lis_task = tokio::spawn(lis.run());
-    let handle = start(dir.path(), lis_addr, ProxyRole::AnalyzerClient).await;
-    let listen = listen_addr(&handle);
-    let path = handle.journal_path().to_path_buf();
+    for role in ROLES {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let (listener, target_addr) = target_listener().await;
+        let handle = start(dir.path(), target_addr, role).await;
+        let listen = listen_addr(&handle);
+        let path = handle.journal_path().to_path_buf();
+        let (mut accepted, mut target) = pair(&listener, listen).await;
 
-    let mut stream = TcpStream::connect(listen).await.expect("анализатор");
-    stream.write_all(b"ORU").await.expect("фрагмент");
-    // Даём прокси открыть пару и переслать фрагмент, затем останавливаем сессию:
-    // «Стоп» закрывает пару, не дожидаясь второй стороны (FR-7).
-    let mut forwarded = false;
-    for _ in 0..200 {
+        accepted.write_all(b"ORU").await.expect("фрагмент");
+        // Даём прокси переслать фрагмент, затем останавливаем сессию: «Стоп» закрывает
+        // пару, не дожидаясь второй стороны (FR-7).
+        let mut buffer = [0u8; 8];
+        timeout(WAIT, target.read(&mut buffer))
+            .await
+            .expect("{role}: фрагмент дошёл до цели")
+            .expect("чтение цели");
+
+        let stats = handle.stop().await.expect("остановка");
+        assert_eq!(stats.connections, 1, "{role}");
+        let _ = drain(&mut target).await;
+
+        let close = wait_for_the_close(&path).await;
+        assert_eq!(close.by, ClosedBy::Bytetap, "{role}");
+        assert_eq!(close.reason, "stop", "{role}");
         let outcome = read_all(&path).expect("журнал читается");
-        let opened = outcome
-            .lines
-            .iter()
-            .any(|line| matches!(line.event, Event::Open(_)));
-        forwarded = outcome
-            .lines
-            .iter()
-            .any(|line| matches!(&line.event, Event::Data(data) if data.dir == Dir::AnalyzerToLis));
-        if opened && forwarded {
-            break;
-        }
-        sleep(Duration::from_millis(10)).await;
+        assert!(
+            matches!(
+                outcome.lines.last().expect("последняя строка").event,
+                Event::SessionEnd(_)
+            ),
+            "{role}: итоги сессии записаны"
+        );
+        assert_eq!(
+            recorded_bytes(&path, 1, accepted_role(role).dir()),
+            b"ORU",
+            "{role}: фрагмент записан"
+        );
+        drop(accepted);
     }
-    assert!(forwarded, "фрагмент дошёл до журнала до остановки");
+}
 
-    let stats = handle.stop().await.expect("остановка");
-    assert_eq!(stats.connections, 1);
-    timeout(WAIT, lis_task)
-        .await
-        .expect("ЛИС увидела закрытие")
-        .expect("задача ЛИС")
-        .expect("сессия закрыла пару");
+/// Сторона, которая не читает, не отнимает у журнала отправленное: на «Стоп» в журнале
+/// ровно те байты, которые получил адресат (M4-AC10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_pair_records_exactly_the_bytes_the_target_received() {
+    // Поток заведомо больше буферов сокетов (на loopback это единицы мегабайт):
+    // запись в цель, которая не читает, обязательно оборвётся на середине.
+    let payload = vec![b'A'; 16 * 1024 * 1024];
+    for role in ROLES {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let (listener, target_addr) = target_listener().await;
+        let handle = start(dir.path(), target_addr, role).await;
+        let listen = listen_addr(&handle);
+        let path = handle.journal_path().to_path_buf();
+        let (mut accepted, mut target) = pair(&listener, listen).await;
 
-    let outcome = read_all(&path).expect("журнал читается");
-    let close = outcome
-        .lines
-        .iter()
-        .find_map(|line| match &line.event {
-            Event::Close(close) => Some(close),
-            _ => None,
-        })
-        .expect("close пары");
-    assert_eq!(close.by, ClosedBy::Bytetap);
-    assert_eq!(close.reason, "stop");
-    assert!(matches!(
-        outcome.lines.last().expect("последняя строка").event,
-        Event::SessionEnd(_)
-    ));
-    assert_eq!(recorded_bytes(&path, 1, Dir::AnalyzerToLis), b"ORU");
-    drop(stream);
+        // Цель не читает: насос упирается в её буфер, и запись обрывается на середине.
+        let sent = payload.clone();
+        let writer = tokio::spawn(async move {
+            let _ = accepted.write_all(&sent).await;
+            let _ = accepted.shutdown().await;
+        });
+        sleep(Duration::from_millis(300)).await;
+        handle.stop().await.expect("остановка");
+        let _ = writer.await;
+
+        let received = drain(&mut target).await;
+        let recorded = recorded_bytes(&path, 1, accepted_role(role).dir());
+        assert_eq!(
+            received, recorded,
+            "{role}: журнал записал ровно то, что получила цель"
+        );
+        assert!(
+            received.len() < payload.len(),
+            "{role}: запись оборвана на середине ({} из {})",
+            received.len(),
+            payload.len()
+        );
+    }
+}
+
+/// `FIN` одной стороны, а вторая молчит: по истечении `PROXY_LINGER` пару закрывает
+/// bytetap, иначе зависшая сторона держала бы её вечно (M4-AC5, M4-В7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_linger_expiry_closes_the_pair_as_bytetap_timeout() {
+    for role in ROLES {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let (listener, target_addr) = target_listener().await;
+        let handle = start(dir.path(), target_addr, role).await;
+        let listen = listen_addr(&handle);
+        let path = handle.journal_path().to_path_buf();
+        let (mut accepted, mut target) = pair(&listener, listen).await;
+
+        accepted.write_all(b"ORU").await.expect("фрагмент");
+        accepted.shutdown().await.expect("FIN принятой стороны");
+        // Цель читает до конца и молчит: соединение не закрывает.
+        let mut buffer = [0u8; 64];
+        let mut received = 0;
+        while let Ok(read) = target.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+            received += read;
+        }
+        assert_eq!(received, 3, "{role}: фрагмент дошёл до цели");
+
+        let started = Instant::now();
+        let close = wait_for_the_close(&path).await;
+        let waited = started.elapsed();
+        assert_eq!(close.by, ClosedBy::Bytetap, "{role}");
+        assert_eq!(close.reason, "timeout", "{role}");
+        assert!(
+            waited >= Duration::from_secs(4),
+            "{role}: пара доживала обратное направление {waited:?}"
+        );
+        handle.stop().await.expect("остановка");
+    }
+}
+
+/// Сброс второго направления во время `PROXY_LINGER` — ошибка пары, но `close` остаётся
+/// за стороной, закрывшей первой (M4-AC5, M4-AC16).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_during_the_linger_is_an_error_and_keeps_the_first_close() {
+    for role in ROLES {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let (listener, target_addr) = target_listener().await;
+        let handle = start(dir.path(), target_addr, role).await;
+        let listen = listen_addr(&handle);
+        let path = handle.journal_path().to_path_buf();
+        let (mut accepted, mut target) = pair(&listener, listen).await;
+
+        accepted.write_all(b"ORU").await.expect("фрагмент");
+        accepted.shutdown().await.expect("FIN принятой стороны");
+        let mut buffer = [0u8; 8];
+        timeout(WAIT, target.read(&mut buffer))
+            .await
+            .expect("{role}: фрагмент дошёл до цели")
+            .expect("чтение цели");
+        target.write_all(b"ACK").await.expect("ответ");
+        // Ответ дочитан прокси, и цель сбрасывает соединение, пока пара доживает
+        // обратное направление.
+        sleep(Duration::from_millis(50)).await;
+        target.set_zero_linger().expect("нулевой linger");
+        drop(target);
+
+        let close = wait_for_the_close(&path).await;
+        assert_eq!(close.by, accepted_role(role).closed_by(), "{role}");
+        assert_eq!(close.reason, "eof", "{role}");
+        let outcome = read_all(&path).expect("журнал читается");
+        let error = outcome
+            .lines
+            .iter()
+            .find_map(|line| match &line.event {
+                Event::Error(error) => Some(error),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{role}: ошибка второго направления не записана"));
+        assert_eq!(error.conn, Some(1), "{role}: ошибка относится к паре");
+        assert_eq!(
+            error.code.as_deref(),
+            Some("connection_read_failed"),
+            "{role}: {error:?}"
+        );
+        // Сброс второй стороны во время дожития уходит и первой стороне сбросом, а не
+        // полуоткрытым `FIN`: собеседник пары уже не ждёт ответа (FR-7).
+        assert!(
+            drain_to_close(&mut accepted).await.1,
+            "{role}: принятая сторона увидела сброс"
+        );
+        handle.stop().await.expect("остановка");
+    }
 }

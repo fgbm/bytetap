@@ -14,6 +14,9 @@ os_info.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serialport.workspace = true
+# Второй дескриптор сокета пары: `SO_LINGER 0` на закрытии сбросом (FR-7). Пакет уже
+# в графе через tokio, а нужен только `SockRef` и `set_linger` без реактора.
+socket2 = "0.6"
 tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]

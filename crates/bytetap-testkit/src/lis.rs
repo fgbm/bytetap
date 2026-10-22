@@ -9,7 +9,11 @@
 //!   в обе стороны без разбора протокола;
 //! - [`LisBehaviour::Hl7Ack`] подтверждает каждое сообщение MLLP готовым ACK;
 //! - [`LisBehaviour::AstmAck`] подтверждает `ENQ` и каждый кадр E1381 и завершает передачу
-//!   по `EOT`.
+//!   по `EOT`;
+//! - [`LisBehaviour::EchoAfterEof`] отвечает всем принятым только после `FIN` собеседника:
+//!   так проверяется полузакрытие, где ЛИС отвечает после конца запроса (FR-7);
+//! - [`LisBehaviour::HoldAfterEof`] после `FIN` молчит и держит соединение открытым: так
+//!   проверяется срок `PROXY_LINGER`, по которому пару закрывает bytetap.
 //!
 //! Ответы режутся на записи так же, как у эмулятора анализатора ([`Fragmentation`]).
 //! Данные — только синтетические (`ANALYZER`, `LIS`, `PATIENT^TEST`).
@@ -47,6 +51,10 @@ pub enum LisBehaviour {
     Hl7Ack,
     /// Подтверждать `ENQ` и каждый кадр ASTM E1381, конец — по `EOT`.
     AstmAck,
+    /// Молчать до `FIN` собеседника, затем вернуть всё принятое и закрыть соединение.
+    EchoAfterEof,
+    /// Молчать до `FIN` собеседника и держать соединение открытым до таймаута.
+    HoldAfterEof,
 }
 
 /// Кто подключается: ЛИС ждёт прокси или сама идёт на порт bytetap.
@@ -194,12 +202,16 @@ impl LisEmulator {
         let mut in_frame = false;
         let mut answers = 0;
         let mut buffer = [0u8; 4096];
+        let mut eof = false;
         loop {
             let read = timeout(self.timeout, stream.read(&mut buffer))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ЛИС не дождалась данных"))?;
             let read = match read {
-                Ok(0) => break,
+                Ok(0) => {
+                    eof = true;
+                    break;
+                }
                 Ok(read) => read,
                 // Сброс соединения — тоже конец обмена.
                 Err(error) if error.kind() == io::ErrorKind::ConnectionReset => break,
@@ -237,6 +249,19 @@ impl LisEmulator {
                         }
                     }
                 }
+                // Ответ после `FIN` собеседника: до конца запроса эмулятор молчит.
+                LisBehaviour::EchoAfterEof | LisBehaviour::HoldAfterEof => {}
+            }
+        }
+        if eof {
+            match self.behaviour {
+                LisBehaviour::EchoAfterEof => {
+                    self.send(stream, &received).await?;
+                    answers += 1;
+                }
+                // Соединение не закрывается: bytetap закрывает пару по своему сроку.
+                LisBehaviour::HoldAfterEof => tokio::time::sleep(self.timeout).await,
+                LisBehaviour::Echo | LisBehaviour::Hl7Ack | LisBehaviour::AstmAck => {}
             }
         }
         Ok((received, answers))
@@ -311,6 +336,62 @@ mod tests {
         let report = server.await.unwrap().unwrap();
         assert_eq!(report.answers, 1);
         assert_eq!(report.all_received(), framed);
+    }
+
+    #[tokio::test]
+    async fn echo_after_eof_answers_only_at_the_end() {
+        let lis = LisEmulator::listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap()
+            .with_behaviour(LisBehaviour::EchoAfterEof);
+        let addr = lis.local_addr().unwrap();
+        let server = tokio::spawn(lis.run());
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"request").await.unwrap();
+        let mut early = [0u8; 1];
+        assert!(
+            timeout(Duration::from_millis(200), stream.read(&mut early))
+                .await
+                .is_err(),
+            "до `FIN` эмулятор молчит"
+        );
+        stream.shutdown().await.unwrap();
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer).await.unwrap();
+        assert_eq!(answer, b"request", "ответ пришёл после `FIN`");
+        drop(stream);
+
+        let report = server.await.unwrap().unwrap();
+        assert_eq!(report.answers, 1);
+        assert_eq!(report.all_received(), b"request");
+    }
+
+    #[tokio::test]
+    async fn hold_after_eof_keeps_the_connection_open() {
+        let hold = Duration::from_millis(300);
+        let lis = LisEmulator::listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap()
+            .with_behaviour(LisBehaviour::HoldAfterEof)
+            .with_timeout(hold);
+        let addr = lis.local_addr().unwrap();
+        let server = tokio::spawn(lis.run());
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"request").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let started = std::time::Instant::now();
+        let mut buffer = [0u8; 8];
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert_eq!(read, 0, "конец соединения");
+        assert!(
+            started.elapsed() >= hold / 2,
+            "соединение держалось открытым {:?}",
+            started.elapsed()
+        );
+        drop(stream);
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
