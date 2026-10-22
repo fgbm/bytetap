@@ -127,6 +127,15 @@ async fn a_backlog_beyond_the_limit_is_a_journal_failure() {
         "session_end",
         "без журнала итогов сессии нет"
     );
+    // После отказа писатель не принимает ни одного события: файл — чистый префикс записи,
+    // и `close`, который сессия пишет при остановке, в него уже не попадает.
+    assert!(
+        !outcome
+            .lines
+            .iter()
+            .any(|line| matches!(line.event, Event::Close(_))),
+        "после journal_backlog журнал не дописывает close"
+    );
     assert!(
         outcome
             .lines

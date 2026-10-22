@@ -65,6 +65,25 @@ async fn a_journal_failure_stops_the_forwarding() {
             .expect("первый обмен");
         assert_eq!(&echo, b"ORU0001");
 
+        // Журнал асинхронный: `open` и `data` первого обмена могут ещё лежать в очереди
+        // писателя, а хук ломает ту пачку, в которую они попадут. Ждём, пока `open`
+        // окажется в файле, иначе проверка ниже увидела бы отказ раньше записи.
+        timeout(WAIT, async {
+            loop {
+                let outcome = bytetap_core::journal::read_all(&path).expect("журнал читается");
+                if outcome
+                    .lines
+                    .iter()
+                    .any(|line| matches!(line.event, Event::Open(_)))
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{role}: open первого обмена не дошёл до файла"));
+
         // Отказ на ближайшей пачке: `open` и оба `data` первого обмена уже записаны.
         TEST_FAIL_AFTER_EVENTS.store(test_events_in_batches() + 1, Ordering::Relaxed);
 
