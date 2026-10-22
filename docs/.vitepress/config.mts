@@ -76,6 +76,7 @@ export default defineConfig({
                 },
               ],
             },
+            { text: "Бэклог", link: "/dev/backlog" },
             { text: "Архитектура", link: "/dev/architecture" },
             { text: "Дизайн-система", link: "/dev/design" },
             { text: "Тестирование", link: "/dev/testing" },
