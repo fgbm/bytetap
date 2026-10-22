@@ -45,7 +45,11 @@ const MONO_MEDIUM: &str = "plex-mono-medium";
 /// Шрифты IBM Plex (OFL) встроены в exe. egui не знает весов шрифта: каждый вес —
 /// отдельное семейство.
 pub fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
+    // Шрифты egui (`default_fonts`: Ubuntu-Light, Hack, значки egui) не нужны: Plex
+    // покрывает весь набор интерфейса (кириллица, стрелки, `‹CR›`, `…`), а иконки —
+    // Lucide через resvg. Фича `default_fonts` у eframe отключена, поэтому набор
+    // начинается с пустого, а не с четырёх лишних мегабайт в exe (NFR-7).
+    let mut fonts = FontDefinitions::empty();
     let faces: [(&str, &'static [u8]); 5] = [
         (
             "plex-sans",
@@ -73,29 +77,27 @@ pub fn install_fonts(ctx: &egui::Context) {
             .font_data
             .insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
     }
-    // Встроенные шрифты egui остаются запасными: в них есть глифы, которых нет в Plex.
-    let fallback_sans = fonts.families[&FontFamily::Proportional].clone();
-    let fallback_mono = fonts.families[&FontFamily::Monospace].clone();
+    // Запасного набора нет: в семействах только Plex. Веса — отдельные семейства,
+    // начертание заголовков и чисел берётся из них, а не из «толщины» egui.
     let family = |first: &str, rest: &[String]| {
         let mut list = vec![first.to_owned()];
         list.extend(rest.iter().cloned());
         list
     };
-    fonts.families.insert(
-        FontFamily::Proportional,
-        family("plex-sans", &fallback_sans),
-    );
     fonts
         .families
-        .insert(FontFamily::Monospace, family("plex-mono", &fallback_mono));
+        .insert(FontFamily::Proportional, family("plex-sans", &[]));
+    fonts
+        .families
+        .insert(FontFamily::Monospace, family("plex-mono", &[]));
     for name in [SANS_MEDIUM, SANS_SEMIBOLD] {
         fonts
             .families
-            .insert(FontFamily::Name(name.into()), family(name, &fallback_sans));
+            .insert(FontFamily::Name(name.into()), family(name, &[]));
     }
     fonts.families.insert(
         FontFamily::Name(MONO_MEDIUM.into()),
-        family(MONO_MEDIUM, &fallback_mono),
+        family(MONO_MEDIUM, &[]),
     );
     ctx.set_fonts(fonts);
 }
