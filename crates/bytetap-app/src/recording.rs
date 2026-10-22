@@ -21,11 +21,13 @@ use eframe::egui::{
 use tokio::sync::watch;
 
 use crate::app::{BytetapApp, NoteTarget};
-use crate::feed::{self, Detected, ENCODINGS, FeedEvent, FeedRing};
-use crate::feedrows::{HEX_ROW_HEIGHT, TEXT_ROW_HEIGHT, hex_row, text_format, text_row, truncated};
+use crate::feed::{self, Detected, ENCODINGS, FeedEvent, FeedKind, FeedRing};
+use crate::feedrows::{
+    HEX_ROW_HEIGHT, Pair, TEXT_ROW_HEIGHT, hex_row, text_format, text_row, truncated,
+};
 use crate::icons::{self, Icon};
 use crate::live::{self, JournalFailure, JournalFailureCode, SharedFeed};
-use crate::settings::{AppConfig, Encoding, FeedView, Responder, SessionMode};
+use crate::settings::{AppConfig, Encoding, FeedView, ProxyMode, Responder, SessionMode};
 use crate::theme::tokens::{
     RADIUS_CHIP, RADIUS_PANEL, RADIUS_RECORD, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_2XS,
     TEXT_BASE, TEXT_DATA, TEXT_XS,
@@ -138,6 +140,9 @@ pub struct RecordingView {
     fixed_elapsed: Option<Duration>,
     /// Настройки, с которыми запись запущена: сводка режима в шапке.
     pub(crate) config: AppConfig,
+    /// Адреса сторон пары прокси из последнего `open` (FR-5, M4-AC13): сводка двух
+    /// сторон в шапке. До первого соединения оба пусты.
+    sides: (Option<String>, Option<String>),
     /// Фактический адрес слушателя TCP-сервера или адрес анализатора.
     pub(crate) local_addr: String,
     pub(crate) journal_path: Option<PathBuf>,
@@ -173,6 +178,7 @@ impl RecordingView {
             started: Instant::now(),
             fixed_elapsed: None,
             config,
+            sides: (None, None),
             local_addr,
             journal_path: None,
             failure: None,
@@ -292,6 +298,7 @@ impl RecordingView {
             if self.detected.is_none() {
                 self.detected = feed::detect(&event);
             }
+            self.remember_sides(&event);
             if let Some(conn) = event.conn {
                 *self.conns.entry(conn).or_default() += 1;
             }
@@ -321,7 +328,8 @@ impl RecordingView {
         added
     }
 
-    /// Сводка режима в шапке: «жду на :5000 · HL7 (авто)», «COM5 · 9600 8N1».
+    /// Сводка режима в шапке: «жду на :5000 · HL7 (авто)», «COM5 · 9600 8N1»,
+    /// «анализатор 192.168.1.51 ⇄ bytetap :50025 ⇄ ЛИС 10.0.0.5:5000».
     pub fn summary(&self, stats: &Stats) -> String {
         let cfg = &self.config;
         match cfg.mode {
@@ -338,11 +346,7 @@ impl RecordingView {
             ),
             SessionMode::TcpServer => {
                 // Порт 0 выбирает система: в сводке — тот, что занят на самом деле.
-                let port = self
-                    .local_addr
-                    .rsplit_once(':')
-                    .map_or_else(|| cfg.listen_port.to_string(), |(_, port)| port.to_owned());
-                let port = format!(":{port}");
+                let port = self.listen_port();
                 if stats.connections > 0 {
                     t!(
                         "record.onPort",
@@ -357,7 +361,79 @@ impl RecordingView {
                     )
                 }
             }
+            // Сводка прокси — две стороны и bytetap посередине (M4-AC13): у остальных
+            // режимов за запись одна вторая сторона, у пары их две.
+            SessionMode::Proxy => pair_summary(
+                cfg.proxy_role,
+                &self.listen_port(),
+                &format!("{}:{}", cfg.proxy_host, cfg.proxy_port),
+                self.sides.0.as_deref(),
+                self.sides.1.as_deref(),
+            ),
         }
+    }
+
+    /// Порт прослушивания для сводки: «:50025», фактический, если система выбрала его
+    /// сама (порт 0 в форме).
+    fn listen_port(&self) -> String {
+        let port = self.local_addr.rsplit_once(':').map_or_else(
+            || self.config.listen_port.to_string(),
+            |(_, port)| port.to_owned(),
+        );
+        format!(":{port}")
+    }
+
+    /// Сводка шапки галлеей: у прокси адреса моноширинным, подписи сторон muted,
+    /// разделители faint — как в макете M4-4. У остальных режимов — одна строка.
+    pub fn summary_job(&self, p: &Palette, stats: &Stats) -> LayoutJob {
+        if self.config.mode != SessionMode::Proxy {
+            return LayoutJob::single_section(
+                self.summary(stats),
+                text_format(theme::sans(TEXT_DATA), p.text_muted),
+            );
+        }
+        let cfg = &self.config;
+        let pieces = pair_pieces(
+            cfg.proxy_role,
+            &self.listen_port(),
+            &format!("{}:{}", cfg.proxy_host, cfg.proxy_port),
+            self.sides.0.as_deref(),
+            self.sides.1.as_deref(),
+        );
+        let mut job = LayoutJob::default();
+        for piece in &pieces {
+            let format = match piece {
+                PairPiece::Label(_) => text_format(theme::sans(TEXT_DATA), p.text_muted),
+                PairPiece::Address(_) => text_format(theme::mono_medium(TEXT_DATA), p.text),
+                PairPiece::Separator => text_format(theme::sans(TEXT_DATA), p.text_faint),
+            };
+            job.append(&piece.text(), 0.0, format);
+        }
+        job
+    }
+
+    /// Пара сторон ленты: у прокси строки говорят «открыто: анализатор → ЛИС» и «ЛИС
+    /// закрыла соединение», у остальных режимов — как раньше.
+    pub fn pair(&self) -> Pair {
+        Pair::of(self.config.mode, self.config.proxy_role)
+    }
+
+    /// Адреса сторон пары из события `open`: принятая сторона — в `peer`, исходящая — в
+    /// `link`. Роль стороны в журнале не зависит от того, кто инициировал соединение.
+    fn remember_sides(&mut self, event: &FeedEvent) {
+        let FeedKind::Open {
+            peer,
+            link: Some(link),
+        } = &event.kind
+        else {
+            return;
+        };
+        self.sides = match link.role {
+            bytetap_core::journal::LinkRole::Lis => (Some(peer.clone()), Some(link.peer.clone())),
+            bytetap_core::journal::LinkRole::Analyzer => {
+                (Some(link.peer.clone()), Some(peer.clone()))
+            }
+        };
     }
 
     fn responder_name(&self) -> &'static str {
@@ -372,6 +448,108 @@ impl RecordingView {
             },
         }
     }
+}
+
+/// Кусок сводки пары прокси: подпись стороны, адрес или разделитель.
+///
+/// Из кусков собираются обе формы сводки — строка для AccessKit и подсказки и галлея
+/// шапки с моноширинными адресами (M4-4): так текст и рисунок не расходятся.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PairPiece {
+    /// Подпись стороны: «анализатор», «bytetap», «ЛИС» — muted.
+    Label(String),
+    /// Адрес или порт: моноширинный, цвет текста.
+    Address(String),
+    /// Разделитель «⇄» с пробелами по краям — faint.
+    Separator,
+}
+
+impl PairPiece {
+    /// Кусок как текст с пробелом после него: строки для подсказки и AccessKit.
+    ///
+    /// Пробел стоит в конце каждого куска, а не в начале разделителя: раскладка egui не
+    /// выводит пробел, с которого начинается кусок, и «⇄» прилипал бы к адресу.
+    fn text(&self) -> String {
+        match self {
+            Self::Label(text) | Self::Address(text) => format!("{text} "),
+            Self::Separator => format!("{PAIR_SEPARATOR} "),
+        }
+    }
+}
+
+/// Адрес анализатора в сводке — без порта соединения: у принятой стороны он случайный,
+/// а в макете M4-4 показан адрес прибора.
+fn analyzer_address(address: &str) -> &str {
+    match address.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|ch| ch.is_ascii_digit()) && !host.is_empty() => {
+            host
+        }
+        _ => address,
+    }
+}
+
+/// Разделитель сторон пары в сводке шапки.
+const PAIR_SEPARATOR: char = '⇄';
+
+/// Сводка пары прокси кусками: «анализатор 192.168.1.51 ⇄ bytetap :50025 ⇄ ЛИС
+/// 10.0.0.5:5000».
+///
+/// Пока пары не было, известна одна сторона — цель из настроек и порт прослушивания:
+/// адрес второй стороны прокси узнаёт только из её соединения.
+fn pair_pieces(
+    role: ProxyMode,
+    listen: &str,
+    target: &str,
+    analyzer: Option<&str>,
+    lis: Option<&str>,
+) -> Vec<PairPiece> {
+    let analyzer_label = || PairPiece::Label(t!("feed.byAnalyzer").to_owned());
+    let lis_label = || PairPiece::Label(t!("feed.byLis").to_owned());
+    let bytetap = || PairPiece::Label("bytetap".to_owned());
+    match (analyzer, lis) {
+        (Some(analyzer), Some(lis)) => vec![
+            analyzer_label(),
+            PairPiece::Address(analyzer_address(analyzer).to_owned()),
+            PairPiece::Separator,
+            bytetap(),
+            PairPiece::Address(listen.to_owned()),
+            PairPiece::Separator,
+            lis_label(),
+            PairPiece::Address(lis.to_owned()),
+        ],
+        _ => match role {
+            ProxyMode::AnalyzerClient => vec![
+                bytetap(),
+                PairPiece::Address(listen.to_owned()),
+                PairPiece::Separator,
+                lis_label(),
+                PairPiece::Address(target.to_owned()),
+            ],
+            ProxyMode::AnalyzerServer => vec![
+                analyzer_label(),
+                PairPiece::Address(analyzer_address(target).to_owned()),
+                PairPiece::Separator,
+                bytetap(),
+                PairPiece::Address(listen.to_owned()),
+            ],
+        },
+    }
+}
+
+/// Сводка пары прокси строкой: ею пользуются шапка записи, шапка просмотра журнала и
+/// подсказка обрезанной сводки.
+pub(crate) fn pair_summary(
+    role: ProxyMode,
+    listen: &str,
+    target: &str,
+    analyzer: Option<&str>,
+    lis: Option<&str>,
+) -> String {
+    let text: String = pair_pieces(role, listen, target, analyzer, lis)
+        .iter()
+        .map(PairPiece::text)
+        .collect();
+    text.trim_end().to_owned()
 }
 
 /// Байты: «512 Б», «10,2 КБ», «1,2 МБ» (FR-25, счётчики в шапке записи).
@@ -414,8 +592,8 @@ pub fn failure_reason(code: JournalFailureCode) -> &'static str {
 }
 
 /// Текст события `error`/`info` по коду; неизвестный код — английский `message` журнала.
-pub fn event_text(code: Option<&str>, message: &str) -> String {
-    feedrows::event_text(code, message)
+pub fn event_text(code: Option<&str>, message: &str, pair: Pair) -> String {
+    feedrows::event_text(code, message, pair)
 }
 
 fn encoding_label(encoding: Encoding) -> &'static str {
@@ -443,6 +621,8 @@ impl BytetapApp {
         };
         let stats = rec.stats();
         let summary = rec.summary(&stats);
+        // У прокси сводка — из кусков: адреса моноширинным, подписи сторон muted (M4-4).
+        let summary_job = rec.summary_job(&self.pal(), &stats);
         let elapsed = rec.elapsed().as_secs();
         let p = self.pal();
         let counters_width = counters_width(ui, &p, &stats);
@@ -457,17 +637,10 @@ impl BytetapApp {
                     app.stop_recording(&ctx);
                 }
                 let width = ui.available_width().max(0.0);
-                let job = LayoutJob::single_section(
-                    summary.clone(),
-                    text_format(theme::sans(TEXT_DATA), p.text_muted),
-                );
+                let job = summary_job.clone();
                 // Сводка обрезается «…» по остатку шапки: в узком окне она не должна
                 // выталкивать счётчики и кнопки окна за край (находка ревью шага 5).
-                let full = ui.painter().layout_no_wrap(
-                    summary.clone(),
-                    theme::sans(TEXT_DATA),
-                    p.text_muted,
-                );
+                let full = ui.painter().layout_job(job.clone());
                 let galley = truncated(ui, job, width);
                 let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
                 response.widget_info(|| WidgetInfo::labeled(Role::Label, true, &summary));
@@ -1083,6 +1256,7 @@ fn feed_list(
     }
     let row_height = if hex { HEX_ROW_HEIGHT } else { TEXT_ROW_HEIGHT };
     let multi = rec.conns.len() > 1;
+    let pair = rec.pair();
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut scroll = ScrollArea::vertical()
         .id_salt("bt-feed")
@@ -1102,9 +1276,9 @@ fn feed_list(
                 continue;
             };
             if hex {
-                hex_row(ui, p, &event, line, multi, encoding);
+                hex_row(ui, p, &event, line, multi, pair, encoding);
             } else {
-                text_row(ui, p, &event, multi, encoding);
+                text_row(ui, p, &event, multi, pair, encoding);
             }
         }
     });
@@ -1349,14 +1523,65 @@ mod tests {
     #[test]
     fn codes_have_texts() {
         assert_eq!(
-            event_text(Some("connect_failed"), "x"),
+            event_text(Some("connect_failed"), "x", Pair::None),
             "Не удалось подключиться к анализатору — повторяю."
         );
-        assert_eq!(event_text(Some("unknown"), "raw"), "raw");
-        assert_eq!(event_text(None, "raw"), "raw");
+        assert_eq!(event_text(Some("unknown"), "raw", Pair::None), "raw");
+        assert_eq!(event_text(None, "raw", Pair::None), "raw");
+        // Недоступная цель прокси названа второй стороной пары (M4-AC6).
+        assert_eq!(
+            event_text(Some("proxy_connect_failed"), "x", Pair::TargetLis),
+            "Не удалось подключиться к ЛИС — соединение закрыто, жду следующее."
+        );
+        assert_eq!(
+            event_text(Some("proxy_connect_timeout"), "x", Pair::TargetAnalyzer),
+            "Анализатор не ответил за отведённое время — соединение закрыто, жду следующее."
+        );
         assert_eq!(
             failure_reason(JournalFailureCode::DiskFull),
             "на диске нет места"
+        );
+    }
+
+    /// Сводка прокси: до первого соединения — порт и цель, после — обе стороны пары.
+    #[test]
+    fn the_proxy_summary_shows_both_sides() {
+        let mut cfg = AppConfig::with_log_dir("C:/logs");
+        cfg.mode = SessionMode::Proxy;
+        cfg.proxy_host = "10.0.0.5".into();
+        cfg.proxy_port = 5000;
+        let mut view = RecordingView::detached(cfg.clone());
+        view.local_addr = "0.0.0.0:50025".into();
+        let stats = Stats::default();
+        assert_eq!(view.summary(&stats), "bytetap :50025 ⇄ ЛИС 10.0.0.5:5000");
+
+        let open = FeedEvent {
+            time: "10:15:03.000".into(),
+            mono_us: Some(0),
+            conn: Some(1),
+            kind: FeedKind::Open {
+                peer: "192.168.1.51:49152".into(),
+                link: Some(bytetap_core::journal::Link {
+                    role: bytetap_core::journal::LinkRole::Lis,
+                    peer: "10.0.0.5:5000".into(),
+                    local: "192.168.1.10:50231".into(),
+                }),
+            },
+        };
+        view.remember_sides(&open);
+        assert_eq!(
+            view.summary(&stats),
+            "анализатор 192.168.1.51 ⇄ bytetap :50025 ⇄ ЛИС 10.0.0.5:5000"
+        );
+
+        // Топология «анализатор — сервер»: ЛИС приходит сама, цель — анализатор.
+        cfg.proxy_role = ProxyMode::AnalyzerServer;
+        cfg.proxy_host = "192.168.1.51".into();
+        let mut view = RecordingView::detached(cfg);
+        view.local_addr = "0.0.0.0:50025".into();
+        assert_eq!(
+            view.summary(&stats),
+            "анализатор 192.168.1.51 ⇄ bytetap :50025"
         );
     }
 }

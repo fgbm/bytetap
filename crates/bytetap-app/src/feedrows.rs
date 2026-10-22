@@ -7,14 +7,14 @@
 
 use std::sync::Arc;
 
-use bytetap_core::journal::{ClosedBy, Dir};
+use bytetap_core::journal::{ClosedBy, Dir, LinkRole};
 use eframe::egui::{
     self, Align, Align2, Color32, Rect, Role, Sense, Stroke, TextFormat, Ui, WidgetInfo, pos2,
     text::LayoutJob, text::TextWrapping, vec2,
 };
 
 use crate::feed::{self, DataPayload, FeedEvent, FeedKind, HexLine, Segment, Segments};
-use crate::settings::Encoding;
+use crate::settings::{Encoding, ProxyMode, SessionMode};
 use crate::theme::tokens::{SPACE_2, SPACE_3, TEXT_2XS, TEXT_DATA, TEXT_XS};
 use crate::theme::{self, Palette};
 use crate::{t, widgets};
@@ -43,23 +43,101 @@ pub enum RowClass {
     Error,
 }
 
+/// Какая пара сторон у соединения в ленте.
+///
+/// Прокси — единственный режим, где соединение это пара: `open` говорит, кто с кем
+/// соединён, а `close` — кто закрыл (FR-5, FR-7, M4-В5). У остальных режимов пары нет и
+/// строки остаются прежними.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pair {
+    /// Не пара: обычное соединение анализатора с bytetap.
+    #[default]
+    None,
+    /// Цель прокси — ЛИС (топология «анализатор — клиент»).
+    TargetLis,
+    /// Цель прокси — анализатор (топология «анализатор — сервер»).
+    TargetAnalyzer,
+}
+
+impl Pair {
+    /// Пара по режиму и топологии настроек сценария.
+    pub fn of(mode: SessionMode, role: ProxyMode) -> Self {
+        match mode {
+            SessionMode::Proxy => match role {
+                ProxyMode::AnalyzerClient => Self::TargetLis,
+                ProxyMode::AnalyzerServer => Self::TargetAnalyzer,
+            },
+            SessionMode::TcpServer | SessionMode::TcpClient | SessionMode::Serial => Self::None,
+        }
+    }
+
+    /// Соединение — пара двух сторон.
+    pub fn is_pair(self) -> bool {
+        self != Self::None
+    }
+
+    /// Кто на дальнем конце пары: цель, к которой bytetap подключился.
+    fn target(self) -> &'static str {
+        match self {
+            Self::TargetLis => t!("feed.byLis"),
+            Self::TargetAnalyzer => t!("feed.byAnalyzer"),
+            Self::None => "",
+        }
+    }
+
+    /// Кто пришёл на порт bytetap: сторона, противоположная цели.
+    fn accepted(self) -> &'static str {
+        match self {
+            Self::TargetLis => t!("feed.byAnalyzer"),
+            Self::TargetAnalyzer => t!("feed.byLis"),
+            Self::None => "",
+        }
+    }
+}
+
 /// Текст служебной строки (у фрагмента текст идёт сегментами).
-pub fn row_text(event: &FeedEvent) -> (RowClass, String) {
+pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
     let conn = event.conn.unwrap_or_default();
     match &event.kind {
         FeedKind::Data(data) => (RowClass::Data(data.dir), String::new()),
-        FeedKind::Open { peer } => (
-            RowClass::Service,
-            t!("feed.opened", conn = conn, peer = peer),
-        ),
-        FeedKind::Close { by } => (
-            RowClass::Service,
-            t!("feed.closedSimple", conn = conn, by = closed_by(*by)),
-        ),
-        FeedKind::Error { code, message } => {
-            (RowClass::Error, event_text(code.as_deref(), message))
+        FeedKind::Open { peer, link } => {
+            if pair.is_pair() {
+                // Направление пары — по роли исходящей стороны: роль стороны в журнале
+                // не зависит от того, кто инициировал соединение (FR-5).
+                let (from, to) = match link.as_ref().map(|link| link.role) {
+                    Some(LinkRole::Lis) => (t!("feed.byAnalyzer"), t!("feed.byLis")),
+                    Some(LinkRole::Analyzer) => (t!("feed.byLis"), t!("feed.byAnalyzer")),
+                    None => (pair.accepted(), pair.target()),
+                };
+                (
+                    RowClass::Service,
+                    t!("feed.openedPair", conn = conn, from = from, to = to),
+                )
+            } else {
+                (
+                    RowClass::Service,
+                    t!("feed.opened", conn = conn, peer = peer),
+                )
+            }
         }
-        FeedKind::Info { code, message } => (RowClass::Event, event_text(code.as_deref(), message)),
+        FeedKind::Close { by } => {
+            let text = if pair.is_pair() {
+                match by {
+                    ClosedBy::Analyzer => t!("feed.closedPairAnalyzer", conn = conn),
+                    ClosedBy::Lis => t!("feed.closedPairLis", conn = conn),
+                    ClosedBy::Bytetap => t!("feed.closedPairApp", conn = conn),
+                }
+            } else {
+                t!("feed.closedSimple", conn = conn, by = closed_by(*by))
+            };
+            (RowClass::Service, text)
+        }
+        FeedKind::Error { code, message } => {
+            (RowClass::Error, event_text(code.as_deref(), message, pair))
+        }
+        FeedKind::Info { code, message } => {
+            (RowClass::Event, event_text(code.as_deref(), message, pair))
+        }
         FeedKind::Note { text } => (RowClass::Event, text.clone()),
     }
 }
@@ -74,7 +152,7 @@ pub fn closed_by(by: ClosedBy) -> &'static str {
 }
 
 /// Текст события `error`/`info` по коду; неизвестный код — английский `message` журнала.
-pub fn event_text(code: Option<&str>, message: &str) -> String {
+pub fn event_text(code: Option<&str>, message: &str, pair: Pair) -> String {
     let text = match code {
         Some("accept_failed") => t!("events.accept_failed"),
         Some("connect_failed") => t!("events.connect_failed"),
@@ -84,9 +162,25 @@ pub fn event_text(code: Option<&str>, message: &str) -> String {
         Some("answer_timeout") => t!("events.answer_timeout"),
         Some("journal_failure") => t!("events.journal_failure"),
         Some("protocol_undetected") => t!("events.protocol_undetected"),
+        Some("proxy_connect_failed") => proxy_failure_text(pair, true),
+        Some("proxy_connect_timeout") => proxy_failure_text(pair, false),
         _ => message,
     };
     text.to_owned()
+}
+
+/// Недоступная цель прокси: в строке названа вторая сторона — ЛИС или анализатор
+/// (M4-AC6). У ЛИС название не склоняется, у анализатора — склоняется, поэтому для
+/// каждой стороны своя фраза каталога.
+fn proxy_failure_text(pair: Pair, refused: bool) -> &'static str {
+    match (pair, refused) {
+        (Pair::TargetLis, true) => t!("events.proxy_connect_failed_lis"),
+        (Pair::TargetAnalyzer, true) => t!("events.proxy_connect_failed_analyzer"),
+        (Pair::TargetLis, false) => t!("events.proxy_connect_timeout_lis"),
+        (Pair::TargetAnalyzer, false) => t!("events.proxy_connect_timeout_analyzer"),
+        (Pair::None, true) => t!("events.proxy_connect_failed"),
+        (Pair::None, false) => t!("events.proxy_connect_timeout"),
+    }
 }
 
 /// Глиф направления в строке.
@@ -172,8 +266,15 @@ fn data_job(p: &Palette, segments: &Segments, synthetic: bool) -> LayoutJob {
 }
 
 /// Строка «Текст»: время · стрелка · №соединения · данные · «автоответ».
-pub fn text_row(ui: &mut Ui, p: &Palette, event: &FeedEvent, multi: bool, encoding: Encoding) {
-    let (class, text) = row_text(event);
+pub fn text_row(
+    ui: &mut Ui,
+    p: &Palette,
+    event: &FeedEvent,
+    multi: bool,
+    pair: Pair,
+    encoding: Encoding,
+) {
+    let (class, text) = row_text(event, pair);
     let segments = event.data().map(|data| data.segments(encoding));
     // Подпись строки для AccessKit — начало фрагмента: повторы глифов целиком не
     // разворачиваются, подпись строится каждый кадр (U1-AC16).
@@ -256,9 +357,10 @@ pub fn hex_row(
     event: &FeedEvent,
     line: usize,
     multi: bool,
+    pair: Pair,
     encoding: Encoding,
 ) {
-    let (class, text) = row_text(event);
+    let (class, text) = row_text(event, pair);
     let bytes = event.data().map_or(&[][..], |data| data.bytes.as_slice());
     let dump: HexLine = feed::hex_line(bytes, line);
     let hex: Vec<&str> = dump.bytes.iter().map(|(value, _)| value.as_str()).collect();
@@ -405,4 +507,118 @@ pub fn event_of(event: &bytetap_core::journal::Event) -> Option<FeedEvent> {
 /// Байты фрагмента для меню копирования.
 pub fn payload_bytes(data: &DataPayload) -> &[u8] {
     &data.bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use bytetap_core::journal::{Link, LinkRole};
+
+    use super::*;
+
+    fn event(kind: FeedKind) -> FeedEvent {
+        FeedEvent {
+            time: "10:15:03.000".into(),
+            mono_us: Some(0),
+            conn: Some(1),
+            kind,
+        }
+    }
+
+    fn link(role: LinkRole) -> Link {
+        Link {
+            role,
+            peer: "10.0.0.5:5000".into(),
+            local: "192.168.1.10:50231".into(),
+        }
+    }
+
+    /// Пара прокси: `open` называет обе стороны по роли исходящего сокета, `close` —
+    /// кто закрыл (M4-В5, M4-AC13).
+    #[test]
+    fn a_pair_row_names_both_sides_and_who_closed() {
+        let opened = event(FeedKind::Open {
+            peer: "192.168.1.51:49152".into(),
+            link: Some(link(LinkRole::Lis)),
+        });
+        assert_eq!(
+            row_text(&opened, Pair::TargetLis).1,
+            "#1 открыто: анализатор → ЛИС"
+        );
+
+        // Топология «анализатор — сервер»: входящая сторона — ЛИС, цель — анализатор.
+        let opened = event(FeedKind::Open {
+            peer: "10.0.0.5:5000".into(),
+            link: Some(link(LinkRole::Analyzer)),
+        });
+        assert_eq!(
+            row_text(&opened, Pair::TargetAnalyzer).1,
+            "#1 открыто: ЛИС → анализатор"
+        );
+
+        for (by, text) in [
+            (ClosedBy::Lis, "#1 ЛИС закрыла соединение"),
+            (ClosedBy::Analyzer, "#1 анализатор закрыл соединение"),
+            (ClosedBy::Bytetap, "#1 bytetap закрыл соединение"),
+        ] {
+            let close = event(FeedKind::Close { by });
+            assert_eq!(row_text(&close, Pair::TargetLis).1, text);
+        }
+    }
+
+    /// Остальные режимы говорят как раньше: одно соединение, «отключился · ЛИС».
+    #[test]
+    fn the_other_modes_keep_their_rows() {
+        let opened = event(FeedKind::Open {
+            peer: "192.168.1.51:49152".into(),
+            link: None,
+        });
+        assert_eq!(
+            row_text(&opened, Pair::None).1,
+            "#1 подключился 192.168.1.51:49152"
+        );
+        let close = event(FeedKind::Close { by: ClosedBy::Lis });
+        assert_eq!(row_text(&close, Pair::None).1, "#1 отключился · ЛИС");
+    }
+
+    /// Недоступная цель: строка называет вторую сторону пары и остаётся `danger`, а не
+    /// английским текстом журнала (M4-AC6).
+    #[test]
+    fn an_unreachable_target_is_named_by_the_pair() {
+        let error = |code: &str| {
+            event(FeedKind::Error {
+                code: Some(code.into()),
+                message: "connect failed".into(),
+            })
+        };
+        for (pair, code, text) in [
+            (
+                Pair::TargetLis,
+                "proxy_connect_failed",
+                "Не удалось подключиться к ЛИС — соединение закрыто, жду следующее.",
+            ),
+            (
+                Pair::TargetLis,
+                "proxy_connect_timeout",
+                "ЛИС не ответила за отведённое время — соединение закрыто, жду следующее.",
+            ),
+            (
+                Pair::TargetAnalyzer,
+                "proxy_connect_failed",
+                "Не удалось подключиться к анализатору — соединение закрыто, жду следующее.",
+            ),
+        ] {
+            let (class, row) = row_text(&error(code), pair);
+            assert_eq!(class, RowClass::Error);
+            assert_eq!(row, text);
+        }
+        // Пара из настроек сценария: топология задаёт сторону цели.
+        assert_eq!(
+            Pair::of(SessionMode::Proxy, ProxyMode::AnalyzerServer),
+            Pair::TargetAnalyzer
+        );
+        assert_eq!(
+            Pair::of(SessionMode::Serial, ProxyMode::AnalyzerClient),
+            Pair::None
+        );
+    }
 }

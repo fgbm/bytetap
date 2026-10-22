@@ -27,6 +27,7 @@ pub const FILE: &str = "settings.json";
 pub const ALL_INTERFACES: &str = "";
 pub const DEFAULT_PORT: u16 = 5000;
 pub const DEFAULT_CONNECT_HOST: &str = "192.168.1.50";
+pub const DEFAULT_PROXY_HOST: &str = "10.0.0.5";
 pub const DEFAULT_BAUD: u32 = 9600;
 pub const DEFAULT_RECONNECT_SEC: u32 = 5;
 
@@ -43,7 +44,22 @@ pub enum SessionMode {
     #[default]
     TcpServer,
     TcpClient,
+    Proxy,
     Serial,
+}
+
+/// Топология прокси (FR-5, M4-В1): кто из двух сторон приходит на порт bytetap.
+///
+/// Значения совпадают с `role` заголовка журнала (`analyzer_client`, `analyzer_server`),
+/// поэтому настройки, форма и журнал говорят об одном и том же одним словом.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyMode {
+    /// Анализатор — клиент: bytetap слушает порт для анализатора, подключается к ЛИС.
+    #[default]
+    AnalyzerClient,
+    /// Анализатор — сервер: bytetap слушает порт для ЛИС, подключается к анализатору.
+    AnalyzerServer,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +160,12 @@ pub struct AppConfig {
     pub connect_host: String,
     pub connect_port: u16,
     pub reconnect_sec: u32,
+    /// Топология прокси (FR-5): кто приходит на порт bytetap.
+    pub proxy_role: ProxyMode,
+    /// Цель прокси: адрес второй стороны без порта; в остальных режимах поле не читается.
+    pub proxy_host: String,
+    /// Цель прокси: порт второй стороны.
+    pub proxy_port: u16,
     pub serial: SerialSettings,
     pub responder: Responder,
     pub astm_nak_on_bad_checksum: bool,
@@ -161,6 +183,9 @@ impl AppConfig {
             connect_host: DEFAULT_CONNECT_HOST.to_owned(),
             connect_port: DEFAULT_PORT,
             reconnect_sec: DEFAULT_RECONNECT_SEC,
+            proxy_role: ProxyMode::AnalyzerClient,
+            proxy_host: DEFAULT_PROXY_HOST.to_owned(),
+            proxy_port: DEFAULT_PORT,
             serial: SerialSettings::default(),
             responder: Responder::Auto,
             astm_nak_on_bad_checksum: false,
@@ -316,6 +341,9 @@ pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig 
         connect_host: text(raw.get("connectHost"), &fallback.connect_host),
         connect_port: int(raw.get("connectPort"), fallback.connect_port, 1, u16::MAX),
         reconnect_sec: int(raw.get("reconnectSec"), fallback.reconnect_sec, 0, 3600),
+        proxy_role: choice(raw.get("proxyRole"), fallback.proxy_role),
+        proxy_host: text(raw.get("proxyHost"), &fallback.proxy_host),
+        proxy_port: int(raw.get("proxyPort"), fallback.proxy_port, 1, u16::MAX),
         serial: serial(raw.get("serial"), &fallback.serial),
         responder: choice(raw.get("responder"), fallback.responder),
         astm_nak_on_bad_checksum: flag(
@@ -705,6 +733,8 @@ mod tests {
         let value = serde_json::to_value(sample()).expect("json");
         assert_eq!(value["config"]["mode"], "serial");
         assert_eq!(value["config"]["listenPort"], 5000);
+        assert_eq!(value["config"]["proxyRole"], "analyzer_client");
+        assert_eq!(value["config"]["proxyHost"], "10.0.0.5");
         assert_eq!(value["config"]["serial"]["dataBits"], 8);
         assert_eq!(value["config"]["astmNakOnBadChecksum"], false);
         assert_eq!(value["lastRun"]["port"], "COM5");
@@ -890,6 +920,9 @@ mod tests {
                 "listenPort": 70000,
                 "connectPort": "5001",
                 "reconnectSec": 1.5,
+                "proxyRole": "analyzer_server",
+                "proxyHost": "192.168.1.51",
+                "proxyPort": "6000",
                 "responder": "hl7",
                 "serial": { "dataBits": 7, "stopBits": 3, "parity": "odd", "flow": "magic", "dtr": "yes" },
                 "analyzer": 42
@@ -897,15 +930,18 @@ mod tests {
             "theme": "sepia",
             "profiles": [{ "name": "  " }, 5, { "name": "Ок" }],
             "feed": { "view": "hex", "encoding": "koi8" },
-            "lastRun": { "mode": "proxy", "port": "5000" },
+            "lastRun": { "mode": "proxy", "port": "50025", "host": "10.0.0.5:5000" },
             "window": { "size": [-1, 600] }
         });
         let settings = normalize(&raw, "");
         let config = &settings.config;
-        assert_eq!(config.mode, SessionMode::TcpServer);
+        assert_eq!(config.mode, SessionMode::Proxy);
         assert_eq!(config.listen_port, DEFAULT_PORT);
         assert_eq!(config.connect_port, 5001);
         assert_eq!(config.reconnect_sec, DEFAULT_RECONNECT_SEC);
+        assert_eq!(config.proxy_role, ProxyMode::AnalyzerServer);
+        assert_eq!(config.proxy_host, "192.168.1.51");
+        assert_eq!(config.proxy_port, 6000);
         assert_eq!(config.responder, Responder::Hl7);
         assert_eq!(config.serial.data_bits, 7);
         assert_eq!(config.serial.stop_bits, 1);
@@ -917,8 +953,62 @@ mod tests {
         assert_eq!(settings.profiles.len(), 1);
         assert_eq!(settings.feed.view, FeedView::Hex);
         assert_eq!(settings.feed.encoding, Encoding::Cp1251);
-        assert_eq!(settings.last_run, None);
+        assert_eq!(
+            settings.last_run,
+            Some(LastRun {
+                mode: SessionMode::Proxy,
+                port: "50025".into(),
+                host: "10.0.0.5:5000".into(),
+                baud: 0,
+            })
+        );
         assert_eq!(settings.window, None);
+    }
+
+    /// Прокси-поля переносятся из файла прошлой версии по одному: нет поля — значение по
+    /// умолчанию, чужое значение — тоже; топология читается своим словом (M4-AC13).
+    #[test]
+    fn the_proxy_settings_are_read_and_normalized() {
+        let raw = json!({
+            "config": {
+                "mode": "proxy",
+                "proxyPort": 50026,
+                "proxyHost": " 192.168.1.51 ",
+                "proxyRole": "analyzer_client"
+            }
+        });
+        let settings = normalize(&raw, "");
+        let config = &settings.config;
+        assert_eq!(config.proxy_role, ProxyMode::AnalyzerClient);
+        assert_eq!(config.proxy_host, " 192.168.1.51 ", "пробелы режет форма");
+        assert_eq!(config.proxy_port, 50026);
+
+        let raw = json!({ "config": { "proxyRole": "analyzer_sideways", "proxyPort": 0 } });
+        let settings = normalize(&raw, "");
+        assert_eq!(settings.config.proxy_role, ProxyMode::AnalyzerClient);
+        assert_eq!(settings.config.proxy_port, DEFAULT_PORT);
+        assert_eq!(settings.config.proxy_host, DEFAULT_PROXY_HOST);
+
+        // Профиль прокси хранит обе стороны и топологию: выбор профиля вернёт их.
+        let raw = json!({
+            "config": { "mode": "proxy" },
+            "profiles": [{ "name": "Прокси", "config": {
+                "mode": "proxy",
+                "listenHost": "192.168.1.10",
+                "listenPort": 50025,
+                "proxyHost": "192.168.1.51",
+                "proxyPort": 5000,
+                "proxyRole": "analyzer_server"
+            }}]
+        });
+        let settings = normalize(&raw, "");
+        let profile = &settings.profiles[0].config;
+        assert_eq!(profile.mode, SessionMode::Proxy);
+        assert_eq!(profile.listen_host, "192.168.1.10");
+        assert_eq!(profile.listen_port, 50025);
+        assert_eq!(profile.proxy_role, ProxyMode::AnalyzerServer);
+        assert_eq!(profile.proxy_host, "192.168.1.51");
+        assert_eq!(profile.proxy_port, 5000);
     }
 
     #[test]

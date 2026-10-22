@@ -449,16 +449,21 @@ impl BytetapApp {
     }
 
     /// Тестовый хук смоука (CI, [`AUTOSTART_ENV`]): `tcp_server:<адрес>` — запись
-    /// TCP-сервера с автоответом «Авто» в папку журналов из настроек сразу после запуска.
+    /// TCP-сервера с автоответом «Авто», `proxy:<адрес>> <цель>:<роль>` — запись прокси
+    /// (`proxy:127.0.0.1:0>127.0.0.1:5000:analyzer_client`). Папка журналов — из настроек,
+    /// старт сразу после запуска.
     #[must_use]
     #[cfg(feature = "test-hooks")]
     pub fn with_test_autostart(mut self, ctx: &egui::Context, spec: &str) -> Self {
+        if let Some(rest) = spec.strip_prefix("proxy:") {
+            return self.with_test_proxy_autostart(ctx, rest, spec);
+        }
         let listen = spec
             .strip_prefix("tcp_server:")
             .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok());
         let Some(listen) = listen else {
             diag::error(format!(
-                "{AUTOSTART_ENV}: не понят `{spec}`, нужен tcp_server:<адрес:порт>"
+                "{AUTOSTART_ENV}: не понят `{spec}`, нужен tcp_server:<адрес:порт> или proxy:<адрес>><цель>:<роль>"
             ));
             return self;
         };
@@ -470,6 +475,56 @@ impl BytetapApp {
         let config = SessionConfig::new(listen)
             .with_responder(bytetap_core::journal::Autoresponder::Auto)
             .with_log_dir(cfg.log_dir.clone());
+        self.launch(ctx, config, cfg);
+        self
+    }
+
+    /// Прокси-часть хука [`AUTOSTART_ENV`]: `127.0.0.1:0>127.0.0.1:5000:analyzer_client`.
+    #[must_use]
+    #[cfg(feature = "test-hooks")]
+    fn with_test_proxy_autostart(mut self, ctx: &egui::Context, rest: &str, spec: &str) -> Self {
+        let parsed = rest.split_once('>').and_then(|(listen, target)| {
+            let (target, role) = target.rsplit_once(':')?;
+            let role = match role {
+                "analyzer_client" => bytetap_core::transport::ProxyRole::AnalyzerClient,
+                "analyzer_server" => bytetap_core::transport::ProxyRole::AnalyzerServer,
+                _ => return None,
+            };
+            let listen = listen.parse::<std::net::SocketAddr>().ok()?;
+            let (host, port) = target.rsplit_once(':')?;
+            Some((listen, (host.to_owned(), port.parse::<u16>().ok()?), role))
+        });
+        let Some((listen, (host, port), role)) = parsed else {
+            diag::error(format!(
+                "{AUTOSTART_ENV}: не понят `{spec}`, нужен proxy:<адрес>><цель>:<analyzer_client|analyzer_server>"
+            ));
+            return self;
+        };
+        diag::info(format!(
+            "{AUTOSTART_ENV}: запись прокси {listen} → {host}:{port} ({})",
+            role.as_str()
+        ));
+        let mut cfg = self.settings.config.clone();
+        cfg.mode = SessionMode::Proxy;
+        cfg.listen_host = listen.ip().to_string();
+        cfg.listen_port = listen.port();
+        cfg.proxy_role = match role {
+            bytetap_core::transport::ProxyRole::AnalyzerClient => {
+                crate::settings::ProxyMode::AnalyzerClient
+            }
+            bytetap_core::transport::ProxyRole::AnalyzerServer => {
+                crate::settings::ProxyMode::AnalyzerServer
+            }
+        };
+        cfg.proxy_host = host.clone();
+        cfg.proxy_port = port;
+        let config = SessionConfig::proxy(
+            listen,
+            format!("{host}:{port}"),
+            role,
+            crate::form::PROXY_RETRY,
+        )
+        .with_log_dir(cfg.log_dir.clone());
         self.launch(ctx, config, cfg);
         self
     }
@@ -663,6 +718,13 @@ impl BytetapApp {
     #[must_use]
     pub fn with_more(mut self) -> Self {
         self.form.more = true;
+        self
+    }
+
+    /// Ошибка старта по коду без запуска сессии: снимки и тесты шага сценария.
+    #[must_use]
+    pub fn with_start_error(mut self, error: StartError) -> Self {
+        self.start_error = Some(error);
         self
     }
 

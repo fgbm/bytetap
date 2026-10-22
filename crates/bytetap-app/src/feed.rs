@@ -248,7 +248,10 @@ impl DataPayload {
 pub enum FeedKind {
     Data(DataPayload),
     Open {
+        /// Адрес принятой стороны.
         peer: String,
+        /// Исходящая сторона пары прокси (FR-5); у остальных источников её нет.
+        link: Option<bytetap_core::journal::Link>,
     },
     Close {
         by: ClosedBy,
@@ -298,6 +301,7 @@ impl FeedEvent {
                 Some(open.conn),
                 FeedKind::Open {
                     peer: open.peer.clone(),
+                    link: open.link.clone(),
                 },
             ),
             Event::Close(close) => (

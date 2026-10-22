@@ -445,7 +445,9 @@ impl JournalFailure {
 /// TCP-сервера всё, что не про адрес, — про журнал.
 pub fn start_error(err: &io::Error, source: &Source) -> StartError {
     match source {
-        Source::TcpServer { listen } => {
+        // Прокси занимает порт прослушивания так же, как TCP-сервер: занятый порт —
+        // `port_in_use` под полем порта, всё остальное — про журнал (M4-AC13).
+        Source::TcpServer { listen } | Source::Proxy { listen, .. } => {
             let port = listen.port().to_string();
             match ErrorCode::from_io_kind(err.kind()) {
                 ErrorCode::PortInUse => {
@@ -457,9 +459,6 @@ pub fn start_error(err: &io::Error, source: &Source) -> StartError {
         }
         Source::TcpClient { .. } => StartError::new(ErrorCode::Io, err.to_string()),
         Source::Serial { settings, .. } => serial_error(err, settings, port_listed),
-        // Экран прокси — шаг 2 этапа M4; у ядра та же ошибка старта, что у TCP-сервера:
-        // занятый порт прослушивания либо недоступная папка журналов.
-        Source::Proxy { .. } => StartError::new(ErrorCode::Io, err.to_string()),
     }
 }
 

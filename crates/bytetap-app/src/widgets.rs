@@ -5,9 +5,9 @@
 //! каждого своего виджета — роль и подпись для AccessKit.
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, CursorIcon, Frame, Id, Margin, Popup, Rect, Response,
-    RichText, Role, ScrollArea, Sense, Stroke, TextEdit, TextWrapMode, Ui, Vec2, WidgetInfo, pos2,
-    vec2,
+    self, Align2, Color32, CornerRadius, CursorIcon, EventFilter, Frame, Id, Margin, Popup, Rect,
+    Response, RichText, Role, ScrollArea, Sense, Stroke, TextEdit, TextWrapMode, Ui, Vec2,
+    WidgetInfo, pos2, vec2,
 };
 
 use crate::icons::{self, Icon};
@@ -480,6 +480,65 @@ pub fn checkbox(ui: &mut Ui, p: &Palette, value: &mut bool, text: &str) -> Respo
         p.text,
     );
     response
+}
+
+/// Стрелки в радио-паре достаются самой паре, а не переходу фокуса по экрану: Tab
+/// по-прежнему уводит с пары, Escape — закрывает меню.
+const RADIO_FILTER: EventFilter = EventFilter {
+    tab: false,
+    horizontal_arrows: true,
+    vertical_arrows: true,
+    escape: false,
+};
+
+/// Радиокнопка списка-пары: круг 14px (выбранная — точка `ctrl` и рамка `ctrl`) и
+/// подпись 13px, 20px высотой.
+///
+/// Радио-пара — настройка сценария прокси (M4-В1, FR-5). Стрелки по группе обрабатывает
+/// экран: у каждой кнопки своя роль `RadioButton` и своя подпись, поэтому экранный диктор
+/// читает выбор как выбор. Возвращает `true`, если ответ нажат в этом кадре.
+pub fn radio(ui: &mut Ui, p: &Palette, id: Id, selected: bool, text: &str) -> Response {
+    let galley = label_galley(ui, text, TEXT_SM, p.text);
+    let dot_size = 14.0;
+    let size = vec2(
+        dot_size + 8.0 + galley.size().x,
+        galley.size().y.max(dot_size).max(20.0),
+    );
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let response = ui.interact(rect, id, Sense::click());
+    // Фильтр ставится на ту кнопку пары, что в фокусе: вызов для остальных — не действие.
+    ui.ctx()
+        .memory_mut(|memory| memory.set_focus_lock_filter(id, RADIO_FILTER));
+    response
+        .widget_info(|| WidgetInfo::selected(Role::RadioButton, ui.is_enabled(), selected, text));
+    let center = pos2(rect.left() + dot_size / 2.0, rect.center().y);
+    let circle = Rect::from_center_size(center, Vec2::splat(dot_size));
+    let border = if selected {
+        p.ctrl
+    } else if response.hovered() {
+        p.text_muted
+    } else {
+        p.border
+    };
+    ui.painter().circle(
+        center,
+        dot_size / 2.0,
+        p.surface_0,
+        Stroke::new(1.5, border),
+    );
+    if selected {
+        ui.painter().circle_filled(center, 3.5, p.ctrl);
+    }
+    focus_ring(ui, p, &response, circle, radius(RADIUS_RECORD.min(127.0)));
+    ui.painter().galley(
+        pos2(
+            circle.right() + 8.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        p.text,
+    );
+    response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 /// «Старт»: тёмная пилюля 42px во всю ширину с красной точкой.

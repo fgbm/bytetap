@@ -12,12 +12,15 @@
 use std::path::{Path, PathBuf};
 
 use bytetap_core::journal::view::DENSITY_BUCKETS;
-use bytetap_core::journal::{Event, JournalSummary};
+use bytetap_core::journal::{Event, JournalSummary, Mode, Session};
 use eframe::egui::Rect;
 
 use crate::feed::FeedEvent;
+use crate::feedrows::Pair;
 use crate::feedscroll::FeedScroll;
 use crate::journal::{PAGE_SIZE, PageSource};
+use crate::settings::ProxyMode;
+use crate::t;
 use crate::theme::Palette;
 
 /// Сколько комментариев журнала показывает строка под шапкой.
@@ -249,6 +252,79 @@ pub fn notes_line(header_note: &str, appended: &[String]) -> String {
         }
     }
     parts.join(" · ")
+}
+
+/// Пара сторон журнала прокси: по режиму и `settings.role` заголовка (M4-AC13).
+///
+/// У остальных режимов пары нет, и строки ленты остаются прежними: «#1 отключился · ЛИС».
+#[must_use]
+pub fn pair_of_journal(header: &Session) -> Pair {
+    if header.mode != Mode::Proxy {
+        return Pair::None;
+    }
+    match role_of_journal(header) {
+        ProxyMode::AnalyzerClient => Pair::TargetLis,
+        ProxyMode::AnalyzerServer => Pair::TargetAnalyzer,
+    }
+}
+
+/// Топология из заголовка журнала; в старом журнале поля нет — «анализатор — клиент»,
+/// как у умолчания настроек.
+#[must_use]
+pub fn role_of_journal(header: &Session) -> ProxyMode {
+    match header
+        .settings
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("analyzer_server") => ProxyMode::AnalyzerServer,
+        _ => ProxyMode::AnalyzerClient,
+    }
+}
+
+/// Сводка пары сторон прокси из заголовка: `settings` знает порт прослушивания и цель,
+/// а принятая сторона в заголовок не пишется — её даёт только `open` ленты.
+#[must_use]
+pub fn proxy_summary(header: &Session) -> Option<String> {
+    if header.mode != Mode::Proxy {
+        return None;
+    }
+    let listen = header
+        .settings
+        .get("listen")
+        .and_then(serde_json::Value::as_str)?;
+    let target = header
+        .settings
+        .get("target")
+        .and_then(serde_json::Value::as_str)?;
+    let port = listen
+        .rsplit_once(':')
+        .map_or_else(|| listen.to_owned(), |(_, port)| format!(":{port}"));
+    Some(crate::recording::pair_summary(
+        role_of_journal(header),
+        &port,
+        target,
+        None,
+        None,
+    ))
+}
+
+/// Подпись журнала в шапке просмотра: «ANALYZER · 00:42:18»; у журнала прокси вместо
+/// модели анализатора — сводка двух сторон (M4-AC13).
+#[must_use]
+pub fn journal_meta(header: &Session, duration_us: u64) -> String {
+    let span = duration(duration_us);
+    match proxy_summary(header) {
+        Some(summary) => format!("{summary} · {span}"),
+        None => {
+            let analyzer = header
+                .analyzer
+                .clone()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| t!("journal.notSpecified").to_owned());
+            format!("{analyzer} · {span}")
+        }
+    }
 }
 
 /// Событие ленты из строки журнала: заголовок и итоги в ленту не идут.

@@ -8,10 +8,11 @@
 //! последние записи, «сейчас») — синтетическое, через `Fixtures`.
 
 use bytetap_app::background::Interface;
+use bytetap_app::errors::{ErrorCode, StartError};
 use bytetap_app::live::{JournalFailure, JournalFailureCode};
 use bytetap_app::recording::RecordingFixture;
 use bytetap_app::settings::{
-    FeedView, LastRun, LoadWarning, SessionMode, Settings, Store, ThemeMode,
+    FeedView, LastRun, LoadWarning, ProxyMode, SessionMode, Settings, Store, ThemeMode,
 };
 use bytetap_app::{BytetapApp, Fixtures, Screen, theme};
 use bytetap_core::journal::RecentJournal;
@@ -262,18 +263,124 @@ fn long_summary_recording(size: (f32, f32)) -> Harness<'static, BytetapApp> {
     harness
 }
 
+/// Журнал прокси: заголовок с двумя сторонами, пара соединений и `session_end`.
+///
+/// Файл лежит во временной папке, страница 0 прочитана заранее: снимок просмотра видит
+/// шапку со сводкой пары и строки ленты «#1 открыто: анализатор → ЛИС» (M4-AC13).
+fn proxy_journal_view() -> bytetap_app::viewing::JournalView {
+    use bytetap_app::journal::{JournalCache, JournalOpen};
+    use bytetap_core::journal::{Close, ClosedBy, Data, Dir, Event, Link, LinkRole, Open};
+
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("bytetap-20261022101503-proxy.jsonl");
+    let mut header = bytetap_core::journal::Session::new(
+        bytetap_core::journal::Mode::Proxy,
+        bytetap_core::journal::Autoresponder::None,
+        serde_json::json!({
+            "listen": "192.168.1.10:50025",
+            "target": "10.0.0.5:5000",
+            "role": "analyzer_client",
+        }),
+        bytetap_core::journal::Host {
+            os: "Windows 11 23H2".to_owned(),
+        },
+    );
+    header.analyzer = Some("ANALYZER".to_owned());
+    let mut text = serde_json::to_string(&Event::Session(header)).expect("заголовок");
+    text.push('\n');
+    let open = Open {
+        t: "2026-10-22T10:15:03.000000+03:00".into(),
+        mono_us: 0,
+        conn: 1,
+        peer: "192.168.1.51:49152".into(),
+        local: "192.168.1.10:50025".into(),
+        link: Some(Link {
+            role: LinkRole::Lis,
+            peer: "10.0.0.5:5000".into(),
+            local: "192.168.1.10:50231".into(),
+        }),
+    };
+    text.push_str(&serde_json::to_string(&Event::Open(open)).expect("open"));
+    text.push('\n');
+    let data = Event::Data(Data::new(
+        "2026-10-22T10:15:03.004000+03:00",
+        4_000,
+        1,
+        Dir::AnalyzerToLis,
+        false,
+        b"\x0bMSH|^~\\&|ANALYZER|LAB|LIS||20261022101503||ORU^R01|MSG0001|P|2.3.1\r\x1c\r",
+    ));
+    text.push_str(&serde_json::to_string(&data).expect("событие"));
+    text.push('\n');
+    let close = Close {
+        t: "2026-10-22T10:15:09.120000+03:00".into(),
+        mono_us: 6_120_000,
+        conn: 1,
+        by: ClosedBy::Lis,
+        reason: "eof".into(),
+    };
+    text.push_str(&serde_json::to_string(&Event::Close(close)).expect("close"));
+    text.push('\n');
+    std::fs::write(&path, text).expect("журнал");
+    let cache = JournalCache::default();
+    let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
+    let mut view = bytetap_app::viewing::JournalView::new(
+        opened.path.clone(),
+        opened.summary.clone(),
+        opened.lengths.clone(),
+        opened.first_event.clone(),
+    );
+    let events = cache
+        .read(&opened.path, 0, bytetap_app::journal::PAGE_SIZE)
+        .expect("страница");
+    let generation = view.source.request_page(0);
+    view.source.store_page(0, generation, events);
+    view.path = format!("{LOG_DIR}\\bytetap-20261022101503-proxy.jsonl").into();
+    view
+}
+
+fn proxy_viewing(dark: bool, size: (f32, f32)) -> Harness<'static, BytetapApp> {
+    let mut harness = Harness::builder()
+        .with_size(size)
+        .with_theme(if dark { Theme::Dark } else { Theme::Light })
+        .wgpu()
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings(dark), None, None)
+                .with_fixtures(fixtures())
+                .with_journal_fixture(proxy_journal_view())
+        });
+    harness.run_steps(8);
+    harness
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn viewing_proxy_light() {
+    let _gpu = gpu();
+    proxy_viewing(false, WINDOW).snapshot_options("viewing-proxy-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn viewing_proxy_dark() {
+    let _gpu = gpu();
+    proxy_viewing(true, WINDOW).snapshot_options("viewing-proxy-dark", &options());
+}
+
 /// Узкое окно: кнопки окна внутри экрана, шапка не налезает сама на себя (находка
 /// ревью шага 5).
 ///
 /// Слева — длинные подписи (анализатор в 200 символов, сводка TCP-клиента со
-/// счётчиками в гигабайтах): раньше правая группа вставала за концом левой части и
-/// «Закрыть» уезжало за край окна.
+/// счётчиками в гигабайтах, сводка двух сторон прокси): раньше правая группа вставала
+/// за концом левой части и «Закрыть» уезжало за край окна.
 #[test]
 fn the_header_fits_a_narrow_window() {
     for (size, label) in [(NARROW, "720×560"), (LAPTOP, "1366×768")] {
         for (name, harness) in [
             ("viewing-text", long_analyzer_viewing(size)),
             ("recording-text", long_summary_recording(size)),
+            ("viewing-proxy", proxy_viewing(false, size)),
+            ("recording-proxy", proxy_recording(false, false, size)),
         ] {
             assert_header_fits(&harness, size, &format!("{name} на {label}"));
         }
@@ -352,19 +459,10 @@ fn header_full_texts(harness: &Harness<'static, BytetapApp>) -> Vec<String> {
         return vec![rec.summary(&stats)];
     }
     if let Some(view) = harness.state().viewing() {
-        let analyzer = view
-            .summary
-            .header
-            .analyzer
-            .clone()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| bytetap_app::t!("journal.notSpecified").to_owned());
+        // Подпись — та же, что рисует шапка: у журнала прокси в ней сводка двух сторон.
         return vec![
             bytetap_app::viewing::file_name(&view.path),
-            format!(
-                "{analyzer} · {}",
-                bytetap_app::viewing::duration(view.summary.duration_us)
-            ),
+            bytetap_app::viewing::journal_meta(&view.summary.header, view.summary.duration_us),
         ];
     }
     Vec::new()
@@ -512,6 +610,171 @@ fn step_serial_more_dark() {
     serial_more(true).snapshot_options("step-serial-more-dark", &options());
 }
 
+/// Прокси: радио-пара топологии с AccessKit-ролью `radio` — щелчок и стрелки выбирают
+/// сторону, Tab обходит обе кнопки (M4-В1, M4-AC13).
+#[test]
+fn the_proxy_topology_is_a_radio_pair() {
+    let mut harness = plain(
+        proxy_settings(false, ProxyMode::AnalyzerClient),
+        None,
+        Screen::Step(SessionMode::Proxy),
+    );
+    harness.get_by_role_and_label(Role::RadioButton, "Анализатор подключается к ЛИС");
+    harness.get_by_role_and_label(Role::RadioButton, "ЛИС подключается к анализатору");
+    assert_eq!(
+        harness.state().settings().config.proxy_role,
+        ProxyMode::AnalyzerClient
+    );
+
+    // Щелчок выбирает вторую топологию: смысл полей ниже меняется вместе с ним.
+    harness
+        .get_by_role_and_label(Role::RadioButton, "ЛИС подключается к анализатору")
+        .click();
+    harness.run_steps(2);
+    assert_eq!(
+        harness.state().settings().config.proxy_role,
+        ProxyMode::AnalyzerServer
+    );
+    harness.get_by_label("Адрес анализатора");
+
+    // Стрелка с фокуса на кнопке переключает пару и уводит фокус выбранной кнопке:
+    // из группы стрелки не выходят.
+    let mut harness = plain(
+        proxy_settings(false, ProxyMode::AnalyzerClient),
+        None,
+        Screen::Step(SessionMode::Proxy),
+    );
+    harness
+        .get_by_role_and_label(Role::RadioButton, "Анализатор подключается к ЛИС")
+        .focus();
+    harness.run_steps(1);
+    harness.key_press(Key::ArrowDown);
+    harness.run_steps(2);
+    assert_eq!(
+        harness.state().settings().config.proxy_role,
+        ProxyMode::AnalyzerServer
+    );
+    harness.key_press(Key::ArrowUp);
+    harness.run_steps(2);
+    assert_eq!(
+        harness.state().settings().config.proxy_role,
+        ProxyMode::AnalyzerClient
+    );
+    assert_eq!(
+        harness.state().screen,
+        Screen::Step(SessionMode::Proxy),
+        "стрелки не уходят с шага"
+    );
+}
+
+/// Замена текста поля: фокус, выделение всего (Ctrl+A), ввод — текст не приклеивается
+/// к тому, что было в поле.
+fn replace_in(harness: &mut Harness<'static, BytetapApp>, label: &str, text: &str) {
+    harness
+        .get_by_role_and_label(Role::TextInput, label)
+        .focus();
+    harness.run_steps(1);
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, Key::A);
+    harness.run_steps(1);
+    // Выделение снимается Backspace: так поле пустеет и когда новый текст пустой.
+    harness.key_press(Key::Backspace);
+    harness.run_steps(1);
+    harness
+        .get_by_role_and_label(Role::TextInput, label)
+        .type_text(text);
+    harness.run_steps(1);
+}
+
+/// Прокси: поля проверяются до старта — порт прослушивания, адрес и порт цели; ошибка
+/// встаёт под своим полем, а сборка конфигурации несёт топологию и цель (M4-AC13).
+#[test]
+fn the_proxy_form_checks_its_fields_and_builds_the_config() {
+    let mut harness = plain(
+        proxy_settings(false, ProxyMode::AnalyzerClient),
+        None,
+        Screen::Step(SessionMode::Proxy),
+    );
+    replace_in(&mut harness, "Порт, который слушает bytetap", "70000");
+    replace_in(&mut harness, "Порт цели", "0");
+    harness.run_steps(2);
+    assert_eq!(
+        harness
+            .query_all_by_label("Порт — целое число от 1 до 65535.")
+            .count(),
+        2,
+        "своя ошибка у каждого порта"
+    );
+    assert!(harness.state().pending_session().is_none());
+
+    // Пустой адрес цели краснеет только после «Старт».
+    replace_in(&mut harness, "Порт, который слушает bytetap", "50025");
+    replace_in(&mut harness, "Порт цели", "5000");
+    replace_in(&mut harness, "Адрес ЛИС", "");
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    harness.get_by_label("Укажите адрес ЛИС");
+    assert_eq!(harness.state().screen, Screen::Step(SessionMode::Proxy));
+
+    replace_in(&mut harness, "Адрес ЛИС", "10.0.0.5");
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    let config = harness
+        .state()
+        .pending_session()
+        .expect("конфигурация прокси собрана");
+    assert_eq!(
+        config.source,
+        Source::Proxy {
+            listen: "0.0.0.0:50025".parse().unwrap(),
+            target: "10.0.0.5:5000".into(),
+            role: bytetap_core::transport::ProxyRole::AnalyzerClient,
+            retry: bytetap_app::form::PROXY_RETRY,
+        }
+    );
+    assert_eq!(
+        harness
+            .state()
+            .settings()
+            .last_run
+            .as_ref()
+            .map(|run| format!("{} {}", run.port, run.host)),
+        Some("50025 10.0.0.5:5000".to_owned())
+    );
+}
+
+/// Прокси: крупный адрес, предупреждение FR-8 и строка брандмауэра — на шаге, в
+/// спокойных muted-строках, без баннера и модального окна (M4-AC7, M4-AC8).
+#[test]
+fn the_proxy_step_shows_the_address_and_the_warnings() {
+    let harness = plain(
+        proxy_settings(false, ProxyMode::AnalyzerClient),
+        None,
+        Screen::Step(SessionMode::Proxy),
+    );
+    harness.get_by_label("Впишите в анализатор");
+    harness.get_by_label("192.168.1.10:50025");
+    harness.get_by_label("Автоответ выключен: байты идут без изменений.");
+    harness.get_by_label(
+        "Многие ЛИС определяют анализатор по IP-адресу: пока идёт запись, в ЛИС укажите IP ноутбука — 192.168.1.10.",
+    );
+    harness.get_by_label(
+        "При первом старте Windows спросит разрешение брандмауэра — разрешите для частных сетей.",
+    );
+    harness.get_by_role_and_label(Role::Button, "Скопировать");
+    // Поля автоответчика в режиме нет вовсе.
+    assert!(harness.query_by_label("Автоответ").is_none());
+
+    // Топология «анализатор — сервер»: адрес вписывается в ЛИС, предупреждение о нём.
+    let mut settings = proxy_settings(false, ProxyMode::AnalyzerServer);
+    settings.config.listen_port = 5000;
+    let harness = plain(settings, None, Screen::Step(SessionMode::Proxy));
+    harness.get_by_label("Впишите в ЛИС");
+    harness.get_by_label("192.168.1.10:5000");
+    harness.get_by_label(
+        "В ЛИС анализатор теперь виден с адреса ноутбука: если ЛИС определяет его по IP, укажите там адрес — 192.168.1.10.",
+    );
+}
+
 /// Набор текста в поле: фокус и ввод в разных кадрах, курсор — в конце текста.
 fn type_into(harness: &mut Harness<'static, BytetapApp>, label: &str, text: &str) {
     harness
@@ -600,12 +863,12 @@ fn arrows_choose_a_card_and_enter_opens_it() {
     harness.run_steps(2);
     assert_eq!(
         harness.state().selected_card(),
-        2,
-        "вверх с первой — на последнюю"
+        3,
+        "вверх с первой — на последнюю, прокси"
     );
     harness.key_press(Key::Enter);
     harness.run_steps(2);
-    assert_eq!(harness.state().screen, Screen::Step(SessionMode::Serial));
+    assert_eq!(harness.state().screen, Screen::Step(SessionMode::Proxy));
 }
 
 #[test]
@@ -623,6 +886,30 @@ fn the_last_card_shows_when_it_ran_and_a_click_opens_a_card() {
     harness.get_by_label("Сценарии").click();
     harness.run_steps(2);
     assert_eq!(harness.state().screen, Screen::Scenarios);
+}
+
+/// Четвёртая карточка стартового экрана — прокси: описание из макета M4-1, последний
+/// запуск обеими сторонами, щелчок открывает шаг прокси (M4-В2, M4-AC13).
+#[test]
+fn the_proxy_card_opens_the_proxy_step() {
+    let mut settings = settings(false);
+    settings.last_run = Some(LastRun {
+        mode: SessionMode::Proxy,
+        port: "50025".into(),
+        host: "10.0.0.5:5000".into(),
+        baud: 0,
+    });
+    let mut harness = plain(settings, None, Screen::Scenarios);
+    harness.get_by_label_contains("последний раз: :50025 → 10.0.0.5:5000");
+    harness
+        .get_by_role_and_label(
+            Role::Button,
+            "Встать между анализатором и ЛИС. bytetap слушает порт и пересылает дальше — запись при работающей ЛИС · последний раз: :50025 → 10.0.0.5:5000",
+        )
+        .click();
+    harness.run_steps(2);
+    assert_eq!(harness.state().screen, Screen::Step(SessionMode::Proxy));
+    harness.get_by_role_and_label(Role::RadioButton, "Анализатор подключается к ЛИС");
 }
 
 #[test]
@@ -853,6 +1140,10 @@ fn every_screen_has_its_heading() {
             "Я подключаюсь к анализатору",
         ),
         (Screen::Step(SessionMode::Serial), "Кабель COM-порта"),
+        (
+            Screen::Step(SessionMode::Proxy),
+            "Встать между анализатором и ЛИС",
+        ),
         (Screen::Recording, "Стоп 00:00"),
     ] {
         let mut harness = Harness::builder()
@@ -1395,6 +1686,209 @@ fn recording_fixture(extra: usize) -> RecordingFixture {
     }
 }
 
+/// Настройки шага прокси: порт прослушивания 50025, цель — вторая сторона (M4-2, M4-3).
+fn proxy_settings(dark: bool, role: ProxyMode) -> Settings {
+    let mut settings = settings(dark);
+    settings.config.mode = SessionMode::Proxy;
+    settings.config.proxy_role = role;
+    settings.config.listen_port = match role {
+        ProxyMode::AnalyzerClient => 50025,
+        ProxyMode::AnalyzerServer => 5000,
+    };
+    match role {
+        ProxyMode::AnalyzerClient => {
+            settings.config.proxy_host = "10.0.0.5".into();
+            settings.config.proxy_port = 5000;
+        }
+        ProxyMode::AnalyzerServer => {
+            settings.config.proxy_host = "192.168.1.51".into();
+            settings.config.proxy_port = 5000;
+        }
+    }
+    settings
+}
+
+/// Шаг прокси: топология, заполненные поля, «Дополнительно» по флагу, необязательная
+/// ошибка у порта прослушивания (порт 5000 занят — макет M4-3).
+fn proxy_step(
+    dark: bool,
+    role: ProxyMode,
+    more: bool,
+    busy_port: bool,
+) -> Harness<'static, BytetapApp> {
+    let settings = proxy_settings(dark, role);
+    let port = settings.config.listen_port;
+    harness_with(
+        settings,
+        None,
+        Screen::Step(SessionMode::Proxy),
+        WINDOW,
+        move |app| {
+            let app = if more { app.with_more() } else { app };
+            if busy_port {
+                app.with_start_error(
+                    StartError::new(ErrorCode::PortInUse, "address in use")
+                        .with_param("port", port.to_string()),
+                )
+            } else {
+                app
+            }
+        },
+    )
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn step_proxy_light() {
+    let _gpu = gpu();
+    proxy_step(false, ProxyMode::AnalyzerClient, false, false)
+        .snapshot_options("step-proxy-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn step_proxy_dark() {
+    let _gpu = gpu();
+    proxy_step(true, ProxyMode::AnalyzerClient, false, false)
+        .snapshot_options("step-proxy-dark", &options());
+}
+
+/// Топология «ЛИС подключается к анализатору»: «Дополнительно» раскрыто, порт 5000
+/// занят — ошибка под полем порта, как в макете M4-3.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn step_proxy_server_light() {
+    let _gpu = gpu();
+    proxy_step(false, ProxyMode::AnalyzerServer, true, true)
+        .snapshot_options("step-proxy-server-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn step_proxy_server_dark() {
+    let _gpu = gpu();
+    proxy_step(true, ProxyMode::AnalyzerServer, true, true)
+        .snapshot_options("step-proxy-server-dark", &options());
+}
+
+/// Запись прокси: сводка двух сторон в шапке, две пары в ленте, «#1 ЛИС закрыла
+/// соединение» (M4-4). `error` — недоступная цель строкой `danger` (M4-6).
+fn proxy_recording_fixture(error: bool) -> RecordingFixture {
+    use bytetap_core::journal::{
+        Close, ClosedBy, Data, Dir, ErrorEvent, Event, Link, LinkRole, Open, Stats,
+    };
+
+    let cp1251 = |text: &str| -> Vec<u8> {
+        let (bytes, _, _) = encoding_rs::WINDOWS_1251.encode(text);
+        bytes.into_owned()
+    };
+    let at = |ms: u64| {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-10-22T10:15:03.000+03:00").unwrap();
+        (base + chrono::Duration::milliseconds(ms as i64))
+            .format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+            .to_string()
+    };
+    let msg = |id: &str| {
+        cp1251(&format!(
+            "\x0bMSH|^~\\&|ANALYZER|LAB|LIS||20261022101503||ORU^R01|{id}|P|2.3.1\rPID|1||000123||PATIENT^TEST\rOBX|1|NM|GLU^Glucose||5.4|mmol/L|3.9-6.1|N|||F\r\x1c\r"
+        ))
+    };
+    let ack = |id: &str| {
+        cp1251(&format!(
+            "\x0bMSH|^~\\&|LIS||ANALYZER|LAB|20261022101503||ACK^R01|BT{id}|P|2.3.1\rMSA|AA|{id}\r\x1c\r"
+        ))
+    };
+    let open = |conn: u32, peer: &str, ms: u64| {
+        Event::Open(Open {
+            t: at(ms),
+            mono_us: ms * 1000,
+            conn,
+            peer: peer.into(),
+            local: "192.168.1.10:50025".into(),
+            link: Some(Link {
+                role: LinkRole::Lis,
+                peer: "10.0.0.5:5000".into(),
+                local: "192.168.1.10:50231".into(),
+            }),
+        })
+    };
+    let data = |ms: u64, conn: u32, dir: Dir, bytes: &[u8]| {
+        Event::Data(Data::new(at(ms), ms * 1000, conn, dir, false, bytes))
+    };
+    let mut events = Vec::new();
+    if error {
+        // Цель недоступна до первого соединения: `open` нет, есть только ошибка.
+        events.push(Event::Error(ErrorEvent {
+            t: at(0),
+            mono_us: 0,
+            conn: None,
+            code: Some("proxy_connect_failed".into()),
+            message: "connect failed".into(),
+        }));
+    }
+    events.extend([
+        open(1, "192.168.1.51:49152", 3_000),
+        data(3_000, 1, Dir::AnalyzerToLis, &msg("MSG0001")),
+        data(3_004, 1, Dir::LisToAnalyzer, &ack("MSG0001")),
+        Event::Close(Close {
+            t: at(6_120),
+            mono_us: 6_120_000,
+            conn: 1,
+            by: ClosedBy::Lis,
+            reason: "eof".into(),
+        }),
+    ]);
+    if !error {
+        events.extend([
+            open(2, "192.168.1.51:49153", 9_460),
+            data(9_460, 2, Dir::AnalyzerToLis, &msg("MSG0002")),
+        ]);
+    }
+    let connection = if error { 1 } else { 2 };
+    RecordingFixture {
+        events,
+        stats: Stats {
+            connections: connection,
+            bytes_analyzer_to_lis: if error { 1_229 } else { 4_710 },
+            bytes_lis_to_analyzer: if error { 386 } else { 1_229 },
+        },
+        elapsed: std::time::Duration::from_secs(41),
+        local_addr: "192.168.1.10:50025".into(),
+        journal_path: Some(format!("{LOG_DIR}\\bytetap-20261022101503-proxy.jsonl").into()),
+        dropped: 0,
+    }
+}
+
+fn proxy_recording(dark: bool, error: bool, size: (f32, f32)) -> Harness<'static, BytetapApp> {
+    let settings = proxy_settings(dark, ProxyMode::AnalyzerClient);
+    harness_with(settings, None, Screen::Scenarios, size, move |app| {
+        app.with_recording_fixture(proxy_recording_fixture(error))
+    })
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_proxy_light() {
+    let _gpu = gpu();
+    proxy_recording(false, false, WINDOW).snapshot_options("recording-proxy-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_proxy_dark() {
+    let _gpu = gpu();
+    proxy_recording(true, false, WINDOW).snapshot_options("recording-proxy-dark", &options());
+}
+
+/// Цель недоступна: строка ошибки цветом `danger` над первой парой (M4-6).
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_proxy_error_light() {
+    let _gpu = gpu();
+    proxy_recording(false, true, WINDOW)
+        .snapshot_options("recording-proxy-error-light", &options());
+}
+
 fn recording(dark: bool, view: FeedView, extra: usize) -> Harness<'static, BytetapApp> {
     let mut settings = settings(dark);
     settings.feed.view = view;
@@ -1792,17 +2286,36 @@ fn ten_thousand_rows_draw_only_the_visible_ones() {
 }
 
 /// Роли AccessKit, по которым человек действует: у каждой должна быть подпись.
-const INTERACTIVE: [Role; 9] = [
+const INTERACTIVE: [Role; 10] = [
     Role::Button,
     Role::ComboBox,
     Role::TextInput,
     Role::MultilineTextInput,
     Role::CheckBox,
+    Role::RadioButton,
     Role::MenuItem,
     Role::ListBoxOption,
     Role::ScrollBar,
     Role::Link,
 ];
+
+/// Шаг прокси с раскрытым «Дополнительно» в окне `size`: поля анализатора, комментария,
+/// папки журналов и профиля.
+fn proxy_more(size: (f32, f32)) -> Harness<'static, BytetapApp> {
+    let mut harness = Harness::builder().with_size(size).build_eframe(move |cc| {
+        BytetapApp::new(
+            &cc.egui_ctx,
+            proxy_settings(false, ProxyMode::AnalyzerClient),
+            None,
+            None,
+        )
+        .with_fixtures(fixtures())
+        .with_screen(Screen::Step(SessionMode::Proxy))
+        .with_more()
+    });
+    harness.run_steps(2);
+    harness
+}
 
 /// Экран с раскрытым «Дополнительно»: поля профилей и папки журналов.
 fn plain_more(screen: Screen) -> Harness<'static, BytetapApp> {
@@ -1823,10 +2336,19 @@ fn audit_nodes(
     harness: &Harness<'static, BytetapApp>,
     screen: &str,
 ) -> Vec<(Role, String, egui::Rect)> {
+    audit_nodes_in(harness, screen, WINDOW)
+}
+
+/// То же в окне `size`: раскрытый шаг прокси выше окна 1200×800.
+fn audit_nodes_in(
+    harness: &Harness<'static, BytetapApp>,
+    screen: &str,
+    size: (f32, f32),
+) -> Vec<(Role, String, egui::Rect)> {
     use egui_kittest::kittest::NodeT as _;
     harness.check_accessibility();
     let mut found = Vec::new();
-    let (w, h) = WINDOW;
+    let (w, h) = size;
     for node in harness.root().children_recursive() {
         let accesskit = node.accesskit_node();
         if accesskit.is_hidden() || !INTERACTIVE.contains(&accesskit.role()) {
@@ -1909,6 +2431,38 @@ fn every_screen_names_its_widgets() {
         (Role::ComboBox, "Формат"),
         (Role::CheckBox, "DTR"),
         (Role::CheckBox, "RTS"),
+        (Role::TextInput, "Анализатор"),
+        (Role::TextInput, "Комментарий"),
+        (Role::ComboBox, "Профиль"),
+        (Role::Button, "Выбрать"),
+    ] {
+        assert!(has(&nodes, role, label), "нет {role:?} «{label}»");
+    }
+
+    // Шаг прокси: радио-пара топологии, порт с интерфейсом, цель, крупный адрес.
+    let proxy = plain(
+        proxy_settings(false, ProxyMode::AnalyzerClient),
+        None,
+        Screen::Step(SessionMode::Proxy),
+    );
+    let nodes = audit_nodes(&proxy, "шаг прокси");
+    for (role, label) in [
+        (Role::RadioButton, "Анализатор подключается к ЛИС"),
+        (Role::RadioButton, "ЛИС подключается к анализатору"),
+        (Role::TextInput, "Порт, который слушает bytetap"),
+        (Role::ComboBox, "Интерфейс"),
+        (Role::TextInput, "Адрес ЛИС"),
+        (Role::TextInput, "Порт цели"),
+        (Role::Button, "Скопировать"),
+        (Role::Button, "Старт"),
+    ] {
+        assert!(has(&nodes, role, label), "нет {role:?} «{label}»");
+    }
+    // «Дополнительно» раскрыто: профиль и папка журналов на месте, как у других режимов.
+    // Окно выше 800 точек: раскрытый шаг прокси в него не влезает и прокручивается.
+    let harness = proxy_more((1200.0, 1000.0));
+    let nodes = audit_nodes_in(&harness, "шаг прокси с «Дополнительно»", (1200.0, 1000.0));
+    for (role, label) in [
         (Role::TextInput, "Анализатор"),
         (Role::TextInput, "Комментарий"),
         (Role::ComboBox, "Профиль"),
@@ -2020,6 +2574,27 @@ fn tab_visits_every_screen_in_reading_order() {
     let format = position("Формат").expect("формат в обходе");
     let profile = position("Профиль").expect("профиль в обходе");
     assert!(port < format && format < profile, "{labels:#?}");
+
+    // Шаг прокси: радио-пара, порт с интерфейсом, цель, крупный адрес — сверху вниз.
+    let order = tab_walk(
+        &mut plain(
+            proxy_settings(false, ProxyMode::AnalyzerClient),
+            None,
+            Screen::Step(SessionMode::Proxy),
+        ),
+        24,
+    );
+    assert_reading_order("шаг прокси", &order);
+    let labels: Vec<&str> = order.iter().map(|(label, _)| label.as_str()).collect();
+    let client = position_of(&labels, "Анализатор подключается к ЛИС").expect("радио 1");
+    let server = position_of(&labels, "ЛИС подключается к анализатору").expect("радио 2");
+    let port = position_of(&labels, "Порт, который слушает bytetap").expect("порт");
+    let target = position_of(&labels, "Адрес ЛИС").expect("адрес цели");
+    let start = position_of(&labels, "Старт").expect("«Старт»");
+    assert!(
+        client < server && server < port && port < target && target < start,
+        "{labels:#?}"
+    );
 
     let order = tab_walk(&mut plain_recording(FeedView::Text, 0), 24);
     assert_reading_order("запись", &order);

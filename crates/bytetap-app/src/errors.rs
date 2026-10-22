@@ -94,6 +94,8 @@ impl ErrorCode {
 pub enum ErrorField {
     Port,
     Address,
+    /// Порт цели прокси (FR-5): «Адрес ЛИС» и «Порт цели» — разные поля.
+    TargetPort,
     Serial,
     LogDir,
     Start,
@@ -169,7 +171,13 @@ impl StartError {
             args.insert(key.as_str(), value.clone());
         }
         let args: Vec<(&str, String)> = args.into_iter().collect();
-        i18n::fill(self.code.template(), &args)
+        // У прокси адрес неверен у цели — ЛИС или анализатора, — и фраза говорит о цели,
+        // а не об анализаторе (M4-AC13).
+        let template = match (self.code, cfg.mode) {
+            (ErrorCode::AddressInvalid, SessionMode::Proxy) => t!("errors.address_invalid_proxy"),
+            _ => self.code.template(),
+        };
+        i18n::fill(template, &args)
     }
 }
 

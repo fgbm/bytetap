@@ -11,14 +11,15 @@ use std::time::Duration;
 
 use bytetap_core::journal::Autoresponder;
 use bytetap_core::session::SessionConfig;
+use bytetap_core::transport::ProxyRole;
 use bytetap_core::transport::serial::{
     self as core_serial, MAX_BAUD, MIN_BAUD, SerialFormat, SerialSettings as CoreSerial,
 };
 
 use crate::errors::{ErrorCode, ErrorField, StartError};
 use crate::settings::{
-    AppConfig, BAUD_MAX, BAUD_MIN, BAUD_RATES, Flow, LastRun, Parity, Responder, SerialSettings,
-    SessionMode,
+    AppConfig, BAUD_MAX, BAUD_MIN, BAUD_RATES, Flow, LastRun, Parity, ProxyMode, Responder,
+    SerialSettings, SessionMode,
 };
 use crate::t;
 
@@ -26,6 +27,13 @@ use crate::t;
 pub const SERIAL_RECONNECT_SEC: u64 = 5;
 /// Предел интервала переподключения TCP-клиента: 0…3600 секунд.
 pub const MAX_RECONNECT_SEC: u32 = 3600;
+/// Пауза прокси после неудачного подключения к цели (FR-5, M4-AC6).
+///
+/// Переподключения у прокси нет — вторая сторона приходит сама, — и пауза нужна только
+/// затем, чтобы недоступная цель не крутила `accept` без задержки. Сто миллисекунд —
+/// нижняя граница ядра, дальше серия ошибок схлопывается в журнале и ленте. Те же
+/// сто миллисекунд держит `bytetap-cli capture --proxy`.
+pub const PROXY_RETRY: Duration = Duration::from_millis(100);
 
 /// Форматы COM-порта в списке формы (FR-11).
 pub const FORMATS: [&str; 9] = [
@@ -136,6 +144,13 @@ pub fn last_run_of(cfg: &AppConfig) -> LastRun {
             host: String::new(),
             baud: cfg.serial.baud,
         },
+        // У прокси сторона две: порт прослушивания и цель — карточка показывает обе.
+        SessionMode::Proxy => LastRun {
+            mode: cfg.mode,
+            port: cfg.listen_port.to_string(),
+            host: format!("{}:{}", cfg.proxy_host, cfg.proxy_port),
+            baud: 0,
+        },
         SessionMode::TcpServer => LastRun {
             mode: cfg.mode,
             port: cfg.listen_port.to_string(),
@@ -151,6 +166,8 @@ pub struct Touched {
     pub port: bool,
     pub address: bool,
     pub serial: bool,
+    /// Порт цели прокси: своё поле — своя ошибка.
+    pub target_port: bool,
 }
 
 /// Текст полей формы: то, что набрано, а не то, что уже принято в настройки.
@@ -159,10 +176,18 @@ pub struct FormState {
     pub port_text: String,
     pub connect_host: String,
     pub connect_port_text: String,
+    /// Адрес цели прокси (FR-5): ЛИС в топологии «анализатор — клиент» и анализатор в
+    /// топологии «анализатор — сервер».
+    pub proxy_host: String,
+    /// Порт цели прокси.
+    pub proxy_port_text: String,
     pub reconnect_text: String,
     pub baud_text: String,
     /// Скорость вне типового списка: поле ввода вместо списка.
     pub baud_other: bool,
+    /// Радио-паре топологии вернуть фокус на следующем кадре: стрелка переключает пару,
+    /// но egui успевает увести фокус по своей навигации до того, как пара запрётся.
+    pub radio_focus: Option<crate::settings::ProxyMode>,
     /// Раскрыто «Дополнительно».
     pub more: bool,
     /// Нажали «Старт»: только после этого пустые поля краснеют.
@@ -178,9 +203,12 @@ impl FormState {
             port_text: String::new(),
             connect_host: String::new(),
             connect_port_text: String::new(),
+            proxy_host: String::new(),
+            proxy_port_text: String::new(),
             reconnect_text: String::new(),
             baud_text: String::new(),
             baud_other: false,
+            radio_focus: None,
             more: false,
             attempted: false,
             touched: Touched::default(),
@@ -195,6 +223,8 @@ impl FormState {
         self.port_text = cfg.listen_port.to_string();
         self.connect_host = cfg.connect_host.clone();
         self.connect_port_text = cfg.connect_port.to_string();
+        self.proxy_host = cfg.proxy_host.clone();
+        self.proxy_port_text = cfg.proxy_port.to_string();
         self.reconnect_text = cfg.reconnect_sec.to_string();
         self.baud_text = cfg.serial.baud.to_string();
         self.baud_other = !BAUD_RATES.contains(&cfg.serial.baud);
@@ -218,6 +248,7 @@ impl FormState {
             || match field {
                 ErrorField::Port => self.touched.port,
                 ErrorField::Address => self.touched.address,
+                ErrorField::TargetPort => self.touched.target_port,
                 ErrorField::Serial => self.touched.serial,
                 ErrorField::LogDir | ErrorField::Start => false,
             };
@@ -233,11 +264,26 @@ impl FormState {
                 };
                 check_port(text).err().map(PortProblem::text)
             }
-            ErrorField::Address => self
-                .connect_host
-                .trim()
-                .is_empty()
-                .then(|| t!("form.addressRequired")),
+            ErrorField::Address => {
+                if cfg.mode == SessionMode::Proxy {
+                    if self.proxy_host.trim().is_empty() {
+                        Some(match cfg.proxy_role {
+                            ProxyMode::AnalyzerClient => t!("form.proxyLisRequired"),
+                            ProxyMode::AnalyzerServer => t!("form.proxyAnalyzerRequired"),
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    self.connect_host
+                        .trim()
+                        .is_empty()
+                        .then(|| t!("form.addressRequired"))
+                }
+            }
+            ErrorField::TargetPort => check_port(&self.proxy_port_text)
+                .err()
+                .map(PortProblem::text),
             ErrorField::Serial => {
                 if Self::serial_port_missing(cfg) {
                     Some(t!("form.serialRequired"))
@@ -258,13 +304,18 @@ impl FormState {
             SessionMode::TcpClient => {
                 check_port(&self.connect_port_text).is_ok() && !self.connect_host.trim().is_empty()
             }
+            SessionMode::Proxy => {
+                check_port(&self.port_text).is_ok()
+                    && check_port(&self.proxy_port_text).is_ok()
+                    && !self.proxy_host.trim().is_empty()
+            }
             SessionMode::Serial => {
                 !Self::serial_port_missing(cfg) && self.baud_value(cfg).is_some()
             }
         }
     }
 
-    /// Набранное уходит в настройки: порты, адрес, скорость, переподключение.
+    /// Набранное уходит в настройки: порты, адреса, скорость, переподключение.
     pub fn commit(&self, cfg: &mut AppConfig) {
         if let Ok(port) = check_port(&self.port_text) {
             cfg.listen_port = port;
@@ -272,7 +323,11 @@ impl FormState {
         if let Ok(port) = check_port(&self.connect_port_text) {
             cfg.connect_port = port;
         }
+        if let Ok(port) = check_port(&self.proxy_port_text) {
+            cfg.proxy_port = port;
+        }
         cfg.connect_host = self.connect_host.trim().to_owned();
+        cfg.proxy_host = self.proxy_host.trim().to_owned();
         cfg.reconnect_sec = parse_reconnect(&self.reconnect_text);
         if let Some(baud) = self.baud_value(cfg) {
             cfg.serial.baud = baud;
@@ -291,6 +346,14 @@ fn responder(responder: Responder) -> Autoresponder {
         Responder::Hl7 => Autoresponder::Hl7Mllp,
         Responder::Astm => Autoresponder::AstmE1381,
         Responder::None => Autoresponder::None,
+    }
+}
+
+/// Топология прокси в виде роли ядра: экран и журнал называют её одним словом.
+fn proxy_role(role: ProxyMode) -> ProxyRole {
+    match role {
+        ProxyMode::AnalyzerClient => ProxyRole::AnalyzerClient,
+        ProxyMode::AnalyzerServer => ProxyRole::AnalyzerServer,
     }
 }
 
@@ -410,6 +473,14 @@ pub fn session_config(
         SessionMode::Serial => SessionConfig::serial(
             serial_settings(&cfg.serial)?,
             Duration::from_secs(SERIAL_RECONNECT_SEC),
+        ),
+        // Прокси — четвёртый источник (FR-5): слушать одну сторону и подключаться к
+        // другой. Автоответчика в нём нет, `with_responder` ниже на прокси не действует.
+        SessionMode::Proxy => SessionConfig::proxy(
+            listen_addr(&cfg.listen_host, cfg.listen_port)?,
+            connect_addr(&cfg.proxy_host, cfg.proxy_port)?,
+            proxy_role(cfg.proxy_role),
+            PROXY_RETRY,
         ),
     }
     .with_responder(responder(cfg.responder))
@@ -625,6 +696,114 @@ mod tests {
         assert_eq!(error.field(cfg.mode), ErrorField::Start);
     }
 
+    /// Прокси: поля обеих сторон проверяются до старта; сборка `SessionConfig` несёт
+    /// топологию, цель и паузу источника (M4-AC1, M4-AC2, M4-AC13).
+    #[test]
+    fn the_proxy_config_listens_and_connects_by_topology() {
+        let mut cfg = config(SessionMode::Proxy);
+        cfg.listen_host = "192.168.1.10".into();
+        cfg.listen_port = 50025;
+        cfg.proxy_host = " 10.0.0.5 ".into();
+        cfg.proxy_port = 5000;
+        cfg.analyzer = "A-1".into();
+        let core = session_config(&cfg, None).expect("прокси");
+        assert_eq!(
+            core.source,
+            Source::Proxy {
+                listen: "192.168.1.10:50025".parse().unwrap(),
+                target: "10.0.0.5:5000".into(),
+                role: ProxyRole::AnalyzerClient,
+                retry: PROXY_RETRY,
+            }
+        );
+        // Автоответчика в прокси нет всегда, какой бы профиль ни стоял в настройках:
+        // в заголовок журнала идёт «без ответов», автомат не создаётся (FR-6).
+        assert_eq!(core.header_responder(), Autoresponder::None);
+        assert_eq!(core.analyzer.as_deref(), Some("A-1"));
+
+        cfg.proxy_role = ProxyMode::AnalyzerServer;
+        cfg.proxy_host = "192.168.1.51".into();
+        cfg.listen_host = String::new();
+        let core = session_config(&cfg, None).expect("анализатор — сервер");
+        assert_eq!(
+            core.source,
+            Source::Proxy {
+                listen: "0.0.0.0:50025".parse().unwrap(),
+                target: "192.168.1.51:5000".into(),
+                role: ProxyRole::AnalyzerServer,
+                retry: PROXY_RETRY,
+            }
+        );
+
+        // Имя цели разрешает ядро при каждой попытке: форма отдаёт его как есть.
+        cfg.proxy_host = "lis.example".into();
+        let core = session_config(&cfg, None).expect("имя цели");
+        assert!(
+            matches!(&core.source, Source::Proxy { target, .. } if target == "lis.example:5000")
+        );
+
+        // IPv6 в цели — в скобках, иначе адрес не разберётся как HOST:PORT.
+        cfg.proxy_host = "fe80::1".into();
+        let core = session_config(&cfg, None).expect("IPv6");
+        assert!(matches!(&core.source, Source::Proxy { target, .. } if target == "[fe80::1]:5000"));
+
+        cfg.proxy_host = "10.0.0 .5".into();
+        let error = session_config(&cfg, None).expect_err("пробел в адресе");
+        assert_eq!(error.code, ErrorCode::AddressInvalid);
+        assert_eq!(error.field(cfg.mode), ErrorField::Address);
+    }
+
+    /// Поля прокси: порт прослушивания, адрес цели и порт цели — каждое со своей
+    /// ошибкой, и ни одно не краснеет до ввода или «Старт» (M4-AC13).
+    #[test]
+    fn the_proxy_fields_are_checked_one_by_one() {
+        let mut cfg = config(SessionMode::Proxy);
+        let mut form = FormState::new(&cfg);
+        form.port_text = "0".into();
+        form.proxy_host.clear();
+        form.proxy_port_text = "70000".into();
+        assert!(!form.valid(&cfg));
+        assert_eq!(form.local_error(&cfg, ErrorField::Port), None);
+        assert_eq!(form.local_error(&cfg, ErrorField::Address), None);
+        assert_eq!(form.local_error(&cfg, ErrorField::TargetPort), None);
+
+        form.touched.port = true;
+        form.touched.target_port = true;
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::Port),
+            Some("Порт — целое число от 1 до 65535.")
+        );
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::TargetPort),
+            Some("Порт — целое число от 1 до 65535.")
+        );
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::Address),
+            None,
+            "адрес краснеет только после «Старт»"
+        );
+
+        form.attempted = true;
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::Address),
+            Some("Укажите адрес ЛИС")
+        );
+        cfg.proxy_role = ProxyMode::AnalyzerServer;
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::Address),
+            Some("Укажите адрес анализатора")
+        );
+
+        form.proxy_host = "192.168.1.51".into();
+        form.proxy_port_text = "5000".into();
+        form.port_text = "50025".into();
+        assert!(form.valid(&cfg));
+        form.commit(&mut cfg);
+        assert_eq!(cfg.proxy_host, "192.168.1.51");
+        assert_eq!(cfg.proxy_port, 5000);
+        assert_eq!(cfg.listen_port, 50025);
+    }
+
     #[test]
     fn the_serial_config_carries_the_port_settings() {
         let mut cfg = config(SessionMode::Serial);
@@ -685,5 +864,15 @@ mod tests {
         assert_eq!((run.port.as_str(), run.baud), ("COM3", 9600));
         cfg.mode = SessionMode::TcpServer;
         assert_eq!(last_run_of(&cfg).port, "5000");
+        // Прокси: порт прослушивания и цель — на карточке обе стороны.
+        cfg.mode = SessionMode::Proxy;
+        cfg.listen_port = 50025;
+        cfg.proxy_host = "10.0.0.5".into();
+        cfg.proxy_port = 5000;
+        let run = last_run_of(&cfg);
+        assert_eq!(
+            (run.port.as_str(), run.host.as_str()),
+            ("50025", "10.0.0.5:5000")
+        );
     }
 }

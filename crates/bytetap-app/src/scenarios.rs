@@ -1,8 +1,9 @@
 //! Стартовый экран — выбор сценария (FR-25, U1-AC9), как `ScenariosView.vue`.
 //!
-//! Три карточки отвечают на один вопрос: как анализатор связан с ноутбуком. Карточка
-//! последнего запуска обведена и показывает его порт. ↑/↓ ходят по карточкам, Enter
-//! открывает выбранную. Ниже — до трёх последних записей папки журналов.
+//! Четыре карточки отвечают на один вопрос: как анализатор связан с ноутбуком. Карточка
+//! последнего запуска обведена и показывает его порт, а у прокси — обе стороны. ↑/↓ ходят
+//! по карточкам, Enter открывает выбранную. Ниже — до трёх последних записей папки
+//! журналов.
 
 use bytetap_core::journal::RecentJournal;
 use chrono::{DateTime, TimeZone};
@@ -22,10 +23,11 @@ use crate::theme::{self, Palette, radius};
 use crate::widgets;
 
 /// Карточки сценариев в порядке экрана.
-pub const CARDS: [SessionMode; 3] = [
+pub const CARDS: [SessionMode; 4] = [
     SessionMode::TcpServer,
     SessionMode::TcpClient,
     SessionMode::Serial,
+    SessionMode::Proxy,
 ];
 
 fn card_id(index: usize) -> egui::Id {
@@ -41,6 +43,7 @@ pub fn mode_title(mode: SessionMode) -> &'static str {
         SessionMode::TcpServer => t!("scenarios.serverTitle"),
         SessionMode::TcpClient => t!("scenarios.clientTitle"),
         SessionMode::Serial => t!("scenarios.serialTitle"),
+        SessionMode::Proxy => t!("scenarios.proxyTitle"),
     }
 }
 
@@ -49,6 +52,7 @@ fn mode_description(mode: SessionMode) -> &'static str {
         SessionMode::TcpServer => t!("scenarios.serverDescription"),
         SessionMode::TcpClient => t!("scenarios.clientDescription"),
         SessionMode::Serial => t!("scenarios.serialDescription"),
+        SessionMode::Proxy => t!("scenarios.proxyDescription"),
     }
 }
 
@@ -57,6 +61,7 @@ fn mode_icon(mode: SessionMode) -> Icon {
         SessionMode::TcpServer => Icon::MonitorDown,
         SessionMode::TcpClient => Icon::Network,
         SessionMode::Serial => Icon::Usb,
+        SessionMode::Proxy => Icon::ArrowRightLeft,
     }
 }
 
@@ -67,6 +72,8 @@ pub fn last_detail(run: Option<&LastRun>, mode: SessionMode) -> Option<String> {
         SessionMode::TcpClient => format!("{}:{}", run.host, run.port),
         SessionMode::Serial => format!("{} · {}", run.port, run.baud),
         SessionMode::TcpServer => t!("scenarios.lastPort", port = run.port),
+        // У прокси две стороны: порт прослушивания и цель, а не один порт (M4-В2).
+        SessionMode::Proxy => format!(":{} → {}", run.port, run.host),
     };
     Some(t!("scenarios.lastTime", detail = detail))
 }
@@ -446,6 +453,22 @@ mod tests {
         assert_eq!(
             last_detail(Some(&run), SessionMode::TcpClient).as_deref(),
             Some("последний раз: 10.0.0.7:6000")
+        );
+        // Прокси показывает обе стороны, а не один порт (M4-В2, M4-AC13).
+        let run = LastRun {
+            mode: SessionMode::Proxy,
+            port: "50025".into(),
+            host: "10.0.0.5:5000".into(),
+            baud: 0,
+        };
+        assert_eq!(
+            last_detail(Some(&run), SessionMode::Proxy).as_deref(),
+            Some("последний раз: :50025 → 10.0.0.5:5000")
+        );
+        assert_eq!(
+            card_index(SessionMode::Proxy),
+            3,
+            "прокси — четвёртая карточка"
         );
     }
 

@@ -9,6 +9,7 @@ use eframe::egui::{self, Color32, ImageSource, Rect, Ui, Vec2};
 pub enum Icon {
     ArrowDown,
     ArrowLeft,
+    ArrowRightLeft,
     Check,
     ChevronDown,
     ChevronRight,
@@ -36,6 +37,7 @@ impl Icon {
         match self {
             Self::ArrowDown => egui::include_image!("../assets/icons/arrow-down.svg"),
             Self::ArrowLeft => egui::include_image!("../assets/icons/arrow-left.svg"),
+            Self::ArrowRightLeft => egui::include_image!("../assets/icons/arrow-right-left.svg"),
             Self::Check => egui::include_image!("../assets/icons/check.svg"),
             Self::ChevronDown => egui::include_image!("../assets/icons/chevron-down.svg"),
             Self::ChevronRight => egui::include_image!("../assets/icons/chevron-right.svg"),

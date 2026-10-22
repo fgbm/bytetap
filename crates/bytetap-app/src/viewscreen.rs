@@ -21,7 +21,9 @@ use crate::icons::{self, Icon};
 use crate::settings::{Encoding, FeedView};
 use crate::theme::tokens::{RADIUS_CHIP, SPACE_2, SPACE_3, TEXT_2XS, TEXT_XS};
 use crate::theme::{self, Palette, radius};
-use crate::viewing::{NOTES_SHOWN, density_bars, duration, file_name, notes_line};
+use crate::viewing::{
+    NOTES_SHOWN, density_bars, file_name, journal_meta, notes_line, pair_of_journal,
+};
 use crate::{t, widgets};
 
 /// Высота панели над лентой — как при записи.
@@ -37,19 +39,12 @@ const LABEL_WIDTH: f32 = 16.0;
 
 /// Шапка просмотра журнала: бренд, «×», имя файла, метаданные, комментарий, тема.
 pub fn title_bar(app: &mut BytetapApp, ui: &mut Ui) {
+    // У журнала прокси в подписи — сводка двух сторон, у остальных — анализатор.
     let (name, meta) = match &app.viewing {
-        Some(view) => {
-            let name = file_name(&view.path);
-            let analyzer = view
-                .summary
-                .header
-                .analyzer
-                .clone()
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| t!("journal.notSpecified").to_owned());
-            let meta = format!("{analyzer} · {}", duration(view.summary.duration_us));
-            (name, meta)
-        }
+        Some(view) => (
+            file_name(&view.path),
+            journal_meta(&view.summary.header, view.summary.duration_us),
+        ),
         None => (String::new(), String::new()),
     };
     let (icon, theme_label) = if app.dark() {
@@ -424,6 +419,8 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     // Колонка номера соединения — когда соединений было больше одного: как в UI v2,
     // где в просмотре берутся итоги сессии из сводки журнала.
     let multi = view.summary.stats.connections > 1;
+    // Пара двух сторон — у журнала прокси: «#1 открыто: анализатор → ЛИС».
+    let pair = pair_of_journal(&view.summary.header);
     if let Some(event) = view.seek.take() {
         // Переход к событию: строка — по номеру строки события в текущем виде.
         let target = if hex { view.hex_row_of(event) } else { event };
@@ -456,9 +453,9 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
                     continue;
                 };
                 if hex {
-                    hex_row(ui, &p, &event, line, multi, encoding);
+                    hex_row(ui, &p, &event, line, multi, pair, encoding);
                 } else {
-                    text_row(ui, &p, &event, multi, encoding);
+                    text_row(ui, &p, &event, multi, pair, encoding);
                 }
             }
         },
