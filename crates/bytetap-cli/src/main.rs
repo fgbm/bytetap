@@ -17,6 +17,7 @@ use bytetap_core::journal::{
     Mode, MonoClock, Note, Session, now_rfc3339,
 };
 use bytetap_core::session::{Session as CaptureSession, SessionConfig, journal_failure_reason};
+use bytetap_core::transport::ProxyRole;
 use bytetap_core::transport::serial::{Flow, SerialFormat, SerialSettings};
 use chrono::DateTime;
 use clap::{ArgGroup, Parser, Subcommand};
@@ -51,8 +52,19 @@ const FEED_WIDTH: usize = 120;
 /// его вечно. Предел совпадает с ожиданием журнала при остановке сессии.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// JSON Schema формата, вшита в бинарь: проверка не зависит от файлов рядом и от сети (FR-24).
-const SCHEMA: &str = include_str!("../../../docs/public/schema/bytetap-session-1.schema.json");
+/// JSON Schema формата `/1`, вшита в бинарь: проверка не зависит от файлов рядом и от сети
+/// (FR-24). Схема выбирается по полю `format` заголовка журнала.
+const SCHEMA_V1: &str = include_str!("../../../docs/public/schema/bytetap-session-1.schema.json");
+
+/// JSON Schema формата `/2`: тот же формат плюс необязательное поле `link` у `open`.
+const SCHEMA_V2: &str = include_str!("../../../docs/public/schema/bytetap-session-2.schema.json");
+
+/// Сколько ждёт прокси после неудачного подключения к цели.
+///
+/// У прокси нет переподключения — сторона приходит сама, — и пауза нужна только затем,
+/// чтобы недоступная цель не крутила `accept` без задержки. Сто миллисекунд — нижняя
+/// граница ядра, дальше ошибки схлопываются в журнале (M4-AC6).
+const PROXY_RETRY: Duration = Duration::from_millis(100);
 
 /// Запись «сырого» обмена между лабораторным анализатором и ЛИС.
 #[derive(Debug, Parser)]
@@ -64,8 +76,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Записать обмен: ждать анализатор, подключиться к нему или открыть COM-порт
-    Capture(CaptureArgs),
+    /// Записать обмен: ждать анализатор, подключиться к нему, открыть COM-порт или встать
+    /// в разрыв между анализатором и ЛИС
+    Capture(Box<CaptureArgs>),
     /// Показать доступные COM-порты с понятным описанием (FR-12)
     Ports,
     /// Проверить журнал сессии по схеме и напечатать статистику
@@ -92,29 +105,57 @@ enum Command {
     },
 }
 
-/// Параметры записи: ровно один источник — прослушивание, подключение или COM-порт.
+/// Параметры записи: ровно один источник — прослушивание, подключение, COM-порт или прокси.
 #[derive(Debug, clap::Args)]
 #[command(group(
     ArgGroup::new("source")
         .required(true)
         .multiple(false)
-        .args(["listen", "connect", "serial"])
+        .args(["listen", "connect", "serial", "proxy"])
 ))]
 struct CaptureArgs {
     /// Адрес и порт прослушивания, например `0.0.0.0:5000`
-    #[arg(long, value_name = "ADDR", conflicts_with_all = ["connect", "serial"])]
+    #[arg(
+        long,
+        value_name = "ADDR",
+        conflicts_with_all = ["connect", "serial", "proxy"]
+    )]
     listen: Option<SocketAddr>,
     /// Адрес анализатора-сервера, к которому подключаться, например `192.168.1.50:5000`
-    #[arg(long, value_name = "HOST:PORT", conflicts_with_all = ["listen", "serial"])]
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        conflicts_with_all = ["listen", "serial", "proxy"]
+    )]
     connect: Option<String>,
     /// Имя COM-порта, например `COM5` или `/dev/ttyUSB0`
     #[arg(
         long,
         value_name = "NAME",
-        conflicts_with_all = ["listen", "connect"],
+        conflicts_with_all = ["listen", "connect", "proxy"],
         requires_all = ["baud", "format"]
     )]
     serial: Option<String>,
+    /// Порт, на который приходит одна из сторон прокси, например `0.0.0.0:50025`
+    #[arg(
+        long,
+        value_name = "ADDR",
+        requires_all = ["to", "role"],
+        conflicts_with_all = ["listen", "connect", "serial"]
+    )]
+    proxy: Option<SocketAddr>,
+    /// Цель прокси — адрес второй стороны, например `192.168.1.50:5000`
+    #[arg(long, value_name = "HOST:PORT", requires = "proxy")]
+    to: Option<String>,
+    /// Топология прокси: `analyzer-client` — анализатор приходит сам,
+    /// `analyzer-server` — bytetap подключается к анализатору
+    #[arg(
+        long,
+        value_name = "ROLE",
+        requires = "proxy",
+        value_parser = ["analyzer-client", "analyzer-server"]
+    )]
+    role: Option<String>,
     /// Скорость порта: 1…4 000 000, типовые 300–115200
     #[arg(
         long,
@@ -144,9 +185,16 @@ struct CaptureArgs {
         value_parser = clap::value_parser!(u64).range(0..=3600)
     )]
     reconnect_sec: Option<u64>,
-    /// Профиль автоответчика: `auto`, `hl7`, `astm` или `none`
-    #[arg(long, value_name = "PROFILE", value_parser = ["auto", "hl7", "astm", "none"])]
-    responder: String,
+    /// Профиль автоответчика: `auto`, `hl7`, `astm` или `none`;
+    /// с `--proxy` несовместим — в прокси автоответчика нет (FR-6)
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        value_parser = ["auto", "hl7", "astm", "none"],
+        required_unless_present = "proxy",
+        conflicts_with = "proxy"
+    )]
+    responder: Option<String>,
     /// ASTM: отвечать `NAK` на неверную контрольную сумму вместо `ACK`
     #[arg(long)]
     astm_nak: bool,
@@ -178,7 +226,7 @@ fn parse_switch(value: &str) -> Result<bool, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Capture(args) => capture(args),
+        Command::Capture(args) => capture(*args),
         Command::Ports => ports(),
         Command::Verify { file } => verify(&file),
         Command::Note { file, text } => note(&file, &text),
@@ -198,14 +246,16 @@ const KINDS: [&str; 8] = [
     "session_end",
 ];
 
-/// `bytetap-cli capture`: ждёт анализатор, подключается к нему или открывает COM-порт,
-/// отвечает анализатору, пишет журнал и печатает ленту до Ctrl+C (FR-1, FR-2, FR-9).
+/// `bytetap-cli capture`: ждёт анализатор, подключается к нему, открывает COM-порт или
+/// встаёт в разрыв, отвечает анализатору, пишет журнал и печатает ленту до Ctrl+C
+/// (FR-1, FR-2, FR-5, FR-9).
 fn capture(args: CaptureArgs) -> ExitCode {
-    let responder = match args.responder.as_str() {
-        "auto" => Autoresponder::Auto,
-        "astm" => Autoresponder::AstmE1381,
-        "hl7" => Autoresponder::Hl7Mllp,
-        _ => Autoresponder::None,
+    let responder = match args.responder.as_deref() {
+        Some("auto") => Autoresponder::Auto,
+        Some("astm") => Autoresponder::AstmE1381,
+        Some("hl7") => Autoresponder::Hl7Mllp,
+        // С `--proxy` профиля нет: clap не пропускает `--responder` вместе с ним (FR-6).
+        Some(_) | None => Autoresponder::None,
     };
     if args.astm_nak && !astm_nak_applies(responder) {
         warn!(
@@ -213,16 +263,18 @@ fn capture(args: CaptureArgs) -> ExitCode {
             responder.as_str()
         );
     }
-    let (mut config, target) = match (&args.listen, &args.connect, &args.serial) {
-        (Some(listen), None, None) => (SessionConfig::new(*listen), format!("Слушаю {listen}")),
-        (None, Some(connect), None) => {
+    let (mut config, target) = match (&args.listen, &args.connect, &args.serial, &args.proxy) {
+        (Some(listen), None, None, None) => {
+            (SessionConfig::new(*listen), format!("Слушаю {listen}"))
+        }
+        (None, Some(connect), None, None) => {
             let reconnect = Duration::from_secs(args.reconnect_sec.unwrap_or(5));
             (
                 SessionConfig::tcp_client(connect.clone(), reconnect),
                 format!("Подключаюсь к {connect}"),
             )
         }
-        (None, None, Some(serial)) => {
+        (None, None, Some(serial), None) => {
             let format = args.format.unwrap_or(SerialFormat::EIGHT_N_ONE);
             let baud = args.baud.unwrap_or(9600);
             let settings = SerialSettings::new(serial.clone(), baud, format)
@@ -233,10 +285,26 @@ fn capture(args: CaptureArgs) -> ExitCode {
                 format!("Порт {serial}"),
             )
         }
+        (None, None, None, Some(proxy)) => {
+            // `--to` и `--role` обязательны с `--proxy`: clap не пропустит их отсутствие.
+            let to = args.to.clone().unwrap_or_default();
+            let role = match args.role.as_deref() {
+                Some("analyzer-server") => ProxyRole::AnalyzerServer,
+                _ => ProxyRole::AnalyzerClient,
+            };
+            let title = match role {
+                ProxyRole::AnalyzerClient => "анализатор — клиент",
+                ProxyRole::AnalyzerServer => "анализатор — сервер",
+            };
+            (
+                SessionConfig::proxy(*proxy, to.clone(), role, PROXY_RETRY),
+                format!("Слушаю {proxy} → {to} ({title})"),
+            )
+        }
         // clap требует ровно один источник: сюда не попадает ни один набор аргументов.
-        (listen, connect, serial) => {
+        (listen, connect, serial, proxy) => {
             warn!(
-                "ошибка: нужен ровно один источник соединений — --listen, --connect или --serial (получено: listen={listen:?}, connect={connect:?}, serial={serial:?})"
+                "ошибка: нужен ровно один источник соединений — --listen, --connect, --serial или --proxy (получено: listen={listen:?}, connect={connect:?}, serial={serial:?}, proxy={proxy:?})"
             );
             return ExitCode::FAILURE;
         }
@@ -520,22 +588,10 @@ fn ports() -> ExitCode {
 }
 
 /// `bytetap-cli verify`: проверка каждой строки по схеме и краткая статистика (M1-AC1, M1-AC15).
+///
+/// Схема выбирается по полю `format` заголовка: журнал `/1` проверяется схемой `/1`,
+/// журнал `/2` — схемой `/2` (M4-AC9). Версия формата печатается.
 fn verify(file: &Path) -> ExitCode {
-    let schema: Value = match serde_json::from_str(SCHEMA) {
-        Ok(schema) => schema,
-        Err(err) => {
-            warn!("ошибка: вшитая схема формата не разобралась: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let validator = match jsonschema::validator_for(&schema) {
-        Ok(validator) => validator,
-        Err(err) => {
-            warn!("ошибка: вшитая схема формата не принята движком: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-
     let reader = match journal::JournalReader::open(file) {
         Ok(reader) => reader,
         Err(err) => {
@@ -552,6 +608,9 @@ fn verify(file: &Path) -> ExitCode {
     let mut first_kind: Option<&'static str> = None;
     let mut sessions = 0usize;
     let mut ended = false;
+    // Схема появляется вместе с заголовком: до него версия формата неизвестна.
+    let mut format: Option<String> = None;
+    let mut validator: Option<jsonschema::Validator> = None;
 
     for item in reader {
         match item {
@@ -561,8 +620,18 @@ fn verify(file: &Path) -> ExitCode {
                     first_kind = Some(line.event.kind());
                 }
                 *counts.entry(line.event.kind()).or_default() += 1;
-                if matches!(line.event, Event::Session(_)) {
+                if let Event::Session(header) = &line.event {
                     sessions += 1;
+                    if format.is_none() {
+                        format = Some(header.format.clone());
+                        match validator_for(&header.format) {
+                            Ok(built) => validator = Some(built),
+                            Err(message) => {
+                                errors += 1;
+                                warn!("ошибка: строка {}: {message}", line.number);
+                            }
+                        }
+                    }
                 }
                 // После итогов сессии файл может дополняться только комментариями.
                 if ended && !matches!(line.event, Event::Note(_)) {
@@ -591,7 +660,9 @@ fn verify(file: &Path) -> ExitCode {
                     Event::SessionEnd(_) => ended = true,
                     Event::Session(_) | Event::Error(_) | Event::Info(_) | Event::Note(_) => {}
                 }
-                if let Err(error) = validator.validate(&line.value) {
+                if let Some(validator) = &validator
+                    && let Err(error) = validator.validate(&line.value)
+                {
                     errors += 1;
                     warn!("ошибка: строка {}: {error}", line.number);
                 }
@@ -619,6 +690,9 @@ fn verify(file: &Path) -> ExitCode {
     }
 
     say!("Журнал: {}", file.display());
+    if let Some(format) = &format {
+        say!("Формат: {format}");
+    }
     say!("Строк: {lines}");
     let kinds: Vec<String> = KINDS
         .iter()
@@ -640,6 +714,26 @@ fn verify(file: &Path) -> ExitCode {
     }
     say!("Проверка пройдена.");
     ExitCode::SUCCESS
+}
+
+/// Схема формата по полю `format` заголовка журнала.
+///
+/// Журнал проверяется версией не старше записавшей: неизвестная версия — ошибка проверки,
+/// а не молчаливый пропуск строк (M4-AC9).
+fn validator_for(format: &str) -> Result<jsonschema::Validator, String> {
+    let text = match format {
+        "bytetap-session/1" => SCHEMA_V1,
+        "bytetap-session/2" => SCHEMA_V2,
+        other => {
+            return Err(format!(
+                "неизвестная версия формата {other}: журнал проверяется версией не старше записавшей"
+            ));
+        }
+    };
+    let schema: Value = serde_json::from_str(text)
+        .map_err(|err| format!("вшитая схема {format} не разобралась: {err}"))?;
+    jsonschema::validator_for(&schema)
+        .map_err(|err| format!("вшитая схема {format} не принята движком: {err}"))
 }
 
 /// Проверяет то, чего не видно схеме: `len` и `text` должны выводиться из `b64`.
@@ -775,9 +869,23 @@ mod tests {
     }
 
     #[test]
-    fn embedded_schema_is_valid() {
-        let schema: Value = serde_json::from_str(SCHEMA).expect("схема — корректный JSON");
-        assert!(jsonschema::validator_for(&schema).is_ok());
+    fn embedded_schemas_are_valid_and_cover_both_versions() {
+        for (format, text) in [
+            ("bytetap-session/1", SCHEMA_V1),
+            ("bytetap-session/2", SCHEMA_V2),
+        ] {
+            let schema: Value =
+                serde_json::from_str(text).unwrap_or_else(|err| panic!("{format}: {err}"));
+            assert!(jsonschema::validator_for(&schema).is_ok(), "{format}");
+            assert!(
+                validator_for(format).is_ok(),
+                "схема {format} выбирается по версии формата"
+            );
+        }
+        assert!(
+            validator_for("bytetap-session/3").is_err(),
+            "неизвестная версия — ошибка, а не пропуск проверки"
+        );
     }
 
     #[test]
@@ -904,6 +1012,114 @@ mod tests {
             "hl7",
         ]);
         assert!(reconnect.is_err(), "интервал 0…3600");
+    }
+
+    #[test]
+    fn capture_takes_a_proxy_with_its_target_and_role() {
+        let parsed = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--proxy",
+            "0.0.0.0:50025",
+            "--to",
+            "10.0.0.5:5000",
+            "--role",
+            "analyzer-client",
+        ])
+        .expect("прокси без --responder: автоответчика в нём нет");
+        let Command::Capture(args) = parsed.command else {
+            panic!("ожидался capture");
+        };
+        assert_eq!(args.proxy, Some("0.0.0.0:50025".parse().unwrap()));
+        assert_eq!(args.to.as_deref(), Some("10.0.0.5:5000"));
+        assert_eq!(args.role.as_deref(), Some("analyzer-client"));
+        assert!(args.responder.is_none());
+
+        let server = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--proxy",
+            "0.0.0.0:50025",
+            "--to",
+            "10.0.0.5:5000",
+            "--role",
+            "analyzer-server",
+        ]);
+        assert!(server.is_ok(), "{:?}", server.err());
+
+        let without_target = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--proxy",
+            "0.0.0.0:50025",
+            "--role",
+            "analyzer-client",
+        ]);
+        assert!(without_target.is_err(), "--to обязателен с --proxy");
+
+        let without_role = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--proxy",
+            "0.0.0.0:50025",
+            "--to",
+            "10.0.0.5:5000",
+        ]);
+        assert!(without_role.is_err(), "--role обязателен с --proxy");
+
+        let bad_role = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--proxy",
+            "0.0.0.0:50025",
+            "--to",
+            "10.0.0.5:5000",
+            "--role",
+            "server",
+        ]);
+        assert!(bad_role.is_err(), "роль — только из перечня");
+
+        // Автоответчик в прокси не создаётся: `--responder` — ошибка запуска, а не
+        // молчаливое игнорирование (FR-6).
+        let with_responder = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--proxy",
+            "0.0.0.0:50025",
+            "--to",
+            "10.0.0.5:5000",
+            "--role",
+            "analyzer-client",
+            "--responder",
+            "hl7",
+        ]);
+        assert!(with_responder.is_err(), "--responder с --proxy");
+
+        let with_listen = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--proxy",
+            "0.0.0.0:50025",
+            "--to",
+            "10.0.0.5:5000",
+            "--role",
+            "analyzer-client",
+            "--listen",
+            "0.0.0.0:5000",
+        ]);
+        assert!(with_listen.is_err(), "два источника одновременно");
+    }
+
+    #[test]
+    fn the_proxy_flags_are_described_in_help() {
+        let capture = Cli::command()
+            .find_subcommand_mut("capture")
+            .expect("команда capture")
+            .render_help()
+            .to_string();
+        for flag in ["--proxy", "--to", "--role"] {
+            assert!(capture.contains(flag), "в справке нет {flag}: {capture}");
+        }
     }
 
     #[test]

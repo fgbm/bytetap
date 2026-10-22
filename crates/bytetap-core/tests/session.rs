@@ -100,8 +100,9 @@ fn recorded_bytes(
 
 /// Проверяет журнал так же, как `bytetap-cli verify`, и возвращает статистику `session_end`.
 fn check_journal(lines: &[(Value, Event)], connections: u32) -> Stats {
+    // Новые журналы пишутся в формате `/2` (M4-AC9).
     let schema_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/public/schema/bytetap-session-1.schema.json");
+        .join("../../docs/public/schema/bytetap-session-2.schema.json");
     let schema: Value = serde_json::from_str(
         &std::fs::read_to_string(&schema_path).expect("схема формата рядом с документацией"),
     )

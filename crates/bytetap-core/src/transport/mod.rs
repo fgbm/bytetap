@@ -1,7 +1,8 @@
-//! Транспорты сессии: источник соединений и байтовый поток (FR-1, FR-2, FR-9).
+//! Транспорты сессии: источник соединений и байтовый поток (FR-1, FR-2, FR-5, FR-9).
 //!
 //! Источник знает, откуда берутся соединения: `TcpServer` принимает анализатор,
-//! `TcpClient` сам подключается к анализатору-серверу, `Serial` открывает COM-порт.
+//! `TcpClient` сам подключается к анализатору-серверу, `Serial` открывает COM-порт,
+//! `Proxy` встаёт в разрыв и на каждое входящее соединение подключается к цели (FR-5).
 //! Дальше всё одинаково: [`Connection`] отдаёт [`Transport`] — `AsyncRead + AsyncWrite`,
 //! а нумерация `conn`, автоответчик и журнал остаются делом сессии ([`crate::session`]).
 //!
@@ -10,7 +11,8 @@
 //! источник, а сессия схлопывает повторы в одно `error` и ждёт в `select!` вместе
 //! с остановкой и отказом журнала (NFR-5).
 //!
-//! Прокси TCP появится в M4 и станет ещё одним источником.
+//! Прокси — не вторая сессия, а четвёртый источник: пара соединений приходит одним
+//! [`Connection`], у которого заполнено поле [`Connection::link`].
 
 pub mod serial;
 pub mod tcp;
@@ -23,9 +25,12 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 use self::serial::{SerialConnection, SerialSettings};
 use self::tcp::{TcpServer, TcpServerSource};
+
+pub use crate::journal::LinkRole;
 
 /// Наименьшая пауза переподключения.
 ///
@@ -60,6 +65,61 @@ pub struct Connection {
     pub peer: String,
     /// Локальная сторона: адрес сокета или пустая строка у порта.
     pub local: String,
+    /// Исходящая сторона пары прокси (FR-5); у остальных источников её нет.
+    pub link: Option<Link>,
+}
+
+/// Исходящая сторона пары прокси: сокет, который bytetap открыл к цели.
+///
+/// Входящая сторона лежит в самом [`Connection`]: вместе они и есть одна пара, одно
+/// соединение журнала. `role` — кто на дальнем конце: направление фрагментов и сторона
+/// закрытия считаются по роли, а не по тому, кто инициировал соединение (FR-5, FR-7).
+pub struct Link {
+    /// Байтовый поток исходящего сокета.
+    pub transport: Box<dyn Transport>,
+    /// Кто на дальнем конце: анализатор или ЛИС.
+    pub role: LinkRole,
+    /// Адрес цели, к которой подключился bytetap.
+    pub peer: String,
+    /// Локальный адрес исходящего сокета.
+    pub local: String,
+}
+
+/// Топология прокси: кто из двух сторон подключается к bytetap (FR-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyRole {
+    /// Анализатор — клиент: bytetap слушает порт для анализатора и подключается к ЛИС.
+    AnalyzerClient,
+    /// Анализатор — сервер: bytetap слушает порт для ЛИС и подключается к анализатору.
+    AnalyzerServer,
+}
+
+impl ProxyRole {
+    /// Значение роли в поле `settings.role` заголовка журнала.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AnalyzerClient => "analyzer_client",
+            Self::AnalyzerServer => "analyzer_server",
+        }
+    }
+
+    /// Кто стоит на дальнем конце пары: цель подключения.
+    #[must_use]
+    pub const fn target_role(self) -> LinkRole {
+        match self {
+            // Анализатор приходит сам, bytetap идёт к ЛИС.
+            Self::AnalyzerClient => LinkRole::Lis,
+            // ЛИС приходит сама, bytetap идёт к анализатору.
+            Self::AnalyzerServer => LinkRole::Analyzer,
+        }
+    }
+}
+
+impl std::fmt::Display for ProxyRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Что источник вернул на очередной запрос.
@@ -127,6 +187,17 @@ pub enum Source {
         /// Пауза между попытками открыть порт.
         reconnect: Duration,
     },
+    /// Встать в разрыв между анализатором и ЛИС (FR-5).
+    Proxy {
+        /// Адрес и порт, на который приходит одна из сторон; порт `0` — любой свободный.
+        listen: SocketAddr,
+        /// Цель, к которой bytetap подключается на каждое входящее соединение.
+        target: String,
+        /// Кто подключается к bytetap: анализатор или ЛИС.
+        role: ProxyRole,
+        /// Пауза после неудачного подключения к цели.
+        retry: Duration,
+    },
 }
 
 /// Готовый источник: соединения и строка для строки состояния.
@@ -181,6 +252,26 @@ impl Source {
                     local: settings.port.clone(),
                 })
             }
+            Self::Proxy {
+                listen,
+                target,
+                role,
+                retry,
+            } => {
+                // Цель стартом не проверяется: недоступная ЛИС — событие `error`,
+                // а не отказ старта (M3-AC1, M4-AC6).
+                let server = TcpServer::bind(*listen).await?;
+                let local = server.local_addr()?.to_string();
+                Ok(OpenedSource {
+                    source: Box::new(ProxySource {
+                        accepted: TcpServerSource::new(server),
+                        target: target.clone(),
+                        role: *role,
+                        retry: *retry,
+                    }),
+                    local,
+                })
+            }
         }
     }
 
@@ -191,6 +282,7 @@ impl Source {
             Self::TcpServer { .. } => crate::journal::Mode::TcpServer,
             Self::TcpClient { .. } => crate::journal::Mode::TcpClient,
             Self::Serial { .. } => crate::journal::Mode::Serial,
+            Self::Proxy { .. } => crate::journal::Mode::Proxy,
         }
     }
 
@@ -214,7 +306,87 @@ impl Source {
                 "dtr": settings.dtr,
                 "rts": settings.rts,
             }),
+            Self::Proxy { target, role, .. } => serde_json::json!({
+                "listen": local,
+                "target": target,
+                "role": role.as_str(),
+            }),
         }
+    }
+}
+
+/// Сколько ждёт попытка подключения к цели прокси, прежде чем стать `proxy_connect_timeout`.
+///
+/// Тот же срок, что у TCP-клиента: `connect` без срока висит минутами, а ждать дольше
+/// десяти секунд анализатору или ЛИС уже незачем — входящее соединение всё это время
+/// стоит без `open` (M4-AC6).
+const PROXY_CONNECT_TIMEOUT: Duration = CONNECT_TIMEOUT;
+
+/// Прокси: принимает сторону и на каждое входящее соединение подключается к цели (FR-5).
+///
+/// Пара появляется только целиком: сначала принятый сокет, затем исходящий. Неудачное
+/// подключение к цели не создаёт соединения — принятый сокет закрывается, а сессия
+/// получает [`Next::Retry`]: `open` без второго сокета не пишется (M4-AC6).
+///
+/// Слушатель ведёт [`TcpServerSource`]: ошибка `accept` повторяется с той же растущей
+/// паузой, что у TCP-сервера, а `TCP_NODELAY` ставится на обоих сокетах пары (NFR-6).
+struct ProxySource {
+    accepted: TcpServerSource,
+    target: String,
+    role: ProxyRole,
+    retry: Duration,
+}
+
+impl ConnectionSource for ProxySource {
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Next> + Send + '_>> {
+        Box::pin(async move {
+            let after = reconnect_pause(self.retry);
+            let accepted = match self.accepted.next().await {
+                Next::Connected(connection) => connection,
+                Next::Retry { error, after } => return Next::Retry { error, after },
+            };
+            let linked = timeout(
+                PROXY_CONNECT_TIMEOUT,
+                TcpStream::connect(self.target.as_str()),
+            )
+            .await;
+            match linked {
+                Ok(Ok(stream)) => {
+                    // Пересылка не должна ждать Nagle на обоих сокетах пары (NFR-6).
+                    let _ = stream.set_nodelay(true);
+                    let link_peer = stream
+                        .peer_addr()
+                        .map_or_else(|_| self.target.clone(), |addr| addr.to_string());
+                    let link_local = stream
+                        .local_addr()
+                        .map_or_else(|_| String::new(), |addr| addr.to_string());
+                    Next::Connected(Connection {
+                        transport: accepted.transport,
+                        peer: accepted.peer,
+                        local: accepted.local,
+                        link: Some(Link {
+                            transport: Box::new(stream),
+                            role: self.role.target_role(),
+                            peer: link_peer,
+                            local: link_local,
+                        }),
+                    })
+                }
+                // Принятый сокет выгружается здесь же: соединения из одного сокета не бывает.
+                Ok(Err(error)) => Next::Retry { error, after },
+                Err(_elapsed) => Next::Retry {
+                    error: io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "connect to {} timed out after {} s",
+                            self.target,
+                            PROXY_CONNECT_TIMEOUT.as_secs()
+                        ),
+                    ),
+                    after,
+                },
+            }
+        })
     }
 }
 
@@ -223,7 +395,6 @@ struct TcpClientSource {
     addr: String,
     reconnect: Duration,
 }
-
 impl ConnectionSource for TcpClientSource {
     fn sequential(&self) -> bool {
         true
@@ -252,6 +423,7 @@ impl ConnectionSource for TcpClientSource {
                         transport: Box::new(stream),
                         peer,
                         local,
+                        link: None,
                     })
                 }
                 Ok(Err(error)) => Next::Retry { error, after },
@@ -289,6 +461,7 @@ impl SerialSource {
             peer: self.settings.port.clone(),
             // У порта нет адресов: правило записано в `session-format.md` (M3-AC2).
             local: String::new(),
+            link: None,
         })
     }
 }
@@ -356,6 +529,63 @@ mod tests {
             reconnect_pause(Duration::from_secs(5)),
             Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn a_proxy_source_reports_its_settings_and_the_target_role() {
+        let proxy = Source::Proxy {
+            listen: "0.0.0.0:50025".parse().unwrap(),
+            target: "10.0.0.5:5000".to_owned(),
+            role: ProxyRole::AnalyzerClient,
+            retry: Duration::from_millis(100),
+        };
+        assert_eq!(proxy.mode(), crate::journal::Mode::Proxy);
+        assert_eq!(
+            proxy.settings("0.0.0.0:50025"),
+            serde_json::json!({
+                "listen": "0.0.0.0:50025",
+                "target": "10.0.0.5:5000",
+                "role": "analyzer_client",
+            })
+        );
+        assert_eq!(ProxyRole::AnalyzerClient.target_role(), LinkRole::Lis);
+        assert_eq!(ProxyRole::AnalyzerServer.target_role(), LinkRole::Analyzer);
+        assert_eq!(ProxyRole::AnalyzerServer.as_str(), "analyzer_server");
+        assert_eq!(ProxyRole::AnalyzerClient.to_string(), "analyzer_client");
+    }
+
+    #[tokio::test]
+    async fn a_proxy_binds_its_port_and_does_not_require_the_target() {
+        // Порт цели занят сокетом без `listen`: подключение откажет, но старт — нет.
+        let socket = tokio::net::TcpSocket::new_v4().expect("сокет");
+        socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .expect("порт занят без прослушивания");
+        let target = socket.local_addr().expect("адрес цели");
+        let source = Source::Proxy {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            target: target.to_string(),
+            role: ProxyRole::AnalyzerClient,
+            retry: Duration::from_millis(100),
+        };
+        let mut opened = source.open().await.expect("старт без цели");
+        assert_ne!(
+            opened.local.parse::<SocketAddr>().expect("адрес").port(),
+            0,
+            "порт выбран системой"
+        );
+        let analyzer =
+            tokio::net::TcpStream::connect(opened.local.parse::<SocketAddr>().expect("адрес"))
+                .await
+                .expect("анализатор пришёл");
+        match opened.source.next().await {
+            Next::Retry { after, .. } => {
+                assert_eq!(after, Duration::from_millis(100), "пауза источника")
+            }
+            Next::Connected(_) => panic!("цели нет"),
+        }
+        drop(analyzer);
+        drop(socket);
     }
 
     #[tokio::test]

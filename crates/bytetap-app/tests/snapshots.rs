@@ -1304,6 +1304,7 @@ fn recording_fixture(extra: usize) -> RecordingFixture {
             conn: 1,
             peer: "192.168.1.51:49152".into(),
             local: "0.0.0.0:5000".into(),
+            link: None,
         }),
         Event::Open(Open {
             t: at(0),
@@ -1311,6 +1312,7 @@ fn recording_fixture(extra: usize) -> RecordingFixture {
             conn: 2,
             peer: "192.168.1.52:49152".into(),
             local: "0.0.0.0:5000".into(),
+            link: None,
         }),
         data(
             500,

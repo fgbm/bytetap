@@ -106,6 +106,7 @@ impl ConnectionSource for TcpServerSource {
                         transport: Box::new(connection),
                         peer,
                         local,
+                        link: None,
                     })
                 }
                 Err(error) => {

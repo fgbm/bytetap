@@ -2061,6 +2061,8 @@ fn describe(source: &Source) -> String {
         Source::TcpServer { listen } => format!("tcp_server {listen}"),
         Source::TcpClient { addr, .. } => format!("tcp_client {addr}"),
         Source::Serial { settings, .. } => format!("serial {} {}", settings.port, settings.baud),
+        // Экран прокси — шаг 2 этапа M4: пока источник только называется в журнале запуска.
+        Source::Proxy { target, role, .. } => format!("proxy {} {target}", role.as_str()),
     }
 }
 

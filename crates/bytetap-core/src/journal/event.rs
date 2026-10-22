@@ -1,7 +1,9 @@
 //! События журнала сессии: типы, поля и их сериализация (FR-21, FR-22).
 //!
-//! Имена полей и значения перечислений совпадают с форматом `bytetap-session/1`
+//! Имена полей и значения перечислений совпадают с форматом `bytetap-session/2`
 //! (`docs/reference/session-format.md`) и описаны схемой
+//! `docs/public/schema/bytetap-session-2.schema.json`. От `/1` формат отличается одним
+//! необязательным полем `link` в `open`: журналы `/1` читаются как раньше, их схема —
 //! `docs/public/schema/bytetap-session-1.schema.json`.
 
 use std::fmt;
@@ -15,7 +17,7 @@ use crate::journal::now_rfc3339;
 use crate::text;
 
 /// Версия формата журнала в поле `format` заголовка сессии.
-pub const FORMAT: &str = "bytetap-session/1";
+pub const FORMAT: &str = "bytetap-session/2";
 
 /// Строка журнала.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +189,74 @@ impl fmt::Display for ClosedBy {
     }
 }
 
+/// Кто стоит на дальнем конце пары прокси (поле `link.role`).
+///
+/// Роль стороны задаёт направление фрагментов: байты из сокета анализатора — всегда
+/// `analyzer_to_lis`, из сокета ЛИС — `lis_to_analyzer`, кто бы ни инициировал соединение.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkRole {
+    /// Анализатор.
+    Analyzer,
+    /// ЛИС.
+    Lis,
+}
+
+impl LinkRole {
+    /// Значение в поле `link.role`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Analyzer => "analyzer",
+            Self::Lis => "lis",
+        }
+    }
+
+    /// Противоположная сторона пары: у анализатора — ЛИС и наоборот.
+    #[must_use]
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::Analyzer => Self::Lis,
+            Self::Lis => Self::Analyzer,
+        }
+    }
+
+    /// Направление фрагментов, прочитанных из сокета этой стороны.
+    #[must_use]
+    pub const fn dir(self) -> Dir {
+        match self {
+            Self::Analyzer => Dir::AnalyzerToLis,
+            Self::Lis => Dir::LisToAnalyzer,
+        }
+    }
+
+    /// Кто закрыл пару, если закрыла эта сторона.
+    #[must_use]
+    pub const fn closed_by(self) -> ClosedBy {
+        match self {
+            Self::Analyzer => ClosedBy::Analyzer,
+            Self::Lis => ClosedBy::Lis,
+        }
+    }
+}
+
+impl fmt::Display for LinkRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Исходящая сторона пары прокси (поле `link` в `open`, формат `/2`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Link {
+    /// Кто на дальнем конце: `analyzer` или `lis`.
+    pub role: LinkRole,
+    /// Адрес цели, к которой подключился bytetap.
+    pub peer: String,
+    /// Локальный адрес исходящего сокета bytetap.
+    pub local: String,
+}
+
 /// Сведения о машине, на которой шла сессия.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Host {
@@ -290,10 +360,13 @@ pub struct Open {
     pub mono_us: u64,
     /// Номер соединения внутри сессии, с 1.
     pub conn: u32,
-    /// Адрес и порт анализатора.
+    /// Адрес и порт анализатора (у прокси — принятой стороны).
     pub peer: String,
     /// Локальный адрес и порт.
     pub local: String,
+    /// Исходящая сторона пары прокси (формат `/2`, FR-5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<Link>,
 }
 
 /// Фрагмент обмена (FR-22).
@@ -478,7 +551,7 @@ mod tests {
             serde_json::to_value(&event).unwrap(),
             json!({
                 "type": "session",
-                "format": "bytetap-session/1",
+                "format": "bytetap-session/2",
                 // Версия — та, что пишет `Session::new`: сверять заголовок с числом,
                 // зашитым в тест, значило бы править тест на каждом релизе.
                 "app_version": env!("CARGO_PKG_VERSION"),
@@ -545,6 +618,42 @@ mod tests {
     }
 
     #[test]
+    fn a_proxy_open_carries_the_outgoing_side_of_the_pair() {
+        let open = Event::Open(Open {
+            t: "2026-10-22T10:15:00.123456+03:00".to_owned(),
+            mono_us: 1000,
+            conn: 1,
+            peer: "192.168.1.51:49152".to_owned(),
+            local: "192.168.1.10:50025".to_owned(),
+            link: Some(Link {
+                role: LinkRole::Lis,
+                peer: "10.0.0.5:5000".to_owned(),
+                local: "192.168.1.10:50231".to_owned(),
+            }),
+        });
+        assert_eq!(
+            serde_json::to_value(&open).unwrap(),
+            json!({
+                "type": "open",
+                "t": "2026-10-22T10:15:00.123456+03:00",
+                "mono_us": 1000,
+                "conn": 1,
+                "peer": "192.168.1.51:49152",
+                "local": "192.168.1.10:50025",
+                "link": {
+                    "role": "lis",
+                    "peer": "10.0.0.5:5000",
+                    "local": "192.168.1.10:50231"
+                }
+            })
+        );
+        assert_eq!(LinkRole::Lis.as_str(), "lis");
+        assert_eq!(LinkRole::Lis.opposite(), LinkRole::Analyzer);
+        assert_eq!(LinkRole::Lis.dir(), Dir::LisToAnalyzer);
+        assert_eq!(LinkRole::Analyzer.closed_by(), ClosedBy::Analyzer);
+    }
+
+    #[test]
     fn close_open_error_and_session_end_shapes() {
         let open = Event::Open(Open {
             t: "2026-10-19T10:15:00.100000+03:00".to_owned(),
@@ -552,6 +661,7 @@ mod tests {
             conn: 1,
             peer: "192.168.1.50:49152".to_owned(),
             local: "192.168.1.10:5000".to_owned(),
+            link: None,
         });
         assert_eq!(
             serde_json::to_value(&open).unwrap(),
@@ -652,6 +762,7 @@ mod tests {
                 conn: 1,
                 peer: "p".to_owned(),
                 local: "l".to_owned(),
+                link: None,
             }),
             Event::Data(Data::new("t", 2, 1, Dir::AnalyzerToLis, false, b"x")),
             Event::Close(Close {
@@ -704,7 +815,9 @@ mod tests {
         assert_eq!(Mode::TcpClient.to_string(), "tcp_client");
         assert_eq!(Mode::Serial.to_string(), "serial");
         assert_eq!(Mode::ComTcp.to_string(), "com_tcp");
+        assert_eq!(Mode::Proxy.to_string(), "proxy");
         assert_eq!(Dir::LisToAnalyzer.to_string(), "lis_to_analyzer");
+        assert_eq!(LinkRole::Lis.to_string(), "lis");
         assert_eq!(Autoresponder::AstmE1381.to_string(), "astm_e1381");
         assert_eq!(ClosedBy::Bytetap.to_string(), "bytetap");
     }

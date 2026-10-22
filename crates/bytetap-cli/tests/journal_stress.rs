@@ -21,9 +21,10 @@ const MIN_LINES: usize = 2_000;
 /// Сколько ждём наполнения журнала — с запасом на медленную CI-машину.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Схема формата новых журналов: стресс-журнал пишется в `/2` (M4-AC9).
 fn schema() -> Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/public/schema/bytetap-session-1.schema.json");
+        .join("../../docs/public/schema/bytetap-session-2.schema.json");
     serde_json::from_str(&std::fs::read_to_string(&path).expect("схема формата")).expect("JSON")
 }
 

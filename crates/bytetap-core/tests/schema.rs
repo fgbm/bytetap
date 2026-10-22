@@ -1,20 +1,24 @@
-//! События, которые пишет ядро, проходят валидацию по JSON Schema формата (M1-AC1).
+//! События, которые пишет ядро, проходят валидацию по JSON Schema формата (M1-AC1, M4-AC9).
+//!
+//! Новые журналы пишутся в формате `/2` и проверяются схемой `/2`; журналы `/1` читаются
+//! и проверяются своей схемой, которая не менялась.
 
 use std::path::PathBuf;
 
 use bytetap_core::journal::{
-    Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, Host, InfoEvent, Mode, Note,
-    Session, SessionEnd, Stats, read_all,
+    Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, Host, InfoEvent, Link, LinkRole,
+    Mode, Note, Open, Session, SessionEnd, Stats, read_all,
 };
 use serde_json::{Value, json};
 
-fn schema_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/public/schema/bytetap-session-1.schema.json")
+fn schema_path(version: u32) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../docs/public/schema/bytetap-session-{version}.schema.json"
+    ))
 }
 
-fn schema() -> Value {
-    let path = schema_path();
+fn schema(version: u32) -> Value {
+    let path = schema_path(version);
     let text = std::fs::read_to_string(&path).expect("схема формата рядом с документацией");
     serde_json::from_str(&text).expect("схема — корректный JSON")
 }
@@ -31,12 +35,13 @@ fn events() -> Vec<Event> {
     let payload = b"\x0bMSH|^~\\&|ANALYZER|LAB|LIS|LAB|20261019101500||ORU^R01|1|P|2.3.1\r\x1c\r";
     vec![
         Event::Session(session),
-        Event::Open(bytetap_core::journal::Open {
+        Event::Open(Open {
             t: bytetap_core::journal::now_rfc3339(),
             mono_us: 1000,
             conn: 1,
             peer: "192.168.1.50:49152".to_owned(),
             local: "192.168.1.10:5000".to_owned(),
+            link: None,
         }),
         Event::Data(Data::new(
             bytetap_core::journal::now_rfc3339(),
@@ -94,7 +99,7 @@ fn events() -> Vec<Event> {
 
 #[test]
 fn every_event_type_validates_against_the_schema() {
-    let schema = schema();
+    let schema = schema(2);
     let validator = jsonschema::validator_for(&schema).expect("схема проверяется движком");
     for event in events() {
         let value = serde_json::to_value(&event).expect("сериализация");
@@ -106,7 +111,7 @@ fn every_event_type_validates_against_the_schema() {
 
 #[test]
 fn journal_written_by_the_core_validates_line_by_line() {
-    let schema = schema();
+    let schema = schema(2);
     let validator = jsonschema::validator_for(&schema).expect("схема проверяется движком");
     let text: String = events()
         .iter()
@@ -129,7 +134,7 @@ fn journal_written_by_the_core_validates_line_by_line() {
 
 #[test]
 fn tcp_client_and_serial_headers_validate_against_the_schema() {
-    let schema = schema();
+    let schema = schema(2);
     let validator = jsonschema::validator_for(&schema).expect("схема проверяется движком");
     for (mode, settings) in [
         (
@@ -157,8 +162,86 @@ fn tcp_client_and_serial_headers_validate_against_the_schema() {
 }
 
 #[test]
+fn a_proxy_pair_validates_against_the_schema() {
+    let schema = schema(2);
+    let validator = jsonschema::validator_for(&schema).expect("схема проверяется движком");
+    let header = Session::new(
+        Mode::Proxy,
+        Autoresponder::None,
+        json!({"listen": "127.0.0.1:50025", "target": "127.0.0.1:5000", "role": "analyzer_server"}),
+        Host::current(),
+    );
+    let events = [
+        Event::Session(header),
+        Event::Open(Open {
+            t: bytetap_core::journal::now_rfc3339(),
+            mono_us: 1000,
+            conn: 1,
+            peer: "192.168.1.60:49152".to_owned(),
+            local: "127.0.0.1:50025".to_owned(),
+            link: Some(Link {
+                role: LinkRole::Analyzer,
+                peer: "127.0.0.1:5000".to_owned(),
+                local: "127.0.0.1:50026".to_owned(),
+            }),
+        }),
+        Event::Data(Data::new(
+            bytetap_core::journal::now_rfc3339(),
+            2000,
+            1,
+            Dir::LisToAnalyzer,
+            false,
+            b"\x05",
+        )),
+        Event::Close(Close {
+            t: bytetap_core::journal::now_rfc3339(),
+            mono_us: 3000,
+            conn: 1,
+            by: ClosedBy::Lis,
+            reason: "eof".to_owned(),
+        }),
+        Event::Error(ErrorEvent {
+            t: bytetap_core::journal::now_rfc3339(),
+            mono_us: 4000,
+            conn: None,
+            code: Some("proxy_connect_timeout".to_owned()),
+            message: "connect failed: connect to 10.0.0.5:5000 timed out after 10 s".to_owned(),
+        }),
+    ];
+    for event in events {
+        let value = serde_json::to_value(&event).expect("сериализация");
+        if let Err(error) = validator.validate(&value) {
+            panic!("событие {} не прошло схему: {error}\n{value}", event.kind());
+        }
+    }
+}
+
+#[test]
+fn the_v1_fixture_reads_and_validates_against_the_v1_schema() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/journal/minimal.jsonl");
+    let outcome = read_all(&path).expect("фикстура /1 читается");
+    assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+    let Event::Session(header) = &outcome.lines[0].event else {
+        panic!("первая строка — заголовок");
+    };
+    assert_eq!(
+        header.format, "bytetap-session/1",
+        "фикстура старого формата"
+    );
+
+    let schema = schema(1);
+    let validator = jsonschema::validator_for(&schema).expect("схема /1 проверяется движком");
+    for line in &outcome.lines {
+        if let Err(error) = validator.validate(&line.value) {
+            panic!("строка {} не прошла схему /1: {error}", line.number);
+        }
+    }
+}
+
+#[test]
 fn schema_rejects_broken_events() {
-    let schema = schema();
+    let schema = schema(2);
     let validator = jsonschema::validator_for(&schema).expect("схема проверяется движком");
     let broken = [
         // нет обязательного `b64`

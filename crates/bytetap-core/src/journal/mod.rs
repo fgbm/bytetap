@@ -16,8 +16,8 @@ use std::time::Instant;
 use chrono::{Local, SecondsFormat};
 
 pub use event::{
-    Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, FORMAT, Host, InfoEvent, Mode,
-    Note, Open, Session, SessionEnd, Stats,
+    Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, FORMAT, Host, InfoEvent, Link,
+    LinkRole, Mode, Note, Open, Session, SessionEnd, Stats,
 };
 pub use reader::{JournalLine, JournalReader, LineError, LineErrorKind, ReadOutcome, read_all};
 pub use recent::{MAX_RECENT_JOURNALS, RecentJournal, recent};
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn format_constant_is_the_expected_version() {
-        assert_eq!(FORMAT, "bytetap-session/1");
+        assert_eq!(FORMAT, "bytetap-session/2");
     }
 
     #[test]

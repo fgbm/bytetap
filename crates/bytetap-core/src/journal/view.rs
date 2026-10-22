@@ -740,7 +740,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::journal::{Autoresponder, Data, Host, Mode, Open, SessionEnd};
+    use crate::journal::{Autoresponder, ClosedBy, Data, Host, Mode, Open, SessionEnd};
 
     /// Синтетический журнал из `tests/fixtures/journal`.
     fn fixture() -> PathBuf {
@@ -1020,6 +1020,54 @@ mod tests {
 
     /// Отказ журнала обрывает файл без `session_end`, а иногда и посреди строки:
     /// просмотр открывает то, что успело записаться (FR-29, NFR-5).
+    /// Журнал прокси формата `/2` открывается просмотром так же, как `/1` (M4-AC9).
+    #[test]
+    fn a_proxy_journal_of_the_second_format_opens() {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let path = dir.path().join("proxy.jsonl");
+        let session = Session::new(
+            Mode::Proxy,
+            Autoresponder::None,
+            json!({"listen": "127.0.0.1:50025", "target": "127.0.0.1:5000", "role": "analyzer_client"}),
+            Host {
+                os: "Linux".to_owned(),
+            },
+        );
+        let mut text = line(&Event::Session(session));
+        text.push_str(&line(&Event::Open(Open {
+            t: "2026-10-22T10:15:01.000000+03:00".to_owned(),
+            mono_us: 1000,
+            conn: 1,
+            peer: "127.0.0.1:49152".to_owned(),
+            local: "127.0.0.1:50025".to_owned(),
+            link: Some(crate::journal::Link {
+                role: crate::journal::LinkRole::Lis,
+                peer: "127.0.0.1:5000".to_owned(),
+                local: "127.0.0.1:50026".to_owned(),
+            }),
+        })));
+        text.push_str(&line(&data(2000, 1, Dir::AnalyzerToLis, 16)));
+        text.push_str(&line(&Event::Close(crate::journal::Close {
+            t: "2026-10-22T10:15:02.000000+03:00".to_owned(),
+            mono_us: 3000,
+            conn: 1,
+            by: ClosedBy::Analyzer,
+            reason: "eof".to_owned(),
+        })));
+        std::fs::write(&path, text).expect("журнал прокси");
+
+        let summary = JournalCache::default().open(&path).expect("сводка");
+        assert_eq!(summary.header.mode, Mode::Proxy);
+        assert_eq!(summary.header.format, crate::journal::FORMAT);
+        assert_eq!(summary.events, 3, "open, data и close");
+        assert_eq!(summary.stats.connections, 1);
+        assert_eq!(summary.duration_us, 3000);
+        let page = JournalCache::default()
+            .read(&path, 0, 10)
+            .expect("страница журнала");
+        assert!(matches!(&page[0], Event::Open(open) if open.link.is_some()));
+    }
+
     #[test]
     fn a_journal_interrupted_by_a_failure_still_opens() {
         let dir = tempfile::tempdir().expect("временная папка");
@@ -1031,6 +1079,7 @@ mod tests {
             conn: 1,
             peer: "192.168.1.50:49152".to_owned(),
             local: "127.0.0.1:5000".to_owned(),
+            link: None,
         })));
         text.push_str(&line(&data(0, 1, Dir::AnalyzerToLis, 10)));
         text.push_str(&line(&data(1_000, 2, Dir::LisToAnalyzer, 20)));

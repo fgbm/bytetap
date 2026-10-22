@@ -87,6 +87,7 @@ fn journal_text() -> String {
         conn: 1,
         peer: "192.168.1.51:49152".to_owned(),
         local: "127.0.0.1:5000".to_owned(),
+        link: None,
     }));
     let msg = |id: &str, body: &str| {
         cp1251(&format!(

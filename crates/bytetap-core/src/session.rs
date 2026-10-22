@@ -1,4 +1,4 @@
-//! Сессия записи: слушает TCP, ведёт соединения, пишет журнал и рассылает события (FR-1…FR-4).
+//! Сессия записи: слушает TCP, ведёт соединения, пишет журнал и рассылает события (FR-1…FR-5).
 //!
 //! Сессия — актор: [`Session::start`] занимает порт, создаёт файл журнала и запускает задачу,
 //! которая принимает соединения и обслуживает их. Всё остальное общается с ней через
@@ -10,18 +10,24 @@
 //! сохраняется: `data` входящий идёт раньше `data` ответа. Журнал при этом не блокирует
 //! пересылку: [`Journal::record`] только кладёт событие в канал (NFR-6, ADR 0001).
 //!
+//! Режим прокси — тот же код сессии с другим источником: пара сокетов приходит одним
+//! [`Connection`] с заполненным [`Connection::link`], обслуживает её [`serve_proxy`] рядом
+//! с [`serve`]. Нумерация `conn`, счётчики, журнал, схлопывание ошибок, комментарий
+//! и остановка общие (M4-AC16).
+//!
 //! Соединения нумеруются с 1 сквозным счётчиком сессии. Параллельные соединения
 //! обслуживаются независимо, последовательные получают новый номер. Ошибка в соединении
 //! закрывает только его (NFR-5): сессия пишет `error`, `close` и продолжает слушать.
 //!
 //! Отказ журнала останавливает сессию: [`Journal::record`], вернувший `false`, значит, что
 //! события больше не попадают на диск. Сессия рассылает подписчикам `error` с причиной,
-//! перестаёт отвечать анализатору (ни одного ACK после отказа), закрывает соединения и
-//! завершается без `session_end`; [`SessionHandle::stop`] возвращает ошибку с причиной
-//! (ADR 0001, «Ошибка записи»).
+//! перестаёт отвечать анализатору (ни одного ACK после отказа) и в прокси перестаёт
+//! пересылать байты, закрывает соединения и завершается без `session_end`;
+//! [`SessionHandle::stop`] возвращает ошибку с причиной (ADR 0001, «Ошибка записи»).
 //!
 //! Автоответчик у каждого соединения свой ([`Responder`]), а источник `MSH-10` — общий на
 //! сессию ([`ControlIdSource`]): номера ответов не повторяются между соединениями.
+//! В прокси автоответчика нет вообще: байты идут без изменений (FR-6).
 
 use std::collections::HashSet;
 use std::io;
@@ -32,18 +38,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{Local, SecondsFormat};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::journal::{
     Autoresponder, Close, ClosedBy, Data, Dir, ErrorEvent, Event, Host, InfoEvent, Journal,
-    JournalFailureReason, Mode, MonoClock, Note, Open, Session as SessionHeader, SessionEnd, Stats,
-    default_log_dir, io_message, log_dir_warning, now_rfc3339, session_file_name,
+    JournalFailureReason, LinkRole, Mode, MonoClock, Note, Open, Session as SessionHeader,
+    SessionEnd, Stats, default_log_dir, io_message, log_dir_warning, now_rfc3339,
+    session_file_name,
 };
 use crate::responder::{Action, ControlIdSource, Now, Responder, ResponderEvent, ResponderKind};
-use crate::transport::{Connection, ConnectionSource, Next, Source, Transport};
+use crate::transport::{Connection, ConnectionSource, Link, Next, ProxyRole, Source, Transport};
 
 /// Сколько событий держат каналы подписчиков.
 ///
@@ -60,6 +67,13 @@ const READ_BUFFER: usize = 16 * 1024;
 /// анализатора уходит в буфер сокета за микросекунды, а пять секунд — уже заведомо сбой
 /// приёма, а не медленный диск (журнал в пересылку не входит, NFR-6).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Сколько пара прокси доживает после `FIN` одной стороны, прежде чем закрыться сама (FR-7).
+///
+/// Протоколы, где сторона полузакрывается после запроса и ждёт ответа, не должны рваться
+/// там, где без прокси работали: обратное направление доживает до своего `FIN`, но не
+/// дольше пяти секунд — иначе зависшая сторона держала бы пару вечно (M4-В7).
+const PROXY_LINGER: Duration = Duration::from_secs(5);
 
 /// Сколько `run` ждёт задачи соединений после остановки, прежде чем прервать их.
 ///
@@ -209,6 +223,36 @@ impl SessionConfig {
         }
     }
 
+    /// Сессия прокси: слушать одну сторону и подключаться к другой (FR-5).
+    ///
+    /// `role` — кто приходит на порт bytetap: анализатор (`AnalyzerClient`) или ЛИС
+    /// (`AnalyzerServer`). `retry` — пауза после неудачного подключения к цели.
+    ///
+    /// Автоответчика здесь нет и быть не может (FR-6): байты идут без изменений, а прибор
+    /// получает ответы от ЛИС. Поэтому профиль — [`Autoresponder::None`], и [`SessionConfig::with_responder`]
+    /// на прокси не действует: заголовок журнала и автомат остаются «без ответов».
+    #[must_use]
+    pub fn proxy(
+        listen: SocketAddr,
+        target: impl Into<String>,
+        role: ProxyRole,
+        retry: Duration,
+    ) -> Self {
+        Self {
+            source: Source::Proxy {
+                listen,
+                target: target.into(),
+                role,
+                retry,
+            },
+            responder: Autoresponder::None,
+            astm_nak_on_bad_checksum: false,
+            log_dir: None,
+            analyzer: None,
+            note: None,
+        }
+    }
+
     /// Источник соединений вместо адреса прослушивания.
     #[must_use]
     pub fn with_source(mut self, source: Source) -> Self {
@@ -231,7 +275,13 @@ impl SessionConfig {
     }
 
     /// Профиль автоответчика в виде, из которого строится автомат соединения (FR-14).
+    ///
+    /// В прокси автоответчика нет всегда, какой бы профиль ни был задан настройками
+    /// (FR-6): второй автомат отвечал бы прибору вместо ЛИС.
     fn responder_kind(&self) -> ResponderKind {
+        if matches!(self.source, Source::Proxy { .. }) {
+            return ResponderKind::None;
+        }
         match self.responder {
             Autoresponder::Auto => ResponderKind::Auto,
             Autoresponder::Hl7Mllp => ResponderKind::Hl7,
@@ -240,6 +290,17 @@ impl SessionConfig {
             },
             Autoresponder::None => ResponderKind::None,
         }
+    }
+
+    /// Профиль автоответчика для заголовка журнала.
+    ///
+    /// У прокси он всегда `none`: поле заголовка должно совпадать с тем, что делает сессия.
+    #[must_use]
+    pub const fn header_responder(&self) -> Autoresponder {
+        if matches!(self.source, Source::Proxy { .. }) {
+            return Autoresponder::None;
+        }
+        self.responder
     }
 
     /// Папка журналов вместо папки по умолчанию (FR-19).
@@ -323,7 +384,7 @@ impl Session {
         let mut header = SessionHeader::at(
             started,
             mode,
-            config.responder,
+            config.header_responder(),
             // `settings` — фактические настройки режима: у TCP-сервера это адрес, выбранный
             // системой при порте 0, у клиента — адрес анализатора и интервал, у COM — порт
             // и параметры (M3-AC16).
@@ -806,7 +867,19 @@ fn source_failure(mode: Mode) -> (&'static str, &'static str) {
         Mode::TcpServer => ("accept failed", "accept_failed"),
         Mode::TcpClient => ("connect failed", "connect_failed"),
         Mode::Serial => ("serial port open failed", "serial_open_failed"),
-        Mode::Proxy | Mode::ComMonitor | Mode::ComTcp => ("source failed", "source_failed"),
+        Mode::Proxy => ("connect failed", "proxy_connect_failed"),
+        Mode::ComMonitor | Mode::ComTcp => ("source failed", "source_failed"),
+    }
+}
+
+/// Код ошибки источника с поправкой на её вид.
+///
+/// У прокси отказ цели и её молчание — разные коды (M4-AC6): инженеру важно отличить
+/// «ЛИС не отвечает» от «ЛИС отказала в соединении».
+fn source_failure_code(mode: Mode, code: &'static str, error: &io::Error) -> &'static str {
+    match (mode, error.kind()) {
+        (Mode::Proxy, io::ErrorKind::TimedOut) => "proxy_connect_timeout",
+        _ => code,
     }
 }
 
@@ -896,27 +969,61 @@ async fn run(
                     // `open` пишется здесь, а не в задаче соединения: так порядок строк
                     // совпадает с порядком номеров, и открытие не может оказаться после
                     // первых фрагментов этого же соединения.
-                    let Connection { transport, peer, local } = connection;
+                    let Connection {
+                        transport,
+                        peer,
+                        local,
+                        link,
+                    } = connection;
                     shared.publish(Event::Open(Open {
                         t: now_rfc3339(),
                         mono_us: shared.clock.now_us(),
                         conn,
                         peer,
                         local,
+                        // У прокси `open` несёт обе стороны пары (формат `/2`).
+                        link: link.as_ref().map(|link| crate::journal::Link {
+                            role: link.role,
+                            peer: link.peer.clone(),
+                            local: link.local.clone(),
+                        }),
                     }));
                     let shared = Arc::clone(&shared);
                     let mut conn_stop = stop.clone();
                     let mut conn_failure = failure.clone();
                     tasks.spawn(async move {
-                        let mut transport = transport;
-                        serve(transport.as_mut(), conn, &shared, &mut conn_stop, &mut conn_failure)
-                            .await;
+                        match link {
+                            Some(link) => {
+                                serve_proxy(
+                                    transport,
+                                    link,
+                                    conn,
+                                    shared,
+                                    &mut conn_stop,
+                                    &mut conn_failure,
+                                )
+                                .await;
+                            }
+                            None => {
+                                let mut transport = transport;
+                                serve(
+                                    transport.as_mut(),
+                                    conn,
+                                    &shared,
+                                    &mut conn_stop,
+                                    &mut conn_failure,
+                                )
+                                .await;
+                            }
+                        }
                     });
                 }
                 Next::Retry { error, after } => {
-                    // Неудачное подключение не роняет сессию (NFR-5, M3-AC1, M3-AC2):
-                    // одно `error`, повторы схлопываются, ожидание прерывается «Стопом».
+                    // Неудачное подключение не роняет сессию (NFR-5, M3-AC1, M3-AC2,
+                    // M4-AC6): одно `error`, повторы схлопываются, ожидание прерывается
+                    // «Стопом».
                     let message = format!("{prefix}: {}", io_message(&error));
+                    let code = source_failure_code(mode, code, &error);
                     match source_errors.failed(message) {
                         SourceReport::Repeated => {}
                         SourceReport::First(message) => {
@@ -1128,6 +1235,203 @@ async fn serve(
     let _ = transport.shutdown().await;
 }
 
+/// Чем закончился насос одного направления пары прокси.
+enum Pump {
+    /// Сторона закрыла свою половину (`FIN`): запись в обратную сторону полузакрыта.
+    Eof(LinkRole),
+    /// Обмен прерван ошибкой сокета: сброс, обрыв, ошибка записи.
+    Broken {
+        /// Сторона, из которой читал насос.
+        role: LinkRole,
+        /// Что именно случилось.
+        error: io::Error,
+        /// `true` — ошибка на записи, `false` — на чтении.
+        writing: bool,
+    },
+    /// Сессия остановлена или журнал отказал: пересылка прекращается.
+    Stopped,
+}
+
+/// Обслуживает пару прокси до закрытия (FR-5, FR-6, FR-7, M4-AC16).
+///
+/// Пара — одно соединение журнала с одним `conn`: `open` уже написан сессией. Внутри два
+/// насоса, по одному на направление: каждый читает в свой буфер [`READ_BUFFER`], пишет
+/// прочитанное в другой сокет и только потом кладёт `data` в журнал — с фактически
+/// переданными байтами. Журнал в пути пересылки не стоит: `record` только кладёт событие
+/// в канал писателя (NFR-6, FR-20).
+///
+/// Закрытие по FR-7: первая закончившаяся сторона задаёт `by` и `reason` одного `close`.
+/// `FIN` пересылается полузакрытием, и обратное направление доживает до своего `FIN`, но
+/// не дольше [`PROXY_LINGER`]; истёк срок — пара закрывается как `bytetap/timeout`.
+/// Сброс закрывает обе стороны сразу, «Стоп» и отказ журнала — тоже.
+async fn serve_proxy(
+    accepted: Box<dyn Transport>,
+    link: Link,
+    conn: u32,
+    shared: Arc<Shared>,
+    stop: &mut watch::Receiver<bool>,
+    failure: &mut watch::Receiver<Option<JournalFailureReason>>,
+) {
+    // Принятая сторона — противоположная роли дальнего конца пары (FR-5).
+    let accepted_role = link.role.opposite();
+    let (accepted_read, accepted_write) = tokio::io::split(accepted);
+    let (link_read, link_write) = tokio::io::split(link.transport);
+
+    let mut pumps: JoinSet<Pump> = JoinSet::new();
+    pumps.spawn(pump(
+        accepted_read,
+        link_write,
+        accepted_role,
+        conn,
+        Arc::clone(&shared),
+        stop.clone(),
+        failure.clone(),
+    ));
+    pumps.spawn(pump(
+        link_read,
+        accepted_write,
+        link.role,
+        conn,
+        Arc::clone(&shared),
+        stop.clone(),
+        failure.clone(),
+    ));
+
+    let (mut by, mut reason, linger) = match pumps.join_next().await {
+        Some(Ok(outcome)) => match outcome {
+            Pump::Eof(role) => (role.closed_by(), "eof", PROXY_LINGER),
+            Pump::Broken {
+                role,
+                error,
+                writing,
+            } => {
+                let (by, reason) = proxy_broken(role, &error, writing);
+                let (code, what) = if writing {
+                    ("connection_write_failed", "proxy write failed")
+                } else {
+                    ("connection_read_failed", "proxy read failed")
+                };
+                shared.error_with_code(
+                    Some(conn),
+                    Some(code),
+                    format!("{what}: {}", io_message(&error)),
+                );
+                (by, reason, Duration::ZERO)
+            }
+            Pump::Stopped => (ClosedBy::Bytetap, "stop", Duration::ZERO),
+        },
+        // Насосов не осталось или задача упала: пары больше нет.
+        None | Some(Err(_)) => (ClosedBy::Bytetap, "error", Duration::ZERO),
+    };
+
+    if !linger.is_zero() {
+        // `FIN` одной стороны: обратное направление доживает до своего `FIN`;
+        // истёк срок — закрывает bytetap, иначе зависшая сторона держала бы пару вечно.
+        if timeout(linger, pumps.join_next()).await.is_err() {
+            by = ClosedBy::Bytetap;
+            reason = "timeout";
+        }
+    }
+    // Оставшийся насос прерывается вместе с сокетами: пара закрыта.
+    pumps.shutdown().await;
+    shared.close_conn(conn, by, reason);
+}
+
+/// Один насос пары: читает из `from` и пишет прочитанное в `to` (FR-6, NFR-6).
+///
+/// Отправленный фрагмент пишется в журнал после записи в сокет и с фактически переданными
+/// байтами: в журнале ровно то, что получил адресат, включая обрыв на середине.
+async fn pump(
+    mut from: tokio::io::ReadHalf<Box<dyn Transport>>,
+    mut to: tokio::io::WriteHalf<Box<dyn Transport>>,
+    role: LinkRole,
+    conn: u32,
+    shared: Arc<Shared>,
+    mut stop: watch::Receiver<bool>,
+    mut failure: watch::Receiver<Option<JournalFailureReason>>,
+) -> Pump {
+    let mut buffer = vec![0u8; READ_BUFFER];
+    loop {
+        // Отказ журнала останавливает пересылку: байты, которых нет в журнале, дальше
+        // не идут, иначе ЛИС получила бы обмен, которого в записи нет (M4-AC10).
+        if failure.borrow().is_some() {
+            return Pump::Stopped;
+        }
+        let read = tokio::select! {
+            biased;
+            () = wait_for_stop(&mut stop) => return Pump::Stopped,
+            () = wait_for_failure(&mut failure) => return Pump::Stopped,
+            read = from.read(&mut buffer) => read,
+        };
+        match read {
+            Ok(0) => {
+                // `FIN` этой стороны — полузакрытие записи в другую (FR-7).
+                let _ = to.shutdown().await;
+                return Pump::Eof(role);
+            }
+            Ok(len) => {
+                let payload = &buffer[..len];
+                let sent = AtomicUsize::new(0);
+                let written = write_counted(&mut to, payload, &sent).await;
+                let sent = sent.load(Ordering::Relaxed).min(payload.len());
+                record_forwarded(&shared, conn, role.dir(), &payload[..sent]);
+                if let Err(error) = written {
+                    return Pump::Broken {
+                        role,
+                        error,
+                        writing: true,
+                    };
+                }
+                if failure.borrow().is_some() {
+                    return Pump::Stopped;
+                }
+            }
+            Err(error) => {
+                return Pump::Broken {
+                    role,
+                    error,
+                    writing: false,
+                };
+            }
+        }
+    }
+}
+
+/// Кто закрыл пару по ошибке сокета и почему.
+///
+/// Ошибка чтения — сторону сбросила та сторона, из которой читали; ошибка записи — та,
+/// в которую писали, то есть противоположная. Всё остальное bytetap считает своей ошибкой.
+fn proxy_broken(role: LinkRole, error: &io::Error, writing: bool) -> (ClosedBy, &'static str) {
+    match error.kind() {
+        io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof => {
+            let closer = if writing { role.opposite() } else { role };
+            (closer.closed_by(), "reset")
+        }
+        _ => (ClosedBy::Bytetap, "error"),
+    }
+}
+
+/// Записывает фактически пересланный фрагмент: байты, статистику и событие `data`.
+///
+/// Пустой фрагмент не пишется: байтов, которых не было, в журнале быть не должно.
+fn record_forwarded(shared: &Shared, conn: u32, dir: Dir, payload: &[u8]) {
+    if payload.is_empty() {
+        return;
+    }
+    shared.counters.add(dir, payload.len() as u64);
+    shared.publish(Event::Data(Data::new(
+        timestamp().0,
+        shared.clock.now_us(),
+        conn,
+        dir,
+        false,
+        payload,
+    )));
+}
+
 /// Выполняет действия автоответчика по порядку: ответ — в сокет, затем в журнал.
 ///
 /// Ответ уходит в сокет до записи в журнал: событие `data` с `synthetic: true` появляется
@@ -1221,8 +1525,11 @@ async fn apply(
 /// `write_all` не говорит, сколько байт успело уйти. Счётчик [`AtomicUsize`] общий
 /// с вызывающим: если запись прервёт таймаут или остановка, отправленная часть
 /// останется в счётчике и попадёт в журнал — анализатор её получил.
-async fn write_counted(
-    transport: &mut dyn Transport,
+///
+/// Подходит и полузакрытой записи пары прокси (`WriteHalf`), поэтому ограничение —
+/// [`AsyncWrite`], а не транспорт соединения.
+async fn write_counted<W: AsyncWrite + Unpin + ?Sized>(
+    transport: &mut W,
     payload: &[u8],
     sent: &AtomicUsize,
 ) -> io::Result<()> {
@@ -1514,6 +1821,67 @@ mod tests {
         assert_eq!(
             source_failure(Mode::Serial),
             ("serial port open failed", "serial_open_failed")
+        );
+        assert_eq!(
+            source_failure(Mode::Proxy),
+            ("connect failed", "proxy_connect_failed")
+        );
+    }
+
+    #[test]
+    fn an_unreachable_proxy_target_is_told_from_a_silent_one() {
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        assert_eq!(
+            source_failure_code(Mode::Proxy, "proxy_connect_failed", &refused),
+            "proxy_connect_failed"
+        );
+        let timed_out = io::Error::from(io::ErrorKind::TimedOut);
+        assert_eq!(
+            source_failure_code(Mode::Proxy, "proxy_connect_failed", &timed_out),
+            "proxy_connect_timeout"
+        );
+        assert_eq!(
+            source_failure_code(Mode::TcpClient, "connect_failed", &timed_out),
+            "connect_failed",
+            "у TCP-клиента таймаут своего кода не получает"
+        );
+    }
+
+    #[test]
+    fn a_proxy_session_has_no_responder_at_all() {
+        let config = SessionConfig::proxy(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:5000",
+            ProxyRole::AnalyzerClient,
+            Duration::from_millis(100),
+        )
+        .with_responder(Autoresponder::AstmE1381)
+        .with_astm_nak(true);
+        assert_eq!(
+            config.header_responder(),
+            Autoresponder::None,
+            "в прокси автоответчика нет: байты идут без изменений (FR-6)"
+        );
+        assert_eq!(config.responder_kind(), ResponderKind::None);
+        assert_eq!(config.source.mode(), Mode::Proxy);
+    }
+
+    #[test]
+    fn a_pair_is_closed_by_the_side_that_broke_it() {
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        // Чтение из сокета анализатора: сбросил анализатор.
+        assert_eq!(
+            proxy_broken(LinkRole::Analyzer, &reset, false),
+            (ClosedBy::Analyzer, "reset")
+        );
+        // Запись в сокет ЛИС: сбросила ЛИС, а не тот, из кого читали.
+        assert_eq!(
+            proxy_broken(LinkRole::Analyzer, &reset, true),
+            (ClosedBy::Lis, "reset")
+        );
+        assert_eq!(
+            proxy_broken(LinkRole::Analyzer, &io::Error::other("странно"), false),
+            (ClosedBy::Bytetap, "error")
         );
     }
 

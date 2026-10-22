@@ -1141,6 +1141,7 @@ mod tests {
             conn: 1,
             peer: "192.168.1.51:49152".into(),
             local: "0.0.0.0:5000".into(),
+            link: None,
         });
         let event = FeedEvent::from_session(&open).unwrap();
         assert_eq!(event.time, "--:--:--.---");

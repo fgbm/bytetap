@@ -457,6 +457,9 @@ pub fn start_error(err: &io::Error, source: &Source) -> StartError {
         }
         Source::TcpClient { .. } => StartError::new(ErrorCode::Io, err.to_string()),
         Source::Serial { settings, .. } => serial_error(err, settings, port_listed),
+        // Экран прокси — шаг 2 этапа M4; у ядра та же ошибка старта, что у TCP-сервера:
+        // занятый порт прослушивания либо недоступная папка журналов.
+        Source::Proxy { .. } => StartError::new(ErrorCode::Io, err.to_string()),
     }
 }
 

@@ -73,6 +73,103 @@ fn verify_accepts_the_synthetic_fixture() {
     assert!(text.contains("lis_to_analyzer 76"), "{text}");
     assert!(text.contains("Соединения: 1"), "{text}");
     assert!(text.contains("Проверка пройдена"), "{text}");
+    assert!(
+        text.contains("Формат: bytetap-session/1"),
+        "версия формата печатается: {text}"
+    );
+}
+
+/// Журнал прокси в формате `/2`: пара в `open` и проверка схемой новой версии (M4-AC9).
+#[test]
+fn verify_checks_a_proxy_journal_of_the_second_format() {
+    use bytetap_core::journal::{
+        Autoresponder, Close, ClosedBy, Data, Dir, Event, Host, Link, LinkRole, Mode, Open,
+        Session, SessionEnd, Stats, now_rfc3339,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.jsonl");
+    let message = b"\x0bMSH|^~\\&|ANALYZER\r\x1c\r";
+    let events = [
+        Event::Session(Session::new(
+            Mode::Proxy,
+            Autoresponder::None,
+            json!({"listen": "127.0.0.1:50025", "target": "127.0.0.1:5000", "role": "analyzer_client"}),
+            Host::current(),
+        )),
+        Event::Open(Open {
+            t: now_rfc3339(),
+            mono_us: 1000,
+            conn: 1,
+            peer: "127.0.0.1:49152".to_owned(),
+            local: "127.0.0.1:50025".to_owned(),
+            link: Some(Link {
+                role: LinkRole::Lis,
+                peer: "127.0.0.1:5000".to_owned(),
+                local: "127.0.0.1:50026".to_owned(),
+            }),
+        }),
+        Event::Data(Data::new(
+            now_rfc3339(),
+            2000,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            message,
+        )),
+        Event::Data(Data::new(
+            now_rfc3339(),
+            3000,
+            1,
+            Dir::LisToAnalyzer,
+            false,
+            b"\x06",
+        )),
+        Event::Close(Close {
+            t: now_rfc3339(),
+            mono_us: 4000,
+            conn: 1,
+            by: ClosedBy::Analyzer,
+            reason: "eof".to_owned(),
+        }),
+        Event::SessionEnd(SessionEnd {
+            t: now_rfc3339(),
+            mono_us: 5000,
+            stats: Stats {
+                connections: 1,
+                bytes_analyzer_to_lis: message.len() as u64,
+                bytes_lis_to_analyzer: 1,
+            },
+        }),
+    ];
+    let text: String = events
+        .iter()
+        .map(|event| format!("{}\n", serde_json::to_string(event).expect("сериализация")))
+        .collect();
+    std::fs::write(&path, text).unwrap();
+
+    let output = verify(&path);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("Формат: bytetap-session/2"), "{text}");
+    assert!(text.contains("Соединения: 1"), "{text}");
+    assert!(text.contains("Проверка пройдена"), "{text}");
+}
+
+#[test]
+fn verify_rejects_a_journal_of_an_unknown_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut lines = fixture_lines();
+    lines[0]["format"] = json!("bytetap-session/9");
+    let path = write_lines(dir.path(), &lines);
+
+    let output = verify(&path);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("неизвестная версия формата"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]

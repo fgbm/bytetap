@@ -1,10 +1,12 @@
 //! Тестовые помощники для crates bytetap: пути к синтетическим журналам, общие фикстуры
-//! и эмуляторы анализатора — HL7/MLLP и ASTM E1381 — для интеграционных тестов на loopback (T-2).
+//! и эмуляторы сторон обмена — анализатора и ЛИС, HL7/MLLP и ASTM E1381 — для
+//! интеграционных тестов на loopback (T-2).
 //!
 //! Crate не публикуется в crates.io (`publish = false`) и используется только тестами.
 
 pub mod astm;
 pub mod emulator;
+pub mod lis;
 pub mod server;
 
 use std::path::{Path, PathBuf};

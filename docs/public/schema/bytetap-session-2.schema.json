@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fgbm.github.io/bytetap/schema/bytetap-session-2.schema.json",
+  "title": "Журнал сессии bytetap, формат bytetap-session/2",
+  "description": "Одна строка файла — одно событие. Первая строка сессии — session, последняя при штатной остановке — session_end. От формата /1 отличается необязательным полем link у open (пара прокси). Описание формата: docs/reference/session-format.md",
+  "oneOf": [
+    { "$ref": "#/$defs/session" },
+    { "$ref": "#/$defs/open" },
+    { "$ref": "#/$defs/data" },
+    { "$ref": "#/$defs/close" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/info" },
+    { "$ref": "#/$defs/note" },
+    { "$ref": "#/$defs/session_end" }
+  ],
+  "$defs": {
+    "time": {
+      "description": "Время по системным часам: RFC 3339 с микросекундами и смещением от UTC",
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{6}[+-]\\d{2}:\\d{2}$"
+    },
+    "mono_us": {
+      "description": "Микросекунды от начала сессии по монотонным часам",
+      "type": "integer",
+      "minimum": 0
+    },
+    "conn": {
+      "description": "Номер соединения внутри сессии, с 1",
+      "type": "integer",
+      "minimum": 1
+    },
+    "dir": {
+      "description": "Направление фрагмента относительно анализатора и ЛИС",
+      "enum": ["analyzer_to_lis", "lis_to_analyzer"]
+    },
+    "code": {
+      "description": "Код события для интерфейса: connect_failed, proxy_connect_failed, proxy_connect_timeout, protocol_undetected и другие из docs/reference/session-format.md",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "link": {
+      "description": "Исходящая сторона пары прокси: кто на дальнем конце и адреса сокета bytetap",
+      "type": "object",
+      "required": ["role", "peer", "local"],
+      "properties": {
+        "role": {
+          "description": "Кто на дальнем конце пары: анализатор или ЛИС",
+          "enum": ["analyzer", "lis"]
+        },
+        "peer": {
+          "description": "Адрес цели, к которой подключился bytetap",
+          "type": "string"
+        },
+        "local": {
+          "description": "Локальный адрес исходящего сокета bytetap",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "session": {
+      "type": "object",
+      "description": "Заголовок сессии, первая строка файла (FR-21)",
+      "required": [
+        "type",
+        "format",
+        "app_version",
+        "started_at",
+        "mode",
+        "autoresponder",
+        "settings",
+        "host"
+      ],
+      "properties": {
+        "type": { "const": "session" },
+        "format": { "const": "bytetap-session/2" },
+        "app_version": { "type": "string", "minLength": 1 },
+        "started_at": { "$ref": "#/$defs/time" },
+        "mode": {
+          "description": "Режим работы",
+          "enum": ["tcp_server", "tcp_client", "proxy", "serial", "com_monitor", "com_tcp"]
+        },
+        "autoresponder": {
+          "description": "Профиль автоответчика; у прокси всегда none (FR-6)",
+          "enum": ["hl7_mllp", "astm_e1381", "none", "auto"]
+        },
+        "settings": {
+          "description": "Настройки сессии, состав зависит от режима",
+          "type": "object"
+        },
+        "analyzer": { "type": "string" },
+        "note": { "type": "string" },
+        "host": {
+          "type": "object",
+          "required": ["os"],
+          "properties": {
+            "os": {
+              "description": "Описание ОС в формате os_info: тип, версия, издание в скобках и разрядность в квадратных скобках, например Windows 11 Professional 10.0.22631 [64-bit]",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "open": {
+      "type": "object",
+      "description": "Открытие соединения; у прокси несёт обе стороны пары (FR-5)",
+      "required": ["type", "t", "mono_us", "conn", "peer", "local"],
+      "properties": {
+        "type": { "const": "open" },
+        "t": { "$ref": "#/$defs/time" },
+        "mono_us": { "$ref": "#/$defs/mono_us" },
+        "conn": { "$ref": "#/$defs/conn" },
+        "peer": { "type": "string" },
+        "local": { "type": "string" },
+        "link": { "$ref": "#/$defs/link" }
+      },
+      "additionalProperties": false
+    },
+    "data": {
+      "type": "object",
+      "description": "Фрагмент обмена: исходные байты и копия для чтения глазами (FR-22)",
+      "required": ["type", "t", "mono_us", "conn", "dir", "synthetic", "len", "b64", "text"],
+      "properties": {
+        "type": { "const": "data" },
+        "t": { "$ref": "#/$defs/time" },
+        "mono_us": { "$ref": "#/$defs/mono_us" },
+        "conn": { "$ref": "#/$defs/conn" },
+        "dir": { "$ref": "#/$defs/dir" },
+        "synthetic": {
+          "description": "true для ответов автоответчика (FR-4); в прокси всегда false",
+          "type": "boolean"
+        },
+        "len": {
+          "description": "Длина фрагмента в байтах",
+          "type": "integer",
+          "minimum": 0
+        },
+        "b64": {
+          "description": "Исходные байты фрагмента в base64, единственный источник правды",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]*={0,2}$"
+        },
+        "text": {
+          "description": "Копия для чтения глазами: печатные ASCII как есть, кроме <, управляющие как <STX> и подобные, остальные байты как <xHH> в верхнем регистре",
+          "type": "string",
+          "pattern": "^(?:[ -;=-~]|<(?:STX|ETX|EOT|ENQ|ACK|LF|VT|CR|NAK|ETB|FS|x[0-9A-F]{2})>)*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "close": {
+      "type": "object",
+      "description": "Закрытие соединения",
+      "required": ["type", "t", "mono_us", "conn", "by", "reason"],
+      "properties": {
+        "type": { "const": "close" },
+        "t": { "$ref": "#/$defs/time" },
+        "mono_us": { "$ref": "#/$defs/mono_us" },
+        "conn": { "$ref": "#/$defs/conn" },
+        "by": {
+          "description": "Кто закрыл соединение",
+          "enum": ["analyzer", "lis", "bytetap"]
+        },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "description": "Ошибка обработки: соединение при этом не обязательно закрывается, сессия продолжается (NFR-5)",
+      "required": ["type", "t", "mono_us", "message"],
+      "properties": {
+        "type": { "const": "error" },
+        "t": { "$ref": "#/$defs/time" },
+        "mono_us": { "$ref": "#/$defs/mono_us" },
+        "conn": { "$ref": "#/$defs/conn" },
+        "code": { "$ref": "#/$defs/code" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "info": {
+      "type": "object",
+      "description": "Замечание обработчика: обмен не прерван, но событие стоит записать (мусор вне рамки, поле, выброшенное из ACK)",
+      "required": ["type", "t", "mono_us", "message"],
+      "properties": {
+        "type": { "const": "info" },
+        "t": { "$ref": "#/$defs/time" },
+        "mono_us": { "$ref": "#/$defs/mono_us" },
+        "conn": { "$ref": "#/$defs/conn" },
+        "code": { "$ref": "#/$defs/code" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "note": {
+      "type": "object",
+      "description": "Комментарий инженера, в том числе дописанный после остановки (FR-23)",
+      "required": ["type", "t", "text"],
+      "properties": {
+        "type": { "const": "note" },
+        "t": { "$ref": "#/$defs/time" },
+        "mono_us": { "$ref": "#/$defs/mono_us" },
+        "text": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "session_end": {
+      "type": "object",
+      "description": "Итоги сессии, последняя строка при штатной остановке",
+      "required": ["type", "t", "mono_us", "stats"],
+      "properties": {
+        "type": { "const": "session_end" },
+        "t": { "$ref": "#/$defs/time" },
+        "mono_us": { "$ref": "#/$defs/mono_us" },
+        "stats": {
+          "type": "object",
+          "required": ["connections", "bytes_analyzer_to_lis", "bytes_lis_to_analyzer"],
+          "properties": {
+            "connections": {
+              "description": "Число соединений за сессию; в прокси — число пар",
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes_analyzer_to_lis": { "type": "integer", "minimum": 0 },
+            "bytes_lis_to_analyzer": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
