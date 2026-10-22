@@ -9,17 +9,32 @@
 //! Живой процесс на Windows меряет CI-смоук `native-windows`: CPU в простое за 10 с.
 
 use std::io::Write as _;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytetap_app::background::Interface;
-use bytetap_app::live::{FRAME, FRAME_SLOWEST};
+use bytetap_app::live::{FRAME, FRAME_SLOWEST, Phase};
 use bytetap_app::settings::{SessionMode, Settings};
 use bytetap_app::{BytetapApp, Fixtures, Screen};
 use egui_kittest::{Harness, kittest::Queryable as _};
 
 const LOG_DIR: &str = r"C:\Users\operator\Documents\bytetap";
 const WINDOW: (f32, f32) = (1200.0, 800.0);
+
+/// Сколько ждать старта сессии и адреса её слушателя.
+///
+/// Старт — привязка порта, файл журнала и задача runtime: на загруженном раннере это
+/// не первый кадр, а иногда и не четвёртый, поэтому ждём условие, а не число кадров.
+const READY_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Сколько ждать кадра, который окно просит таймером, а не событием.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Предел окна замера при потоке фрагментов: клиент шлёт 1.5 с, остальное — запас
+/// загруженного раннера.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn settings() -> Settings {
     let mut settings = Settings::with_log_dir(LOG_DIR);
@@ -48,6 +63,62 @@ fn repaint_delay(harness: &Harness<'static, BytetapApp>) -> Duration {
         .map(|output| output.repaint_delay)
         .min()
         .unwrap_or(Duration::MAX)
+}
+
+/// Кадр окна и короткая пауза: задачи runtime и потоки фоновой работы идут не в нём.
+///
+/// Часы egui в [`Harness`] управляемые (`predicted_dt`), а пауза нужна внешним задачам:
+/// без неё поток окна не отдаёт им процессор.
+fn tick(harness: &mut Harness<'static, BytetapApp>) {
+    harness.step();
+    std::thread::sleep(Duration::from_millis(1));
+}
+
+/// Ждёт, пока запись начнётся и сессия ядра назовёт адрес слушателя.
+///
+/// Экран записи появляется уже в кадре «Старт», а сессия ядра — только когда задача
+/// старта отдаст результат: сколько кадров это займёт, зависит от машины, поэтому
+/// готовность — условие с таймаутом, а не число кадров. Порт `0` выбирает система
+/// (M3-AC16): адрес из настроек совпал бы с настоящим только случайно, и подключаться
+/// к записи можно лишь по адресу сессии.
+fn wait_for_listener(harness: &mut Harness<'static, BytetapApp>) -> SocketAddr {
+    let deadline = Instant::now() + READY_TIMEOUT;
+    let mut local = String::new();
+    while Instant::now() <= deadline {
+        if harness.state().phase() == Phase::Recording
+            && let Some(rec) = harness.state().recording()
+        {
+            local = rec.local_addr().to_owned();
+            if let Ok(addr) = local.parse() {
+                return addr;
+            }
+        }
+        tick(harness);
+    }
+    panic!(
+        "запись не началась за {READY_TIMEOUT:?}: фаза {:?}, адрес слушателя {local:?}",
+        harness.state().phase()
+    );
+}
+
+/// Ждёт интервал, который окно просит таймером, и возвращает его.
+///
+/// Готовность сессии будит окно немедленно (`request_repaint` задачи старта), и такой
+/// запрос — событие, а не интервал кадра: он виден нулевой задержкой и первым в окне
+/// замера не считается. Дальше идут только запросы по таймеру.
+fn wait_for_timer_frame(harness: &mut Harness<'static, BytetapApp>) -> Duration {
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    loop {
+        tick(harness);
+        let delay = repaint_delay(harness);
+        if delay != Duration::ZERO && delay != Duration::MAX {
+            return delay;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "окно не просит кадр по таймеру за {FRAME_TIMEOUT:?}: {delay:?}"
+        );
+    }
 }
 
 /// В простое кадров нет: окно открыто, запись не идёт, событий нет (NFR-5).
@@ -80,10 +151,6 @@ fn an_idle_window_asks_for_no_frames() {
 /// ленту без новых строк перерисовывать незачем (NFR-5, U1-AC24).
 #[test]
 fn a_quiet_recording_asks_for_one_frame_per_second() {
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("свободный порт");
-        listener.local_addr().expect("адрес").port()
-    };
     let dir = tempfile::tempdir().expect("временная папка");
     let log_dir = dir.path().to_string_lossy().into_owned();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -98,34 +165,29 @@ fn a_quiet_recording_asks_for_one_frame_per_second() {
             let mut settings = Settings::with_log_dir(&log_dir);
             settings.config.mode = SessionMode::TcpServer;
             settings.config.listen_host = "127.0.0.1".into();
-            settings.config.listen_port = port;
+            // Порт выбирает система: занимать его тесту незачем, и чужой процесс его
+            // не перехватит между проверкой и старт-сессией.
+            settings.config.listen_port = 0;
             BytetapApp::new(&cc.egui_ctx, settings, None, None)
                 .with_fixtures(fixtures())
                 .with_runtime(handle)
-                .with_test_autostart(&cc.egui_ctx, &format!("tcp_server:127.0.0.1:{port}"))
+                .with_test_autostart(&cc.egui_ctx, "tcp_server:127.0.0.1:0")
         });
     // Никто не подключается: событий в ленте нет, запись ждёт.
-    harness.run_steps(4);
-    assert!(harness.state().recording().is_some(), "запись началась");
-    let mut asked = Vec::new();
-    for _ in 0..8 {
+    wait_for_listener(&mut harness);
+    // Первый интервал — кадр по таймеру: мгновенный запрос от старта уже позади.
+    let mut asked = vec![wait_for_timer_frame(&mut harness)];
+    for _ in 1..8 {
         harness.step();
         asked.push(repaint_delay(&harness));
-        std::thread::sleep(Duration::from_millis(10));
     }
-    let slow: Vec<Duration> = asked
-        .iter()
-        .copied()
-        .filter(|delay| *delay != Duration::MAX)
-        .collect();
-    assert_eq!(
-        slow.len(),
-        asked.len(),
-        "запись идёт: кадр просится по таймеру, а не по событию"
+    assert!(
+        asked.iter().all(|delay| *delay != Duration::MAX),
+        "запись идёт: кадр просится по таймеру, а не по событию: {asked:?}"
     );
     assert!(
-        slow.iter().all(|delay| *delay >= FRAME_SLOWEST),
-        "без новых событий кадр не чаще раза в секунду: {slow:?}"
+        asked.iter().all(|delay| *delay >= FRAME_SLOWEST),
+        "без новых событий кадр не чаще раза в секунду: {asked:?}"
     );
 }
 
@@ -203,10 +265,6 @@ fn feed_fixture(events: usize) -> bytetap_app::recording::RecordingFixture {
 /// то есть не больше 30 кадров в секунду (NFR-5).
 #[test]
 fn a_recording_session_asks_for_at_most_thirty_frames_per_second() {
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("свободный порт");
-        listener.local_addr().expect("адрес").port()
-    };
     let dir = tempfile::tempdir().expect("временная папка");
     let log_dir = dir.path().to_string_lossy().into_owned();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -221,24 +279,25 @@ fn a_recording_session_asks_for_at_most_thirty_frames_per_second() {
             let mut settings = Settings::with_log_dir(&log_dir);
             settings.config.mode = SessionMode::TcpServer;
             settings.config.listen_host = "127.0.0.1".into();
-            settings.config.listen_port = port;
+            // Порт выбирает система: адрес слушателя берём у сессии.
+            settings.config.listen_port = 0;
             BytetapApp::new(&cc.egui_ctx, settings, None, None)
                 .with_fixtures(fixtures())
                 .with_runtime(handle)
-                .with_test_autostart(&cc.egui_ctx, &format!("tcp_server:127.0.0.1:{port}"))
+                .with_test_autostart(&cc.egui_ctx, "tcp_server:127.0.0.1:0")
         });
-    harness.run_steps(4);
-    let local = harness
-        .state()
-        .recording()
-        .expect("запись началась")
-        .local_addr()
-        .to_owned();
-    let addr: std::net::SocketAddr = local.parse().expect("адрес слушателя");
+    // Запись начинается с кадра «Старт», а порт слушает сессия ядра: до её готовности
+    // подключаться некуда, и адреса в состоянии окна ещё нет.
+    let addr = wait_for_listener(&mut harness);
+    // Первый интервал после старта — событие сессии, а не кадр ленты.
+    wait_for_timer_frame(&mut harness);
 
-    // Клиент шлёт 10 фрагментов каждые 100 мс — 100 фрагментов в секунду.
+    // Клиент шлёт по фрагменту каждые 100 мс — 10 фрагментов в секунду.
+    let done = Arc::new(AtomicBool::new(false));
+    let client_done = Arc::clone(&done);
     let client = std::thread::spawn(move || {
         let Ok(mut stream) = TcpStream::connect(addr) else {
+            client_done.store(true, Ordering::Relaxed);
             return 0;
         };
         let mut sent = 0;
@@ -255,19 +314,28 @@ fn a_recording_session_asks_for_at_most_thirty_frames_per_second() {
         // Автоответ приходит в ленту: читаем, чтобы буфер сокета не переполнился.
         let _ = stream.set_nonblocking(true);
         std::thread::sleep(Duration::from_millis(200));
+        client_done.store(true, Ordering::Relaxed);
         sent
     });
 
-    // Кадры идут, пока идёт поток; каждый кадр смотрит, что просит приложение.
+    // Кадры идут, пока идёт поток; каждый кадр смотрит, что просит приложение. Окно
+    // замера — сам поток, а не секунды по часам: на загруженном раннере кадров за те же
+    // секунды меньше, и число замеров не должно от этого зависеть от машины.
     let started = Instant::now();
     let mut requested = Vec::new();
-    while started.elapsed() < Duration::from_secs(2) {
+    while !done.load(Ordering::Relaxed) {
+        assert!(
+            started.elapsed() < STREAM_TIMEOUT,
+            "клиент не закончил поток за {STREAM_TIMEOUT:?}"
+        );
         harness.step();
         requested.push(repaint_delay(&harness));
         std::thread::sleep(Duration::from_millis(10));
     }
     let sent = client.join().expect("клиент HL7");
     assert!(sent > 0, "клиент не отправил ни одного сообщения");
+    // Последний фрагмент мог прийти к самому концу потока: его видит следующий кадр.
+    harness.step();
 
     // Пока идёт запись, кадр запрашивается — но не чаще раза в 33 мс.
     let asked: Vec<Duration> = requested
@@ -287,15 +355,17 @@ fn a_recording_session_asks_for_at_most_thirty_frames_per_second() {
         }
     }
     eprintln!("задержки перерисовки: {histogram:?}");
-    // Мгновенная перерисовка — событие сессии (старт, остановка), а не фрагмент
-    // ленты: 100 фрагментов в секунду не просят по кадру на каждый.
+    // Мгновенная перерисовка — событие сессии (старт, остановка) или перестройка
+    // самого окна (полоса прокрутки ленты появилась), а не фрагмент ленты: 10
+    // фрагментов в секунду не просят по кадру на каждый. Запросы старта сняты до
+    // замера (`wait_for_timer_frame`), поэтому здесь их не больше горстки.
     let immediate = asked
         .iter()
         .filter(|delay| **delay == Duration::ZERO)
         .count();
     assert!(
         immediate <= 4,
-        "{immediate} мгновенных перерисовок за 2 с: событие сессии просит кадр, фрагмент — нет"
+        "{immediate} мгновенных перерисовок за поток: событие окна просит кадр, фрагмент — нет"
     );
     let periodic: Vec<Duration> = asked
         .iter()
@@ -312,15 +382,19 @@ fn a_recording_session_asks_for_at_most_thirty_frames_per_second() {
     );
     let per_second = 1.0 / fastest.as_secs_f64();
     // Сколько кадров нарисует цикл событий за окно замера: мгновенные плюс таймер.
-    let drawn = immediate as f64 + 2.0 / fastest.as_secs_f64();
+    let window = started.elapsed().as_secs_f64().max(0.001);
+    let drawn = immediate as f64 + window / fastest.as_secs_f64();
     eprintln!(
-        "кадров в секунду при записи: {per_second:.1}; за 2 с цикл нарисует {drawn:.0} кадров"
+        "кадров в секунду при записи: {per_second:.1}; за {window:.1} с поток нарисует {drawn:.0} кадров"
     );
     assert!(
         per_second <= 30.4,
         "{per_second:.1} кадров в секунду при записи"
     );
-    assert!(drawn <= 30.0 * 2.0 + 4.0, "{drawn:.0} кадров за 2 с");
+    assert!(
+        drawn <= 30.0 * window + 4.0,
+        "{drawn:.0} кадров за {window:.1} с"
+    );
 
     // Лента видит поток: фрагменты и автоответы дошли до окна.
     let rows = harness.state().recording().map_or(0, |rec| rec.rows());
