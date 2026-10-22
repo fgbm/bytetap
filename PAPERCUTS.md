@@ -41,3 +41,7 @@ egui_kittest `check_accessibility` ловит только роли `is_input`: 
 ## 2026-10-22 07:20 — deepseek-v4.1-flash
 
 `gh run view <id> --json artifacts` отвечает `Unknown JSON field: "artifacts"` (artifacts не входят в набор `--json`), а `gh run download` имена артефактов не подсказывает. Список — `gh api repos/<owner>/<repo>/actions/runs/<id>/artifacts --jq '.artifacts[] | .name'`.
+
+## 2026-10-22 10:48 — deepseek-v4.1-flash
+
+`git rm -r app` кладёт удаления в индекс, и следующий `git commit` без `-a` забирает их вместе с единственным добавленным файлом: коммит «правка одной строки в ci.yml» уехал на 99 файлов и сломал CI (package.json ещё звал workspace `app`). Перед частичным коммитом смотреть `git status --short` целиком: `git rm` — это уже staging.
