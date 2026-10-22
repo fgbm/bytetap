@@ -74,6 +74,10 @@ export default defineConfig({
                   text: "U1 — нативный интерфейс (egui)",
                   link: "/dev/stages/U1",
                 },
+                {
+                  text: "M4 — прокси TCP",
+                  link: "/dev/stages/M4",
+                },
               ],
             },
             { text: "Бэклог", link: "/dev/backlog" },
