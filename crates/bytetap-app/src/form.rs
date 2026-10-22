@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use bytetap_core::journal::Autoresponder;
 use bytetap_core::session::SessionConfig;
-use bytetap_core::transport::ProxyRole;
 use bytetap_core::transport::serial::{
     self as core_serial, MAX_BAUD, MIN_BAUD, SerialFormat, SerialSettings as CoreSerial,
 };
+use bytetap_core::transport::{ProxyRole, peer_fits_listener, unmapped_ip};
 
 use crate::errors::{ErrorCode, ErrorField, StartError};
 use crate::settings::{
@@ -105,7 +105,8 @@ impl AddressProblem {
 ///
 /// Пустая строка — фильтра нет, `Ok(None)`: так поле и открывается у нового профиля.
 /// Принимается IPv4 и IPv6 без порта: порт входящего выбирает клиент, и задавать его
-/// в настройке бессмысленно.
+/// в настройке бессмысленно. `::ffff:a.b.c.d` — тот же IPv4: двойной стек отдаёт
+/// входящие IPv4 так, и фильтр в этой записи должен совпасть с IPv4-слушателем.
 ///
 /// # Errors
 ///
@@ -116,8 +117,80 @@ pub fn check_allow_from(text: &str) -> Result<Option<IpAddr>, AddressProblem> {
         return Ok(None);
     }
     text.parse::<IpAddr>()
-        .map(Some)
+        .map(|ip| Some(unmapped_ip(ip)))
         .map_err(|_| AddressProblem::Format)
+}
+
+/// Что не так с адресом цели прокси: текст ошибки у поля (FR-5, FR-8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetProblem {
+    /// Порт вписан в адрес: для порта у формы своё поле.
+    PortInside,
+    /// Скобки не парой или не вокруг IPv6-адреса.
+    Brackets,
+    /// Зона адреса (`%eth0`): такую цель ядро не разрешит.
+    Zone,
+}
+
+impl TargetProblem {
+    fn text(self) -> &'static str {
+        match self {
+            Self::PortInside => t!("form.targetPortInside"),
+            Self::Brackets => t!("form.targetBrackets"),
+            Self::Zone => t!("form.targetZone"),
+        }
+    }
+}
+
+/// Что не так с непустым адресом цели прокси (FR-5, FR-8).
+///
+/// Двоеточие, которое не делает строку IPv6-литералом, означает порт внутри адреса: без
+/// этой проверки цель стала бы `10.0.0.5:5000:5000`. Скобки допустимы только парой и
+/// только вокруг IPv6-адреса — иначе адрес не разберётся как HOST:PORT: `[fe80::1`,
+/// `fe80::1]`, `[[fe80::1]]` и `[10.0.0.5]` дают ошибку у поля, а не порт в адресе. Зона
+/// (`fe80::1%eth0`) в строке адреса не разбирается вовсе, и к такой цели ядро не
+/// подключилось бы.
+pub(crate) fn target_host_problem(host: &str) -> Option<TargetProblem> {
+    let host = host.trim();
+    let address = match host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        Some(inner) => {
+            // Скобки внутри скобок: `[[fe80::1]]`.
+            if inner.contains(['[', ']']) {
+                return Some(TargetProblem::Brackets);
+            }
+            inner
+        }
+        None => {
+            // Скобка врозь: половина пары или лишняя.
+            if host.contains('[') || host.contains(']') {
+                return Some(TargetProblem::Brackets);
+            }
+            host
+        }
+    };
+    if address.contains('%') {
+        return Some(TargetProblem::Zone);
+    }
+    if address.parse::<Ipv6Addr>().is_ok() {
+        return None;
+    }
+    if host != address {
+        // Скобки были, а внутри не IPv6-литерал: `[10.0.0.5]`, `[lis.example]`.
+        return Some(TargetProblem::Brackets);
+    }
+    host.contains(':').then_some(TargetProblem::PortInside)
+}
+
+/// Адрес без скобок: скобки допустимы только вокруг IPv6, а разбор адреса ждёт его как
+/// есть.
+pub(crate) fn unbracketed(host: &str) -> &str {
+    let host = host.trim();
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 fn parity_letter(parity: Parity) -> char {
@@ -323,9 +396,7 @@ impl FormState {
 
     /// Что не так с адресом цели прокси (FR-5, FR-8).
     ///
-    /// Пустой адрес просит его вписать; двоеточие, которое не делает строку IPv6-литералом,
-    /// означает порт внутри адреса — для порта у формы своё поле, и без этой проверки цель
-    /// стала бы `10.0.0.5:5000:5000`.
+    /// Пустой адрес просит его вписать; остальное — [`target_host_problem`].
     fn target_problem(&self, cfg: &AppConfig) -> Option<&'static str> {
         let host = self.proxy_host.trim();
         if host.is_empty() {
@@ -334,32 +405,38 @@ impl FormState {
                 ProxyMode::AnalyzerServer => t!("form.proxyAnalyzerRequired"),
             });
         }
-        let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
-        (host.contains(':') && unbracketed.parse::<Ipv6Addr>().is_err())
-            .then(|| t!("form.targetPortInside"))
+        target_host_problem(host).map(TargetProblem::text)
     }
 
     /// Что не так с фильтром по адресу входящего (FR-8).
     ///
-    /// Неразборчивый адрес просит адрес без порта; IPv6 при IPv4-слушателе не совпадёт ни
-    /// с одним входящим — входящее приходит с адресом того семейства, на котором слушает
-    /// bytetap.
+    /// Неразборчивый адрес просит адрес без порта; адрес другого семейства, чем
+    /// слушатель, не совпадёт ни с одним входящим — входящее приходит с адресом того
+    /// семейства, на котором слушает bytetap.
     fn allow_from_problem(&self, cfg: &AppConfig) -> Option<&'static str> {
         match check_allow_from(&self.proxy_allow_from) {
             Err(problem) => Some(problem.text()),
-            Ok(Some(IpAddr::V6(_))) if !Self::listen_is_ipv6(cfg) => {
-                Some(t!("errors.allow_from_ipv4_listener"))
+            Ok(Some(allowed))
+                if Self::listener_addr(cfg)
+                    .is_some_and(|listen| !peer_fits_listener(listen, allowed)) =>
+            {
+                Some(t!("errors.allow_from_family"))
             }
             _ => None,
         }
     }
 
-    /// Слушатель прокси — IPv6-адрес. Форма выбирает интерфейс из IPv4-адресов машины,
-    /// поэтому IPv6 приходит только из файла настроек.
-    fn listen_is_ipv6(cfg: &AppConfig) -> bool {
+    /// Слушатель прокси как адрес. Форма выбирает интерфейс из IPv4-адресов машины,
+    /// поэтому `::` приходит только из файла настроек; пустой интерфейс — все адреса.
+    fn listener_addr(cfg: &AppConfig) -> Option<SocketAddr> {
         let host = cfg.listen_host.trim();
         let host = host.trim_start_matches('[').trim_end_matches(']');
-        host.parse::<Ipv6Addr>().is_ok()
+        if host.is_empty() {
+            return Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, cfg.listen_port)));
+        }
+        host.parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, cfg.listen_port))
     }
 
     /// Своя проверка поля: текст ошибки или `None`.
@@ -1041,6 +1118,66 @@ mod tests {
         assert!(form.valid(&cfg));
     }
 
+    /// Скобки в адресе цели — только парой и только вокруг IPv6: половина пары, лишняя
+    /// пара и скобки вокруг IPv4 дают ошибку у поля, а не «порт в адресе» (M4-AC13).
+    #[test]
+    fn odd_brackets_and_a_zone_are_refused_with_their_own_text() {
+        let mut cfg = config(SessionMode::Proxy);
+        let mut form = FormState::new(&cfg);
+        form.proxy_port_text = "5000".into();
+        form.attempted = true;
+        let brackets = "Скобки — только парой и только вокруг IPv6-адреса, например [fe80::1]. Впишите адрес без лишних скобок: 10.0.0.5.";
+        for host in [
+            "[fe80::1",
+            "fe80::1]",
+            "[[fe80::1]]",
+            "[10.0.0.5]",
+            "fe80::1[",
+            "]fe80::1[",
+        ] {
+            form.proxy_host = host.into();
+            assert_eq!(
+                form.local_error(&cfg, ErrorField::Address),
+                Some(brackets),
+                "{host}"
+            );
+            assert!(!form.valid(&cfg), "{host}: сессия не собирается");
+        }
+
+        // Зона адреса: ядро такую цель не разрешит, и текст должен говорить о зоне, а не
+        // о порте в адресе.
+        let zone = "Зона адреса (например, %eth0) не поддерживается: впишите адрес без зоны.";
+        for host in ["fe80::1%eth0", "[fe80::1%eth0]"] {
+            form.proxy_host = host.into();
+            assert_eq!(
+                form.local_error(&cfg, ErrorField::Address),
+                Some(zone),
+                "{host}"
+            );
+        }
+
+        // Порт в адресе остаётся портом в адресе.
+        form.proxy_host = "10.0.0.5:5000".into();
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::Address),
+            Some(
+                "Порт — в отдельном поле: в адресе цели только адрес, например 10.0.0.5, а порт впишите в «Порт цели»."
+            )
+        );
+
+        // Пара вокруг IPv6 доходит до ядра как HOST:PORT.
+        form.proxy_host = "[fe80::1]".into();
+        form.commit(&mut cfg);
+        let core = session_config(&cfg, None).expect("IPv6 в скобках");
+        assert!(
+            matches!(&core.source, Source::Proxy { target, .. } if target == "[fe80::1]:5000"),
+            "{:?}",
+            core.source
+        );
+        assert_eq!(unbracketed("[fe80::1]"), "fe80::1", "проба идёт без скобок");
+        assert_eq!(unbracketed(" 10.0.0.5 "), "10.0.0.5");
+    }
+
     /// IPv6-адрес в фильтре при IPv4-слушателе не пропустит никого: входящее приходит с
     /// адресом того семейства, на котором слушает bytetap (FR-8).
     #[test]
@@ -1054,7 +1191,7 @@ mod tests {
         assert_eq!(
             form.local_error(&cfg, ErrorField::AllowFrom),
             Some(
-                "Слушатель bytetap — IPv4, поэтому IPv6-адрес в фильтре не совпадёт ни с кем. Укажите IPv4 того, кто подключается."
+                "Адрес другого семейства, чем слушатель bytetap: такое входящее не совпадёт ни с кем. Слушатель IPv4 — впишите IPv4 (192.168.1.51), слушатель IPv6 — IPv6."
             )
         );
         assert!(!form.valid(&cfg), "с таким фильтром сессия не собирается");
@@ -1064,12 +1201,28 @@ mod tests {
         assert_eq!(form.local_error(&cfg, ErrorField::AllowFrom), None);
         assert!(form.valid(&cfg));
 
+        // `::ffff:a.b.c.d` — тот же IPv4: двойной стек отдаёт так входящие IPv4.
+        form.proxy_allow_from = "::ffff:192.168.1.51".into();
+        assert_eq!(form.local_error(&cfg, ErrorField::AllowFrom), None);
+        form.commit(&mut cfg);
+        let core = session_config(&cfg, None).expect("прокси с mapped-фильтром");
+        assert!(matches!(
+            &core.source,
+            Source::Proxy {
+                allow_from: Some(IpAddr::V4(addr)),
+                ..
+            } if *addr == Ipv4Addr::new(192, 168, 1, 51)
+        ));
+
         // IPv6-слушатель из файла настроек: семейства совпадают.
         form.proxy_allow_from = "fe80::1".into();
         let mut ipv6 = cfg.clone();
         ipv6.listen_host = "::".into();
         assert_eq!(form.local_error(&ipv6, ErrorField::AllowFrom), None);
         assert!(form.valid(&ipv6));
+        // Двойной стек принимает и IPv4 — фильтр IPv4 под `[::]` тоже годится.
+        form.proxy_allow_from = "192.168.1.51".into();
+        assert_eq!(form.local_error(&ipv6, ErrorField::AllowFrom), None);
     }
 
     /// Цель прокси ведёт на собственный порт bytetap: адрес второй стороны — этот же

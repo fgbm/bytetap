@@ -6,6 +6,8 @@
 //! NAK, профили) — под свёрнутым «Дополнительно». Ошибка показывается красным текстом
 //! 12px под своим полем, без баннеров.
 
+use std::time::{Duration, Instant};
+
 use eframe::egui::{
     self, Align, Color32, CursorIcon, Frame, Id, Key, Layout, Modifiers, Rect, RichText, Role,
     Sense, Stroke, Ui, UiBuilder, Vec2, WidgetInfo, vec2,
@@ -34,6 +36,11 @@ use crate::{diag, t};
 const FORM_WIDTH: f32 = 512.0;
 /// Сколько «Скопировано» держится на кнопке, секунды.
 const COPIED_FOR: f64 = 1.5;
+/// Пауза без изменений в «Адресе цели», после которой считается адрес источника (FR-8).
+///
+/// Проба идёт в сеть своим потоком: без паузы каждое нажатие клавиши запускало бы
+/// новый поток, а его результат устаревал бы, не дойдя до строки.
+const PROBE_DEBOUNCE: Duration = Duration::from_millis(400);
 
 const RESPONDERS: [Responder; 4] = [
     Responder::Auto,
@@ -796,24 +803,49 @@ impl BytetapApp {
         if self.fixtures {
             return None;
         }
-        if self
-            .proxy_probe
-            .as_ref()
-            .is_none_or(|(probed, _)| *probed != key)
-        {
-            let probe_host = host;
-            let hook = self.proxy_probe_hook.clone();
-            self.proxy_probe = Some((
-                key,
-                Loaded::Loading(Task::spawn(ctx, move || match hook {
-                    Some(probe) => probe(&probe_host, port),
-                    None => background::source_addr(&probe_host, port),
-                })),
-            ));
+        // Цель, на которую ругается поле, не спрашиваем: адреса некуда показать, а поток
+        // на каждое нажатие клавиши — лишняя работа (FR-8).
+        if form::target_host_problem(&host).is_some() {
+            return None;
         }
-        self.proxy_probe
-            .as_ref()
-            .and_then(|(_, probe)| probe.ready().cloned().flatten())
+        // Дебаунс: пока в «Адресе цели» набирают, проба не начинается. Ключ помнится
+        // вместе с моментом последнего изменения, а кадр запрашивается к концу паузы:
+        // иначе окно без движения мыши не перерисовалось бы (FR-8).
+        match &self.proxy_probe_pending {
+            Some((pending, since)) if *pending == key => {
+                let left = PROBE_DEBOUNCE.saturating_sub(since.elapsed());
+                if !left.is_zero() {
+                    ctx.request_repaint_after(left);
+                    return None;
+                }
+            }
+            _ => {
+                self.proxy_probe_pending = Some((key, Instant::now()));
+                ctx.request_repaint_after(PROBE_DEBOUNCE);
+                return None;
+            }
+        }
+        // Одна проба в полёте: чужую не бросаем, а её результат к этой цели не относится
+        // и отбрасывается по ключу.
+        if let Some((probed, probe)) = &self.proxy_probe {
+            if *probed == key {
+                return probe.ready().cloned().flatten();
+            }
+            if matches!(probe, Loaded::Loading(_)) {
+                ctx.request_repaint_after(PROBE_DEBOUNCE);
+                return None;
+            }
+        }
+        let probe_host = form::unbracketed(&host).to_owned();
+        let hook = self.proxy_probe_hook.clone();
+        self.proxy_probe = Some((
+            key,
+            Loaded::Loading(Task::spawn(ctx, move || match hook {
+                Some(probe) => probe(&probe_host, port),
+                None => background::source_addr(&probe_host, port),
+            })),
+        ));
+        None
     }
 
     /// «Дополнительно»: свёрнуто, пока его не раскрыли или под ним нет ошибки.
@@ -1360,6 +1392,64 @@ mod tests {
             app.source_address(&ctx).as_deref(),
             Some("192.168.1.98"),
             "адрес из записи относится к этой цели"
+        );
+    }
+
+    /// Проба FR-8 ждёт, пока цель перестанут менять, и держит один поток: набранное по
+    /// буквам имя спрашивается у сети один раз, а цель с ошибкой у поля — ни разу
+    /// (M4-AC18).
+    #[test]
+    fn the_fr8_probe_waits_for_the_target_to_settle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let ctx = egui::Context::default();
+        let mut settings = crate::settings::Settings::with_log_dir("C:/logs");
+        settings.config.mode = SessionMode::Proxy;
+        settings.config.proxy_role = ProxyMode::AnalyzerClient;
+        let mut app = BytetapApp::new(&ctx, settings, None, None);
+        app.form.proxy_port_text = "5000".into();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let counted = Arc::clone(&calls);
+        let seen = Arc::clone(&asked);
+        app.proxy_probe_hook = Some(Arc::new(move |host: &str, port: u16| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            seen.lock().expect("список").push(format!("{host}:{port}"));
+            Some("192.168.1.10".to_owned())
+        }));
+
+        // Цель набирают по буквам: проба не начинается, пока набор не кончился.
+        for host in ["1", "10", "10.0", "10.0.0", "10.0.0.5"] {
+            app.form.proxy_host = host.into();
+            assert_eq!(app.source_address(&ctx), None, "{host}");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "проба ждёт паузы");
+
+        // Пауза прошла: одна проба по последней цели, а не по каждой букве.
+        let probed = wait_for_probe(&mut app, &ctx);
+        assert_eq!(probed.as_deref(), Some("192.168.1.10"));
+        assert_eq!(
+            asked.lock().expect("список").as_slice(),
+            ["10.0.0.5:5000"],
+            "спрошена только конечная цель"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "один поток на всю набранную цель"
+        );
+
+        // Цель, на которую ругается поле, в сеть не идёт вовсе.
+        app.form.proxy_host = "10.0.0.5:5000".into();
+        for _ in 0..40 {
+            assert_eq!(app.source_address(&ctx), None);
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "цель с ошибкой не спрашивается"
         );
     }
 

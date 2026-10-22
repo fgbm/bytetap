@@ -321,7 +321,7 @@ fn an_ipv6_peer_filter_under_an_ipv4_listener_is_an_error_at_the_field() {
     harness.get_by_label("Старт").click();
     harness.run_steps(2);
     harness.get_by_label(
-        "Слушатель bytetap — IPv4, поэтому IPv6-адрес в фильтре не совпадёт ни с кем. Укажите IPv4 того, кто подключается.",
+        "Адрес другого семейства, чем слушатель bytetap: такое входящее не совпадёт ни с кем. Слушатель IPv4 — впишите IPv4 (192.168.1.51), слушатель IPv6 — IPv6.",
     );
     assert!(
         harness.state().pending_session().is_none(),

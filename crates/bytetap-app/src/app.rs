@@ -217,6 +217,9 @@ pub struct BytetapApp {
     /// Тот же адрес, посчитанный в фоне по цели из формы (FR-8): ключ «адрес:порт» и
     /// результат.
     pub(crate) proxy_probe: Option<(String, Loaded<Option<String>>)>,
+    /// Цель, у которой считается адрес, и когда она последний раз менялась: проба
+    /// начинается не сразу, а через 400 мс без изменений (FR-8).
+    pub(crate) proxy_probe_pending: Option<(String, std::time::Instant)>,
     /// Подмена фоновой пробы адреса в тестах: в работе `None` — адрес считает
     /// [`background::source_addr`], а тест подставляет свою, чтобы не ходить в сеть.
     pub(crate) proxy_probe_hook: Option<SourceProbe>,
@@ -361,6 +364,7 @@ impl BytetapApp {
             interfaces: Loaded::Idle,
             proxy_source: None,
             proxy_probe: None,
+            proxy_probe_pending: None,
             proxy_probe_hook: None,
             ports: Loaded::Idle,
             recents: Loaded::Idle,
@@ -1314,6 +1318,7 @@ impl BytetapApp {
         // Адрес цели мог смениться, пока шага не было: пробу FR-8 и адрес из прошлой
         // записи считаем заново.
         self.proxy_probe = None;
+        self.proxy_probe_pending = None;
         self.proxy_source = None;
         self.screen = Screen::Step(mode);
         self.save_settings();
