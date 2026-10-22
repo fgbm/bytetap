@@ -17,8 +17,8 @@ use bytetap_core::journal::{
     Mode, MonoClock, Note, Session, now_rfc3339,
 };
 use bytetap_core::session::{Session as CaptureSession, SessionConfig, journal_failure_reason};
-use bytetap_core::transport::ProxyRole;
 use bytetap_core::transport::serial::{Flow, SerialFormat, SerialSettings};
+use bytetap_core::transport::{ProxyRole, is_proxy_target_is_self};
 use chrono::DateTime;
 use clap::{ArgGroup, Parser, Subcommand};
 use serde_json::{Value, json};
@@ -145,7 +145,7 @@ struct CaptureArgs {
     )]
     proxy: Option<SocketAddr>,
     /// Цель прокси — адрес второй стороны, например `192.168.1.50:5000`
-    #[arg(long, value_name = "HOST:PORT", requires = "proxy")]
+    #[arg(long, value_name = "HOST:PORT", requires = "proxy", value_parser = parse_target)]
     to: Option<String>,
     /// Топология прокси: `analyzer-client` — анализатор приходит сам,
     /// `analyzer-server` — bytetap подключается к анализатору
@@ -195,8 +195,9 @@ struct CaptureArgs {
         conflicts_with = "proxy"
     )]
     responder: Option<String>,
-    /// ASTM: отвечать `NAK` на неверную контрольную сумму вместо `ACK`
-    #[arg(long)]
+    /// ASTM: отвечать `NAK` на неверную контрольную сумму вместо `ACK`;
+    /// с `--proxy` несовместим — ASTM-автомата в прокси нет (FR-6)
+    #[arg(long, conflicts_with = "proxy")]
     astm_nak: bool,
     /// Папка журналов вместо папки по умолчанию
     #[arg(long, value_name = "DIR")]
@@ -212,6 +213,25 @@ struct CaptureArgs {
 /// `--astm-nak` действует только там, где есть ASTM-автомат (FR-17).
 const fn astm_nak_applies(responder: Autoresponder) -> bool {
     matches!(responder, Autoresponder::AstmE1381 | Autoresponder::Auto)
+}
+
+/// `HOST:PORT` цели прокси: имя узла или адрес и порт 1…65535 (FR-5).
+///
+/// Проверка на старте, а не при первом подключении: опечатка в адресе иначе выглядела бы
+/// в журнале отказом недоступной ЛИС и всплыла бы уже во время записи (M4-AC14).
+fn parse_target(value: &str) -> Result<String, String> {
+    let text = value.trim();
+    let Some((host, port)) = text.rsplit_once(':') else {
+        return Err(format!("`{value}`: нужен адрес вида HOST:PORT"));
+    };
+    if host.trim().is_empty() || host.contains(char::is_whitespace) {
+        return Err(format!("`{value}`: нужен адрес вида HOST:PORT"));
+    }
+    match port.parse::<u16>() {
+        Ok(0) => Err(format!("`{value}`: порт — число 1…65535")),
+        Ok(_) => Ok(text.to_owned()),
+        Err(_) => Err(format!("`{value}`: порт — число 1…65535")),
+    }
 }
 
 /// `on`/`off` для DTR и RTS.
@@ -263,6 +283,7 @@ fn capture(args: CaptureArgs) -> ExitCode {
             responder.as_str()
         );
     }
+    let proxy = args.proxy.is_some();
     let (mut config, target) = match (&args.listen, &args.connect, &args.serial, &args.proxy) {
         (Some(listen), None, None, None) => {
             (SessionConfig::new(*listen), format!("Слушаю {listen}"))
@@ -396,9 +417,20 @@ fn capture(args: CaptureArgs) -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(CaptureError::Journal(reason)) if proxy => {
+            // В прокси автоответчика нет: после сбоя останавливается пересылка.
+            warn!("Запись в журнал прервана: {reason}. Сессия остановлена, пересылка прекращена.");
+            ExitCode::FAILURE
+        }
         Err(CaptureError::Journal(reason)) => {
             warn!(
                 "Запись в журнал прервана: {reason}. Сессия остановлена, анализатор не получил подтверждений после сбоя."
+            );
+            ExitCode::FAILURE
+        }
+        Err(CaptureError::Start(err)) if is_proxy_target_is_self(&err) => {
+            warn!(
+                "ошибка: цель прокси совпадает с адресом прослушивания — bytetap подключился бы сам к себе. Укажите адрес второй стороны."
             );
             ExitCode::FAILURE
         }
@@ -1094,6 +1126,51 @@ mod tests {
             "hl7",
         ]);
         assert!(with_responder.is_err(), "--responder с --proxy");
+
+        // «NAK на неверную сумму ASTM» относится к ASTM-автомату, которого в прокси нет.
+        let with_astm_nak = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--proxy",
+            "0.0.0.0:50025",
+            "--to",
+            "10.0.0.5:5000",
+            "--role",
+            "analyzer-client",
+            "--astm-nak",
+        ]);
+        assert!(with_astm_nak.is_err(), "--astm-nak с --proxy");
+
+        for bad_target in [
+            "10.0.0.5",
+            "10.0.0.5:",
+            ":5000",
+            "10.0.0.5:0",
+            "10.0.0.5:port",
+        ] {
+            let parsed = Cli::try_parse_from([
+                "bytetap-cli",
+                "capture",
+                "--proxy",
+                "0.0.0.0:50025",
+                "--to",
+                bad_target,
+                "--role",
+                "analyzer-client",
+            ]);
+            assert!(parsed.is_err(), "`{bad_target}` — не HOST:PORT");
+        }
+        let named = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--proxy",
+            "0.0.0.0:50025",
+            "--to",
+            "lab-lis.local:5000",
+            "--role",
+            "analyzer-client",
+        ]);
+        assert!(named.is_ok(), "имя узла допустимо: {:?}", named.err());
 
         let with_listen = Cli::try_parse_from([
             "bytetap-cli",
