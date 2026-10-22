@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1240">
+<title>Лента-A · Выделение строк и горизонтальная прокрутка текста</title>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+:root{
+  --font-ui:'IBM Plex Sans','Segoe UI',system-ui,sans-serif;
+  --font-mono:'IBM Plex Mono','Cascadia Mono',Consolas,monospace;
+  --s0:#ffffff;--s1:#f6f7f9;--tr:#f6f7f9;--bd:#e2e5e9;--bf:#eef0f2;
+  --tx:#0f1418;--mu:#5f6873;--ft:#8a939c;--hv:#f1f3f5;
+  --a2l:#0a7d4f;--l2a:#b4530a;--ctrl:#2f3fbf;--danger:#c01f2f;
+  --rec:#ef3b2d;--recbg:#0f1418;--recfg:#ffffff;
+  --sel:#e8ecfb;--selfrag:#d5defa;
+  --page:#e7e9ec;
+}
+html[data-theme="dark"]{
+  --s0:#0d1013;--s1:#13181d;--tr:#0a0d10;--bd:#252d36;--bf:#1a2027;
+  --tx:#dde4ea;--mu:#7d8995;--ft:#5a6570;--hv:#161c22;
+  --a2l:#3ee08f;--l2a:#ffb23e;--ctrl:#8fb4ff;--danger:#ff6464;
+  --rec:#ff4d4d;--recbg:#2a1416;--recfg:#ffc2c2;
+  --sel:#1c2739;--selfrag:#243553;
+  --page:#23272c;
+}
+body{margin:0;padding:28px 16px 40px;background:var(--page);font-family:var(--font-ui);color:var(--tx);
+  display:flex;flex-direction:column;align-items:center;-webkit-font-smoothing:antialiased}
+.cap{width:1200px;font-size:12px;color:var(--mu);margin:0 0 10px;display:flex;gap:8px;align-items:baseline}
+.cap b{font-weight:600;color:var(--tx)}
+.window{width:1200px;height:800px;background:var(--s0);border:1px solid var(--bd);border-radius:8px;
+  overflow:hidden;display:flex;flex-direction:column;box-shadow:0 10px 34px rgba(15,20,24,.13)}
+.titlebar{height:44px;flex:none;display:flex;align-items:center;padding-left:14px;border-bottom:1px solid var(--bf);gap:0}
+.brand{display:inline-flex;align-items:center;font:500 13px/1 var(--font-mono);letter-spacing:-.2px;color:var(--tx)}
+.brand .dots{display:inline-flex;gap:3px;margin-right:6px}
+.brand .dots i{width:6px;height:6px;border-radius:50%;display:block}
+.sp{flex:1}
+.theme{width:36px;height:44px;display:inline-flex;align-items:center;justify-content:center;color:var(--mu)}
+.wbtn{width:46px;height:44px;display:inline-flex;align-items:center;justify-content:center;color:var(--tx)}
+.wbtn .ic{stroke-width:1.2}
+.ic{flex:none}
+.screen{flex:1;min-height:0;display:flex;flex-direction:column}
+.stopbar{display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 15px 0 12px;border-radius:999px;
+  background:var(--recbg);color:var(--recfg);font-size:13.5px;font-weight:600;margin-left:14px}
+.stopbar .dot{width:8px;height:8px;border-radius:50%;background:var(--rec);display:block}
+.stopbar .t{font:500 13px/1 var(--font-mono)}
+.summary{display:inline-flex;align-items:center;gap:5px;margin-left:16px;font-size:12.5px;color:var(--mu);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:430px}
+.counters{display:inline-flex;align-items:center;gap:9px;font:400 12.5px/1 var(--font-mono);color:var(--tx);
+  white-space:nowrap;margin-left:18px}
+.counters .g{font-family:var(--font-ui);font-size:12px}
+.counters .a{color:var(--a2l)}
+.counters .l{color:var(--l2a)}
+.counters .u{color:var(--mu)}
+
+/* трасса */
+.trace{flex:none;background:var(--tr);border-bottom:1px solid var(--bf);padding:5px 12px 7px}
+.lane{height:26px;display:flex;align-items:center;gap:8px}
+.lane .gl{width:14px;display:flex;justify-content:center;font-size:12px;color:var(--mu)}
+.wave{flex:1;height:24px;display:flex;align-items:center;gap:2px;overflow:hidden}
+.wave i{display:block;width:2px;border-radius:1px;flex:none}
+
+/* панель над лентой */
+.fbar{flex:none;height:34px;display:flex;align-items:center;gap:16px;padding:0 12px;border-bottom:1px solid var(--bf);
+  font-size:12.5px;color:var(--mu)}
+.dd{display:inline-flex;align-items:center;gap:4px}
+.dd .ic{stroke-width:1.8}
+.chips{margin-left:auto;display:flex;gap:6px;align-items:center}
+.chip{height:26px;border:1px solid var(--bd);border-radius:6px;display:inline-flex;align-items:center;
+  padding:0 10px;font-size:12px;color:var(--mu)}
+.chip.s{padding:1px 7px;border-radius:999px;font:400 11px/1.5 var(--font-mono);height:auto}
+.chip.s.on{background:var(--tx);border-color:var(--tx);color:var(--s0)}
+.count{font-size:11.5px;color:var(--ft);padding-left:4px;white-space:nowrap}
+
+/* лента */
+.feed{flex:1;min-height:0;overflow:hidden;font:400 12.5px/1 var(--font-mono);position:relative}
+.r{height:28px;display:flex;align-items:center;gap:8px;padding:0 12px;white-space:nowrap}
+.r .t{width:94px;flex:none;color:var(--ft)}
+.r .g{width:12px;flex:none;display:flex;justify-content:center;font-family:var(--font-ui);font-size:12px}
+.r .c{width:24px;flex:none;color:var(--ft);font-size:11px}
+.r .x{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.r.a2l .g{color:var(--a2l)}
+.r.l2a .g{color:var(--l2a)}
+.r.svc .x{display:flex;align-items:center;color:var(--mu)}
+.r.ev .x{color:var(--mu)}
+.r .line{flex:1;height:1px;background:var(--bf);margin-left:8px;min-width:12px}
+.r.on{background:var(--sel)}
+.r.on .t{color:var(--mu)}
+.cc{color:var(--ctrl);opacity:.55;font-size:11px}
+.syn{color:var(--l2a)}
+
+/* строка A: текст окном, без «…» — за правым краем продолжение */
+.r.win .x{text-overflow:clip;overflow:hidden}
+
+/* горизонтальная полоса прокрутки ленты */
+.hbar{flex:none;height:12px;display:flex;align-items:center;padding:0 4px 2px}
+.hbar .track{flex:1;height:6px;border-radius:3px;background:var(--s1);position:relative;margin-right:10px}
+.hbar .thumb{position:absolute;top:0;left:18%;height:6px;width:34%;border-radius:3px;background:var(--mu);opacity:.45}
+</style>
+</head>
+<body>
+<div class="cap"><b>Лента-A</b><span>Выделение строк блоком: три строки выделены, Ctrl+C копирует «время → текст»; горизонтальная прокрутка только текстовой колонки, время и направление закреплены</span></div>
+<div class="window">
+<div class="titlebar"><span class="brand"><span class="dots"><i style="background:var(--a2l)"></i><i style="background:var(--l2a)"></i></span>bytetap</span><span class="stopbar"><span class="dot"></span>Стоп<span class="t">00:14:07</span></span><span class="summary">подключено · :5000 · HL7 (авто)</span><span class="counters"><span class="g a">→</span>629 Б <span class="g l">←</span>195 Б <span class="u">2 соед.</span></span><span class="sp"></span><span class="theme"><svg class="ic" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg></span><span class="wbtn"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/></svg></span><span class="wbtn"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="5" y="5" rx="1"/></svg></span><span class="wbtn"><svg class="ic" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></span></div>
+<div class="screen">
+<div class="trace">
+  <div class="lane"><span class="gl">→</span><span class="wave" data-dir="a2l"></span></div>
+  <div class="lane"><span class="gl">←</span><span class="wave" data-dir="l2a"></span></div>
+</div>
+<div class="fbar"><span class="dd">Текст<svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span><span class="dd">CP1251<svg class="ic" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></span><span class="chips"><span class="chip s on">все</span><span class="chip s">#1</span><span class="chip s">#2</span><span class="count">выбрано 3 · Ctrl+C</span></span></div>
+<div class="feed">
+  <div class="r svc"><span class="t">10:15:03.000</span><span class="g"></span><span class="c"></span><span class="x">#1 подключился 192.168.1.51:49152<span class="line"></span></span></div>
+  <div class="r a2l win on"><span class="t">10:15:03.512</span><span class="g">→</span><span class="c">#1</span><span class="x">OBX|1|NM|GLU^Glucose||5.4|mmol/L|3.9-6.1|N|||F<span class="cc">‹CR›</span>OBX|2|NM|Na^Sodium||140|mmol/L|136-145|N|||F<span class="cc">‹CR›</span>OBX|3|NM|K^Potassium||4.2|mmol/L|3.5-5.1|N|||F<span class="cc">‹CR›</span><span class="cc">‹FS›</span><span class="cc">‹CR›</span></span></div>
+  <div class="r l2a win on"><span class="t">10:15:03.640</span><span class="g">←</span><span class="c">#1</span><span class="x">MSA|AA|MSG0001<span class="cc">‹CR›</span>ERR|||0|I|<span class="cc">‹FS›</span><span class="cc">‹CR›</span><span class="syn">автоответ</span></span></div>
+  <div class="r a2l win on"><span class="t">10:15:04.120</span><span class="g">→</span><span class="c">#1</span><span class="x">OBX|4|NM|ALT^Alanine aminotransferase||31|U/L|10-49|N|||F<span class="cc">‹CR›</span>OBX|5|NM|AST^Aspartate aminotransferase||24|U/L|10-40|N|||F<span class="cc">‹CR›</span><span class="cc">‹FS›</span><span class="cc">‹CR›</span></span></div>
+  <div class="r a2l win"><span class="t">10:15:05.004</span><span class="g">→</span><span class="c">#1</span><span class="x">OBX|6|NM|BIL^Bilirubin total||12.4|µmol/L|3.4-20.5|N|||F<span class="cc">‹CR›</span>OBX|7|NM|CREA^Creatinine||88|µmol/L|62-106|N|||F<span class="cc">‹CR›</span><span class="cc">‹FS›</span><span class="cc">‹CR›</span></span></div>
+  <div class="r l2a win"><span class="t">10:15:05.132</span><span class="g">←</span><span class="c">#1</span><span class="x">MSA|AA|MSG0002<span class="cc">‹CR›</span><span class="cc">‹FS›</span><span class="cc">‹CR›</span><span class="syn">автоответ</span></span></div>
+  <div class="r a2l win"><span class="t">10:15:07.300</span><span class="g">→</span><span class="c">#2</span><span class="x">PID|1||000124||PATIENT^TEST<span class="cc">‹CR›</span>OBX|1|NM|GLU^Glucose||4.8|mmol/L|3.9-6.1|N|||F<span class="cc">‹CR›</span><span class="cc">‹FS›</span><span class="cc">‹CR›</span></span></div>
+  <div class="r svc"><span class="t">10:15:09.120</span><span class="g"></span><span class="c"></span><span class="x">#1 ЛИС закрыла соединение<span class="line"></span></span></div>
+  <div class="r a2l win"><span class="t">10:15:11.850</span><span class="g">→</span><span class="c">#2</span><span class="x">OBX|2|NM|K^Potassium||4.1|mmol/L|3.5-5.1|N|||F<span class="cc">‹CR›</span>OBX|3|NM|Na^Sodium||139|mmol/L|136-145|N|||F<span class="cc">‹FS›</span><span class="cc">‹CR›</span></span></div>
+  <div class="r l2a win"><span class="t">10:15:11.980</span><span class="g">←</span><span class="c">#2</span><span class="x">MSA|AA|MSG0003<span class="cc">‹CR›</span><span class="cc">‹FS›</span><span class="cc">‹CR›</span><span class="syn">автоответ</span></span></div>
+  <div class="r a2l win"><span class="t">10:15:13.400</span><span class="g">→</span><span class="c">#2</span><span class="x">QRD|20261022101513|R|I|MSG0004|||10^RD<span class="cc">‹CR›</span>QRF|LAB|20261022<span class="cc">‹CR›</span><span class="cc">‹FS›</span><span class="cc">‹CR›</span></span></div>
+  <div class="r l2a win"><span class="t">10:15:13.520</span><span class="g">←</span><span class="c">#2</span><span class="x">MSA|AA|MSG0004<span class="cc">‹CR›</span><span class="cc">‹FS›</span><span class="cc">‹CR›</span><span class="syn">автоответ</span></span></div>
+  <div class="r svc"><span class="t">10:15:15.000</span><span class="g"></span><span class="c"></span><span class="x">#2 ЛИС закрыла соединение<span class="line"></span></span></div>
+  <div class="r ev"><span class="t">10:15:11.002</span><span class="g"></span><span class="c"></span><span class="x">Автоответчик: ACK отправлен</span></div>
+</div>
+<div class="hbar"><span class="track"><span class="thumb"></span></span></div>
+</div>
+</div>
+<script>
+const H=[3,14,5,3,20,7,3,3,11,4,3,18,6,3,3,9,3,15,4,3,3,22,8,3,3,12,5,3,17,3,3,6,13,3,3,19,5,3,3,10,4,3,21,7,3,3,14,3,3,9,16,3,3,5,18,4,3,3,11,6,3,20,3,3,8,13,3,3,17,5,3,3,10,4,3,22,7,3,3,12,5,3];
+document.querySelectorAll('.wave').forEach(function(w){
+  var dir=w.dataset.dir;
+  for(var k=0;k<6;k++){H.forEach(function(h){var i=document.createElement('i');i.style.height=h+'px';i.style.background='var(--'+dir+')';w.appendChild(i);});}
+});
+</script>
+</body>
+</html>
