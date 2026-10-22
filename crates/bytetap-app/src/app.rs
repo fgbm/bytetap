@@ -1398,9 +1398,11 @@ impl BytetapApp {
                 // Цена кадра и период: по ним видно, почему кадров столько (NFR-5).
                 let period = live::next_period(crate::gpu::software(), self.frame_cost.cost());
                 diag::info(format!(
-                    "цена кадра записи: {} мс, период запроса кадра {} мс",
+                    "цена кадра записи: {} мс, период запроса кадра {} мс (работа {} мс, ожидание презентации {} мс)",
                     self.frame_cost.cost().as_millis(),
-                    period.as_millis()
+                    period.as_millis(),
+                    self.frame_cost.work().as_millis(),
+                    self.frame_cost.present().as_millis()
                 ));
             }
             self.recorded_path = Some(outcome.journal_path.clone());
@@ -1865,25 +1867,22 @@ impl BytetapApp {
     /// меряется по часам, а не по `unstable_dt` egui: в тестах и на первом кадре он
     /// равен предсказанному, а не прожитому. `started` — начало кадра, `work` — его
     /// длительность.
-    fn measure_frame_cost(&mut self, started: Instant, work: Duration) {
+    fn measure_frame_cost(&mut self, started: Instant, delay: Option<Duration>, work: Duration) {
         let spacing = self
             .frame_started
             .replace(started)
             .map(|last| started.saturating_duration_since(last));
+        self.frame_work = work;
         // Только запись: в простое окно спит по своему таймеру, и промежуток между
-        // кадрами — не цена кадра.
+        // кадрами — не цена кадра. Последняя цена записи остаётся: её читает итог в
+        // журнале запуска, который пишется уже после остановки.
         if self.live.is_none() {
-            self.frame_cost.reset();
-            self.frame_work = work;
             return;
         }
         // Свёрнутое окно кадров не рисует: промежуток в секунды — не цена кадра.
-        let spacing = spacing.filter(|spacing| {
-            self.frame_delay
-                .is_none_or(|delay| *spacing <= delay + MAX_GAP)
-        });
-        self.frame_cost.sample(spacing, self.frame_delay, work);
-        self.frame_work = work;
+        let spacing =
+            spacing.filter(|spacing| delay.is_none_or(|delay| *spacing <= delay + MAX_GAP));
+        self.frame_cost.sample(spacing, delay, work);
     }
 }
 
@@ -1933,6 +1932,9 @@ impl eframe::App for BytetapApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let probe = crate::probe::frame_start();
+        // Ожидание, которое окно просило в прошлом кадре: `draw` ниже поставит новое, а
+        // цена кадра считается по тому, что действовало в измеряемом промежутке.
+        let frame_delay = self.frame_delay;
         let frame_started = Instant::now();
         if !self.ready
             && let Some(state) = frame.wgpu_render_state()
@@ -1985,7 +1987,7 @@ impl eframe::App for BytetapApp {
         }
         // Работа над кадром — время до `frame_end`: она и есть та часть цены кадра,
         // которую окно знает про себя (остальное — ожидание презентации).
-        self.measure_frame_cost(frame_started, frame_started.elapsed());
+        self.measure_frame_cost(frame_started, frame_delay, frame_started.elapsed());
         crate::probe::frame_end(&ctx, frame, probe);
     }
 

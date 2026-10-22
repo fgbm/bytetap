@@ -103,6 +103,18 @@ impl FrameBudget {
         self.cost
     }
 
+    /// Работа окна над последним кадром.
+    #[must_use]
+    pub fn work(&self) -> Duration {
+        self.work
+    }
+
+    /// Ожидание презентации: растр, отправка и представление кадра.
+    #[must_use]
+    pub fn present(&self) -> Duration {
+        self.present
+    }
+
     /// Забыть замеры: новая запись, окно было свёрнуто.
     pub fn reset(&mut self) {
         *self = Self::default();
