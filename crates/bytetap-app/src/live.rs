@@ -20,8 +20,8 @@ use bytetap_core::journal::{JournalFailureReason, OsFamily, Stats};
 use bytetap_core::session::{
     Session, SessionConfig, SessionCounters, SessionEvent, SessionHandle, journal_failure_reason,
 };
-use bytetap_core::transport::Source;
 use bytetap_core::transport::serial::SerialSettings;
+use bytetap_core::transport::{Source, is_proxy_target_is_self};
 use eframe::egui;
 use tokio::sync::{broadcast, watch};
 
@@ -372,16 +372,24 @@ pub enum JournalFailureCode {
     Network,
     Busy,
     Timeout,
+    /// Очередь писателя переполнена (M4-AC12): не диск, а объём, который сессия успела
+    /// накопить, поэтому своей причиной, а не «ошибка записи».
+    Backlog,
     Io,
 }
 
 impl JournalFailureCode {
-    /// Вид отказа по причине от ядра: сначала код ОС (таблица по семейству ОС — 5 в
+    /// Вид отказа по причине от ядра: сначала свой код причины (`journal_backlog` у
+    /// переполненной очереди писателя), затем код ОС (таблица по семейству ОС — 5 в
     /// Windows и в Linux значит разное), затем вид ошибки.
     pub fn from_failure(reason: &JournalFailureReason) -> Self {
-        match reason.raw_os_error() {
-            Some(code) => Self::from_os_code(reason, code),
-            None => Self::from_kind(reason.kind()),
+        match reason.code() {
+            Some("journal_backlog") => Self::Backlog,
+            Some(_) => Self::Io,
+            None => match reason.raw_os_error() {
+                Some(code) => Self::from_os_code(reason, code),
+                None => Self::from_kind(reason.kind()),
+            },
         }
     }
 
@@ -444,6 +452,11 @@ impl JournalFailure {
 /// Ядро сначала занимает адрес или открывает порт, потом создаёт журнал, поэтому у
 /// TCP-сервера всё, что не про адрес, — про журнал.
 pub fn start_error(err: &io::Error, source: &Source) -> StartError {
+    // Петля прокси на себя — ошибка настройки, а не про журнал: ошибка старта есть только
+    // у цели, заданной адресом (M4-AC6), и встаёт под «Порт цели».
+    if is_proxy_target_is_self(err) {
+        return StartError::new(ErrorCode::ProxyTargetSelf, err.to_string());
+    }
     match source {
         // Прокси занимает порт прослушивания так же, как TCP-сервер: занятый порт —
         // `port_in_use` под полем порта, всё остальное — про журнал (M4-AC13).
@@ -727,7 +740,12 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
+    use bytetap_core::transport::ProxyTargetIsSelf;
     use bytetap_core::transport::serial::SerialFormat;
+
+    use crate::errors::ErrorField;
+    use crate::settings::SessionMode;
+    use bytetap_core::transport::ProxyRole;
 
     /// Период кадра записи: на аппаратном растре он фиксирован, на WARP — по цене
     /// прошлых кадров, и медленный кадр задаёт своё ожидание.
@@ -1211,6 +1229,23 @@ mod tests {
             ErrorCode::Io
         );
 
+        // Петля прокси на себя — свой код и своё поле, а не «журнал» (M4-AC6).
+        let proxy = Source::Proxy {
+            listen: "0.0.0.0:50025".parse::<SocketAddr>().unwrap(),
+            target: "127.0.0.1:50025".into(),
+            role: ProxyRole::AnalyzerClient,
+            retry: Duration::from_secs(5),
+        };
+        let looped = io::Error::new(
+            io::ErrorKind::InvalidInput,
+            ProxyTargetIsSelf {
+                addr: "127.0.0.1:50025".parse().unwrap(),
+            },
+        );
+        let error = start_error(&looped, &proxy);
+        assert_eq!(error.code, ErrorCode::ProxyTargetSelf);
+        assert_eq!(error.field(SessionMode::Proxy), ErrorField::TargetPort);
+
         let settings = SerialSettings::new("COM5", 9600, SerialFormat::EIGHT_N_ONE);
         let serial =
             |kind, listed: bool| serial_error(&io::Error::from(kind), &settings, |_| listed);
@@ -1275,6 +1310,25 @@ mod tests {
         let other = JournalFailureReason::from_message("device refused the write");
         assert_eq!(
             JournalFailureCode::from_failure(&other),
+            JournalFailureCode::Io
+        );
+    }
+
+    /// Свой код причины важнее вида ошибки: переполненная очередь писателя — не «ошибка
+    /// записи на диск», хотя ОС здесь ни при чём (M4-AC12).
+    #[test]
+    fn a_coded_failure_reason_keeps_its_own_code() {
+        let backlog = JournalFailureReason::from_message("journal writer backlog is full")
+            .with_code("journal_backlog");
+        assert_eq!(
+            JournalFailureCode::from_failure(&backlog),
+            JournalFailureCode::Backlog
+        );
+        let coded =
+            JournalFailureReason::from_code(io::ErrorKind::NotFound, Some(2), OsFamily::Unix)
+                .with_code("something_else");
+        assert_eq!(
+            JournalFailureCode::from_failure(&coded),
             JournalFailureCode::Io
         );
     }

@@ -608,6 +608,7 @@ pub fn failure_reason(code: JournalFailureCode) -> &'static str {
         JournalFailureCode::Network => t!("banner.journalFailureReasons.network"),
         JournalFailureCode::Busy => t!("banner.journalFailureReasons.busy"),
         JournalFailureCode::Timeout => t!("banner.journalFailureReasons.timeout"),
+        JournalFailureCode::Backlog => t!("banner.journalFailureReasons.backlog"),
         JournalFailureCode::Io => t!("banner.journalFailureReasons.io"),
     }
 }

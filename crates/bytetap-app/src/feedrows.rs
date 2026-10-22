@@ -39,6 +39,8 @@ pub enum RowClass {
     Service,
     /// Событие `info` или комментарий.
     Event,
+    /// Замечание, о котором стоит знать: цвет `warn`, а не спокойный `muted`.
+    Warning,
     /// Ошибка.
     Error,
 }
@@ -142,7 +144,14 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
             (RowClass::Error, event_text(code.as_deref(), message, pair))
         }
         FeedKind::Info { code, message } => {
-            (RowClass::Event, event_text(code.as_deref(), message, pair))
+            // Переполнение очереди писателя — не ошибка обмена, но и не спокойная строка:
+            // инженеру стоит знать, что журнал отстаёт (M4-AC12).
+            let class = if code.as_deref() == Some("journal_backlog_warning") {
+                RowClass::Warning
+            } else {
+                RowClass::Event
+            };
+            (class, event_text(code.as_deref(), message, pair))
         }
         FeedKind::Note { text } => (RowClass::Event, text.clone()),
     }
@@ -167,9 +176,14 @@ pub fn event_text(code: Option<&str>, message: &str, pair: Pair) -> String {
         Some("connection_write_failed") => t!("events.connection_write_failed"),
         Some("answer_timeout") => t!("events.answer_timeout"),
         Some("journal_failure") => t!("events.journal_failure"),
+        // Отказ журнала по переполнению очереди: в ленте та же фраза, что у остальных
+        // причин, а подробная причина — в строке под шапкой (M4-AC12).
+        Some("journal_backlog") => t!("events.journal_failure"),
         Some("protocol_undetected") => t!("events.protocol_undetected"),
         Some("proxy_connect_failed") => proxy_failure_text(pair, true),
         Some("proxy_connect_timeout") => proxy_failure_text(pair, false),
+        Some("proxy_target_is_self") => t!("events.proxy_target_is_self"),
+        Some("journal_backlog_warning") => t!("events.journal_backlog_warning"),
         _ => message,
     };
     text.to_owned()
@@ -340,6 +354,7 @@ pub fn text_row(
         _ => {
             let color = match class {
                 RowClass::Error => p.danger,
+                RowClass::Warning => p.warn,
                 _ => p.text_muted,
             };
             let job =
@@ -418,6 +433,7 @@ pub fn hex_row(
     let (byte_color, ascii_color) = match class {
         RowClass::Data(_) => (p.text, p.text_muted),
         RowClass::Error => (p.danger, p.danger),
+        RowClass::Warning => (p.warn, p.warn),
         RowClass::Event | RowClass::Service => (p.text_muted, p.text_muted),
     };
     let mut job = LayoutJob::default();
@@ -641,6 +657,47 @@ mod tests {
         assert_eq!(
             Pair::of(SessionMode::Serial, ProxyMode::AnalyzerClient),
             Pair::None
+        );
+    }
+
+    /// Коды ядра из ревью M4 показываются по-русски и своим цветом: петля на себя —
+    /// `danger`, отставание журнала — `warn`, а не спокойный `muted` (M4-AC6, M4-AC12).
+    #[test]
+    fn the_new_core_codes_have_their_rows() {
+        let error = |code: &str| {
+            event(FeedKind::Error {
+                code: Some(code.into()),
+                message: "core text".into(),
+            })
+        };
+        let (class, text) = row_text(&error("proxy_target_is_self"), Pair::TargetLis);
+        assert_eq!(class, RowClass::Error);
+        assert_eq!(text, "Цель указывает на сам bytetap — соединение закрыто.");
+
+        let (class, text) = row_text(&error("accept_failed"), Pair::TargetLis);
+        assert_eq!(class, RowClass::Error);
+        assert_eq!(text, "Не удалось принять соединение — повторяю.");
+
+        let warning = event(FeedKind::Info {
+            code: Some("journal_backlog_warning".into()),
+            message: "journal writer backlog".into(),
+        });
+        let (class, text) = row_text(&warning, Pair::TargetLis);
+        assert_eq!(class, RowClass::Warning);
+        assert!(!text.starts_with("events."), "{text}");
+
+        // Отказ журнала: в ленте та же строка, что у прочих причин отказа.
+        let (class, text) = row_text(&error("journal_backlog"), Pair::None);
+        assert_eq!(class, RowClass::Error);
+        assert_eq!(text, "Запись в журнал прервана.");
+        // Неизвестный код по-прежнему показывает английский текст журнала.
+        let unknown = event(FeedKind::Info {
+            code: Some("other_code".into()),
+            message: "core text".into(),
+        });
+        assert_eq!(
+            row_text(&unknown, Pair::None),
+            (RowClass::Event, "core text".into())
         );
     }
 }
