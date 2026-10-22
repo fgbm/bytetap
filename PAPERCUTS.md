@@ -37,3 +37,7 @@ egui: `ui.spacing_mut().item_spacing` учитывается при размещ
 ## 2026-10-22 00:21 — deepseek-v4.1-flash
 
 egui_kittest `check_accessibility` ловит только роли `is_input`: строка ленты (`Role::Label` с `actions: [Click, Focus]` и текстом в `value`, а не в `label`) проходит проверку без подписи. Своя проверка дерева должна смотреть `label().or(value())`.
+
+## 2026-10-22 07:20 — deepseek-v4.1-flash
+
+`gh run view <id> --json artifacts` отвечает `Unknown JSON field: "artifacts"` (artifacts не входят в набор `--json`), а `gh run download` имена артефактов не подсказывает. Список — `gh api repos/<owner>/<repo>/actions/runs/<id>/artifacts --jq '.artifacts[] | .name'`.
