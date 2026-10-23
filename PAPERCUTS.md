@@ -45,3 +45,11 @@ egui_kittest `check_accessibility` ловит только роли `is_input`: 
 ## 2026-10-22 10:48 — deepseek-v4.1-flash
 
 `git rm -r app` кладёт удаления в индекс, и следующий `git commit` без `-a` забирает их вместе с единственным добавленным файлом: коммит «правка одной строки в ci.yml» уехал на 99 файлов и сломал CI (package.json ещё звал workspace `app`). Перед частичным коммитом смотреть `git status --short` целиком: `git rm` — это уже staging.
+
+## 2026-10-23 14:05 — deepseek-v4.1-flash
+
+egui_kittest: `Event::PointerButton { modifiers }` не обновляет `input.modifiers` — Shift+клик и Ctrl+клик в тестах приходили как обычный клик, и разница была видна только по счётчику выделения. Модификаторы надо слать отдельно: `Event::ModifiersChanged(m)` до нажатия и `ModifiersChanged(default)` после; `Harness::event_modifiers` делает это само.
+
+## 2026-10-23 14:05 — deepseek-v4.1-flash
+
+Хелпер теста, который создаёт `tempfile::tempdir()` и возвращает только харнесс, удаляет папку с журналом до первого кадра: страницы журнала не читаются никогда, а тест висит на «странице, которой нет». Временную папку держать у теста (`journal_harness(dir.path())`), как в `tests/journal.rs`.
