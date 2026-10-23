@@ -471,8 +471,13 @@ fn the_monitor_config_has_no_autoresponder() {
 }
 
 /// Ошибка старта прослушки несёт сторону порта, а журнал не создаётся (M5-AC3).
+///
+/// Тест держит метку хука: с включённой виртуальной парой настоящие порты не
+/// открываются, и ошибки старта не было бы вовсе.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_monitor_start_error_names_the_port_side() {
+    let _hook = HOOK.lock().await;
+    let _guard = HookGuard;
     let dir = tempfile::tempdir().expect("временная папка");
     let missing = "/dev/bytetap-no-such-port";
     let err = Session::start(
@@ -524,6 +529,8 @@ async fn a_monitor_start_error_names_the_port_side() {
 /// Один и тот же порт с двух сторон — свой код ошибки, а не «порт занят» (M5-AC3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_same_port_on_both_sides_is_its_own_error() {
+    let _hook = HOOK.lock().await;
+    let _guard = HookGuard;
     let dir = tempfile::tempdir().expect("временная папка");
     let err = Session::start(
         SessionConfig::com_monitor(
