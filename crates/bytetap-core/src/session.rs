@@ -765,12 +765,15 @@ impl Shared {
         }));
     }
 
-    /// Ошибка источника с адресом отвергнутой стороны (FR-8).
+    /// Ошибка с адресом отвергнутой стороны (FR-8) или с портом отказавшей стороны
+    /// прослушки (M5-AC2).
     ///
-    /// Адрес уходит отдельным полем события: та же строка ленты должна называть его, не
-    /// разбирая английский `message`. `peer` есть только у отказа по фильтру.
+    /// Сторона уходит отдельным полем события: та же строка ленты должна называть её, не
+    /// разбирая английский `message`. У прокси `peer` — адрес отвергнутого, у прослушки —
+    /// имя порта, у которого пропал обмен.
     fn error_with_peer(
         &self,
+        conn: Option<u32>,
         code: Option<&str>,
         peer: Option<String>,
         message: impl Into<String>,
@@ -778,7 +781,7 @@ impl Shared {
         self.publish(Event::Error(ErrorEvent {
             t: now_rfc3339(),
             mono_us: self.clock.now_us(),
-            conn: None,
+            conn,
             code: code.map(str::to_owned),
             peer,
             message: message.into(),
@@ -1208,6 +1211,15 @@ async fn run(
                         link,
                         reset,
                     } = connection;
+                    // Прослушка: имена обоих портов нужны ошибке обмена — она называет
+                    // отказавший порт (M5-AC2). Снимаются до `open`: `peer` уходит в него.
+                    let ports = (mode == Mode::ComMonitor).then(|| MonitorPorts {
+                        analyzer: peer.clone(),
+                        lis: link
+                            .as_ref()
+                            .map(|link| link.peer.clone())
+                            .unwrap_or_default(),
+                    });
                     shared.publish(Event::Open(Open {
                         t: now_rfc3339(),
                         mono_us: shared.clock.now_us(),
@@ -1237,6 +1249,7 @@ async fn run(
                                         &mut conn_stop,
                                         &mut conn_failure,
                                         close_policy(mode),
+                                        ports,
                                     )
                                     .await,
                                 )
@@ -1281,13 +1294,13 @@ async fn run(
                     match report {
                         SourceReport::Repeated => {}
                         SourceReport::First(message) => {
-                            shared.error_with_peer(Some(code), peer, message);
+                            shared.error_with_peer(None, Some(code), peer, message);
                         }
                         SourceReport::Changed { previous, repeats, message } => {
                             if let Some(note) = SourceErrors::changed_note(previous, repeats) {
                                 shared.info_repeating(None, note.code, note.repeats, note.text);
                             }
-                            shared.error_with_peer(Some(code), peer, message);
+                            shared.error_with_peer(None, Some(code), peer, message);
                         }
                     }
                     tokio::select! {
@@ -1556,6 +1569,7 @@ async fn serve_pair(
     stop: &mut watch::Receiver<bool>,
     failure: &mut watch::Receiver<Option<JournalFailureReason>>,
     policy: ClosePolicy,
+    ports: Option<MonitorPorts>,
 ) -> ClosedBy {
     // Принятая сторона — противоположная роли дальнего конца пары (FR-5).
     let accepted_role = link.role.opposite();
@@ -1597,7 +1611,7 @@ async fn serve_pair(
     ));
 
     let (mut by, mut reason, linger) = match pumps.join_next().await {
-        Some(Ok(outcome)) => pair_end(&shared, conn, &outcome),
+        Some(Ok(outcome)) => pair_end(&shared, conn, &outcome, ports.as_ref()),
         // Насосов не осталось или задача упала: пары больше нет.
         None | Some(Err(_)) => (ClosedBy::Bytetap, "error", Duration::ZERO),
     };
@@ -1615,7 +1629,7 @@ async fn serve_pair(
         // Вторая сторона закрывается сразу: `FIN` уже не пересылать, `RST`, «Стоп» или
         // отказ журнала.
         let _ = hangup.send(true);
-        settle(&shared, conn, &mut pumps).await;
+        settle(&shared, conn, &mut pumps, ports.as_ref()).await;
     } else {
         // `FIN` одной стороны: обратное направление доживает до своего `FIN`;
         // истёк срок — закрывает bytetap, иначе зависшая сторона держала бы пару вечно.
@@ -1623,7 +1637,7 @@ async fn serve_pair(
             Ok(Some(Ok(outcome))) => {
                 // Вторая сторона закончилась сама; её ошибка — тоже событие журнала,
                 // но `close` остаётся за первой (FR-7).
-                let _ = pair_end(&shared, conn, &outcome);
+                let _ = pair_end(&shared, conn, &outcome, ports.as_ref());
                 // Сброс во время дожития: собеседник второй стороны уже сбросил
                 // соединение, и ответа он не ждёт. Обе стороны закрываются `RST`,
                 // как при сбросе первой: иначе оставшаяся сторона увидела бы `FIN`
@@ -1636,7 +1650,7 @@ async fn serve_pair(
                 by = ClosedBy::Bytetap;
                 reason = "timeout";
                 let _ = hangup.send(true);
-                settle(&shared, conn, &mut pumps).await;
+                settle(&shared, conn, &mut pumps, ports.as_ref()).await;
             }
         }
     }
@@ -1660,11 +1674,40 @@ async fn serve_pair(
     by
 }
 
+/// Имена портов прослушки: сторона анализатора и сторона ЛИС (M5-AC2).
+///
+/// Пара портов — одно соединение журнала, и ошибка обмена называет отказавший порт, чтобы
+/// лента говорила «COM4 пропал», а не «ошибка чтения соединения» (M5-В8). У прокси портов
+/// нет, поэтому там `None`.
+#[derive(Debug)]
+struct MonitorPorts {
+    /// Порт, к которому подключён анализатор: имя принятой стороны пары.
+    analyzer: String,
+    /// Порт стороны ЛИС: `link.peer` журнала.
+    lis: String,
+}
+
+impl MonitorPorts {
+    /// Имя порта стороны роли в журнале.
+    fn name(&self, role: LinkRole) -> Option<&str> {
+        let name = match role {
+            LinkRole::Analyzer => &self.analyzer,
+            LinkRole::Lis => &self.lis,
+        };
+        (!name.is_empty()).then_some(name.as_str())
+    }
+}
+
 /// Итог насоса: кто закрыл пару, с какой причиной и сколько доживает обратное направление.
 ///
 /// Ошибку транспорта функция пишет в журнал: она относится к паре, а не к решению о закрытии,
 /// поэтому `close` от этого не меняется (FR-7, M5-AC2).
-fn pair_end(shared: &Shared, conn: u32, outcome: &Pump) -> (ClosedBy, &'static str, Duration) {
+fn pair_end(
+    shared: &Shared,
+    conn: u32,
+    outcome: &Pump,
+    ports: Option<&MonitorPorts>,
+) -> (ClosedBy, &'static str, Duration) {
     match outcome {
         Pump::Eof(role) => (role.closed_by(), "eof", PROXY_LINGER),
         Pump::Broken {
@@ -1674,6 +1717,12 @@ fn pair_end(shared: &Shared, conn: u32, outcome: &Pump) -> (ClosedBy, &'static s
         } => {
             let (by, reason) = pair_failure(shared.mode, *role, error, *writing);
             let monitor = shared.mode == Mode::ComMonitor;
+            // Прослушка называет в ошибке отказавший порт: чтение — порт своей стороны,
+            // запись — противоположной. По нему интерфейс говорит «COM4 пропал» (M5-В8).
+            let peer = ports.and_then(|ports| {
+                let failed = if *writing { role.opposite() } else { *role };
+                ports.name(failed).map(str::to_owned)
+            });
             let (code, what) = if *writing {
                 (
                     "connection_write_failed",
@@ -1693,9 +1742,10 @@ fn pair_end(shared: &Shared, conn: u32, outcome: &Pump) -> (ClosedBy, &'static s
                     },
                 )
             };
-            shared.error_with_code(
+            shared.error_with_peer(
                 Some(conn),
                 Some(code),
+                peer,
                 format!("{what}: {}", io_message(error)),
             );
             (by, reason, Duration::ZERO)
@@ -1709,10 +1759,15 @@ fn pair_end(shared: &Shared, conn: u32, outcome: &Pump) -> (ClosedBy, &'static s
 /// `abort` здесь не годится: прерванная посреди записи задача не успела бы записать
 /// в журнал байты, которые адресат получил (M4-AC10). Предел — тот же, что у остановки
 /// сессии; дольше ждать незачем, и тогда задачи прерываются.
-async fn settle(shared: &Shared, conn: u32, pumps: &mut JoinSet<Pump>) {
+async fn settle(
+    shared: &Shared,
+    conn: u32,
+    pumps: &mut JoinSet<Pump>,
+    ports: Option<&MonitorPorts>,
+) {
     match timeout(CONNECTIONS_SHUTDOWN_TIMEOUT, pumps.join_next()).await {
         Ok(Some(Ok(outcome))) => {
-            let _ = pair_end(shared, conn, &outcome);
+            let _ = pair_end(shared, conn, &outcome, ports);
         }
         Ok(_) => {}
         Err(_elapsed) => pumps.shutdown().await,

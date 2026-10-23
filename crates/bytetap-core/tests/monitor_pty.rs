@@ -516,6 +516,24 @@ async fn a_monitor_pair_forwards_astm_and_hl7_over_pty() {
         )),
         "ошибка обмена с кодом отказа"
     );
+    // Пропавший порт назван в самом событии: лента говорит «COM4 пропал», а не разбирает
+    // английский `message` (M5-В8).
+    let lost = outcome.lines.iter().find_map(|line| match &line.event {
+        Event::Error(error)
+            if matches!(
+                error.code.as_deref(),
+                Some("connection_read_failed" | "connection_write_failed")
+            ) =>
+        {
+            Some(error)
+        }
+        _ => None,
+    });
+    assert_eq!(
+        lost.and_then(|error| error.peer.as_deref()),
+        Some(lis_port.as_str()),
+        "в ошибке обмена — имя отказавшего порта"
+    );
 
     // Адаптер подключён обратно: второй `socat` с теми же именами, источник открывает порты
     // заново и пишет новое `open` со следующим `conn`.
