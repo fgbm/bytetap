@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use bytetap_core::journal::{Close, ClosedBy, Dir, Event, LinkRole, Mode, read_all};
 use bytetap_core::session::{Session, SessionConfig};
+use bytetap_core::transport::MonitorSide;
+use bytetap_core::transport::monitor_side;
 use bytetap_core::transport::serial::{SerialFormat, SerialSettings};
 use bytetap_testkit::emulator::frame;
 use bytetap_testkit::fixtures_dir;
@@ -550,4 +552,50 @@ async fn a_monitor_pair_forwards_astm_and_hl7_over_pty() {
 
     let stats = handle.stop().await.expect("остановка");
     assert_eq!(stats.connections, 2, "две пары — два соединения");
+}
+
+/// Ошибка старта на стороне ЛИС: порт анализатора настоящий, порта ЛИС нет (M5-AC3).
+///
+/// Проверяется на pty, потому что нужен настоящий открывающийся порт: ошибка стороны
+/// видна только тогда, когда первый порт уже открыт.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires socat"]
+async fn a_missing_lis_port_is_a_start_error_on_the_lis_side() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let logs = dir.path().join("logs");
+    std::fs::create_dir(&logs).expect("папка журналов");
+    let analyzer = match Socat::start(dir.path(), "analyzer") {
+        Some(socat) => socat,
+        None => return,
+    };
+    let err = Session::start(
+        SessionConfig::com_monitor(
+            SerialSettings::new(
+                analyzer.first.to_string_lossy(),
+                9600,
+                SerialFormat::EIGHT_N_ONE,
+            )
+            .with_lines(false, false),
+            SerialSettings::new("/dev/bytetap-no-such-port", 9600, SerialFormat::EIGHT_N_ONE),
+            RETRY,
+        )
+        .with_log_dir(&logs),
+    )
+    .await
+    .expect_err("порта ЛИС нет");
+    assert_eq!(
+        monitor_side(&err),
+        Some(MonitorSide::Lis),
+        "ошибка называет сторону ЛИС: {err}"
+    );
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    assert!(
+        err.to_string().contains("/dev/bytetap-no-such-port"),
+        "ошибка называет порт: {err}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&logs).expect("папка").count(),
+        0,
+        "журнал не создан"
+    );
 }
