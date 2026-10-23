@@ -2126,6 +2126,68 @@ fn recording_new_rows_dark() {
     harness.snapshot_options("recording-new-rows-dark", &options());
 }
 
+/// Панель деталей выбранной строки (L1-AC3, L1-AC6, L1-AC11): клик по строке ленты
+/// записи открывает панель, вкладки «Текст» и «HEX» — в обеих темах.
+///
+/// Строка выбирается кликом по её подписи — тем же путём, что и мышью у инженера.
+fn details_recording(dark: bool, tab: FeedView) -> Harness<'static, BytetapApp> {
+    let mut harness = recording(dark, FeedView::Text, 0);
+    let row = harness
+        .get_all_by_label_contains("MSG0003")
+        .next()
+        .expect("строка ленты");
+    row.click();
+    harness.run_steps(3);
+    if tab == FeedView::Hex {
+        harness.get_by_label("HEX").click();
+        harness.run_steps(3);
+    }
+    harness
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn details_text_light() {
+    let _gpu = gpu();
+    details_recording(false, FeedView::Text).snapshot_options("details-text-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn details_text_dark() {
+    let _gpu = gpu();
+    details_recording(true, FeedView::Text).snapshot_options("details-text-dark", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn details_hex_light() {
+    let _gpu = gpu();
+    details_recording(false, FeedView::Hex).snapshot_options("details-hex-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn details_hex_dark() {
+    let _gpu = gpu();
+    details_recording(true, FeedView::Hex).snapshot_options("details-hex-dark", &options());
+}
+
+/// Панель в просмотре журнала: та же строка выбрана кликом, панель снизу (L1-AC4).
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn details_viewing_light() {
+    let _gpu = gpu();
+    let mut harness = analyzer_viewing(WINDOW, None);
+    let row = harness
+        .get_all_by_label_contains("ORU^R01")
+        .next()
+        .expect("строка журнала");
+    row.click();
+    harness.run_steps(3);
+    harness.snapshot_options("details-viewing-light", &options());
+}
+
 /// Узкое окно и ноутбук: шапка с длинной сводкой и счётчиками (находка ревью шага 5).
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]

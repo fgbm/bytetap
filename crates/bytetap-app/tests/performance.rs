@@ -244,6 +244,104 @@ fn frame_cost_probe() {
     }
 }
 
+/// Цена кадра с открытой панелью деталей (L1-AC10): 10 000 строк в ленте и фрагмент
+/// 16 КБ из управляющих байтов — худший случай раскладки панели.
+///
+/// Запуск руками: `cargo test -p bytetap-app --test performance -- --ignored --nocapture`.
+/// В CI не идёт: время кадра зависит от машины. Панель показывает полный фрагмент, а не
+/// первые 2048 байт, поэтому кадр меряется на вкладке «Текст» (раскладка 10 000 глифов)
+/// и на вкладке «HEX» (1024 строки дампа).
+#[test]
+#[ignore = "профиль машины, не проверка"]
+fn details_panel_frame_cost() {
+    use std::time::Instant;
+
+    use egui_kittest::kittest::Queryable as _;
+
+    let rows = 10_000usize;
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings(), None, None)
+                .with_fixtures(fixtures())
+                .with_recording_fixture(control_fixture(rows))
+        });
+    harness.run_steps(6);
+    let measure = |harness: &mut Harness<'static, BytetapApp>, label: &str| {
+        let mut times = Vec::new();
+        for _ in 0..30 {
+            let started = Instant::now();
+            harness.step();
+            times.push(started.elapsed());
+        }
+        times.sort_unstable();
+        eprintln!(
+            "{label}: медиана кадра {:?}, худший {:?}",
+            times[times.len() / 2],
+            times[times.len() - 1]
+        );
+    };
+    measure(&mut harness, "панель закрыта, 10 000 строк");
+    let row = harness
+        .get_all_by_label_contains("CTRL16K")
+        .next()
+        .expect("строка длинного фрагмента");
+    row.click();
+    harness.run_steps(4);
+    measure(
+        &mut harness,
+        "панель открыта, «Текст», 16 КБ управляющих байт",
+    );
+    harness.get_by_label("HEX").click();
+    harness.run_steps(4);
+    measure(&mut harness, "панель открыта, «HEX», 16 КБ");
+}
+
+/// Запись из `rows` событий; последнее — 16 КБ управляющих байтов (худший случай).
+fn control_fixture(rows: usize) -> bytetap_app::recording::RecordingFixture {
+    use bytetap_core::journal::{Data, Dir, Event, Stats};
+
+    let mut events: Vec<Event> = (0..rows.saturating_sub(1))
+        .map(|index| {
+            let body = format!(
+                "\x0bMSH|^~\\&|ANALYZER|LAB|LIS||20261019232710||ORU^R01|MSG{index:06}|P|2.3.1\rOBX|1|NM|GLU^Glucose||5.4|mmol/L\r\x1c\r"
+            );
+            Event::Data(Data::new(
+                "2026-10-19T23:27:10.046000+03:00",
+                index as u64 * 100_000 + 1,
+                1,
+                Dir::AnalyzerToLis,
+                false,
+                body.as_bytes(),
+            ))
+        })
+        .collect();
+    let mut long =
+        b"\x0bMSH|^~\\&|ANALYZER|LAB|LIS||20261019232710||ORU^R01|CTRL16K|P|2.3.1\r".to_vec();
+    long.resize(16 * 1024 - 3, 0x01);
+    long.extend_from_slice(b"\x1c\r");
+    events.push(Event::Data(Data::new(
+        "2026-10-19T23:27:10.046000+03:00",
+        rows as u64 * 100_000,
+        1,
+        Dir::AnalyzerToLis,
+        false,
+        &long,
+    )));
+    bytetap_app::recording::RecordingFixture {
+        events,
+        stats: Stats {
+            connections: 1,
+            bytes_analyzer_to_lis: 1_000_000,
+            bytes_lis_to_analyzer: 0,
+        },
+        elapsed: Duration::from_secs(10),
+        local_addr: "0.0.0.0:5000".into(),
+        journal_path: None,
+        dropped: 0,
+    }
+}
+
 /// Запись с `events` фрагментами HL7 для профиля: столько же строк ленты.
 fn feed_fixture(events: usize) -> bytetap_app::recording::RecordingFixture {
     use bytetap_core::journal::{Data, Dir, Event, Stats};
