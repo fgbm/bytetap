@@ -184,6 +184,13 @@ pub struct AppConfig {
     /// линий здесь те же, что у анализатора, и в файле их значения повторяются, а не
     /// выбираются отдельно (M5-В2).
     pub monitor_lis: SerialSettings,
+    /// Второй порт прослушки пока повторяет скорость и формат первого (M5-В2).
+    ///
+    /// Это настройка, а не вывод из совпадения значений: скорость 19200 у обоих портов
+    /// может быть и повтором первого, и собственной у второго. Пока признак стоит, правка
+    /// скорости или формата анализатора переносится во второй порт; первая правка
+    /// второго порта его снимает, и дальше он живёт своей.
+    pub monitor_lis_follows: bool,
     pub responder: Responder,
     pub astm_nak_on_bad_checksum: bool,
     pub analyzer: String,
@@ -192,6 +199,26 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// Настройки второго порта прослушки с учётом признака повтора (M5-В2).
+    ///
+    /// Поток и линии в разрыве общие для обеих сторон, поэтому у второго порта они всегда
+    /// из блока анализатора. Пока второй порт повторяет первый, оттуда же берутся скорость
+    /// и формат; после первой правки второго порта они у него свои.
+    #[must_use]
+    pub fn lis_port(&self) -> SerialSettings {
+        let mut lis = self.monitor_lis.clone();
+        lis.flow = self.serial.flow;
+        lis.dtr = self.serial.dtr;
+        lis.rts = self.serial.rts;
+        if self.monitor_lis_follows {
+            lis.baud = self.serial.baud;
+            lis.data_bits = self.serial.data_bits;
+            lis.parity = self.serial.parity;
+            lis.stop_bits = self.serial.stop_bits;
+        }
+        lis
+    }
+
     pub fn with_log_dir(log_dir: &str) -> Self {
         Self {
             mode: SessionMode::TcpServer,
@@ -206,6 +233,8 @@ impl AppConfig {
             proxy_allow_from: String::new(),
             serial: SerialSettings::default(),
             monitor_lis: SerialSettings::default(),
+            // Новый профиль: второй порт повторяет первый, пока его не тронули.
+            monitor_lis_follows: true,
             responder: Responder::Auto,
             astm_nak_on_bad_checksum: false,
             analyzer: String::new(),
@@ -362,6 +391,17 @@ fn serial(raw: Option<&Value>, fallback: &SerialSettings) -> SerialSettings {
     }
 }
 
+/// Признак «второй порт повторяет первый» из файла (M5-В2).
+///
+/// Есть свой блок `monitorLis`, а признака нет — значит, второй порт уже настраивали
+/// отдельно (файл этой ветки до признака). Нет ни признака, ни блока — файл прошлой
+/// версии, и второй порт повторяет первый, как у нового профиля.
+fn monitor_lis_follows(raw: &Value) -> bool {
+    raw.get("monitorLisFollows")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| raw.get("monitorLis").is_none())
+}
+
 pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig {
     let Some(raw) = raw.filter(|v| v.is_object()) else {
         return fallback.clone();
@@ -370,7 +410,7 @@ pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig 
         text(raw.get("proxyHost"), &fallback.proxy_host),
         int(raw.get("proxyPort"), fallback.proxy_port, 1, u16::MAX),
     );
-    AppConfig {
+    let mut config = AppConfig {
         mode: choice(raw.get("mode"), fallback.mode),
         listen_host: text(raw.get("listenHost"), &fallback.listen_host),
         listen_port: int(raw.get("listenPort"), fallback.listen_port, 1, u16::MAX),
@@ -385,8 +425,9 @@ pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig 
             .to_owned(),
         serial: serial(raw.get("serial"), &fallback.serial),
         // Второй порт прослушки: в файле прошлой версии его нет — тогда умолчание, и
-        // форма предзаполнит скорость и формат по анализатору (M5-AC3).
+        // скорость с форматом предзаполняются первым портом (M5-AC3).
         monitor_lis: serial(raw.get("monitorLis"), &fallback.monitor_lis),
+        monitor_lis_follows: monitor_lis_follows(raw),
         responder: choice(raw.get("responder"), fallback.responder),
         astm_nak_on_bad_checksum: flag(
             raw.get("astmNakOnBadChecksum"),
@@ -395,7 +436,11 @@ pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig 
         analyzer: text(raw.get("analyzer"), &fallback.analyzer),
         note: text(raw.get("note"), &fallback.note),
         log_dir: text(raw.get("logDir"), &fallback.log_dir),
-    }
+    };
+    // Поток и линии у второго порта общие с первым, а пока он его повторяет — и скорость
+    // с форматом: в файле они могут быть старыми (M5-В2).
+    config.monitor_lis = config.lis_port();
+    config
 }
 
 /// Цель прокси из файла: пустой адрес очищается вместе с портом — форма просит вписать
@@ -762,6 +807,9 @@ mod tests {
             size: [1000.0, 700.0],
             maximized: false,
         });
+        // Второй порт прослушки повторяет первый: в файле он лежит теми же значениями,
+        // иначе чтение вернуло бы другие (M5-В2).
+        settings.config.monitor_lis = settings.config.lis_port();
         let config = settings.config.clone();
         upsert_profile(&mut settings.profiles, "  Прибор  ", &config);
         settings
@@ -795,6 +843,8 @@ mod tests {
         assert_eq!(value["config"]["proxyHost"], "", "цель по умолчанию пуста");
         assert_eq!(value["config"]["proxyPort"], 0);
         assert_eq!(value["config"]["serial"]["dataBits"], 8);
+        assert_eq!(value["config"]["monitorLisFollows"], true);
+        assert_eq!(value["config"]["monitorLis"]["parity"], "even");
         assert_eq!(value["config"]["astmNakOnBadChecksum"], false);
         assert_eq!(value["lastRun"]["port"], "COM5");
         assert_eq!(value["feed"]["encoding"], "gbk");
@@ -962,6 +1012,8 @@ mod tests {
         expected.mode = SessionMode::TcpClient;
         expected.connect_port = 6000;
         expected.serial.baud = 19200;
+        // Второй порт повторяет первый, поэтому в настройках он той же скорости (M5-В2).
+        expected.monitor_lis.baud = 19200;
         assert_eq!(settings.config, expected);
         assert_eq!(settings.theme, ThemeMode::System);
         assert_eq!(settings.feed, FeedSettings::default());
@@ -1130,6 +1182,69 @@ mod tests {
             "пробелы режутся"
         );
         assert_eq!(settings.profiles[0].config.proxy_allow_from, "10.0.0.5");
+    }
+
+    /// Признак повтора второго порта: файл без `monitorLis` повторяет первый порт, файл
+    /// со своим блоком и без признака — уже свой, записанный признак читается (M5-В2).
+    #[test]
+    fn the_second_port_follows_the_first_unless_it_has_its_own() {
+        // Файл прошлой версии: второго порта нет.
+        let raw = json!({
+            "config": { "mode": "com_monitor", "serial": {
+                "port": "COM3", "baud": 19200, "dataBits": 7, "parity": "even"
+            }}
+        });
+        let config = normalize(&raw, "").config;
+        assert!(config.monitor_lis_follows);
+        assert_eq!(
+            config.monitor_lis.port, "",
+            "порт второй стороны не выдуман"
+        );
+        let lis = config.lis_port();
+        assert_eq!(
+            (lis.baud, lis.data_bits, lis.parity),
+            (19200, 7, Parity::Even)
+        );
+        assert_eq!(
+            crate::form::serial_format(&lis),
+            "7E1",
+            "формат второго порта — от первого"
+        );
+
+        // Свой блок, признака нет: порт уже настраивали отдельно.
+        let raw = json!({
+            "config": {
+                "mode": "com_monitor",
+                "serial": { "port": "COM3", "baud": 19200 },
+                "monitorLis": { "port": "COM4", "baud": 9600 }
+            }
+        });
+        let config = normalize(&raw, "").config;
+        assert!(!config.monitor_lis_follows);
+        assert_eq!(config.lis_port().baud, 9600);
+
+        // Признак записан: он переживает запись и чтение.
+        let raw = json!({
+            "config": {
+                "mode": "com_monitor",
+                "serial": { "port": "COM3", "baud": 19200 },
+                "monitorLis": { "port": "COM4", "baud": 9600 },
+                "monitorLisFollows": true
+            }
+        });
+        let settings = normalize(&raw, "");
+        assert!(settings.config.monitor_lis_follows);
+        assert_eq!(
+            settings.config.lis_port().baud,
+            19200,
+            "повтор первого порта"
+        );
+        let value = serde_json::to_value(&settings).expect("json");
+        assert_eq!(value["config"]["monitorLisFollows"], true);
+        assert_eq!(normalize(&value, ""), settings);
+
+        let raw = json!({ "config": { "monitorLisFollows": false } });
+        assert!(!normalize(&raw, "").config.monitor_lis_follows);
     }
 
     /// Второй порт прослушки читается из файла и переживает запись; файл прошлой версии

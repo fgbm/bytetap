@@ -181,6 +181,14 @@ enum MonitorPort {
     Lis,
 }
 
+/// Поле прослушки, чьё имя для диктора называет сторону.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum A11yField {
+    Baud,
+    Format,
+    Refresh,
+}
+
 impl MonitorPort {
     /// Поле ошибки старта этой стороны: у порта.
     fn error(self) -> ErrorField {
@@ -203,6 +211,19 @@ impl MonitorPort {
         match self {
             Self::Analyzer => t!("form.monitorAnalyzerPort"),
             Self::Lis => t!("form.monitorLisPort"),
+        }
+    }
+
+    /// Имя для экранного диктора: видимая подпись у двух портов одна — «Скорость»,
+    /// «Формат», — а диктор должен говорить, чья она (M5-AC3).
+    fn a11y(self, what: A11yField) -> &'static str {
+        match (self, what) {
+            (Self::Analyzer, A11yField::Baud) => t!("form.baudAnalyzer"),
+            (Self::Lis, A11yField::Baud) => t!("form.baudLis"),
+            (Self::Analyzer, A11yField::Format) => t!("form.formatAnalyzer"),
+            (Self::Lis, A11yField::Format) => t!("form.formatLis"),
+            (Self::Analyzer, A11yField::Refresh) => t!("form.refreshPortsAnalyzer"),
+            (Self::Lis, A11yField::Refresh) => t!("form.refreshPortsLis"),
         }
     }
 
@@ -241,8 +262,12 @@ impl MonitorPort {
         &self.serial(cfg).port
     }
 
-    fn baud(self, cfg: &crate::settings::AppConfig) -> u32 {
-        self.serial(cfg).baud
+    /// Скорость с учётом признака повтора: у второго порта она может быть от первого.
+    fn baud_for(self, cfg: &crate::settings::AppConfig) -> u32 {
+        match self {
+            Self::Analyzer => cfg.serial.baud,
+            Self::Lis => cfg.lis_port().baud,
+        }
     }
 
     fn baud_other(self, form: &crate::form::FormState) -> bool {
@@ -982,7 +1007,7 @@ impl BytetapApp {
                         }
                     }
                 });
-                if widgets::icon_button(ui, p, Icon::RefreshCw, 15.0, t!("form.refreshPorts"))
+                if widgets::icon_button(ui, p, Icon::RefreshCw, 15.0, side.a11y(A11yField::Refresh))
                     .clicked()
                 {
                     self.refresh_ports(&ctx);
@@ -1009,6 +1034,10 @@ impl BytetapApp {
                         ..FieldLook::default()
                     },
                 );
+                // Имя для диктора называет сторону: видимая подпись у двух портов одна.
+                let name = side.a11y(A11yField::Baud);
+                ui.ctx()
+                    .accesskit_node_builder(response.id, |node| node.set_label(name));
                 if response.changed() {
                     let baud = check_baud(side.baud_text(&mut self.form));
                     if let Some(baud) = baud {
@@ -1017,9 +1046,12 @@ impl BytetapApp {
                                 self.analyzer_changed(|cfg| cfg.serial.baud = baud)
                             }
                             MonitorPort::Lis => {
+                                // Своя скорость второго порта: повтор снят (М5-В2).
                                 self.form.touched.serial_b = true;
-                                self.form.lis_follows = false;
-                                self.settings_mut().config.monitor_lis.baud = baud;
+                                let mut config = self.settings.config.clone();
+                                self.form.lis_port_changed(&mut config);
+                                config.monitor_lis.baud = baud;
+                                self.settings_mut().config = config;
                             }
                         }
                     }
@@ -1030,12 +1062,12 @@ impl BytetapApp {
             options.push(t!("form.baudOther").to_owned());
             let current = BAUD_RATES
                 .iter()
-                .position(|rate| *rate == side.baud(&self.settings.config));
+                .position(|rate| *rate == side.baud_for(&self.settings.config));
             let (_, chosen) = widgets::select(
                 ui,
                 p,
                 Id::unique(side.baud_id()),
-                t!("form.baud"),
+                side.a11y(A11yField::Baud),
                 &options,
                 current,
                 FieldLook {
@@ -1052,13 +1084,24 @@ impl BytetapApp {
                         }
                         MonitorPort::Lis => {
                             self.form.touched.serial_b = true;
-                            self.form.lis_follows = false;
-                            self.settings_mut().config.monitor_lis.baud = *rate;
+                            let mut config = self.settings.config.clone();
+                            self.form.lis_port_changed(&mut config);
+                            config.monitor_lis.baud = *rate;
+                            self.settings_mut().config = config;
                         }
                     },
+                    // «Другая…» — уже своя настройка: второй порт перестал повторять
+                    // первый, а в поле встаёт его собственная скорость (M5-В2).
                     None => match side {
                         MonitorPort::Analyzer => self.form.baud_other = true,
-                        MonitorPort::Lis => self.form.lis_baud_other = true,
+                        MonitorPort::Lis => {
+                            self.form.touched.serial_b = true;
+                            let mut config = self.settings.config.clone();
+                            self.form.lis_port_changed(&mut config);
+                            self.form.lis_baud_text = config.monitor_lis.baud.to_string();
+                            self.form.lis_baud_other = true;
+                            self.settings_mut().config = config;
+                        }
                     },
                 }
             }
@@ -1069,13 +1112,18 @@ impl BytetapApp {
     fn monitor_format_field(&mut self, ui: &mut Ui, p: &Palette, side: MonitorPort) {
         field(ui, p, t!("form.format"), None, |ui, _| {
             let options: Vec<String> = FORMATS.iter().map(|f| (*f).to_owned()).collect();
-            let format = serial_format(side.serial(&self.settings.config));
+            // У повторяющего порта скорость и формат — от анализатора (M5-В2).
+            let serial = match side {
+                MonitorPort::Analyzer => self.settings.config.serial.clone(),
+                MonitorPort::Lis => self.settings.config.lis_port(),
+            };
+            let format = serial_format(&serial);
             let current = FORMATS.iter().position(|f| *f == format);
             let (_, chosen) = widgets::select(
                 ui,
                 p,
                 Id::unique(side.format_id()),
-                t!("form.format"),
+                side.a11y(A11yField::Format),
                 &options,
                 current,
                 FieldLook {
@@ -1090,8 +1138,10 @@ impl BytetapApp {
                     }
                     MonitorPort::Lis => {
                         self.form.touched.serial_b = true;
-                        self.form.lis_follows = false;
-                        apply_format(&mut self.settings_mut().config.monitor_lis, FORMATS[index]);
+                        let mut config = self.settings.config.clone();
+                        self.form.lis_port_changed(&mut config);
+                        apply_format(&mut config.monitor_lis, FORMATS[index]);
+                        self.settings_mut().config = config;
                     }
                 }
             }
@@ -1296,24 +1346,34 @@ impl BytetapApp {
                 self.row(
                     ui,
                     |app, ui| {
-                        field(ui, p, t!("form.reconnect"), None, |ui, label| {
-                            let response = widgets::text_input(
-                                ui,
-                                p,
-                                Id::unique("bt-monitor-reconnect"),
-                                &mut app.form.reconnect_text,
-                                label,
-                                "",
-                                FieldLook {
+                        let error = app.error_text(ErrorField::Reconnect);
+                        field(
+                            ui,
+                            p,
+                            t!("form.reconnect"),
+                            error.as_deref(),
+                            |ui, label| {
+                                let look = FieldLook {
                                     mono: true,
+                                    error: error.is_some(),
                                     ..FieldLook::default()
-                                },
-                            );
-                            if response.changed() {
-                                let sec = parse_reconnect(&app.form.reconnect_text);
-                                app.settings_mut().config.reconnect_sec = sec;
-                            }
-                        });
+                                };
+                                let response = widgets::text_input(
+                                    ui,
+                                    p,
+                                    Id::unique("bt-monitor-reconnect"),
+                                    &mut app.form.reconnect_text,
+                                    label,
+                                    "",
+                                    look,
+                                );
+                                if response.changed() {
+                                    app.form.touched.reconnect = true;
+                                    let sec = parse_reconnect(&app.form.reconnect_text);
+                                    app.settings_mut().config.reconnect_sec = sec;
+                                }
+                            },
+                        );
                     },
                     |_, _| {},
                 );

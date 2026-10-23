@@ -1431,6 +1431,16 @@ impl BytetapApp {
         {
             self.form.more = true;
         }
+        // Интервал переподключения прослушки живёт в «Дополнительно»: «Старт» раскрывает
+        // блок, иначе текст ошибки некуда поставить (M5-AC3).
+        if cfg.mode == SessionMode::ComMonitor
+            && self
+                .form
+                .local_error(cfg, crate::errors::ErrorField::Reconnect)
+                .is_some()
+        {
+            self.form.more = true;
+        }
         if !self.form.valid(cfg) {
             return;
         }

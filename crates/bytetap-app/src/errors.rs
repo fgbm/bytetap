@@ -122,6 +122,8 @@ pub enum ErrorField {
     SerialParamsA,
     /// Скорость и формат порта ЛИС.
     SerialParamsB,
+    /// Интервал переподключения прослушки в «Дополнительно» (1…3600 с).
+    Reconnect,
     LogDir,
     Start,
 }
