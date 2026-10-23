@@ -14,13 +14,14 @@ use std::time::{Duration, Instant};
 use bytetap_core::journal::{JournalFailureReason, Stats};
 use bytetap_core::session::SessionCounters;
 use eframe::egui::{
-    self, Align, Color32, CursorIcon, Frame, Id, Key, Layout, Popup, Rect, RectAlign, RichText,
-    Role, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, WidgetInfo, epaint::Shadow, pos2,
-    text::LayoutJob, vec2,
+    self, Align, Color32, CursorIcon, Frame, Id, Key, Layout, Modifiers, Popup, Rect, RectAlign,
+    RichText, Role, ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, WidgetInfo, epaint::Shadow,
+    pos2, text::LayoutJob, vec2,
 };
 use tokio::sync::watch;
 
 use crate::app::{BytetapApp, NoteTarget};
+use crate::details::{self, Details};
 use crate::feed::{self, Detected, ENCODINGS, FeedEvent, FeedKind, FeedRing};
 use crate::feedrows::{
     HEX_ROW_HEIGHT, Pair, TEXT_ROW_HEIGHT, hex_row, text_format, text_row, truncated,
@@ -109,6 +110,14 @@ impl RowIndex {
         Some((seq, (line - start) as usize))
     }
 
+    /// Номер строки экрана, с которой начинается событие `seq`.
+    pub fn row_of(&self, seq: u64) -> Option<usize> {
+        let base = self.entries.front()?.1;
+        let index = self.entries.partition_point(|(entry, _)| *entry < seq);
+        let (entry, start) = *self.entries.get(index)?;
+        (entry == seq).then(|| (start - base) as usize)
+    }
+
     /// Индекс заново: другой вид или фильтр.
     pub fn rebuild(ring: &FeedRing, hex: bool, filter: Option<u32>) -> Self {
         let mut index = Self::new(hex, filter);
@@ -134,6 +143,10 @@ pub struct RecordingView {
     pending: u64,
     filter: Option<u32>,
     jump_bottom: bool,
+    /// Прокрутить ленту к событию: его строка встанет в верхнюю треть видимой области.
+    jump_row: Option<usize>,
+    /// Выбранное событие и панель деталей (L1).
+    pub(crate) details: Details,
     counters: Option<SessionCounters>,
     fixed_stats: Stats,
     started: Instant,
@@ -176,6 +189,8 @@ impl RecordingView {
             pending: 0,
             filter: None,
             jump_bottom: false,
+            jump_row: None,
+            details: Details::default(),
             counters: None,
             fixed_stats: Stats::default(),
             started: Instant::now(),
@@ -272,6 +287,40 @@ impl RecordingView {
         self.conns.keys().copied().collect()
     }
 
+    /// Соседнее событие для ↑/↓: по ленте с учётом фильтра соединения.
+    pub fn step_selection(&mut self, step: i32) {
+        let Some(key) = self.details.key() else {
+            return;
+        };
+        let keys: Vec<u64> = self
+            .feed
+            .since(0)
+            .filter(|(_, event)| feed::passes(event, self.filter))
+            .map(|(seq, _)| seq)
+            .collect();
+        let Some(index) = keys.iter().position(|seq| *seq == key) else {
+            return;
+        };
+        let next = index as i64 + i64::from(step);
+        if next < 0 || next as usize >= keys.len() {
+            return;
+        }
+        let seq = keys[next as usize];
+        let Some(event) = self.feed.get(seq).cloned() else {
+            return;
+        };
+        self.details.open(seq, event);
+        self.jump_row = self.rows.row_of(seq);
+    }
+
+    /// Снять выбор и вернуть следование за концом ленты (Esc и «×» панели, Л-В9).
+    pub fn close_details(&mut self) {
+        self.details.close();
+        self.follow = true;
+        self.pending = 0;
+        self.jump_bottom = true;
+    }
+
     pub fn set_filter(&mut self, filter: Option<u32>) {
         if self.filter != filter {
             self.filter = filter;
@@ -319,6 +368,9 @@ impl RecordingView {
             added += 1;
         }
         self.rows.evict_before(self.feed.first_seq());
+        // Выбранное событие могло уйти из кольца: панель остаётся с прочитанным текстом
+        // и говорит об этом подписью (Л-В6).
+        self.details.check_evicted(self.feed.first_seq());
         if self
             .filter
             .is_some_and(|conn| !self.conns.contains_key(&conn))
@@ -626,13 +678,7 @@ pub fn event_text(
 }
 
 fn encoding_label(encoding: Encoding) -> &'static str {
-    match encoding {
-        Encoding::Ascii => t!("feed.encAscii"),
-        Encoding::Cp1251 => t!("feed.encCp1251"),
-        Encoding::Utf8 => t!("feed.encUtf8"),
-        Encoding::Gbk => t!("feed.encGbk"),
-        Encoding::Latin1 => t!("feed.encLatin1"),
-    }
+    feed::encoding_label(encoding)
 }
 
 fn view_label(view: FeedView) -> &'static str {
@@ -786,21 +832,47 @@ impl BytetapApp {
         let p = self.pal();
         let hex = self.settings.feed.view == FeedView::Hex;
         let encoding = self.settings.feed.encoding;
+        let panel_height = self.settings.feed.panel_height;
+        // Esc закрывает панель, но не диалог комментария: там Esc — отмена ввода.
+        let escape = ui.input(|input| input.key_pressed(Key::Escape)) && self.note.is_none();
         let Some(rec) = &mut self.rec else {
             return 0;
         };
         let added = rec.sync(hex);
+        // Высота панели из настроек — пока она закрыта: открытую задаёт разделитель.
+        rec.details.set_default_height(panel_height);
         let now_us = u64::try_from(rec.elapsed().as_micros()).unwrap_or(u64::MAX);
         trace::show(ui, &p, &rec.feed, now_us);
         let mut view = self.settings.feed.view;
         let mut chosen_encoding = encoding;
         feed_bar(ui, &p, rec, &mut view, &mut chosen_encoding);
+        // Панель деталей — до ленты: она забирает высоту снизу, лента получает остаток.
+        let pair = rec.pair();
+        if details::show(ui, &p, &mut rec.details, encoding, pair) {
+            rec.close_details();
+        }
         feed_list(ui, &p, rec, hex, encoding, added);
+        // Esc снимает выбор и возвращает следование (решение владельца, Л-В9).
+        if escape && rec.details.is_open() {
+            rec.close_details();
+            ui.ctx().request_repaint();
+        }
+        // Высоту, выбранную разделителем, запоминаем в настройках — на отпускании мыши.
+        let height = rec
+            .details
+            .take_height_changed()
+            .then(|| rec.details.height());
         if view != self.settings.feed.view || chosen_encoding != encoding {
             let feed = &mut self.settings_mut().feed;
             feed.view = view;
             feed.encoding = chosen_encoding;
             self.save_settings();
+        }
+        if let Some(height) = height {
+            self.settings_mut().feed.panel_height = height;
+            if ui.input(|input| input.pointer.any_released()) {
+                self.save_settings();
+            }
         }
         added
     }
@@ -1255,7 +1327,11 @@ fn conn_chip(ui: &mut Ui, p: &Palette, text: &str, on: bool) -> egui::Response {
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-/// Лента: видимые строки через `show_rows`, догон и таблетка «↓ N новых».
+/// Лента: видимые строки через `show_rows`, выбор события, догон и «↓ N новых».
+///
+/// Клик по строке выбирает событие и открывает панель деталей; ↑/↓ ходят по ленте, а
+/// Esc снимает выбор (L1-AC4, L1-AC9). Пока выбор есть, лента не догоняет конец: новые
+/// события копятся в «↓ N новых», а строка остаётся на месте (решение владельца, Л-В9).
 fn feed_list(
     ui: &mut Ui,
     p: &Palette,
@@ -1286,6 +1362,22 @@ fn feed_list(
     let row_height = if hex { HEX_ROW_HEIGHT } else { TEXT_ROW_HEIGHT };
     let multi = rec.conns.len() > 1;
     let pair = rec.pair();
+    // ↑/↓ — до прокрутки: выбранная строка должна попасть в видимую область в этом же
+    // кадре. В поле панели стрелки принадлежат тексту, поэтому там лента их не берёт.
+    if rec.details.is_open() && !ui.ctx().text_edit_focused() {
+        let step = ui.input_mut(|input| {
+            if input.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                -1
+            } else if input.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                1
+            } else {
+                0
+            }
+        });
+        if step != 0 {
+            rec.step_selection(step);
+        }
+    }
     ui.spacing_mut().item_spacing.y = 0.0;
     let mut scroll = ScrollArea::vertical()
         .id_salt("bt-feed")
@@ -1295,7 +1387,13 @@ fn feed_list(
         // Ниже конца содержимого: область прижмёт прокрутку к последней строке.
         scroll = scroll.vertical_scroll_offset(total as f32 * row_height + area.height());
         rec.jump_bottom = false;
+    } else if let Some(row) = rec.jump_row.take() {
+        // Строка встаёт в верхнюю треть: видно и её, и соседние.
+        let offset = row as f32 * row_height - area.height() / 3.0;
+        scroll = scroll.vertical_scroll_offset(offset.max(0.0));
     }
+    let selected_key = rec.details.key();
+    let mut clicked = None;
     let output = scroll.show_rows(ui, row_height, total, |ui, range| {
         for row in range {
             let Some((seq, line)) = rec.rows.locate(row) else {
@@ -1304,22 +1402,34 @@ fn feed_list(
             let Some(event) = rec.feed.get(seq).cloned() else {
                 continue;
             };
-            if hex {
-                hex_row(ui, p, &event, line, multi, pair, encoding);
+            let selected = selected_key == Some(seq);
+            let response = if hex {
+                hex_row(ui, p, &event, line, multi, pair, encoding, selected)
             } else {
-                text_row(ui, p, &event, multi, pair, encoding);
+                text_row(ui, p, &event, multi, pair, encoding, selected)
+            };
+            if response.clicked() {
+                clicked = Some((seq, event));
             }
         }
     });
+    if let Some((seq, event)) = clicked {
+        rec.details.open(seq, event);
+    }
 
     // Догон: внизу — следим; прокрутка вверх выключает догон и копит «новые».
+    //
+    // Пока событие выбрано, лента стоит (Л-В9): догон не включается даже у нижнего края,
+    // иначе выбранная строка уезжала бы вверх под руками инженера.
     let max = (output.content_size.y - output.inner_rect.height()).max(0.0);
     let slack = if rec.follow {
         4.0 + added as f32 * row_height
     } else {
         4.0
     };
-    if output.state.clamped_offset().y >= max - slack {
+    if rec.details.is_open() {
+        rec.follow = false;
+    } else if output.state.clamped_offset().y >= max - slack {
         rec.follow = true;
         rec.pending = 0;
     } else {

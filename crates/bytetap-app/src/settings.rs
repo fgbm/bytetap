@@ -220,10 +220,23 @@ pub struct Profile {
 }
 
 /// Выбор вида и кодировки ленты — запоминается вместе с настройками.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct FeedSettings {
     pub view: FeedView,
     pub encoding: Encoding,
+    /// Высота панели деталей в точках: её задаёт разделитель панели (L1-AC2).
+    #[serde(rename = "panelHeight")]
+    pub panel_height: f32,
+}
+
+impl Default for FeedSettings {
+    fn default() -> Self {
+        Self {
+            view: FeedView::default(),
+            encoding: Encoding::default(),
+            panel_height: crate::details::PANEL_DEFAULT,
+        }
+    }
 }
 
 /// Размер окна в точках интерфейса и положение в физических пикселях экрана.
@@ -411,6 +424,10 @@ fn normalize_feed(raw: Option<&Value>) -> FeedSettings {
     FeedSettings {
         view: choice(raw.get("view"), base.view),
         encoding: choice(raw.get("encoding"), base.encoding),
+        // Высоту приносит разделитель панели: нечисло и крайности — умолчание и предел.
+        panel_height: number(raw.get("panelHeight"))
+            .filter(|height| height.is_finite() && *height >= crate::details::PANEL_MIN)
+            .map_or(base.panel_height, |height| height.min(4_000.0)),
     }
 }
 
@@ -716,6 +733,7 @@ mod tests {
         settings.feed = FeedSettings {
             view: FeedView::Hex,
             encoding: Encoding::Gbk,
+            panel_height: 300.0,
         };
         settings.last_run = Some(LastRun {
             mode: SessionMode::Serial,
@@ -764,6 +782,7 @@ mod tests {
         assert_eq!(value["config"]["astmNakOnBadChecksum"], false);
         assert_eq!(value["lastRun"]["port"], "COM5");
         assert_eq!(value["feed"]["encoding"], "gbk");
+        assert_eq!(value["feed"]["panelHeight"], 300.0);
         assert_eq!(value["theme"], "dark");
     }
 
@@ -935,6 +954,27 @@ mod tests {
         // Поля профиля без значения берутся из текущей конфигурации, как в Vue-версии.
         assert_eq!(settings.profiles[0].config.listen_port, 7000);
         assert_eq!(settings.profiles[0].config.connect_port, 6000);
+    }
+
+    /// Высота панели деталей: нечисло и слишком маленькое значение — умолчание, очень
+    /// большое — предел, а сохранённое возвращается как есть (L1-AC2).
+    #[test]
+    fn the_panel_height_falls_back_to_the_default() {
+        let height = |value: serde_json::Value| {
+            normalize(
+                &json!({ "feed": { "view": "text", "panelHeight": value } }),
+                "",
+            )
+            .feed
+            .panel_height
+        };
+        let default = FeedSettings::default().panel_height;
+        assert_eq!(height(json!(300.0)), 300.0);
+        assert_eq!(height(json!(240)), 240.0);
+        assert_eq!(height(json!("300")), default);
+        assert_eq!(height(json!(20.0)), default, "меньше предела панели");
+        assert_eq!(height(json!(-5.0)), default);
+        assert_eq!(height(json!(9_000.0)), 4_000.0);
     }
 
     #[test]

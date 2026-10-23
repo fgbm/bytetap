@@ -14,6 +14,7 @@ use eframe::egui::{
 use bytetap_core::journal::view::DENSITY_BUCKETS;
 
 use crate::app::BytetapApp;
+use crate::details;
 use crate::feedrows::{
     HEX_ROW_HEIGHT, TEXT_ROW_HEIGHT, error_row, hex_row, pending_row, text_row, truncated,
 };
@@ -390,10 +391,16 @@ fn view_button(ui: &mut Ui, p: &Palette, text: &str, name: &str) -> egui::Respon
 }
 
 /// Лента журнала: видимые строки своей прокруткой в строках, страницы по требованию.
+///
+/// Клик по строке выбирает событие и открывает панель деталей, ↑/↓ ходят по ленте, Esc
+/// снимает выбор (L1-AC4, L1-AC9). Событие в панели — копия: страницу журнала окно
+/// может выгрузить из памяти, а прочитанный текст остаётся.
 pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     let p = app.pal();
     let hex = app.settings.feed.view == FeedView::Hex;
     let encoding = app.settings.feed.encoding;
+    let panel_height = app.settings.feed.panel_height;
+    let escape = ui.input(|input| input.key_pressed(egui::Key::Escape)) && app.note.is_none();
     let Some(view) = &mut app.viewing else {
         return;
     };
@@ -421,13 +428,40 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     let multi = view.summary.stats.connections > 1;
     // Пара двух сторон — у журнала прокси: «#1 открыто: анализатор → ЛИС».
     let pair = pair_of_journal(&view.summary.header);
+    view.details.set_default_height(panel_height);
+    // ↑/↓ — до прокрутки: выбранная строка подтягивается в видимую область тем же
+    // кадром. В поле панели стрелки принадлежат тексту.
+    if view.details.is_open() && !ui.ctx().text_edit_focused() {
+        let step = ui.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                -1
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                1
+            } else {
+                0
+            }
+        });
+        if step != 0 {
+            step_selection(view, step);
+        }
+    }
     if let Some(event) = view.seek.take() {
         // Переход к событию: строка — по номеру строки события в текущем виде.
         let target = if hex { view.hex_row_of(event) } else { event };
         view.scroll.set_top(target);
     }
+    // Панель деталей — до ленты: она забирает высоту снизу, лента получает остаток.
+    let closed = details::show(ui, &p, &mut view.details, encoding, pair);
+    if closed {
+        view.details.close();
+    }
+    if escape && view.details.is_open() {
+        view.details.close();
+        ui.ctx().request_repaint();
+    }
     // Прокрутка копируется на кадр: замыкание строк держит изменяемую ссылку на журнал.
     let mut scroll = view.scroll;
+    let mut clicked = None;
     let out = scroll.show(
         ui,
         &p,
@@ -452,16 +486,23 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
                     pending_row(ui, &p, row_height);
                     continue;
                 };
-                if hex {
-                    hex_row(ui, &p, &event, line, multi, pair, encoding);
+                let selected = view.details.key() == Some(index as u64);
+                let response = if hex {
+                    hex_row(ui, &p, &event, line, multi, pair, encoding, selected)
                 } else {
-                    text_row(ui, &p, &event, multi, pair, encoding);
+                    text_row(ui, &p, &event, multi, pair, encoding, selected)
+                };
+                if response.clicked() {
+                    clicked = Some((index, std::sync::Arc::new(event)));
                 }
             }
         },
     );
     view.scroll = scroll;
     view.feed_rect = Some(out.inner);
+    if let Some((index, event)) = clicked {
+        view.details.open(index as u64, event);
+    }
     // Видимая область — рамка на карте сессии; страницы — по событиям, а не по строкам:
     // одна строка HEX — кусок события, и номер строки не номер события.
     let last = (out.first + out.visible).min(total.saturating_sub(1));
@@ -474,12 +515,44 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     let start = view.fraction_at_event(first_event);
     let end = (view.fraction_at_event(last_event.saturating_sub(1)) + 1.0 / DENSITY_BUCKETS as f32)
         .min(1.0);
+    let height = view
+        .details
+        .take_height_changed()
+        .then(|| view.details.height());
     app.set_visible(Some((start, end)));
     let ctx = ui.ctx().clone();
     app.request_pages(&ctx, first_event, last_event.max(first_event + 1));
+    if let Some(height) = height {
+        app.settings.feed.panel_height = height;
+        if ui.input(|input| input.pointer.any_released()) {
+            app.save_settings();
+        }
+    }
     if let Some(pause) = app.retry_pages() {
         ctx.request_repaint_after(pause);
     }
+}
+
+/// Соседнее событие журнала для ↑/↓: номер события ±1, но не за пределами журнала.
+fn step_selection(view: &mut crate::viewing::JournalView, step: i32) {
+    let Some(key) = view.details.key() else {
+        return;
+    };
+    let total = view.events();
+    let index = key as i64 + i64::from(step);
+    if index < 0 || index as usize >= total {
+        return;
+    }
+    let index = index as usize;
+    let Some(event) = view.source.event(index) else {
+        // Страница ещё едет: выбор не переезжает на заполнитель.
+        return;
+    };
+    let Some(event) = crate::viewing::feed_event(event) else {
+        return;
+    };
+    view.details.open(index as u64, std::sync::Arc::new(event));
+    view.seek = Some(index);
 }
 
 /// Количество корзин плотности — как в UI v2.
@@ -491,13 +564,7 @@ fn view_label(view: FeedView) -> &'static str {
 }
 
 fn encoding_label(encoding: Encoding) -> &'static str {
-    match encoding {
-        Encoding::Ascii => t!("feed.encAscii"),
-        Encoding::Cp1251 => t!("feed.encCp1251"),
-        Encoding::Utf8 => t!("feed.encUtf8"),
-        Encoding::Gbk => t!("feed.encGbk"),
-        Encoding::Latin1 => t!("feed.encLatin1"),
-    }
+    crate::feed::encoding_label(encoding)
 }
 
 #[cfg(test)]

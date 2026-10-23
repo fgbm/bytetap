@@ -58,6 +58,8 @@
   --bt-text-muted: #5f6873;
   --bt-text-faint: #8a939c;
   --bt-hover: #f1f3f5;
+  --bt-selection: #e8ecfb;
+  --bt-selection-strong: #becdf7;
   --bt-dir-a2l: #0a7d4f;
   --bt-dir-l2a: #b4530a;
   --bt-ctrl: #2f3fbf;
@@ -84,6 +86,8 @@
   --bt-text-muted: #5f6873;
   --bt-text-faint: #8a939c;
   --bt-hover: #f1f3f5;
+  --bt-selection: #e8ecfb;
+  --bt-selection-strong: #becdf7;
   --bt-dir-a2l: #0a7d4f;
   --bt-dir-l2a: #b4530a;
   --bt-ctrl: #2f3fbf;
@@ -114,6 +118,8 @@ html.dark {
   --bt-text-muted: #7d8995;
   --bt-text-faint: #5a6570;
   --bt-hover: #161c22;
+  --bt-selection: #1c2739;
+  --bt-selection-strong: #2c4472;
   --bt-dir-a2l: #3ee08f;
   --bt-dir-l2a: #ffb23e;
   --bt-ctrl: #8fb4ff;

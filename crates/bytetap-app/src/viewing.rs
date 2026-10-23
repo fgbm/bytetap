@@ -15,6 +15,7 @@ use bytetap_core::journal::view::DENSITY_BUCKETS;
 use bytetap_core::journal::{Event, JournalSummary, Mode, Session};
 use eframe::egui::Rect;
 
+use crate::details::Details;
 use crate::feed::FeedEvent;
 use crate::feedrows::Pair;
 use crate::feedscroll::FeedScroll;
@@ -47,6 +48,9 @@ pub struct JournalView {
     pub feed_rect: Option<Rect>,
     /// Префиксные суммы строк HEX-дампа: считаются один раз при первом HEX-виде.
     hex_prefix: Option<Vec<u64>>,
+    /// Выбранное событие и панель деталей (L1): событие берётся копией, поэтому
+    /// выгруженная из памяти страница журнала панель не закрывает.
+    pub details: Details,
 }
 
 impl JournalView {
@@ -68,6 +72,7 @@ impl JournalView {
             scroll: FeedScroll::default(),
             feed_rect: None,
             hex_prefix: None,
+            details: Details::default(),
         }
     }
 

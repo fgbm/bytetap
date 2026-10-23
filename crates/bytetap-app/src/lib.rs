@@ -2,6 +2,7 @@
 
 mod app;
 pub mod background;
+pub mod details;
 pub mod diag;
 pub mod errors;
 pub mod feed;

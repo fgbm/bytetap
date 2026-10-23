@@ -287,12 +287,21 @@ pub fn truncated(ui: &Ui, mut job: LayoutJob, width: f32) -> Arc<egui::Galley> {
     ui.painter().layout_job(job)
 }
 
-/// Строка ленты во всю ширину: наведение — фоном, роль `label` с текстом строки.
-fn row_frame(ui: &mut Ui, p: &Palette, height: f32, name: &str) -> (Rect, egui::Response) {
+/// Строка ленты во всю ширину: выбранная — заливкой `selection`, наведение — фоном
+/// `hover`, роль `label` с текстом строки и признаком выбора для AccessKit (L1-AC8).
+fn row_frame(
+    ui: &mut Ui,
+    p: &Palette,
+    height: f32,
+    name: &str,
+    selected: bool,
+) -> (Rect, egui::Response) {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
-    response.widget_info(|| WidgetInfo::labeled(Role::Label, true, name));
-    if response.hovered() {
+    response.widget_info(|| WidgetInfo::selected(Role::Label, true, selected, name));
+    if selected {
+        ui.painter().rect_filled(rect, 0, p.selection);
+    } else if response.hovered() {
         ui.painter().rect_filled(rect, 0, p.hover);
     }
     (rect, response)
@@ -338,6 +347,9 @@ fn data_job(p: &Palette, segments: &Segments, synthetic: bool) -> LayoutJob {
 }
 
 /// Строка «Текст»: время · стрелка · №соединения · данные · «автоответ».
+///
+/// `selected` — событие открыто в панели деталей: строка подсвечена, а в AccessKit у
+/// неё признак выбора. Возвращается ответ строки: по клику экран выбирает событие.
 pub fn text_row(
     ui: &mut Ui,
     p: &Palette,
@@ -345,7 +357,8 @@ pub fn text_row(
     multi: bool,
     pair: Pair,
     encoding: Encoding,
-) {
+    selected: bool,
+) -> egui::Response {
     let (class, text) = row_text(event, pair);
     let segments = event.data().map(|data| data.segments(encoding));
     // Подпись строки для AccessKit — начало фрагмента: повторы глифов целиком не
@@ -360,7 +373,7 @@ pub fn text_row(
         (RowClass::Data(dir), _) => format!("{} {} {body}", event.time, glyph(dir)),
         _ => format!("{} {body}", event.time),
     };
-    let (rect, response) = row_frame(ui, p, TEXT_ROW_HEIGHT, &name);
+    let (rect, response) = row_frame(ui, p, TEXT_ROW_HEIGHT, &name, selected);
     let painter = ui.painter().clone();
     let cy = rect.center().y;
     let x0 = rect.left() + SPACE_3;
@@ -421,9 +434,14 @@ pub fn text_row(
         }
     }
     row_menu(&response, p, event, &body, encoding);
+    response
 }
 
 /// Строка HEX-дампа: время и стрелка только у первой строки события.
+///
+/// Все строки одного события выбираются вместе: в HEX-виде событие занимает несколько
+/// строк, а панель открывает событие, а не строку (L1-AC5).
+#[allow(clippy::too_many_arguments)]
 pub fn hex_row(
     ui: &mut Ui,
     p: &Palette,
@@ -432,7 +450,8 @@ pub fn hex_row(
     multi: bool,
     pair: Pair,
     encoding: Encoding,
-) {
+    selected: bool,
+) -> egui::Response {
     let (class, text) = row_text(event, pair);
     let bytes = event.data().map_or(&[][..], |data| data.bytes.as_slice());
     let dump: HexLine = feed::hex_line(bytes, line);
@@ -444,7 +463,7 @@ pub fn hex_row(
         hex.join(" "),
         dump.ascii
     );
-    let (rect, response) = row_frame(ui, p, HEX_ROW_HEIGHT, name.trim());
+    let (rect, response) = row_frame(ui, p, HEX_ROW_HEIGHT, name.trim(), selected);
     let painter = ui.painter().clone();
     let font = theme::mono(TEXT_XS);
     let y = rect.top() + 3.0;
@@ -503,6 +522,7 @@ pub fn hex_row(
     let galley = truncated(ui, job, rect.right() - SPACE_3 - x);
     painter.galley(pos2(x, y), galley, p.text);
     row_menu(&response, p, event, &text, encoding);
+    response
 }
 
 /// Строка, чья страница ещё едет: заполнитель той же высоты, чтобы лента не сдвигалась.

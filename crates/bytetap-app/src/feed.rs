@@ -16,6 +16,7 @@ use base64::Engine as _;
 use bytetap_core::journal::{ClosedBy, Dir, Event};
 
 use crate::settings::Encoding;
+use crate::t;
 
 /// Сколько событий держит лента: старые уходят, память не растёт (FR-28).
 pub const FEED_CAPACITY: usize = 10_000;
@@ -206,14 +207,31 @@ impl Segments {
     }
 }
 
+/// Текстовые кеши фрагмента по кодировке в порядке [`ENCODINGS`].
+///
+/// Лежат в `Box`: у события без данных (служебная строка) в [`FeedKind`] не должно
+/// быть трёх массивов кешей — иначе вариант `Data` перевешивает остальные.
+#[derive(Debug, Default)]
+struct TextCaches {
+    /// Текст с пределом показа: то, что видно в строке ленты.
+    shown_part: [OnceLock<Arc<Segments>>; 5],
+    /// Тот же текст без предела показа — для панели деталей (L1-AC1).
+    full: [OnceLock<Arc<Segments>>; 5],
+    /// Полный текст так, как он показывается: глифы `‹CR›` уже развёрнуты.
+    ///
+    /// Панель зовёт его каждый кадр, а на фрагменте в 16 КБ разворот глифов — это
+    /// десятки килобайт строки: без кеша это было бы столько же аллокаций на кадр.
+    shown: [OnceLock<Arc<str>>; 5],
+}
+
 /// Фрагмент обмена: направление, автоответ и исходные байты.
 #[derive(Debug)]
 pub struct DataPayload {
     pub dir: Dir,
     pub synthetic: bool,
     pub bytes: Vec<u8>,
-    /// Текст по кодировке в порядке [`ENCODINGS`]: считается при первом показе.
-    text: [OnceLock<Arc<Segments>>; 5],
+    /// Кеши текста по кодировке: считаются при первом показе.
+    text: Box<TextCaches>,
 }
 
 impl DataPayload {
@@ -222,16 +240,25 @@ impl DataPayload {
             dir,
             synthetic,
             bytes,
-            text: Default::default(),
+            text: Box::default(),
         }
     }
 
     /// Текст фрагмента по кодировке с кешем на событие.
     pub fn segments(&self, encoding: Encoding) -> Arc<Segments> {
-        let slot = &self.text[encoding_index(encoding)];
+        let slot = &self.text.shown_part[encoding_index(encoding)];
         Arc::clone(
             slot.get_or_init(|| Arc::new(text_segments(&self.bytes, encoding, TEXT_LIMIT_BYTES))),
         )
+    }
+
+    /// Полный текст фрагмента по кодировке спанами: без предела [`TEXT_LIMIT_BYTES`].
+    ///
+    /// Панель деталей показывает фрагмент целиком и раскрашивает глифы управления, поэтому
+    /// ей нужны спаны, а не готовая строка; кеш тот же — событие и кодировка (L1-AC1).
+    pub fn full_segments(&self, encoding: Encoding) -> Arc<Segments> {
+        let slot = &self.text.full[encoding_index(encoding)];
+        Arc::clone(slot.get_or_init(|| Arc::new(text_segments(&self.bytes, encoding, usize::MAX))))
     }
 
     /// Полный текст фрагмента по кодировке — без предела [`TEXT_LIMIT_BYTES`].
@@ -239,7 +266,16 @@ impl DataPayload {
     /// Считается только по клику «Скопировать текст»: строка ленты показывает первые
     /// 2048 байт, а копировать инженеру нужно весь фрагмент (U1-AC16).
     pub fn full_text(&self, encoding: Encoding) -> String {
-        plain_text(&text_segments(&self.bytes, encoding, usize::MAX))
+        plain_text(&self.full_segments(encoding))
+    }
+
+    /// Полный текст фрагмента так, как он показывается в ленте: `‹CR›`, `‹x01›`.
+    ///
+    /// Строка возвращается из кеша события и кодировки: панель деталей берёт её каждый
+    /// кадр, а разворот десяти тысяч глифов на 16 КБ — не то, что можно делать в кадре.
+    pub fn shown_text(&self, encoding: Encoding) -> Arc<str> {
+        let slot = &self.text.shown[encoding_index(encoding)];
+        Arc::clone(slot.get_or_init(|| Arc::from(plain_text(&self.full_segments(encoding)))))
     }
 }
 
@@ -806,6 +842,36 @@ pub fn detect(event: &FeedEvent) -> Option<Detected> {
     })
 }
 
+/// Тип сообщения HL7 из начала фрагмента: `ORU^R01` — поле MSH-9.
+///
+/// Панель деталей подписывает событие типом, только когда его видно просто: у HL7
+/// (MLLP, первый байт `0x0B`) это девятое поле первого сегмента `MSH`, у ASTM и
+/// произвольного текста типа сообщения нет — там `None`, а не догадка.
+///
+/// Поля HL7 — ASCII, поэтому байты до конца первого сегмента читаются как ASCII без
+/// кодировки: кириллица в MSH-9 не встречается, а декодировать весь фрагмент в панели
+/// незачем.
+pub fn message_type(data: &DataPayload) -> Option<String> {
+    let bytes = data.bytes.strip_prefix(b"\x0b")?;
+    let end = bytes.iter().position(|&b| b < 0x20).unwrap_or(bytes.len());
+    let header = std::str::from_utf8(&bytes[..end]).ok()?;
+    let msh = header.strip_prefix("MSH")?;
+    let field = msh.split('|').nth(8)?;
+    let field = field.trim();
+    (!field.is_empty()).then(|| field.to_owned())
+}
+
+/// Подпись кодировки ленты: «CP1251», «UTF-8».
+pub fn encoding_label(encoding: Encoding) -> &'static str {
+    match encoding {
+        Encoding::Ascii => t!("feed.encAscii"),
+        Encoding::Cp1251 => t!("feed.encCp1251"),
+        Encoding::Utf8 => t!("feed.encUtf8"),
+        Encoding::Gbk => t!("feed.encGbk"),
+        Encoding::Latin1 => t!("feed.encLatin1"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bytetap_core::journal::{Close, Data, Note, Open};
@@ -1079,6 +1145,60 @@ mod tests {
         );
         let full = data.full_text(Encoding::Ascii);
         assert_eq!(full.chars().count(), 3000, "весь фрагмент, без предела");
+    }
+
+    /// Панель деталей показывает фрагмент целиком: строка ленты — 2048 байт, текст
+    /// панели — все, а глифы в нём уже развёрнуты (L1-AC1).
+    #[test]
+    fn the_panel_text_is_the_whole_fragment_with_glyphs() {
+        let mut bytes = vec![b'x'; TEXT_LIMIT_BYTES + 500];
+        bytes[0] = 0x0b;
+        bytes[10] = 0x0d;
+        let data = DataPayload::new(Dir::AnalyzerToLis, false, bytes);
+        // Строка ленты обрезана, текст панели — нет.
+        assert!(plain_text(&data.segments(Encoding::Ascii)).ends_with('…'));
+        let shown = data.shown_text(Encoding::Ascii);
+        assert_eq!(shown.matches('x').count(), TEXT_LIMIT_BYTES + 498);
+        assert_eq!(shown.matches("‹VT›").count(), 1);
+        assert_eq!(shown.matches("‹CR›").count(), 1);
+        // Кеш на событие и кодировку: панель зовёт его каждый кадр.
+        assert!(Arc::ptr_eq(&shown, &data.shown_text(Encoding::Ascii)));
+        assert!(!Arc::ptr_eq(&shown, &data.shown_text(Encoding::Cp1251)));
+        // Спаны без предела — для раскраски глифов в панели.
+        let segments = data.full_segments(Encoding::Ascii);
+        assert!(segments.text().len() > TEXT_LIMIT_BYTES);
+        assert!(!plain_text(&segments).ends_with('…'));
+    }
+
+    /// Тип сообщения HL7 — поле MSH-9; у ASTM и произвольного текста типа нет.
+    #[test]
+    fn the_hl7_message_type_comes_from_msh_9() {
+        let data = |bytes: &[u8]| DataPayload::new(Dir::AnalyzerToLis, false, bytes.to_vec());
+        assert_eq!(
+            message_type(&data(
+                b"\x0bMSH|^~\\&|ANALYZER|LAB|LIS||20261019101500||ORU^R01|MSG1|P|2.3.1\r\x1c\r"
+            )),
+            Some("ORU^R01".to_owned())
+        );
+        assert_eq!(
+            message_type(&data(b"\x0bMSH|^~\\&|LIS||ANALYZER|LAB|20261019101500||ACK^R01|BT1|P|2.3.1\rMSA|AA|MSG1\r")),
+            Some("ACK^R01".to_owned())
+        );
+        // Не HL7: ASTM, свободный текст, пустой MSH-9.
+        assert_eq!(message_type(&data(b"\x05H|\\^&|ANALYZER")), None);
+        assert_eq!(message_type(&data(b"MSH|^~\\&")), None);
+        assert_eq!(
+            message_type(&data(b"\x0bMSH|^~\\&|A|B|C|D|E|||X\r")),
+            None,
+            "пустое поле — не тип"
+        );
+        // Кириллица в данных не мешает: MSH читается как ASCII до конца сегмента.
+        assert_eq!(
+            message_type(&data(
+                "\x0bMSH|^~\\&|A|B|C|D|E||ORU^R01|X\rOBX||Глюкоза\r".as_bytes()
+            )),
+            Some("ORU^R01".to_owned())
+        );
     }
 
     #[test]
