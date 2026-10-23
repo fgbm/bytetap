@@ -1251,8 +1251,12 @@ fn the_journal_screen_names_its_widgets_and_tabs_in_order() {
         .expect("комментарий");
     assert!(close < comment, "{labels:?}");
 
-    let mut order = Vec::new();
-    for _ in 0..12 {
+    // Порядок сверяется по подписям, а не по координатам: строки ленты занимают на разных
+    // платформах разное число шагов (на windows-latest они в обход Tab не попадают), а
+    // ползунок полосы прокрутки — внутренний прямоугольник её дорожки: «следующая цель
+    // правее» для него неверно, и на коротком экране он стоит у верхнего края (U1-AC25).
+    let mut order: Vec<String> = Vec::new();
+    for _ in 0..200 {
         harness.key_press(Key::Tab);
         harness.run_steps(2);
         let Some(node) = harness
@@ -1262,35 +1266,40 @@ fn the_journal_screen_names_its_widgets_and_tabs_in_order() {
         else {
             continue;
         };
-        let label = node
-            .accesskit_node()
-            .label()
-            .or_else(|| node.accesskit_node().value())
-            .unwrap_or_default();
+        let node = node.accesskit_node();
+        // Строки ленты в списке не идут: видно их столько, сколько помещается на экране.
+        if node.role() == Role::ListItem {
+            continue;
+        }
+        let label = node.label().or_else(|| node.value()).unwrap_or_default();
         assert!(!label.is_empty(), "Tab попал на виджет без подписи");
-        let rect = node.rect();
-        if order
-            .iter()
-            .any(|(seen, seen_rect): &(String, egui::Rect)| *seen == label && *seen_rect == rect)
-        {
+        // Кнопка темы называет состояние интерфейса, а не место: обе подписи — одна цель.
+        let label = match label.as_str() {
+            "Светлая тема" | "Тёмная тема" => "тема".to_owned(),
+            _ => label,
+        };
+        // Круг замкнулся: обход дошёл до первой цели снова.
+        if order.contains(&label) {
             break;
         }
-        order.push((label, rect));
+        order.push(label);
     }
-    assert!(!order.is_empty(), "Tab не нашёл ни одного виджета");
-    for pair in order.windows(2) {
-        let (above, a) = &pair[0];
-        let (below, b) = &pair[1];
-        let dy = b.top() - a.top();
-        assert!(
-            dy >= -22.0,
-            "Tab ушёл вверх: «{above}» {a:?} → «{below}» {b:?}"
-        );
-        if dy.abs() <= 22.0 {
-            assert!(
-                b.left() > a.left() - 0.5,
-                "Tab ушёл влево: «{above}» → «{below}»"
-            );
-        }
-    }
+    // Шапка слева направо и до кнопок окна, затем карта и фильтры, лента и полоса прокрутки.
+    assert_eq!(
+        order.iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "Закрыть журнал",
+            "тема",
+            "Комментарий",
+            "Свернуть",
+            "Развернуть",
+            "Закрыть",
+            "Перейти к месту ленты",
+            "Вид ленты",
+            "Кодировка",
+            "Прокрутка ленты",
+            "Полоса прокрутки ленты",
+        ],
+        "порядок Tab: шапка, карта, фильтры, лента, полоса прокрутки"
+    );
 }
