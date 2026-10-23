@@ -29,12 +29,6 @@ use tokio::time::{sleep, timeout};
 /// Пауза прокси после неудачного подключения к цели.
 const RETRY: Duration = Duration::from_millis(100);
 
-/// Сколько раз тест собирает пару: на общем loopback `connect` изредка получает сброс.
-const PAIR_ATTEMPTS: usize = 5;
-
-/// Сколько тест ждёт `open` пары: он пишется сразу, как обе стороны на месте.
-const OPEN_WAIT: Duration = Duration::from_secs(2);
-
 /// Сколько тест ждёт события или обмена.
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -146,11 +140,12 @@ fn accepted_role(role: ProxyRole) -> LinkRole {
 
 /// Сессия с журналом и пара целиком: принятая сторона пришла, прокси подключился к цели.
 ///
-/// Тесту всё равно, анализатор это или ЛИС: он закрывает сторону по её роли. Признак
-/// собранной пары — `open` в журнале: если подключение к цели не удалось (на общем
-/// loopback `connect` изредка получает сброс — `proxy_connect_failed`), прокси закрывает
-/// принятую сторону и ждёт следующее входящее, а `accept` отдаёт тесту сброшенное
-/// соединение. Такую попытку тест выбрасывает вместе с её сессией и собирает пару заново.
+/// Тесту всё равно, анализатор это или ЛИС: он закрывает сторону по её роли. Сокеты тест
+/// трогает только после `open` в журнале: `accept` отдаёт соединение раньше, чем задача
+/// прокси вернулась из `connect`, и сброс цели (`SO_LINGER 0`) в этот момент приходит
+/// прямо в `connect` — `SO_ERROR` = `ECONNRESET`, `proxy_connect_failed`. Прокси тогда,
+/// как и требует M4-AC6, закрывает принятую сторону и ждёт следующее входящее, а пара
+/// так и не собирается (T-2, M4-AC5).
 async fn pair_with_session(
     role: ProxyRole,
 ) -> (
@@ -160,31 +155,28 @@ async fn pair_with_session(
     TcpStream,
     TcpStream,
 ) {
-    for _ in 0..PAIR_ATTEMPTS {
-        let dir = tempfile::tempdir().expect("временная папка");
-        let (listener, target_addr) = target_listener().await;
-        let handle = start(dir.path(), target_addr, role).await;
-        let listen = listen_addr(&handle);
-        let path = handle.journal_path().to_path_buf();
-        let accepted = TcpStream::connect(listen).await.expect("принятая сторона");
-        let Ok(Ok((target, _))) = timeout(WAIT, listener.accept()).await else {
-            panic!("прокси подключился к цели");
-        };
-        // Слушатель цели больше не нужен: соединение уже установлено.
-        drop(listener);
-        if wait_for_open(&path).await {
-            return (dir, handle, path, accepted, target);
-        }
-        drop(target);
-        drop(accepted);
-        let _ = handle.stop().await;
-    }
-    panic!("пара не собралась за {PAIR_ATTEMPTS} попыток: прокси не подключился к цели");
+    let dir = tempfile::tempdir().expect("временная папка");
+    let (listener, target_addr) = target_listener().await;
+    let handle = start(dir.path(), target_addr, role).await;
+    let listen = listen_addr(&handle);
+    let path = handle.journal_path().to_path_buf();
+    let accepted = TcpStream::connect(listen).await.expect("принятая сторона");
+    let Ok(Ok((target, _))) = timeout(WAIT, listener.accept()).await else {
+        panic!("прокси подключился к цели");
+    };
+    // Слушатель цели больше не нужен: соединение уже установлено.
+    drop(listener);
+    assert!(
+        wait_for_open(&path).await,
+        "прокси не собрал пару за {WAIT:?}: {}",
+        journal_errors(&path)
+    );
+    (dir, handle, path, accepted, target)
 }
 
 /// Ждёт `open` первой пары: он пишется, когда обе стороны на месте.
 async fn wait_for_open(path: &Path) -> bool {
-    let deadline = Instant::now() + OPEN_WAIT;
+    let deadline = Instant::now() + WAIT;
     while Instant::now() <= deadline {
         let outcome = read_all(path).expect("журнал читается");
         if outcome
@@ -197,6 +189,27 @@ async fn wait_for_open(path: &Path) -> bool {
         sleep(Duration::from_millis(5)).await;
     }
     false
+}
+
+/// Ошибки журнала одной строкой: по ним видно, почему пара не собралась.
+fn journal_errors(path: &Path) -> String {
+    let outcome = read_all(path).expect("журнал читается");
+    let errors: Vec<String> = outcome
+        .lines
+        .iter()
+        .filter_map(|line| match &line.event {
+            Event::Error(error) => Some(match error.code.as_deref() {
+                Some(code) => format!("{code}: {}", error.message),
+                None => error.message.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    if errors.is_empty() {
+        "ошибок в журнале нет".to_owned()
+    } else {
+        errors.join("; ")
+    }
 }
 
 /// Ждёт событие `close` пары и возвращает его.
