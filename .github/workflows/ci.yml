@@ -93,11 +93,13 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --no-fail-fast
 
-      - name: COM-тест на pty (socat)
+      - name: COM-тесты на pty (socat)
         if: runner.os == 'Linux'
         env:
           BYTETAP_REQUIRE_SOCAT: "1"
-        run: cargo test -p bytetap-core --test serial -- --ignored
+        run: |
+          cargo test -p bytetap-core --test serial -- --ignored
+          cargo test -p bytetap-core --test monitor_pty -- --ignored
 
       # Эталоны снимков и, при расхождении, *.new.png и *.diff.png egui_kittest.
       - name: Снимки интерфейса
