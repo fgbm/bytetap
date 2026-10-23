@@ -2044,6 +2044,67 @@ fn recording_proxy_error_light() {
         .snapshot_options("recording-proxy-error-light", &options());
 }
 
+/// Клик по строке ленты с текстом `needle` с модификаторами Shift и Ctrl: указатель
+/// сперва ставится на строку, модификаторы приходят сменой состояния, как из окна.
+fn click_row(harness: &mut Harness<'static, BytetapApp>, needle: &str, modifiers: egui::Modifiers) {
+    let at = harness
+        .get_all_by_label_contains(needle)
+        .next()
+        .unwrap_or_else(|| panic!("нет строки «{needle}»"))
+        .rect()
+        .center();
+    harness.event(egui::Event::PointerMoved(at));
+    // Указатель постоял, пока прокрутка забудет его скорость: иначе лента уезжает.
+    harness.run_steps(10);
+    harness.event(egui::Event::ModifiersChanged(modifiers));
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        });
+        harness.run_steps(1);
+    }
+    harness.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+    harness.run_steps(2);
+}
+
+/// Выделение строк блоком на записи: клик по строке и Shift+клик по третьей — три
+/// строки залиты `--bt-selection`, в панели фильтров «выбрано 3 · Ctrl+C».
+fn selection_recording(dark: bool) -> Harness<'static, BytetapApp> {
+    let mut harness = recording(dark, FeedView::Text, 0);
+    click_row(&mut harness, "MSG0003", egui::Modifiers::NONE);
+    click_row(&mut harness, "MSG0005B", egui::Modifiers::SHIFT);
+    harness
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn selection_recording_light() {
+    let _gpu = gpu();
+    selection_recording(false).snapshot_options("selection-recording-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn selection_recording_dark() {
+    let _gpu = gpu();
+    selection_recording(true).snapshot_options("selection-recording-dark", &options());
+}
+
+/// Выделение строк блоком в просмотре журнала: две строки журнала прокси залиты, а
+/// открытая в панели — третья.
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn selection_viewing_light() {
+    let _gpu = gpu();
+    let mut harness = proxy_viewing(false, WINDOW);
+    click_row(&mut harness, "открыто: анализатор", egui::Modifiers::NONE);
+    click_row(&mut harness, "MSG0001", egui::Modifiers::SHIFT);
+    harness.snapshot_options("selection-viewing-light", &options());
+}
+
 fn recording(dark: bool, view: FeedView, extra: usize) -> Harness<'static, BytetapApp> {
     let mut settings = settings(dark);
     settings.feed.view = view;
