@@ -20,7 +20,7 @@ use crate::feed::FeedEvent;
 use crate::feedrows::Pair;
 use crate::feedscroll::FeedScroll;
 use crate::journal::{PAGE_SIZE, PageSource};
-use crate::selection::{CopyKind, Selection};
+use crate::selection::{self, CopyKind, Selection};
 use crate::settings::ProxyMode;
 use crate::t;
 use crate::theme::Palette;
@@ -64,19 +64,51 @@ pub struct JournalView {
     pub copy_notice: Option<String>,
 }
 
-/// Отложенное копирование выделения в просмотре журнала.
+/// Копирование выделения в просмотре журнала, идущее по мере чтения страниц.
 ///
 /// Страницы журнала читаются по видимой области, поэтому выделенный блок может лежать
-/// на страницах, которых ещё нет в памяти. Копирование ждёт их и не кладёт в буфер
-/// половину блока.
-#[derive(Clone, Debug)]
+/// на страницах, которых ещё нет в памяти. Строки собираются **курсором по возрастанию
+/// номеров**: страница прочитана — её строки сразу ложатся в текст. Поэтому большой
+/// блок не держит в памяти весь журнал, не пересобирается каждый кадр, а LRU страниц не
+/// вытесняет то, что ещё не прочитано: его читают по порядку и один раз (находка B1
+/// ревью шага 2).
+#[derive(Clone, Debug, Default)]
 pub struct CopyJob {
-    /// Номера выделенных событий по возрастанию — уже обрезанные пределом.
-    pub indices: Vec<usize>,
-    /// Сколько строк было выделено: для сообщения о пределе.
-    pub total: usize,
     /// Что класть в буфер: текст с временем, HEX или Base64.
     pub kind: CopyKind,
+    /// Номера выделенных событий по возрастанию — не больше предела строк.
+    pub indices: Vec<usize>,
+    /// Сколько событий было выделено: по нему видно, что предел строк сработал.
+    pub total: usize,
+    /// Сколько номеров уже разобрано.
+    pub cursor: usize,
+    /// Сколько строк добавлено в текст.
+    pub rows: usize,
+    /// Сколько байт занял текст.
+    pub bytes: usize,
+    /// Сколько строк не прочитано: страница журнала не читается.
+    pub skipped: usize,
+    /// Текст для буфера: копится по мере прихода страниц.
+    pub text: String,
+    /// Предел строк или байт сработал.
+    pub truncated: bool,
+}
+
+impl CopyJob {
+    /// Задание на выделение: номера не длиннее предела строк.
+    pub fn new(kind: CopyKind, mut indices: Vec<usize>, total: usize) -> Self {
+        // Предел строк уже мог отсечь номера при сборе задания: тогда в буфер войдёт
+        // меньше, чем выделено, и об этом надо сказать.
+        let truncated = total > indices.len();
+        indices.truncate(selection::COPY_MAX_ROWS);
+        Self {
+            kind,
+            indices,
+            total,
+            truncated,
+            ..Self::default()
+        }
+    }
 }
 
 impl JournalView {

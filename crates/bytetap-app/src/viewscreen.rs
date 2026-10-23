@@ -481,7 +481,12 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     let feed_keys = !ui.ctx().text_edit_focused() && !details::resizer_focused(ui);
     // Ctrl+A и Ctrl+C — те же клавиши у панели: поле забирает их фокусом, вкладка HEX —
     // целиком, потому что там они выделяют и копируют строки дампа (L1-AC5, L1-AC6).
-    let copy_keys = feed_keys && view.details.tab() != details::Tab::Hex;
+    let hex_panel = view.details.is_open() && view.details.tab() == details::Tab::Hex;
+    let select_keys = feed_keys && !hex_panel;
+    // Исключение — блок строк на открытой «HEX»: Ctrl+C отдаётся ленте, если выделено
+    // больше одной строки и в дампе ничего не выделено (находка M2 ревью шага 2).
+    let copy_keys = feed_keys
+        && (!hex_panel || (view.selection.count() > 1 && !view.details.has_hex_selection()));
     if feed_keys && (view.details.is_open() || !view.selection.is_empty()) {
         let (step, extend) = ui.input_mut(|input| {
             if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
@@ -594,46 +599,58 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     );
     view.scroll = scroll;
     view.feed_rect = Some(out.inner);
-    if copy_keys {
-        // Ctrl+A — видимые строки: выделять миллион строк журнала, читая его по
-        // страницам, нечего (решение исполнителя, см. L1). Дальше по журналу выделяют
-        // Shift+кликом — выделение живёт в номерах событий.
-        if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
-            view.selection.select_all(visible);
-            view.copy_notice = None;
-        }
-        // Ctrl+C по выделенным строкам: строки на незагруженных страницах сперва
-        // дочитываются, а в буфер уходит весь выделенный блок.
-        if !view.selection.is_empty() && ui.input(|input| input.events.contains(&egui::Event::Copy))
-        {
-            ui.input_mut(|input| {
-                input
-                    .events
-                    .retain(|event| !matches!(event, egui::Event::Copy));
-            });
-            let indices: Vec<usize> = view
-                .selection
-                .seqs()
-                .map(|seq| seq as usize)
-                .take(selection::COPY_MAX_ROWS)
-                .collect();
-            view.copy_job = Some(crate::viewing::CopyJob {
-                indices,
-                total: view.selection.count(),
-                kind: selection::CopyKind::Text,
-            });
-            view.copy_notice = None;
-            ui.ctx().request_repaint();
-        }
+    // Ctrl+A — видимые строки: выделять миллион строк журнала, читая его по страницам,
+    // нечего (решение исполнителя, см. L1). Дальше по журналу выделяют Shift+кликом —
+    // выделение живёт в номерах событий.
+    if select_keys
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
+    {
+        view.selection.select_all(visible);
+        view.copy_notice = None;
+    }
+    // Ctrl+C по выделенным строкам: строки на незагруженных страницах сперва
+    // дочитываются, а в буфер уходит весь выделенный блок.
+    if copy_keys
+        && !view.selection.is_empty()
+        && ui.input(|input| input.events.contains(&egui::Event::Copy))
+    {
+        ui.input_mut(|input| {
+            input
+                .events
+                .retain(|event| !matches!(event, egui::Event::Copy));
+        });
+        let indices: Vec<usize> = view
+            .selection
+            .seqs()
+            .map(|seq| seq as usize)
+            .take(selection::COPY_MAX_ROWS)
+            .collect();
+        view.copy_job = Some(crate::viewing::CopyJob::new(
+            selection::CopyKind::Text,
+            indices,
+            view.selection.count(),
+        ));
+        view.copy_notice = None;
+        ui.ctx().request_repaint();
     }
     if let Some((index, event, rect)) = clicked {
         let modifiers = ui.input(|input| input.modifiers);
-        if modifiers.command {
+        if modifiers.command && modifiers.shift {
+            // Ctrl+Shift+клик: диапазон от якоря добавляется к уже выделенному.
+            view.selection.extend_add(index as u64);
+            view.details.open(index as u64, event);
+            if !was_open {
+                view.reveal = Some(rect);
+            }
+        } else if modifiers.command {
+            // Ctrl+клик: курсор и панель переезжают на строку, даже когда её сняли.
             view.selection.toggle(index as u64);
-            if view.selection.contains(index as u64) {
-                view.details.open(index as u64, event);
+            view.details.open(index as u64, event);
+            if !was_open {
+                view.reveal = Some(rect);
             }
         } else if modifiers.shift {
+            // Shift+клик: диапазон от якоря заменяет прежний, база Ctrl-отметок остаётся.
             view.selection.extend(index as u64);
             view.details.open(index as u64, event);
             if !was_open {
@@ -664,11 +681,11 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
                 MenuAction::CopyBase64 => selection::CopyKind::Base64,
                 _ => selection::CopyKind::Text,
             };
-            view.copy_job = Some(crate::viewing::CopyJob {
-                indices,
-                total: view.selection.count(),
+            view.copy_job = Some(crate::viewing::CopyJob::new(
                 kind,
-            });
+                indices,
+                view.selection.count(),
+            ));
             ui.ctx().request_repaint();
         }
         MenuAction::Clear => {
@@ -682,6 +699,10 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     {
         view.details.close();
         view.selection.clear();
+        // «×» отменяет и незаконченное копирование: выделения, которое оно собирало,
+        // больше нет (находка m6).
+        view.copy_job = None;
+        view.copy_notice = None;
     }
     if escape && (view.details.is_open() || !view.selection.is_empty()) {
         view.details.close();
@@ -707,10 +728,10 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     app.set_visible(Some((start, end)));
     let ctx = ui.ctx().clone();
     app.request_pages(&ctx, first_event, last_event.max(first_event + 1));
-    // Выделение могло лечь на страницы, которых нет в памяти: их дочитываем и только
-    // потом кладём блок в буфер.
-    if let Some((from, to)) = copy_pending(app, &ctx, encoding, pair) {
-        app.request_pages(&ctx, from, to + 1);
+    // Выделение могло лечь на страницы, которых нет в памяти: их дочитываем по мере
+    // копирования и только потом кладём собранные строки в буфер.
+    if let Some((from, to)) = copy_step(app, &ctx, encoding, pair) {
+        app.request_pages(&ctx, from, to.max(from + 1));
     }
     if let Some(height) = height {
         app.settings.feed.panel_height = height;
@@ -721,73 +742,87 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     }
 }
 
-/// Отложенное копирование выделения: дочитать страницы и положить строки в буфер.
+/// Шаг копирования выделения: собрать готовые строки и попросить недостающие страницы.
 ///
-/// Возвращает диапазон событий, страницы которых надо попросить: чтение страниц живёт
-/// в приложении, а экран только говорит, чего не хватает. Копирование не берёт
-/// половину блока: в буфер уходит либо весь выделенный блок, либо ничего и сообщение о
-/// том, что строки ещё читаются.
-fn copy_pending(
+/// Строки идут курсором по возрастанию номеров: страница, которая уже в памяти, отдаёт
+/// свои строки сразу и в текст, а недостающая просится одна (и одна вперёд). Поэтому
+/// большой блок не перечитывается каждый кадр и не требует держать в памяти весь
+/// промежуток выделения — LRU страниц его вытеснил бы (находка B1 ревью шага 2).
+///
+/// Возвращает диапазон событий, страницы которых надо попросить: чтение живёт в
+/// приложении, а экран только говорит, чего не хватает.
+fn copy_step(
     app: &mut BytetapApp,
     ctx: &egui::Context,
     encoding: Encoding,
     pair: Pair,
 ) -> Option<(usize, usize)> {
     let view = app.viewing.as_mut()?;
-    let job = view.copy_job.take()?;
-    let mut events: Vec<std::sync::Arc<crate::feed::FeedEvent>> =
-        Vec::with_capacity(job.indices.len());
-    let mut first_missing = None;
-    let mut last_missing = 0;
-    let mut skipped = 0;
-    for &index in &job.indices {
+    let job = view.copy_job.as_mut()?;
+    let total = view.source.total();
+    while job.cursor < job.indices.len() {
+        let index = job.indices[job.cursor];
         if view.source.page_has_error(index) {
-            skipped += 1;
+            // Строку не прочитать: в буфер её не кладём, но и не ждём вечно.
+            job.skipped += 1;
+            job.cursor += 1;
             continue;
         }
-        match view.source.event(index) {
-            Some(event) => match crate::viewing::feed_event(event) {
-                Some(event) => events.push(std::sync::Arc::new(event)),
-                None => skipped += 1,
-            },
-            None => {
-                first_missing.get_or_insert(index);
-                last_missing = index;
-            }
+        let Some(event) = view.source.event(index) else {
+            // Страница ещё едет: ждём её и одну вперёд — следующая понадобится сразу.
+            view.copy_notice = Some(t!(
+                "journal.copyWaiting",
+                count = selection::rows_count(job.total)
+            ));
+            let ahead = (index + crate::journal::PAGE_SIZE).min(total);
+            return Some((index, ahead));
+        };
+        job.cursor += 1;
+        let Some(event) = crate::viewing::feed_event(event) else {
+            job.skipped += 1;
+            continue;
+        };
+        let Some(line) = selection::line_for(&event, job.kind, pair, encoding) else {
+            continue;
+        };
+        let mut out = selection::CopyOut {
+            text: std::mem::take(&mut job.text),
+            rows: job.rows,
+            bytes: job.bytes,
+            truncated: job.truncated,
+        };
+        let fits = selection::push_line(&mut out, &line);
+        job.text = out.text;
+        job.rows = out.rows;
+        job.bytes = out.bytes;
+        job.truncated = out.truncated;
+        if !fits {
+            break;
         }
     }
-    if let Some(from) = first_missing {
-        // Страницы ещё едут: выбор не теряем, а говорим, что ждём.
-        view.copy_notice = Some(t!("journal.copyWaiting", count = job.total));
-        view.copy_job = Some(job);
-        return Some((from, last_missing));
+    // Готово: в буфер уходит собранное, а сообщение — только если что-то потерялось.
+    let text = std::mem::take(&mut job.text);
+    if !text.is_empty() {
+        ctx.copy_text(text);
     }
-    let out = match job.kind {
-        crate::selection::CopyKind::Text => {
-            crate::selection::copy_rows(events.iter().map(|event| &**event), pair, encoding)
-        }
-        crate::selection::CopyKind::Hex => {
-            crate::selection::copy_rows_hex(events.iter().map(|event| &**event))
-        }
-        crate::selection::CopyKind::Base64 => {
-            crate::selection::copy_rows_base64(events.iter().map(|event| &**event))
-        }
+    let notice = if job.truncated {
+        Some(t!(
+            "feed.copyLimited",
+            copied = selection::rows_count(job.rows),
+            total = selection::rows_count(job.total)
+        ))
+    } else if job.skipped > 0 {
+        Some(t!(
+            "journal.copySkipped",
+            copied = selection::rows_count(job.rows),
+            total = selection::rows_count(job.total),
+            skipped = selection::rows_count(job.skipped)
+        ))
+    } else {
+        None
     };
-    if !out.text.is_empty() {
-        ctx.copy_text(out.text);
-    }
-    view.copy_notice = (out.rows < job.total).then(|| {
-        if skipped > 0 {
-            t!(
-                "journal.copySkipped",
-                copied = out.rows,
-                total = job.total,
-                skipped = skipped
-            )
-        } else {
-            t!("journal.copyDone", copied = out.rows, total = job.total)
-        }
-    });
+    view.copy_notice = notice;
+    view.copy_job = None;
     None
 }
 
@@ -797,7 +832,9 @@ fn copy_pending(
 /// `extend` — Shift: к выделению добавляется диапазон от якоря до соседа, а не
 /// выбирается одна строка (L1, шаг 2).
 fn step_selection(view: &mut crate::viewing::JournalView, step: i32, extend: bool) {
-    let Some(key) = view.details.key() else {
+    // Курсор — выбранное событие, а при закрытой панели якорь выделения: после Ctrl+A
+    // стрелки ходят от него (находка m5).
+    let Some(key) = view.details.key().or_else(|| view.selection.anchor()) else {
         return;
     };
     let total = view.events();
@@ -819,7 +856,11 @@ fn step_selection(view: &mut crate::viewing::JournalView, step: i32, extend: boo
         view.selection.click(index as u64);
     }
     view.copy_notice = None;
-    view.details.open(index as u64, std::sync::Arc::new(event));
+    // Панель переезжает на соседа только когда она открыта: при закрытой панели
+    // стрелки двигают выделение, а панель не открывается под руками.
+    if view.details.is_open() {
+        view.details.open(index as u64, std::sync::Arc::new(event));
+    }
     view.seek = Some(index);
 }
 
