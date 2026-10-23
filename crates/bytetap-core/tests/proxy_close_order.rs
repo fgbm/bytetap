@@ -101,6 +101,23 @@ async fn wait_for_the_close(path: &Path) -> Close {
     panic!("close пары не появился в журнале");
 }
 
+/// Дочитывает сокет до конца и говорит, пришёл ли сброс вместо `FIN`.
+async fn drain_to_close(stream: &mut TcpStream) -> (Vec<u8>, bool) {
+    let mut rest = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match timeout(WAIT, stream.read(&mut buffer)).await {
+            Ok(Ok(0)) => return (rest, false),
+            Ok(Ok(read)) => rest.extend_from_slice(&buffer[..read]),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                return (rest, true);
+            }
+            Ok(Err(error)) => panic!("чтение остатка: {error}"),
+            Err(_) => panic!("сторона не увидела закрытие пары"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_close_names_the_side_that_ended_first_not_the_task_that_returned_first() {
     let _hooks = HookGuard;
@@ -137,5 +154,50 @@ async fn a_close_names_the_side_that_ended_first_not_the_task_that_returned_firs
         "пару закрыл анализатор: его конец увидели первым"
     );
     assert_eq!(close.reason, "eof");
+    handle.stop().await.expect("остановка");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_end_stays_the_closer_when_the_second_side_resets() {
+    // Пара закрывается сразу, без дожития: первая сторона закрылась `FIN`, вторая —
+    // сбросом. `close` называет первую, а сброс уходит обеим (FR-7, M4-AC5).
+    let _hooks = HookGuard;
+    TEST_PUMP_EOF_DELAY_MS.store(DELAY_MS, Ordering::Relaxed);
+    TEST_PUMP_EOF_DELAY_SIDE.store(1, Ordering::Relaxed);
+
+    let dir = tempfile::tempdir().expect("временная папка");
+    let (listener, target_addr) = target_listener().await;
+    let handle = start(dir.path(), target_addr, ProxyRole::AnalyzerClient).await;
+    let listen = listen_addr(&handle);
+    let path = handle.journal_path().to_path_buf();
+    let (mut accepted, mut target) = pair(&listener, listen).await;
+
+    // Анализатор закрывает первым; его задача вернётся только через [`DELAY_MS`].
+    accepted.write_all(b"ORU").await.expect("фрагмент");
+    accepted.shutdown().await.expect("FIN анализатора");
+    let mut forwarded = Vec::new();
+    timeout(WAIT, target.read_to_end(&mut forwarded))
+        .await
+        .expect("FIN дошёл до цели")
+        .expect("чтение цели");
+    assert_eq!(forwarded, b"ORU", "фрагмент переслан до закрытия пары");
+
+    // Цель сбрасывает соединение и возвращается первой: пара закрывается сразу, а сброс
+    // пересылается анализатору.
+    target.set_zero_linger().expect("нулевой linger");
+    drop(target);
+    let (_, reset) = drain_to_close(&mut accepted).await;
+    assert!(reset, "анализатор увидел сброс, а не полуоткрытый FIN");
+
+    let close = wait_for_the_close(&path).await;
+    assert_eq!(
+        close.by,
+        ClosedBy::Analyzer,
+        "пару закрыл анализатор: его конец увидели первым"
+    );
+    assert_eq!(
+        close.reason, "eof",
+        "сброс второй стороны причину не меняет"
+    );
     handle.stop().await.expect("остановка");
 }

@@ -1700,7 +1700,10 @@ async fn serve_pair(
                 close.reason = "timeout";
                 close.seq = None;
                 let _ = hangup.send(true);
-                settle(&mut pumps).await;
+                // Но ошибка обмена второго насоса — по-прежнему событие журнала.
+                if let Some(ended) = settle(&mut pumps).await {
+                    let _ = pair_end(&shared, conn, &ended.outcome, ports.as_ref());
+                }
             }
         }
     }
@@ -1765,10 +1768,18 @@ impl PairClose {
         ports: Option<&MonitorPorts>,
     ) {
         let (by, reason, _) = pair_end(shared, conn, &ended.outcome, ports);
-        if self.seq.is_none_or(|seq| ended.seq < seq) {
+        if earlier(self.seq, ended) {
             (self.by, self.reason, self.seq) = (by, reason, Some(ended.seq));
         }
     }
+}
+
+/// Конец второй стороны решает `close`: её номер меньше уже выбранного.
+///
+/// `None` — насосов не осталось или задача упала: это `bytetap/error`, и конец уцелевшей
+/// стороны его не перекрывает, иначе паника насоса выглядела бы штатным закрытием (M4-AC5).
+fn earlier(chosen: Option<u64>, ended: &PumpEnd) -> bool {
+    chosen.is_some_and(|seq| ended.seq < seq)
 }
 
 /// Имена портов прослушки: сторона анализатора и сторона ЛИС (M5-AC2).
@@ -2533,6 +2544,23 @@ mod tests {
         );
         assert_eq!(config.responder_kind(), ResponderKind::None);
         assert_eq!(config.source.mode(), Mode::Proxy);
+    }
+
+    #[test]
+    fn a_failed_pump_end_is_not_overridden_by_the_surviving_side() {
+        let ended = |seq| PumpEnd {
+            seq,
+            outcome: Pump::Eof(LinkRole::Analyzer),
+        };
+        // Насосов не осталось или задача упала: `bytetap/error` остаётся (M4-AC5).
+        assert!(!earlier(None, &ended(0)));
+        // Конец второй стороны увидели раньше — он и закрывает пару.
+        assert!(earlier(Some(5), &ended(4)));
+        assert!(!earlier(Some(5), &ended(6)));
+        assert!(
+            !earlier(Some(5), &ended(5)),
+            "одновременный конец первого не перекрывает"
+        );
     }
 
     #[test]
