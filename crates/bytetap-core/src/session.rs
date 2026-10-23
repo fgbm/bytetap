@@ -1593,7 +1593,7 @@ async fn serve_pair(
     // это закрытые оба порта (M5-AC2).
     let linger = match policy {
         ClosePolicy::Together => Duration::ZERO,
-        ClosePolicy::Linger(_) => linger,
+        ClosePolicy::Linger(limit) => linger.min(limit),
     };
     // Первая закончившаяся сторона решает, как закрывается пара; сброс второй стороны
     // во время дожития решается отдельно — `close` от него не меняется (FR-7).
