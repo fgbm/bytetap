@@ -57,10 +57,17 @@ fn fixtures() -> Fixtures {
                 addr: "172.16.4.21".into(),
             },
         ],
-        ports: vec![PortInfo {
-            name: "COM3".into(),
-            description: "USB-SERIAL CH340".into(),
-        }],
+        // Два адаптера: так выглядит разрыв линии — COM3 у анализатора, COM4 у ЛИС.
+        ports: vec![
+            PortInfo {
+                name: "COM3".into(),
+                description: "USB-SERIAL CH340".into(),
+            },
+            PortInfo {
+                name: "COM4".into(),
+                description: "USB-SERIAL FT232R".into(),
+            },
+        ],
         recents: vec![
             journal(
                 "bytetap-20261019101500-tcp_server.jsonl",
@@ -381,6 +388,7 @@ fn the_header_fits_a_narrow_window() {
             ("recording-text", long_summary_recording(size)),
             ("viewing-proxy", proxy_viewing(false, size)),
             ("recording-proxy", proxy_recording(false, false, size)),
+            ("recording-monitor", monitor_recording(false, false, size)),
         ] {
             assert_header_fits(&harness, size, &format!("{name} на {label}"));
         }
@@ -1016,12 +1024,16 @@ fn arrows_choose_a_card_and_enter_opens_it() {
     harness.run_steps(2);
     assert_eq!(
         harness.state().selected_card(),
-        3,
-        "вверх с первой — на последнюю, прокси"
+        4,
+        "вверх с первой — на последнюю, прослушку"
     );
     harness.key_press(Key::Enter);
     harness.run_steps(2);
-    assert_eq!(harness.state().screen, Screen::Step(SessionMode::Proxy));
+    assert_eq!(
+        harness.state().screen,
+        Screen::Step(SessionMode::ComMonitor),
+        "последняя карточка — «Встать в разрыв COM-кабеля»"
+    );
 }
 
 #[test]
@@ -1171,6 +1183,226 @@ fn a_start_error_is_shown_under_its_field() {
     harness.get_by_label("Адрес eth0 недоступен на этом компьютере. Выберите другой интерфейс.");
     // Поле интерфейса — в «Дополнительно»: оно раскрыто, чтобы ошибку было видно.
     harness.get_by_role_and_label(Role::ComboBox, "Интерфейс");
+}
+
+/// Шаг прослушки: пустые порты просят каждый своё, одинаковые порты — ошибка у второго,
+/// и сессия не собирается (M5-AC3).
+#[test]
+fn the_monitor_step_asks_for_both_ports() {
+    let mut settings = monitor_settings(false);
+    settings.config.serial.port = String::new();
+    settings.config.monitor_lis.port = String::new();
+    let mut harness = plain(settings, None, Screen::Step(SessionMode::ComMonitor));
+    harness.get_by_role_and_label(Role::ComboBox, "Порт анализатора");
+    harness.get_by_role_and_label(Role::ComboBox, "Порт ЛИС");
+    harness.get_by_label("Автоответ выключен: байты идут без изменений.");
+    harness.get_by_label("Порты занимает только bytetap: закройте ЛИС и программу анализатора.");
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    harness.get_by_label("Выберите порт");
+    harness.get_by_label("Выберите порт ЛИС");
+    assert!(harness.state().pending_session().is_none());
+    assert_eq!(
+        harness.state().screen,
+        Screen::Step(SessionMode::ComMonitor)
+    );
+}
+
+/// Один и тот же порт с двух сторон: ошибка у «Порт ЛИС», а не под «Старт» (M5-AC3).
+#[test]
+fn the_same_port_on_both_sides_is_reported_under_the_lis_port() {
+    let mut settings = monitor_settings(false);
+    settings.config.monitor_lis.port = "COM3".into();
+    let mut harness = plain(settings, None, Screen::Step(SessionMode::ComMonitor));
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    harness.get_by_label(
+        "Этот порт указан и у анализатора. В прослушке нужны два разных порта: анализатор на одном, ЛИС на другом.",
+    );
+    assert!(harness.state().pending_session().is_none());
+}
+
+/// Второй порт повторяет скорость и формат первого, пока его самого не тронули (М5-В2).
+#[test]
+fn the_lis_speed_follows_the_analyzer_until_it_is_changed() {
+    let mut harness = plain(
+        monitor_settings(false),
+        None,
+        Screen::Step(SessionMode::ComMonitor),
+    );
+    // Скорость анализатора: второй порт повторяет её.
+    harness
+        .get_all_by_role_and_label(Role::ComboBox, "Скорость")
+        .next()
+        .expect("скорость анализатора")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("19200").click();
+    harness.run_steps(2);
+    {
+        let config = &harness.state().settings().config;
+        assert_eq!(config.serial.baud, 19200);
+        assert_eq!(
+            config.monitor_lis.baud, 19200,
+            "второй порт повторяет первый"
+        );
+    }
+
+    // Скорость ЛИС своя: правка второго порта не трогает первый.
+    harness
+        .get_all_by_role_and_label(Role::ComboBox, "Скорость")
+        .nth(1)
+        .expect("скорость ЛИС")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("4800").click();
+    harness.run_steps(2);
+    {
+        let config = &harness.state().settings().config;
+        assert_eq!(config.monitor_lis.baud, 4800);
+        assert_eq!(config.serial.baud, 19200, "у анализатора своя скорость");
+    }
+
+    // Дальше скорость второго порта не следует за первым.
+    harness
+        .get_all_by_role_and_label(Role::ComboBox, "Скорость")
+        .next()
+        .expect("скорость анализатора")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("300").click();
+    harness.run_steps(2);
+    let config = &harness.state().settings().config;
+    assert_eq!(config.serial.baud, 300);
+    assert_eq!(
+        config.monitor_lis.baud, 4800,
+        "второй порт больше не повторяет"
+    );
+}
+
+/// «Поток и линии» прослушки: поток общий для обоих портов, и при RTS/CTS или XON/XOFF
+/// под строкой появляется предупреждение, что насквозь они не идут (М5-В3).
+#[test]
+fn the_monitor_flow_warns_about_the_control_lines() {
+    let mut harness = plain(
+        monitor_settings(false),
+        None,
+        Screen::Step(SessionMode::ComMonitor),
+    );
+    harness.get_by_label("Дополнительно").click();
+    harness.run_steps(2);
+    harness.get_by_label("Поток и линии");
+    harness.get_by_role_and_label(Role::CheckBox, "DTR вкл");
+    harness.get_by_role_and_label(Role::CheckBox, "RTS вкл");
+    // Поток «нет» — предупреждения нет.
+    assert!(
+        harness
+            .query_by_label_contains("насквозь не передаются")
+            .is_none()
+    );
+
+    harness
+        .get_by_role_and_label(Role::ComboBox, "Поток")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("RTS-CTS").click();
+    harness.run_steps(2);
+    harness.get_by_label(
+        "Линии управления насквозь не передаются: CTS, DSR и DCD — линии самого bytetap, а не дальней стороны. Аппаратный поток в разрыве не работает.",
+    );
+    // Поток общий: у второго порта тот же (М5-В2).
+    assert_eq!(
+        harness.state().settings().config.monitor_lis.flow,
+        bytetap_app::settings::Flow::Rtscts
+    );
+
+    harness
+        .get_by_role_and_label(Role::ComboBox, "Поток")
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label("XON-XOFF").click();
+    harness.run_steps(2);
+    harness.get_by_label(
+        "XON/XOFF в разрыве искажает запись: драйвер съедает байты 0x11 и 0x13, и они не попадут ни в ленту, ни в журнал, ни в другую сторону. В разрыве поток выключают.",
+    );
+}
+
+/// Ошибки старта прослушки встают под полем отказавшей стороны: сторона приходит в
+/// ошибке ядра, а не угадывается по тексту (M5-AC3).
+#[test]
+fn a_monitor_start_error_is_shown_under_its_port() {
+    let lis = harness_with(
+        monitor_settings(false),
+        None,
+        Screen::Step(SessionMode::ComMonitor),
+        WINDOW,
+        |app| {
+            app.with_start_error(
+                StartError::new(ErrorCode::PortBusy, "Access is denied (os error 5)")
+                    .with_param("port", "COM4")
+                    .with_param("side", "lis"),
+            )
+        },
+    );
+    assert_eq!(
+        lis.state()
+            .start_error()
+            .map(|error| error.field(SessionMode::ComMonitor)),
+        Some(ErrorField::SerialB),
+        "порт ЛИС — своё поле"
+    );
+    lis.get_by_label("Порт COM4 занят другой программой.");
+    lis.get_by_role_and_label(Role::ComboBox, "Порт ЛИС");
+
+    let analyzer = harness_with(
+        monitor_settings(false),
+        None,
+        Screen::Step(SessionMode::ComMonitor),
+        WINDOW,
+        |app| {
+            app.with_start_error(
+                StartError::new(ErrorCode::PortNotFound, "port not found")
+                    .with_param("port", "COM3")
+                    .with_param("side", "analyzer"),
+            )
+        },
+    );
+    assert_eq!(
+        analyzer
+            .state()
+            .start_error()
+            .map(|error| error.field(SessionMode::ComMonitor)),
+        Some(ErrorField::SerialA),
+        "порт анализатора — своё поле"
+    );
+    analyzer.get_by_label("Порт COM3 не найден: проверьте кабель и обновите список.");
+}
+
+/// Карточка прослушки: описание из макета M5-1, оба порта последнего запуска и ошибка
+/// открытия, если портов пара не набралась (M5-В1).
+#[test]
+fn the_monitor_card_opens_the_monitor_step() {
+    let mut settings = settings(false);
+    settings.last_run = Some(LastRun {
+        mode: SessionMode::ComMonitor,
+        port: "COM3".into(),
+        host: "COM4".into(),
+        baud: 9600,
+    });
+    let mut harness = plain(settings, None, Screen::Scenarios);
+    harness.get_by_label_contains("последний раз: COM3 → COM4");
+    harness
+        .get_by_role_and_label(
+            Role::Button,
+            "Встать в разрыв COM-кабеля. Два USB-RS232 в разрез линии: анализатор с одной стороны, ЛИС с другой · последний раз: COM3 → COM4",
+        )
+        .click();
+    harness.run_steps(2);
+    assert_eq!(
+        harness.state().screen,
+        Screen::Step(SessionMode::ComMonitor)
+    );
+    harness.get_by_role_and_label(Role::ComboBox, "Порт анализатора");
 }
 
 #[test]
@@ -1715,6 +1947,313 @@ fn the_layout_is_the_same_at_every_scale() {
 
 /// Синтетическая запись как на снимке UI v2: два соединения, сообщения HL7 с кириллицей
 /// в Windows-1251, автоответы, замечание и закрытия.
+/// Настройки шага прослушки: два адаптера из набора снимков, у каждого свой порт.
+fn monitor_settings(dark: bool) -> Settings {
+    let mut settings = settings(dark);
+    settings.config.mode = SessionMode::ComMonitor;
+    settings.config.serial.port = "COM3".into();
+    settings.config.serial.baud = 9600;
+    settings.config.monitor_lis.port = "COM4".into();
+    settings.config.monitor_lis.baud = 9600;
+    settings
+}
+
+/// Шаг прослушки: свёрнутое или раскрытое «Дополнительно» и, как в макете M5-3, занятый
+/// порт ЛИС (M5-AC3, M5-AC11).
+fn monitor_step(dark: bool, more: bool, lis_busy: bool) -> Harness<'static, BytetapApp> {
+    harness_with(
+        monitor_settings(dark),
+        None,
+        Screen::Step(SessionMode::ComMonitor),
+        WINDOW,
+        move |app| {
+            let app = if more { app.with_more() } else { app };
+            if lis_busy {
+                app.with_start_error(
+                    StartError::new(ErrorCode::PortBusy, "Access is denied (os error 5)")
+                        .with_param("port", "COM4")
+                        .with_param("side", "lis"),
+                )
+            } else {
+                app
+            }
+        },
+    )
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn step_monitor_light() {
+    let _gpu = gpu();
+    monitor_step(false, false, false).snapshot_options("step-monitor-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn step_monitor_dark() {
+    let _gpu = gpu();
+    monitor_step(true, false, false).snapshot_options("step-monitor-dark", &options());
+}
+
+/// Раскрытое «Дополнительно» с занятым портом ЛИС — макет M5-3: ошибка у своего поля, а
+/// не под общим «Старт» (M5-AC3).
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn step_monitor_more_light() {
+    let _gpu = gpu();
+    monitor_step(false, true, true).snapshot_options("step-monitor-more-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn step_monitor_more_dark() {
+    let _gpu = gpu();
+    monitor_step(true, true, true).snapshot_options("step-monitor-more-dark", &options());
+}
+
+/// Запись прослушки: сводка «анализатор COM3 ⇄ bytetap ⇄ ЛИС COM4», счётчики и лента
+/// обмена ASTM E1381 обеих сторон — макеты M5-4 и M5-5 (M5-В8).
+fn monitor_recording_fixture(lost: bool) -> RecordingFixture {
+    use bytetap_core::journal::{
+        Close, ClosedBy, Data, Dir, ErrorEvent, Event, Link, LinkRole, Open, Stats,
+    };
+
+    let at = |ms: u64| {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-10-26T10:15:00.000+03:00").unwrap();
+        (base + chrono::Duration::milliseconds(ms as i64))
+            .format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+            .to_string()
+    };
+    let data = |ms: u64, dir: Dir, bytes: &[u8]| {
+        Event::Data(Data::new(at(ms), ms * 1000, 1, dir, false, bytes))
+    };
+    let frame = |ms: u64| {
+        data(
+            ms,
+            Dir::AnalyzerToLis,
+            b"\x020H|\\^&|||ANALYZER-3^1.0|||||||P|E1394-97|20261026101503\rP|1|000123|PATIENT^TEST\rL|1|N\r\x037A\r\n",
+        )
+    };
+    let mut events = vec![
+        Event::Open(Open {
+            t: at(3_000),
+            mono_us: 3_000_000,
+            conn: 1,
+            peer: "COM3".into(),
+            local: String::new(),
+            link: Some(Link {
+                role: LinkRole::Lis,
+                peer: "COM4".into(),
+                local: String::new(),
+            }),
+        }),
+        data(4_112, Dir::AnalyzerToLis, b"\x05"),
+        data(4_128, Dir::LisToAnalyzer, b"\x06"),
+        frame(4_140),
+        data(4_171, Dir::LisToAnalyzer, b"\x06"),
+        data(4_180, Dir::AnalyzerToLis, b"\x04"),
+        data(9_006, Dir::LisToAnalyzer, b"\x05"),
+        data(9_021, Dir::AnalyzerToLis, b"\x06"),
+        data(
+            9_030,
+            Dir::LisToAnalyzer,
+            b"\x021Q|1|^000123||ALL||||||||O\rL|1|N\r\x032B\r\n",
+        ),
+        data(9_058, Dir::AnalyzerToLis, b"\x06"),
+        data(9_070, Dir::LisToAnalyzer, b"\x04"),
+    ];
+    if lost {
+        // Пропал адаптер стороны ЛИС: ошибка с именем порта, закрытие пары по стороне и
+        // строка о повторах открытия — макет M5-6 (M5-В8).
+        events.extend([
+            data(14_402, Dir::AnalyzerToLis, b"\x05"),
+            data(14_418, Dir::LisToAnalyzer, b"\x06"),
+            Event::Error(ErrorEvent {
+                t: at(14_560),
+                mono_us: 14_560_000,
+                conn: Some(1),
+                code: Some("connection_read_failed".into()),
+                peer: Some("COM4".into()),
+                message: "monitor read failed: The device attached to the port is gone".into(),
+            }),
+            Event::Close(Close {
+                t: at(14_560),
+                mono_us: 14_560_000,
+                conn: 1,
+                by: ClosedBy::Lis,
+                reason: "error".into(),
+            }),
+            Event::Error(ErrorEvent {
+                t: at(14_561),
+                mono_us: 14_561_000,
+                conn: None,
+                code: Some("serial_open_failed".into()),
+                peer: None,
+                message: "serial port open failed: the port is not found".into(),
+            }),
+        ]);
+    }
+    RecordingFixture {
+        events,
+        stats: Stats {
+            connections: 1,
+            bytes_analyzer_to_lis: 4_710,
+            bytes_lis_to_analyzer: 268,
+        },
+        elapsed: std::time::Duration::from_secs(847),
+        local_addr: "COM3".into(),
+        journal_path: Some(format!(r"{LOG_DIR}\bytetap-20261026101500-com_monitor.jsonl").into()),
+        dropped: 0,
+    }
+}
+
+fn monitor_recording(dark: bool, lost: bool, size: (f32, f32)) -> Harness<'static, BytetapApp> {
+    harness_with(
+        monitor_settings(dark),
+        None,
+        Screen::Scenarios,
+        size,
+        move |app| app.with_recording_fixture(monitor_recording_fixture(lost)),
+    )
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_monitor_light() {
+    let _gpu = gpu();
+    monitor_recording(false, false, WINDOW).snapshot_options("recording-monitor-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_monitor_dark() {
+    let _gpu = gpu();
+    monitor_recording(true, false, WINDOW).snapshot_options("recording-monitor-dark", &options());
+}
+
+/// Пропажа порта: строка ошибки цветом `danger` с именем порта, закрытие пары по стороне
+/// и строка о повторах — макет M5-6 (M5-В8).
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_monitor_lost_light() {
+    let _gpu = gpu();
+    monitor_recording(false, true, WINDOW)
+        .snapshot_options("recording-monitor-lost-light", &options());
+}
+
+/// Журнал прослушки: шапка со сводкой двух портов из `settings` и лента пары (M5-AC11).
+fn monitor_journal_view() -> bytetap_app::viewing::JournalView {
+    use bytetap_app::journal::{JournalCache, JournalOpen};
+    use bytetap_core::journal::{Close, ClosedBy, Data, Dir, Event, Link, LinkRole, Open};
+
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("bytetap-20261026101500-com_monitor.jsonl");
+    let mut header = bytetap_core::journal::Session::new(
+        bytetap_core::journal::Mode::ComMonitor,
+        bytetap_core::journal::Autoresponder::None,
+        serde_json::json!({
+            "analyzer": {"port": "COM3", "baud": 9600, "format": "8N1", "flow": "none", "dtr": true, "rts": true},
+            "lis": {"port": "COM4", "baud": 9600, "format": "8N1", "flow": "none", "dtr": true, "rts": true},
+        }),
+        bytetap_core::journal::Host {
+            os: "Windows 11 23H2".to_owned(),
+        },
+    );
+    header.analyzer = Some("ANALYZER-3".to_owned());
+    let mut text = serde_json::to_string(&Event::Session(header)).expect("заголовок");
+    text.push('\n');
+    let open = Open {
+        t: "2026-10-26T10:15:03.000000+03:00".into(),
+        mono_us: 3_000_000,
+        conn: 1,
+        peer: "COM3".into(),
+        local: String::new(),
+        link: Some(Link {
+            role: LinkRole::Lis,
+            peer: "COM4".into(),
+            local: String::new(),
+        }),
+    };
+    text.push_str(&serde_json::to_string(&Event::Open(open)).expect("open"));
+    text.push('\n');
+    for (mono_us, dir, bytes) in [
+        (4_112, Dir::AnalyzerToLis, b"\x05".as_slice()),
+        (4_128, Dir::LisToAnalyzer, b"\x06".as_slice()),
+        (
+            4_140,
+            Dir::AnalyzerToLis,
+            b"\x020H|\\^&|||ANALYZER-3^1.0|||||||P|E1394-97|20261026101503\rL|1|N\r\x037A\r\n"
+                .as_slice(),
+        ),
+        (4_171, Dir::LisToAnalyzer, b"\x06".as_slice()),
+        (4_180, Dir::AnalyzerToLis, b"\x04".as_slice()),
+    ] {
+        let event = Event::Data(Data::new(
+            "2026-10-26T10:15:04.000000+03:00",
+            mono_us,
+            1,
+            dir,
+            false,
+            bytes,
+        ));
+        text.push_str(&serde_json::to_string(&event).expect("событие"));
+        text.push('\n');
+    }
+    let close = Close {
+        t: "2026-10-26T10:15:14.000000+03:00".into(),
+        mono_us: 14_000_000,
+        conn: 1,
+        by: ClosedBy::Bytetap,
+        reason: "stop".into(),
+    };
+    text.push_str(&serde_json::to_string(&Event::Close(close)).expect("close"));
+    text.push('\n');
+    std::fs::write(&path, text).expect("журнал");
+    let cache = JournalCache::default();
+    let opened = JournalOpen::open(&cache, &path).expect("журнал открывается");
+    let mut view = bytetap_app::viewing::JournalView::new(
+        opened.path.clone(),
+        opened.summary.clone(),
+        opened.lengths.clone(),
+        opened.first_event.clone(),
+    );
+    let events = cache
+        .read(&opened.path, 0, bytetap_app::journal::PAGE_SIZE)
+        .expect("страница");
+    let generation = view.source.request_page(0);
+    view.source.store_page(0, generation, events);
+    view.path = format!(r"{LOG_DIR}\bytetap-20261026101500-com_monitor.jsonl").into();
+    view
+}
+
+fn monitor_viewing(dark: bool, size: (f32, f32)) -> Harness<'static, BytetapApp> {
+    let mut harness = Harness::builder()
+        .with_size(size)
+        .with_theme(if dark { Theme::Dark } else { Theme::Light })
+        .wgpu()
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings(dark), None, None)
+                .with_fixtures(fixtures())
+                .with_journal_fixture(monitor_journal_view())
+        });
+    harness.run_steps(8);
+    harness
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn viewing_monitor_light() {
+    let _gpu = gpu();
+    monitor_viewing(false, WINDOW).snapshot_options("viewing-monitor-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn viewing_monitor_dark() {
+    let _gpu = gpu();
+    monitor_viewing(true, WINDOW).snapshot_options("viewing-monitor-dark", &options());
+}
+
 fn recording_fixture(extra: usize) -> RecordingFixture {
     use bytetap_core::journal::{Close, ClosedBy, Data, Dir, Event, InfoEvent, Open, Stats};
 
@@ -2749,6 +3288,51 @@ fn every_screen_names_its_widgets() {
         assert!(has(&nodes, role, label), "нет {role:?} «{label}»");
     }
 
+    // Шаг прослушки: два порта, скорость и формат у каждого, строки подсказок.
+    let monitor = plain(
+        monitor_settings(false),
+        None,
+        Screen::Step(SessionMode::ComMonitor),
+    );
+    let nodes = audit_nodes(&monitor, "шаг прослушки");
+    for (role, label) in [
+        (Role::ComboBox, "Порт анализатора"),
+        (Role::ComboBox, "Порт ЛИС"),
+        (Role::ComboBox, "Скорость"),
+        (Role::ComboBox, "Формат"),
+        (Role::Button, "Старт"),
+        (Role::Button, "Дополнительно"),
+        (Role::Button, "Обновить список портов"),
+    ] {
+        assert!(has(&nodes, role, label), "нет {role:?} «{label}»");
+    }
+    // «Дополнительно» прослушки: поток и линии, переподключение, профиль — в окне выше
+    // 800 точек, как у прокси.
+    let harness = harness_with(
+        monitor_settings(false),
+        None,
+        Screen::Step(SessionMode::ComMonitor),
+        (1200.0, 1000.0),
+        |app| app.with_more(),
+    );
+    let nodes = audit_nodes_in(
+        &harness,
+        "шаг прослушки с «Дополнительно»",
+        (1200.0, 1000.0),
+    );
+    for (role, label) in [
+        (Role::ComboBox, "Поток"),
+        (Role::CheckBox, "DTR вкл"),
+        (Role::CheckBox, "RTS вкл"),
+        (Role::TextInput, "Переподключение, с"),
+        (Role::TextInput, "Анализатор"),
+        (Role::TextInput, "Комментарий"),
+        (Role::ComboBox, "Профиль"),
+        (Role::Button, "Выбрать"),
+    ] {
+        assert!(has(&nodes, role, label), "нет {role:?} «{label}»");
+    }
+
     // Запись: «Стоп», меню «…», счётчики, вид и кодировка ленты, фильтр соединений.
     let harness = plain_recording(FeedView::Text, 0);
     let nodes = audit_nodes(&harness, "запись");
@@ -2904,6 +3488,24 @@ fn tab_visits_every_screen_in_reading_order() {
         client < server && server < port && port < target && target < start,
         "{labels:#?}"
     );
+
+    // Шаг прослушки: порт анализатора со скоростью и форматом, затем порт ЛИС — сверху
+    // вниз, как они стоят в макете M5-2 (M5-AC11).
+    let order = tab_walk(
+        &mut plain(
+            monitor_settings(false),
+            None,
+            Screen::Step(SessionMode::ComMonitor),
+        ),
+        24,
+    );
+    assert_reading_order("шаг прослушки", &order);
+    let labels: Vec<&str> = order.iter().map(|(label, _)| label.as_str()).collect();
+    let a = position_of(&labels, "Порт анализатора").expect("порт анализатора");
+    let b = position_of(&labels, "Порт ЛИС").expect("порт ЛИС");
+    let more = position_of(&labels, "Дополнительно").expect("«Дополнительно»");
+    let start = position_of(&labels, "Старт").expect("«Старт»");
+    assert!(a < b && b < more && more < start, "{labels:#?}");
 
     let order = tab_walk(&mut plain_recording(FeedView::Text, 0), 24);
     assert_reading_order("запись", &order);
