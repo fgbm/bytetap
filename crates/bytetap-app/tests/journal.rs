@@ -1206,6 +1206,9 @@ fn click(harness: &mut Harness<'static, BytetapApp>, at: egui::Pos2) {
     harness.run_steps(1);
 }
 
+/// Общая цель обхода Tab для строк ленты: их число зависит от высоты ленты.
+const ROWS: &str = "строка ленты";
+
 /// Просмотр журнала: у каждой кнопки и у полосы прокрутки есть роль и подпись, а Tab
 /// идёт по шапке слева направо (U1-AC25).
 #[test]
@@ -1219,6 +1222,13 @@ fn the_journal_screen_names_its_widgets_and_tabs_in_order() {
     std::fs::write(&path, text).expect("журнал");
     let mut harness = harness_with_journal(&path);
     harness.run_steps(3);
+    // Первая страница журнала: пока её нет, лента пуста, строк в обходе Tab не будет,
+    // и порядок проверялся бы на пустом экране (на медленном раннере так и выходило).
+    step_until(&mut harness, "первая страница", |h| {
+        h.state()
+            .viewing()
+            .is_some_and(|view| view.source.pages_in_memory() > 0)
+    });
     harness.check_accessibility();
 
     let mut names = Vec::new();
@@ -1251,10 +1261,9 @@ fn the_journal_screen_names_its_widgets_and_tabs_in_order() {
         .expect("комментарий");
     assert!(close < comment, "{labels:?}");
 
-    // Порядок сверяется по подписям, а не по координатам: строки ленты занимают на разных
-    // платформах разное число шагов (на windows-latest они в обход Tab не попадают), а
-    // ползунок полосы прокрутки — внутренний прямоугольник её дорожки: «следующая цель
-    // правее» для него неверно, и на коротком экране он стоит у верхнего края (U1-AC25).
+    // Порядок сверяется по подписям, а не по координатам: ползунок полосы прокрутки —
+    // внутренний прямоугольник её дорожки, и «следующая цель правее» для него неверно,
+    // а на коротком экране он стоит у верхнего края (U1-AC25).
     let mut order: Vec<String> = Vec::new();
     for _ in 0..200 {
         harness.key_press(Key::Tab);
@@ -1267,8 +1276,15 @@ fn the_journal_screen_names_its_widgets_and_tabs_in_order() {
             continue;
         };
         let node = node.accesskit_node();
-        // Строки ленты в списке не идут: видно их столько, сколько помещается на экране.
+        // Строки ленты — в списке: их столько, сколько помещается на экране, поэтому все
+        // подряд идут одной целью, но сама цель обязана быть и стоять между фильтрами
+        // и полосой прокрутки.
         if node.role() == Role::ListItem {
+            let label = node.label().or_else(|| node.value()).unwrap_or_default();
+            assert!(!label.trim().is_empty(), "строка ленты без подписи");
+            if order.last().map(String::as_str) != Some(ROWS) {
+                order.push(ROWS.to_owned());
+            }
             continue;
         }
         let label = node.label().or_else(|| node.value()).unwrap_or_default();
@@ -1297,6 +1313,7 @@ fn the_journal_screen_names_its_widgets_and_tabs_in_order() {
             "Перейти к месту ленты",
             "Вид ленты",
             "Кодировка",
+            ROWS,
             "Прокрутка ленты",
             "Полоса прокрутки ленты",
         ],
