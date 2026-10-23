@@ -137,6 +137,21 @@ pub fn reset_test_published_events() {
     PUBLISHED_EVENTS.store(0, Ordering::Relaxed);
 }
 
+/// Тестовый хук: задержка выхода насоса пары после `FIN`, миллисекунды.
+///
+/// Появляется только со сборкой feature `test-hooks`. Выход насоса и так идёт после
+/// `shutdown` обратной стороны, и на загруженном раннере задача первого закрывшегося
+/// насоса возвращается не первой; задержка делает этот порядок проверяемым (M4-AC5).
+#[cfg(feature = "test-hooks")]
+pub static TEST_PUMP_EOF_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Тестовый хук: чья сторона пары задерживается на [`TEST_PUMP_EOF_DELAY_MS`].
+///
+/// `1` — сторона анализатора, `2` — сторона ЛИС, `0` — хук выключен: задержка нужна той
+/// стороне, которая закрывает пару, иначе вторая сторона закрыла бы её раньше (M4-AC5).
+#[cfg(feature = "test-hooks")]
+pub static TEST_PUMP_EOF_DELAY_SIDE: AtomicU64 = AtomicU64::new(0);
+
 /// Пора закончить сессию самой: хук [`TEST_END_AFTER_EVENTS`] сработал.
 #[cfg(feature = "test-hooks")]
 fn test_hook_end() -> bool {
@@ -474,6 +489,7 @@ impl Session {
             failure: failure_tx,
             open: Mutex::new(HashSet::new()),
             backlog_warned: AtomicBool::new(false),
+            ends: AtomicU64::new(0),
         });
         // Замечания источника идут раньше первого соединения: инженер должен узнать про
         // разрешение таймера и про линии управления до обмена (M5-AC5, М5-В3).
@@ -709,9 +725,20 @@ struct Shared {
     open: Mutex<HashSet<u32>>,
     /// Предупреждение о растущей очереди писателя уже отправлено (M4-AC12).
     backlog_warned: AtomicBool,
+    /// Номера концов пар: по ним `close` называет сторону, закончившуюся первой (M4-AC5).
+    ends: AtomicU64,
 }
 
 impl Shared {
+    /// Номер конца стороны пары: меньшее значение — эту сторону увидели раньше.
+    ///
+    /// Номер берётся в момент события, а не на выходе из задачи насоса: выход ждёт
+    /// `shutdown` обратной стороны, и первым возвращается тот насос, кого отпустил
+    /// планировщик, а не тот, кто увидел конец первым (M4-AC5).
+    fn end_stamp(&self) -> u64 {
+        self.ends.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Кладёт событие в журнал и раздаёт его подписчикам.
     ///
     /// Оба действия не ждут: канал журнала неограниченный, канал подписчиков теряет
@@ -1518,6 +1545,18 @@ enum Pump {
     Stopped,
 }
 
+/// Итог насоса и номер, под которым он увидел конец своей стороны.
+///
+/// Номер проставляется в момент события, а не на выходе из задачи: задача ждёт `shutdown`
+/// обратной стороны, поэтому порядок возврата — порядок планировщика, а не порядок событий.
+/// По номеру [`serve_pair`] называет в `close` сторону, которая закончилась первой (M4-AC5).
+struct PumpEnd {
+    /// Порядок наблюдения: меньшее значение — эта сторона закончилась раньше.
+    seq: u64,
+    /// Что именно закончилось.
+    outcome: Pump,
+}
+
 /// Как закрывается пара: когда прекращать пересылку второй стороны (FR-7, M5-AC2).
 ///
 /// У TCP-сокета есть полузакрытие: `FIN` одной стороны не значит, что обмен кончился,
@@ -1584,7 +1623,7 @@ async fn serve_pair(
     let (accepted_read, accepted_write) = tokio::io::split(accepted);
     let (link_read, link_write) = tokio::io::split(transport);
 
-    let mut pumps: JoinSet<Pump> = JoinSet::new();
+    let mut pumps: JoinSet<PumpEnd> = JoinSet::new();
     pumps.spawn(pump(
         accepted_read,
         link_write,
@@ -1610,47 +1649,58 @@ async fn serve_pair(
         },
     ));
 
-    let (mut by, mut reason, linger) = match pumps.join_next().await {
-        Some(Ok(outcome)) => pair_end(&shared, conn, &outcome, ports.as_ref()),
+    let mut close = match pumps.join_next().await {
+        Some(Ok(ended)) => PairClose::new(&shared, conn, &ended, ports.as_ref()),
         // Насосов не осталось или задача упала: пары больше нет.
-        None | Some(Err(_)) => (ClosedBy::Bytetap, "error", Duration::ZERO),
+        None | Some(Err(_)) => PairClose {
+            seq: None,
+            by: ClosedBy::Bytetap,
+            reason: "error",
+            linger: Duration::ZERO,
+        },
     };
     // Прослушка не доживает обратное направление: у порта нет `FIN`, и закрытая пара —
     // это закрытые оба порта (M5-AC2).
     let linger = match policy {
         ClosePolicy::Together => Duration::ZERO,
-        ClosePolicy::Linger(limit) => linger.min(limit),
+        ClosePolicy::Linger(limit) => close.linger.min(limit),
     };
     // Первая закончившаяся сторона решает, как закрывается пара; сброс второй стороны
     // во время дожития решается отдельно — `close` от него не меняется (FR-7).
-    let mut reset_pair = reason == "reset";
+    let mut reset_pair = close.reason == "reset";
 
     if linger.is_zero() {
         // Вторая сторона закрывается сразу: `FIN` уже не пересылать, `RST`, «Стоп» или
         // отказ журнала.
         let _ = hangup.send(true);
-        settle(&shared, conn, &mut pumps, ports.as_ref()).await;
+        if let Some(ended) = settle(&mut pumps).await {
+            // Конец второй стороны — тоже событие журнала, а `close` называет ту сторону,
+            // которая закончилась раньше по времени (M4-AC5).
+            close.absorb(&shared, conn, &ended, ports.as_ref());
+            reset_pair = reset_pair || is_reset_outcome(&ended.outcome);
+        }
     } else {
         // `FIN` одной стороны: обратное направление доживает до своего `FIN`;
         // истёк срок — закрывает bytetap, иначе зависшая сторона держала бы пару вечно.
         match timeout(linger, pumps.join_next()).await {
-            Ok(Some(Ok(outcome))) => {
-                // Вторая сторона закончилась сама; её ошибка — тоже событие журнала,
-                // но `close` остаётся за первой (FR-7).
-                let _ = pair_end(&shared, conn, &outcome, ports.as_ref());
+            Ok(Some(Ok(ended))) => {
+                // Вторая сторона закончилась сама; её ошибка — тоже событие журнала.
+                close.absorb(&shared, conn, &ended, ports.as_ref());
                 // Сброс во время дожития: собеседник второй стороны уже сбросил
                 // соединение, и ответа он не ждёт. Обе стороны закрываются `RST`,
                 // как при сбросе первой: иначе оставшаяся сторона увидела бы `FIN`
                 // там, где собеседник видел сброс.
-                reset_pair = reset_pair || is_reset_outcome(&outcome);
+                reset_pair = reset_pair || is_reset_outcome(&ended.outcome);
             }
             // Насосов не осталось или задача упала: закрывать уже нечего.
             Ok(_) => {}
             Err(_elapsed) => {
-                by = ClosedBy::Bytetap;
-                reason = "timeout";
+                // Срок истёк: пару закрывает bytetap, итог второго насоса его не меняет.
+                close.by = ClosedBy::Bytetap;
+                close.reason = "timeout";
+                close.seq = None;
                 let _ = hangup.send(true);
-                settle(&shared, conn, &mut pumps, ports.as_ref()).await;
+                settle(&mut pumps).await;
             }
         }
     }
@@ -1670,8 +1720,55 @@ async fn serve_pair(
     drop(pumps);
     drop(accepted_reset);
     drop(link_reset);
-    shared.close_conn(conn, by, reason);
-    by
+    shared.close_conn(conn, close.by, close.reason);
+    close.by
+}
+
+/// Конец пары для `close`: сторона, причина, срок дожития и номер наблюдения.
+///
+/// Пара закрывается той стороной, которая закончилась раньше по времени, а не тем насосом,
+/// чья задача вернулась первой: выход из насоса ждёт `shutdown` обратной стороны, и первым
+/// возвращается тот, кого отпустил планировщик. Поэтому итог второй стороны только уточняет
+/// `close`, если её конец увидели раньше (M4-AC5, FR-7).
+struct PairClose {
+    /// Номер конца выбранной стороны; `None` — насосов не осталось или задача упала.
+    seq: Option<u64>,
+    /// Кто закрыл пару.
+    by: ClosedBy,
+    /// Почему закрылась пара.
+    reason: &'static str,
+    /// Сколько доживает обратное направление.
+    linger: Duration,
+}
+
+impl PairClose {
+    /// Конец пары по итогу первого вернувшегося насоса.
+    fn new(shared: &Shared, conn: u32, ended: &PumpEnd, ports: Option<&MonitorPorts>) -> Self {
+        let (by, reason, linger) = pair_end(shared, conn, &ended.outcome, ports);
+        Self {
+            seq: Some(ended.seq),
+            by,
+            reason,
+            linger,
+        }
+    }
+
+    /// Учитывает конец второй стороны: `close` называет сторону, закончившуюся раньше.
+    ///
+    /// Итог второй стороны пишется в журнал всегда — ошибка обмена относится к паре, — но
+    /// `close` меняется, только если её конец увидели раньше первого (M4-AC5).
+    fn absorb(
+        &mut self,
+        shared: &Shared,
+        conn: u32,
+        ended: &PumpEnd,
+        ports: Option<&MonitorPorts>,
+    ) {
+        let (by, reason, _) = pair_end(shared, conn, &ended.outcome, ports);
+        if self.seq.is_none_or(|seq| ended.seq < seq) {
+            (self.by, self.reason, self.seq) = (by, reason, Some(ended.seq));
+        }
+    }
 }
 
 /// Имена портов прослушки: сторона анализатора и сторона ЛИС (M5-AC2).
@@ -1758,19 +1855,16 @@ fn pair_end(
 ///
 /// `abort` здесь не годится: прерванная посреди записи задача не успела бы записать
 /// в журнал байты, которые адресат получил (M4-AC10). Предел — тот же, что у остановки
-/// сессии; дольше ждать незачем, и тогда задачи прерываются.
-async fn settle(
-    shared: &Shared,
-    conn: u32,
-    pumps: &mut JoinSet<Pump>,
-    ports: Option<&MonitorPorts>,
-) {
+/// сессии; дольше ждать незачем, и тогда задачи прерываются. Итог второго насоса решает
+/// вызывающий: он уточняет `close`, если её сторона закончилась раньше (M4-AC5).
+async fn settle(pumps: &mut JoinSet<PumpEnd>) -> Option<PumpEnd> {
     match timeout(CONNECTIONS_SHUTDOWN_TIMEOUT, pumps.join_next()).await {
-        Ok(Some(Ok(outcome))) => {
-            let _ = pair_end(shared, conn, &outcome, ports);
+        Ok(Some(Ok(ended))) => Some(ended),
+        Ok(_) => None,
+        Err(_elapsed) => {
+            pumps.shutdown().await;
+            None
         }
-        Ok(_) => {}
-        Err(_elapsed) => pumps.shutdown().await,
     }
 }
 
@@ -1799,7 +1893,7 @@ async fn pump(
     conn: u32,
     shared: Arc<Shared>,
     signals: PumpSignals,
-) -> Pump {
+) -> PumpEnd {
     let PumpSignals {
         mut stop,
         mut failure,
@@ -1810,20 +1904,39 @@ async fn pump(
         // Отказ журнала останавливает пересылку: обмен, которого нет в записи, дальше
         // не идёт (M4-AC10).
         if failure.borrow().is_some() {
-            return Pump::Stopped;
+            return PumpEnd {
+                seq: shared.end_stamp(),
+                outcome: Pump::Stopped,
+            };
         }
         let read = tokio::select! {
             biased;
-            () = wait_for_stop(&mut stop) => return Pump::Stopped,
-            () = wait_for_failure(&mut failure) => return Pump::Stopped,
-            () = wait_for_hangup(&mut hangup) => return Pump::Stopped,
+            () = wait_for_stop(&mut stop) => return PumpEnd {
+                seq: shared.end_stamp(),
+                outcome: Pump::Stopped,
+            },
+            () = wait_for_failure(&mut failure) => return PumpEnd {
+                seq: shared.end_stamp(),
+                outcome: Pump::Stopped,
+            },
+            () = wait_for_hangup(&mut hangup) => return PumpEnd {
+                seq: shared.end_stamp(),
+                outcome: Pump::Stopped,
+            },
             read = from.read(&mut buffer) => read,
         };
         match read {
             Ok(0) => {
-                // `FIN` этой стороны — полузакрытие записи в другую (FR-7).
+                // `FIN` этой стороны — полузакрытие записи в другую (FR-7). Номер берётся
+                // до `shutdown`: пару закрыла эта сторона, даже если задача вернётся позже
+                // задачи второй стороны (M4-AC5).
+                let ended = PumpEnd {
+                    seq: shared.end_stamp(),
+                    outcome: Pump::Eof(role),
+                };
                 let _ = to.shutdown().await;
-                return Pump::Eof(role);
+                test_hook_pump_eof_delay(role).await;
+                return ended;
             }
             Ok(len) => {
                 let payload = &buffer[..len];
@@ -1847,21 +1960,32 @@ async fn pump(
                 match outcome {
                     Some(Ok(())) => {}
                     Some(Err(error)) => {
-                        return Pump::Broken {
-                            role,
-                            error,
-                            writing: true,
+                        return PumpEnd {
+                            seq: shared.end_stamp(),
+                            outcome: Pump::Broken {
+                                role,
+                                error,
+                                writing: true,
+                            },
                         };
                     }
                     // Запись прервана: отправленное записано, пересылка кончается.
-                    None => return Pump::Stopped,
+                    None => {
+                        return PumpEnd {
+                            seq: shared.end_stamp(),
+                            outcome: Pump::Stopped,
+                        };
+                    }
                 }
             }
             Err(error) => {
-                return Pump::Broken {
-                    role,
-                    error,
-                    writing: false,
+                return PumpEnd {
+                    seq: shared.end_stamp(),
+                    outcome: Pump::Broken {
+                        role,
+                        error,
+                        writing: false,
+                    },
                 };
             }
         }
@@ -1875,6 +1999,23 @@ async fn wait_for_hangup(hangup: &mut watch::Receiver<bool>) {
     }
     let _ = hangup.changed().await;
 }
+
+/// Задержка выхода насоса после `FIN` на стороне из хука [`TEST_PUMP_EOF_DELAY_SIDE`].
+///
+/// Задержка ставится после `shutdown`: `FIN` уходит второй стороне сразу, а позже
+/// возвращается только задача своего насоса (M4-AC5).
+#[cfg(feature = "test-hooks")]
+async fn test_hook_pump_eof_delay(role: LinkRole) {
+    let side = TEST_PUMP_EOF_DELAY_SIDE.load(Ordering::Relaxed);
+    let ours = (side == 1 && role == LinkRole::Analyzer) || (side == 2 && role == LinkRole::Lis);
+    let millis = TEST_PUMP_EOF_DELAY_MS.load(Ordering::Relaxed);
+    if ours && millis > 0 {
+        tokio::time::sleep(Duration::from_millis(millis)).await;
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+async fn test_hook_pump_eof_delay(_role: LinkRole) {}
 
 /// Сброс ли это: ошибка сокета, после которой пару закрывают `RST`, а не `FIN` (FR-7).
 fn is_reset_kind(error: &io::Error) -> bool {
