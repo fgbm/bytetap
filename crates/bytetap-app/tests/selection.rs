@@ -166,6 +166,20 @@ fn selected(harness: &Harness<'static, BytetapApp>, needle: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Кадры до появления строки: страницы журнала читает фоновый пул, и на медленной
+/// машине они приходят не к третьему кадру.
+fn wait_for_row(harness: &mut Harness<'static, BytetapApp>, needle: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while harness.query_by_label_contains(needle).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "строка «{needle}» не появилась"
+        );
+        harness.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn selection_count(harness: &Harness<'static, BytetapApp>) -> usize {
     harness
         .state()
@@ -340,6 +354,7 @@ fn journal_harness(dir: &std::path::Path, events: usize) -> Harness<'static, Byt
 fn a_journal_selection_waits_for_pages_before_copying() {
     let dir = tempfile::tempdir().expect("временная папка");
     let mut harness = journal_harness(dir.path(), 1200);
+    wait_for_row(&mut harness, "JEV00000");
     // Первая страница уже в памяти: выделяем 900 событий, из них 400 — на втором листе.
     let view = harness.state_mut().viewing_mut().expect("журнал открыт");
     view.selection.select_all(0..900);
@@ -383,6 +398,7 @@ fn a_journal_selection_waits_for_pages_before_copying() {
 fn a_journal_selection_copies_its_rows() {
     let dir = tempfile::tempdir().expect("временная папка");
     let mut harness = journal_harness(dir.path(), 3);
+    wait_for_row(&mut harness, "JEV00000");
     click_row(&mut harness, "JEV00000", Modifiers::NONE);
     click_row(&mut harness, "JEV00002", Modifiers::SHIFT);
     let view = harness.state().viewing().expect("журнал открыт");
