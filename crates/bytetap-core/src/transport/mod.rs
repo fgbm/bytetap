@@ -23,6 +23,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(feature = "test-hooks")]
+use std::sync::Mutex;
+#[cfg(feature = "test-hooks")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -437,6 +439,87 @@ pub enum Source {
         /// Принимать входящие только с этого адреса; `None` — с любого (FR-5, FR-8).
         allow_from: Option<IpAddr>,
     },
+    /// Встать в разрыв COM-кабеля: порт анализатора и порт ЛИС (FR-10).
+    ///
+    /// Пара открытых портов — одно соединение журнала, как пара сокетов у прокси. Сторона
+    /// фиксирована физической ролью порта: первый открытый порт всегда сторона анализатора,
+    /// второй — сторона ЛИС, поэтому топологии, как у прокси, здесь нет (M5, решение М5-В4).
+    ComMonitor {
+        /// Порт, к которому подключён анализатор.
+        analyzer: SerialSettings,
+        /// Порт, к которому подключена ЛИС или преобразователь RS232–Ethernet.
+        lis: SerialSettings,
+        /// Пауза между попытками открыть оба порта после разрыва.
+        retry: Duration,
+    },
+}
+
+/// Сторона прослушки, чей порт отказал (FR-10, M5-AC3).
+///
+/// Ошибка старта несёт сторону, чтобы интерфейс поставил текст под полем COM-A или COM-B,
+/// а не под общим «Старт»: занятый или отсутствующий порт — настройка своего поля.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorSide {
+    /// Порт анализатора.
+    Analyzer,
+    /// Порт ЛИС.
+    Lis,
+}
+
+impl MonitorSide {
+    /// Значение стороны в тексте ошибки.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Analyzer => "analyzer",
+            Self::Lis => "lis",
+        }
+    }
+}
+
+impl std::fmt::Display for MonitorSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Отказ порта прослушки: какой из двух портов не открылся.
+#[derive(Debug)]
+pub struct MonitorPortError {
+    /// Сторона отказавшего порта.
+    pub side: MonitorSide,
+    /// Причина отказа: та же, что вернул `serial::open`.
+    pub error: io::Error,
+}
+
+impl std::fmt::Display for MonitorPortError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Текст отказа порта: он уже называет порт, а сторона уходит отдельным полем
+        // события и в интерфейс — через [`monitor_side`].
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for MonitorPortError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Сторона прослушки, чей порт отказал, если ошибка — отказ порта (M5-AC3).
+///
+/// Интерфейс по ней выбирает поле под ошибку старта, а `Next::Retry` по той же ошибке
+/// остаётся обычной серией отказов источника с кодом `serial_open_failed`.
+#[must_use]
+pub fn monitor_side(err: &io::Error) -> Option<MonitorSide> {
+    err.get_ref()?
+        .downcast_ref::<MonitorPortError>()
+        .map(|error| error.side)
+}
+
+/// Отказ порта прослушки в обёртке [`io::Error`]; вид ошибки — вид отказа порта.
+fn monitor_port_error(side: MonitorSide, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), MonitorPortError { side, error })
 }
 
 /// Готовый источник: соединения и строка для строки состояния.
@@ -525,6 +608,27 @@ impl Source {
                     local,
                 })
             }
+            Self::ComMonitor {
+                analyzer,
+                lis,
+                retry,
+            } => {
+                // Оба порта открываются здесь: занятый или отсутствующий порт — ошибка
+                // старта до создания журнала, как у COM «вместо ЛИС» (M3-AC3, M5-AC3).
+                let pair = open_monitor_ports(analyzer, lis)
+                    .await
+                    .map_err(|(side, error)| monitor_port_error(side, error))?;
+                Ok(OpenedSource {
+                    // Строка состояния называет порт анализатора: он же `peer` в `open`.
+                    local: analyzer.port.clone(),
+                    source: Box::new(MonitorSource {
+                        analyzer: analyzer.clone(),
+                        lis: lis.clone(),
+                        retry: *retry,
+                        pending: Some(pair),
+                    }),
+                })
+            }
         }
     }
 
@@ -536,6 +640,7 @@ impl Source {
             Self::TcpClient { .. } => crate::journal::Mode::TcpClient,
             Self::Serial { .. } => crate::journal::Mode::Serial,
             Self::Proxy { .. } => crate::journal::Mode::Proxy,
+            Self::ComMonitor { .. } => crate::journal::Mode::ComMonitor,
         }
     }
 
@@ -582,8 +687,27 @@ impl Source {
                 }
                 settings
             }
+            Self::ComMonitor { analyzer, lis, .. } => serde_json::json!({
+                "analyzer": port_settings(analyzer),
+                "lis": port_settings(lis),
+            }),
         }
     }
+}
+
+/// Настройки одного порта прослушки для `settings` заголовка (M5-AC6).
+///
+/// Поля те же, что у COM «вместо ЛИС»: по ним интерфейс и инженер видят фактическую
+/// скорость и формат каждой стороны.
+fn port_settings(settings: &SerialSettings) -> serde_json::Value {
+    serde_json::json!({
+        "port": settings.port,
+        "baud": settings.baud,
+        "format": settings.format().to_string(),
+        "flow": settings.flow.as_str(),
+        "dtr": settings.dtr,
+        "rts": settings.rts,
+    })
 }
 
 /// Прокси: принимает сторону и на каждое входящее соединение подключается к цели (FR-5).
@@ -1007,6 +1131,220 @@ impl ConnectionSource for SerialSource {
             }
         })
     }
+}
+
+/// Пара открытых портов прослушки: анализатор и ЛИС (FR-10).
+///
+/// Монопольный доступ — как в режиме «вместо ЛИС»: в физическом разрыве bytetap один держит
+/// оба порта, а программа анализатора и ЛИС должны быть закрыты (M5, ADR 0002).
+pub struct MonitorPair {
+    /// Порт, к которому подключён анализатор: транспорт соединения журнала.
+    analyzer: Box<dyn Transport>,
+    /// Порт, к которому подключена ЛИС: исходящая сторона пары (`link`).
+    lis: Box<dyn Transport>,
+}
+
+/// Открывает оба порта прослушки: сначала анализатора, затем ЛИС.
+///
+/// Отказ несёт сторону: интерфейс ставит ошибку под полем своего порта (M5-AC3). Один и
+/// тот же порт с двух сторон отвергается до открытия: второй `open` вернул бы «занят»,
+/// а причина на самом деле в настройке.
+async fn open_monitor_ports(
+    analyzer: &SerialSettings,
+    lis: &SerialSettings,
+) -> Result<MonitorPair, (MonitorSide, io::Error)> {
+    #[cfg(feature = "test-hooks")]
+    if let Some(pair) = take_virtual_pair() {
+        return pair.map_err(|error| (MonitorSide::Analyzer, error));
+    }
+    analyzer
+        .validate()
+        .map_err(|error| (MonitorSide::Analyzer, error))?;
+    lis.validate().map_err(|error| (MonitorSide::Lis, error))?;
+    if analyzer.port.eq_ignore_ascii_case(&lis.port) {
+        return Err((
+            MonitorSide::Lis,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the monitor needs two different ports: {} is given for both sides",
+                    analyzer.port
+                ),
+            ),
+        ));
+    }
+    let analyzer_port = serial::open_monitor(analyzer)
+        .await
+        .map_err(|error| (MonitorSide::Analyzer, error))?;
+    match serial::open_monitor(lis).await {
+        Ok(lis_port) => Ok(MonitorPair {
+            analyzer: Box::new(analyzer_port),
+            lis: Box::new(lis_port),
+        }),
+        Err(error) => {
+            // Журнала ещё нет, а держать первый порт незачем: соединение выгружается,
+            // и его потоки завершаются сами (ADR 0002).
+            drop(analyzer_port);
+            Err((MonitorSide::Lis, error))
+        }
+    }
+}
+
+/// Прослушка двух COM-портов: пара открытых портов — одно соединение (FR-10, M5-AC2).
+///
+/// Как и COM «вместо ЛИС», источник последовательный: следующая пара открывается только
+/// после закрытия предыдущей и по интервалу переподключения. Пара, открытая стартом,
+/// лежит в `pending`, поэтому первое соединение не открывает порты второй раз, а отмена
+/// `next` ничего не теряет — открытие идёт в самом `next`, без задачи (M5-AC13).
+struct MonitorSource {
+    analyzer: SerialSettings,
+    lis: SerialSettings,
+    retry: Duration,
+    pending: Option<MonitorPair>,
+}
+
+impl MonitorSource {
+    /// Пара как одно соединение журнала: `peer` — порт анализатора, `link` — порт ЛИС.
+    fn connected_connection(&mut self, pair: MonitorPair) -> Next {
+        Next::Connected(Connection {
+            transport: pair.analyzer,
+            peer: self.analyzer.port.clone(),
+            // У порта нет адресов: правило записано в `session-format.md` (M3-AC2).
+            local: String::new(),
+            link: Some(Link {
+                transport: pair.lis,
+                role: LinkRole::Lis,
+                peer: self.lis.port.clone(),
+                local: String::new(),
+                reset: None,
+            }),
+            reset: None,
+        })
+    }
+}
+
+impl ConnectionSource for MonitorSource {
+    fn sequential(&self) -> bool {
+        true
+    }
+
+    fn pause_between_connections(&self) -> Duration {
+        reconnect_pause(self.retry)
+    }
+
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Next> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(pair) = self.pending.take() {
+                return self.connected_connection(pair);
+            }
+            match open_monitor_ports(&self.analyzer, &self.lis).await {
+                Ok(pair) => self.connected_connection(pair),
+                Err((side, error)) => Next::Retry {
+                    error: monitor_port_error(side, error),
+                    after: reconnect_pause(self.retry),
+                    stage: Stage::Open,
+                },
+            }
+        })
+    }
+}
+
+/// Конец виртуального «порта», который держит тест (M5-AC8, M5-AC9).
+///
+/// Это обычный `tokio::io::DuplexStream`: тест читает и пишет в него, как в pty.
+#[cfg(feature = "test-hooks")]
+pub struct VirtualMonitorEnds {
+    /// Конец стороны анализатора.
+    pub analyzer: tokio::io::DuplexStream,
+    /// Конец стороны ЛИС.
+    pub lis: tokio::io::DuplexStream,
+}
+
+/// Сколько байт держит буфер виртуального порта: как у pty, поток ждёт, а не теряет.
+#[cfg(feature = "test-hooks")]
+const VIRTUAL_PORT_BUFFER: usize = 64 * 1024;
+
+/// Виртуальные пары прослушки, ещё не открытые источником.
+#[cfg(feature = "test-hooks")]
+static VIRTUAL_PAIRS: Mutex<Vec<MonitorPair>> = Mutex::new(Vec::new());
+
+/// Хук включён: следующее открытие портов берёт виртуальную пару, а не настоящие порты.
+#[cfg(feature = "test-hooks")]
+static VIRTUAL_ON: AtomicBool = AtomicBool::new(false);
+
+/// Тестовый хук: источник прослушки на виртуальных «портах» вместо настоящих COM.
+///
+/// `windows-latest` виртуальных COM-портов не даёт, поэтому тесты пересылки и сквозной
+/// смоук идут парой в процессе: сессия получает один конец, тест держит другой. `pairs` —
+/// сколько пар готовится: по одной на старт и на каждое переоткрытие.
+///
+/// Хук глобальный для процесса, поэтому тесты, которые им пользуются, идут по очереди.
+///
+/// # Errors
+///
+/// Хук уже занят другим тестом: две сессии не должны делить одну пару портов.
+#[cfg(feature = "test-hooks")]
+pub fn virtual_monitor(
+    analyzer: SerialSettings,
+    lis: SerialSettings,
+    retry: Duration,
+    pairs: usize,
+) -> io::Result<(Source, Vec<VirtualMonitorEnds>)> {
+    let mut slot = VIRTUAL_PAIRS
+        .lock()
+        .map_err(|_| io::Error::other("the virtual monitor hook is poisoned"))?;
+    if VIRTUAL_ON.load(Ordering::Acquire) {
+        return Err(io::Error::other(
+            "the virtual monitor hook is already in use by another test",
+        ));
+    }
+    let mut ends = Vec::with_capacity(pairs);
+    for _ in 0..pairs {
+        let (session_analyzer, test_analyzer) = tokio::io::duplex(VIRTUAL_PORT_BUFFER);
+        let (session_lis, test_lis) = tokio::io::duplex(VIRTUAL_PORT_BUFFER);
+        slot.push(MonitorPair {
+            analyzer: Box::new(session_analyzer),
+            lis: Box::new(session_lis),
+        });
+        ends.push(VirtualMonitorEnds {
+            analyzer: test_analyzer,
+            lis: test_lis,
+        });
+    }
+    VIRTUAL_ON.store(true, Ordering::Release);
+    let source = Source::ComMonitor {
+        analyzer,
+        lis,
+        retry,
+    };
+    Ok((source, ends))
+}
+
+/// Тестовый хук: снимает виртуальные пары при выходе из теста.
+#[cfg(feature = "test-hooks")]
+pub fn reset_virtual_monitor() {
+    VIRTUAL_ON.store(false, Ordering::Release);
+    if let Ok(mut slot) = VIRTUAL_PAIRS.lock() {
+        slot.clear();
+    }
+}
+
+/// Следующая виртуальная пара, если хук включён (M5-AC9).
+///
+/// `None` — хук не включён, открываются настоящие порты. Хук включён, а пар больше нет:
+/// ошибка вместо попытки открыть несуществующий COM — так тест видит нехватку пар сразу.
+#[cfg(feature = "test-hooks")]
+fn take_virtual_pair() -> Option<io::Result<MonitorPair>> {
+    if !VIRTUAL_ON.load(Ordering::Acquire) {
+        return None;
+    }
+    let pair = VIRTUAL_PAIRS
+        .lock()
+        .ok()
+        .and_then(|mut slot| (!slot.is_empty()).then(|| slot.remove(0)));
+    Some(pair.ok_or_else(|| {
+        io::Error::other("the virtual monitor hook has no pair left: the test prepared too few")
+    }))
 }
 
 #[cfg(test)]

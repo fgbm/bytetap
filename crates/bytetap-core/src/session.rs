@@ -261,6 +261,34 @@ impl SessionConfig {
         }
     }
 
+    /// Сессия прослушки двух COM-портов (FR-10).
+    ///
+    /// `analyzer` — порт стороны анализатора, `lis` — порт стороны ЛИС; `retry` — пауза
+    /// между попытками открыть оба порта после разрыва.
+    ///
+    /// Автоответчика здесь нет и быть не может: байты идут без изменений, ответы приходят
+    /// от ЛИС (FR-10, M5-AC4). Поэтому профиль — [`Autoresponder::None`], и
+    /// [`SessionConfig::with_responder`] на прослушку не действует.
+    #[must_use]
+    pub fn com_monitor(
+        analyzer: crate::transport::serial::SerialSettings,
+        lis: crate::transport::serial::SerialSettings,
+        retry: Duration,
+    ) -> Self {
+        Self {
+            source: Source::ComMonitor {
+                analyzer,
+                lis,
+                retry,
+            },
+            responder: Autoresponder::None,
+            astm_nak_on_bad_checksum: false,
+            log_dir: None,
+            analyzer: None,
+            note: None,
+        }
+    }
+
     /// Источник соединений вместо адреса прослушивания.
     #[must_use]
     pub fn with_source(mut self, source: Source) -> Self {
@@ -299,10 +327,13 @@ impl SessionConfig {
 
     /// Профиль автоответчика в виде, из которого строится автомат соединения (FR-14).
     ///
-    /// В прокси автоответчика нет всегда, какой бы профиль ни был задан настройками
-    /// (FR-6): второй автомат отвечал бы прибору вместо ЛИС.
+    /// В прокси и в прослушке автоответчика нет всегда, какой бы профиль ни был задан
+    /// настройками (FR-6, FR-10): второй автомат отвечал бы прибору вместо ЛИС.
     fn responder_kind(&self) -> ResponderKind {
-        if matches!(self.source, Source::Proxy { .. }) {
+        if matches!(
+            self.source,
+            Source::Proxy { .. } | Source::ComMonitor { .. }
+        ) {
             return ResponderKind::None;
         }
         match self.responder {
@@ -317,10 +348,14 @@ impl SessionConfig {
 
     /// Профиль автоответчика для заголовка журнала.
     ///
-    /// У прокси он всегда `none`: поле заголовка должно совпадать с тем, что делает сессия.
+    /// У прокси и прослушки он всегда `none`: поле заголовка должно совпадать с тем,
+    /// что делает сессия.
     #[must_use]
     pub const fn header_responder(&self) -> Autoresponder {
-        if matches!(self.source, Source::Proxy { .. }) {
+        if matches!(
+            self.source,
+            Source::Proxy { .. } | Source::ComMonitor { .. }
+        ) {
             return Autoresponder::None;
         }
         self.responder
@@ -1042,12 +1077,12 @@ fn source_failure(mode: Mode, stage: Stage) -> (&'static str, &'static str) {
     }
 }
 
-/// Что обмен получает после отказа журнала: у прокси автоответчика нет.
+/// Что обмен получает после отказа журнала: у прокси и прослушки автоответчика нет.
 ///
 /// Текст события — английский, для журнала и поиска (`session-format.md`); русский
 /// остаётся интерфейсу.
 fn after_failure(mode: Mode) -> &'static str {
-    if mode == Mode::Proxy {
+    if matches!(mode, Mode::Proxy | Mode::ComMonitor) {
         "; no bytes are forwarded after the failure"
     } else {
         "; no ACKs are sent after the failure"
@@ -1185,7 +1220,7 @@ async fn run(
                     tasks.spawn(async move {
                         match link {
                             Some(link) => {
-                                serve_proxy(
+                                serve_pair(
                                     transport,
                                     reset,
                                     link,
@@ -1193,6 +1228,7 @@ async fn run(
                                     shared,
                                     &mut conn_stop,
                                     &mut conn_failure,
+                                    close_policy(mode),
                                 )
                                 .await;
                             }
@@ -1457,23 +1493,49 @@ enum Pump {
     Stopped,
 }
 
-/// Обслуживает пару прокси до закрытия (FR-5, FR-6, FR-7, M4-AC16).
+/// Как закрывается пара: когда прекращать пересылку второй стороны (FR-7, M5-AC2).
+///
+/// У TCP-сокета есть полузакрытие: `FIN` одной стороны не значит, что обмен кончился,
+/// и обратное направление доживает до своего `FIN` ([`ClosePolicy::Linger`]). У COM-порта
+/// полузакрытия нет — есть только «байт нет» и «порт пропал», поэтому первая же ошибка
+/// чтения или записи закрывает оба порта ([`ClosePolicy::Together`], M5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosePolicy {
+    /// Дожитие обратного направления, но не дольше срока (прокси, FR-7).
+    Linger(Duration),
+    /// Обе стороны закрываются сразу, по первой ошибке или концу данных (прослушка).
+    Together,
+}
+
+/// Политика закрытия пары по режиму сессии: прокси доживает, прослушка закрывает обе.
+fn close_policy(mode: Mode) -> ClosePolicy {
+    if mode == Mode::ComMonitor {
+        ClosePolicy::Together
+    } else {
+        ClosePolicy::Linger(PROXY_LINGER)
+    }
+}
+
+/// Обслуживает пару до закрытия: прокси (FR-5, FR-6, FR-7) и прослушку (FR-10).
 ///
 /// Пара — одно соединение журнала с одним `conn`: `open` уже написан сессией. Внутри два
 /// насоса, по одному на направление: каждый читает в свой буфер [`READ_BUFFER`], собирает
-/// событие `data` по времени чтения, пишет прочитанное в другой сокет и потом кладёт
+/// событие `data` по времени чтения, пишет прочитанное в другой транспорт и потом кладёт
 /// событие в журнал — с фактически переданными байтами. Журнал в пути пересылки не стоит:
 /// `record` только кладёт событие в канал писателя (NFR-6, FR-20).
 ///
-/// Закрытие по FR-7: первая закончившаяся сторона задаёт `by` и `reason` одного `close`.
-/// `FIN` пересылается полузакрытием, и обратное направление доживает до своего `FIN`, но
-/// не дольше [`PROXY_LINGER`]; истёк срок — пара закрывается как `bytetap/timeout`.
-/// Сброс закрывает обе стороны сразу, «Стоп» и отказ журнала — тоже.
+/// Закрытие задаёт [`ClosePolicy`]: у прокси первая закончившаяся сторона определяет `by`
+/// и `reason` одного `close`, `FIN` пересылается полузакрытием, обратное направление
+/// доживает до своего `FIN` не дольше [`PROXY_LINGER`], а истёк срок — пара закрывается
+/// как `bytetap/timeout` (FR-7). У прослушки полузакрытия нет: первая ошибка или конец
+/// данных закрывает обе стороны сразу, `close` тоже один (M5-AC2). Сброс закрывает обе
+/// стороны сразу и в прокси, «Стоп» и отказ журнала — тоже.
 ///
 /// Второй насос останавливается сигналом, а не `abort`: прерванная запись теряла бы
 /// отправленные байты, а они уже дошли до адресата. Насос после сигнала дописывает
 /// отправленное в журнал и возвращается сам.
-async fn serve_proxy(
+#[allow(clippy::too_many_arguments)]
+async fn serve_pair(
     accepted: Box<dyn Transport>,
     accepted_reset: Option<ResetSocket>,
     link: Link,
@@ -1481,6 +1543,7 @@ async fn serve_proxy(
     shared: Arc<Shared>,
     stop: &mut watch::Receiver<bool>,
     failure: &mut watch::Receiver<Option<JournalFailureReason>>,
+    policy: ClosePolicy,
 ) {
     // Принятая сторона — противоположная роли дальнего конца пары (FR-5).
     let accepted_role = link.role.opposite();
@@ -1525,6 +1588,12 @@ async fn serve_proxy(
         Some(Ok(outcome)) => pair_end(&shared, conn, &outcome),
         // Насосов не осталось или задача упала: пары больше нет.
         None | Some(Err(_)) => (ClosedBy::Bytetap, "error", Duration::ZERO),
+    };
+    // Прослушка не доживает обратное направление: у порта нет `FIN`, и закрытая пара —
+    // это закрытые оба порта (M5-AC2).
+    let linger = match policy {
+        ClosePolicy::Together => Duration::ZERO,
+        ClosePolicy::Linger(_) => linger,
     };
     // Первая закончившаяся сторона решает, как закрывается пара; сброс второй стороны
     // во время дожития решается отдельно — `close` от него не меняется (FR-7).
@@ -1580,8 +1649,8 @@ async fn serve_proxy(
 
 /// Итог насоса: кто закрыл пару, с какой причиной и сколько доживает обратное направление.
 ///
-/// Ошибку сокета функция пишет в журнал: она относится к паре, а не к решению о закрытии,
-/// поэтому `close` от этого не меняется (FR-7).
+/// Ошибку транспорта функция пишет в журнал: она относится к паре, а не к решению о закрытии,
+/// поэтому `close` от этого не меняется (FR-7, M5-AC2).
 fn pair_end(shared: &Shared, conn: u32, outcome: &Pump) -> (ClosedBy, &'static str, Duration) {
     match outcome {
         Pump::Eof(role) => (role.closed_by(), "eof", PROXY_LINGER),
@@ -1590,11 +1659,26 @@ fn pair_end(shared: &Shared, conn: u32, outcome: &Pump) -> (ClosedBy, &'static s
             error,
             writing,
         } => {
-            let (by, reason) = proxy_broken(*role, error, *writing);
+            let (by, reason) = pair_failure(shared.mode, *role, error, *writing);
+            let monitor = shared.mode == Mode::ComMonitor;
             let (code, what) = if *writing {
-                ("connection_write_failed", "proxy write failed")
+                (
+                    "connection_write_failed",
+                    if monitor {
+                        "monitor write failed"
+                    } else {
+                        "proxy write failed"
+                    },
+                )
             } else {
-                ("connection_read_failed", "proxy read failed")
+                (
+                    "connection_read_failed",
+                    if monitor {
+                        "monitor read failed"
+                    } else {
+                        "proxy read failed"
+                    },
+                )
             };
             shared.error_with_code(
                 Some(conn),
@@ -1740,10 +1824,26 @@ fn is_reset_outcome(outcome: &Pump) -> bool {
     matches!(outcome, Pump::Broken { error, .. } if is_reset_kind(error))
 }
 
-/// Кто закрыл пару по ошибке сокета и почему.
+/// Кто закрыл пару по ошибке транспорта и почему.
 ///
-/// Ошибка чтения — сторону сбросила та сторона, из которой читали; ошибка записи — та,
-/// в которую писали, то есть противоположная. Всё остальное bytetap считает своей ошибкой.
+/// У прокси ошибка чтения — сторону сбросила та сторона, из которой читали; ошибка записи —
+/// та, в которую писали, то есть противоположная. Всё остальное bytetap считает своей
+/// ошибкой. У прослушки сброса нет: ошибка — это пропавший порт, и `close` называет его
+/// сторону, потому что её адаптер и отключили (M5-AC2).
+fn pair_failure(
+    mode: Mode,
+    role: LinkRole,
+    error: &io::Error,
+    writing: bool,
+) -> (ClosedBy, &'static str) {
+    if mode == Mode::ComMonitor {
+        let failed = if writing { role.opposite() } else { role };
+        return (failed.closed_by(), "error");
+    }
+    proxy_broken(role, error, writing)
+}
+
+/// Кто закрыл пару прокси по ошибке сокета и почему (FR-7).
 fn proxy_broken(role: LinkRole, error: &io::Error, writing: bool) -> (ClosedBy, &'static str) {
     if is_reset_kind(error) {
         let closer = if writing { role.opposite() } else { role };

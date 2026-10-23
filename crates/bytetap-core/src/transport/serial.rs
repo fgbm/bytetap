@@ -16,6 +16,10 @@
 //! Чётности `mark`/`space` в `serialport` нет: после открытия они выставляются напрямую —
 //! `CMSPAR` в termios на Linux и `MARKPARITY`/`SPACEPARITY` в DCB на Windows. На pty
 //! управляющих линий нет, поэтому `ENOTTY` от DTR/RTS не считается ошибкой (M3-AC11).
+//!
+//! Прослушка (FR-10) открывает порт тем же соединением, но короче ждёт чтения
+//! ([`MONITOR_READ_POLL`]): на синхронном handle Windows запись одного устройства ждёт
+//! чтение того же дескриптора, а в разрыве эта задержка — задержка чужого обмена (M5-AC5).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -43,6 +47,15 @@ pub const MAX_BAUD: u32 = 4_000_000;
 /// Меньше — чаще просыпается и быстрее останавливается, больше — меньше нагрузки.
 /// Пятьдесят миллисекунд незаметны для протокола и не мешают переоткрыть порт.
 const READ_POLL: Duration = Duration::from_millis(50);
+
+/// Сколько ждёт поток порта одного чтения в прослушке (NFR-6, M5-AC5).
+///
+/// Windows на синхронном handle выполняет `ReadFile` и `WriteFile` одного устройства
+/// по очереди, поэтому запись в порт ждёт текущее чтение — до таймаута чтения. Пятьдесят
+/// миллисекунд, допустимых в режиме «вместо ЛИС» (ADR 0002), в разрыве задерживали бы
+/// чужой обмен; две миллисекунды держат добавку в бюджете NFR-6 и стоят пятисот
+/// пробуждений в секунду на порт. Разбор выбора — в дополнении к ADR 0002.
+pub const MONITOR_READ_POLL: Duration = Duration::from_millis(2);
 
 /// Сколько фрагментов держит очередь от порта к сессии.
 ///
@@ -519,24 +532,41 @@ const READ_BUFFER: usize = 4096;
 /// Настройки неверны, порт не найден, занят или операционная система отказала
 /// в настройке. Файл журнала к этому моменту ещё не создан (M3-AC3).
 pub async fn open(settings: &SerialSettings) -> io::Result<SerialConnection> {
+    open_with(settings, READ_POLL).await
+}
+
+/// Открывает порт для прослушки: то же соединение, но чтение просыпается чаще.
+///
+/// Отдельная функция, а не настройка режима: таймаут чтения — плата за синхронный handle
+/// Windows, и в разрыве она стоит дешевле, чем в режиме «вместо ЛИС» (M5-AC5, ADR 0002).
+///
+/// # Errors
+///
+/// Те же, что у [`open`].
+pub async fn open_monitor(settings: &SerialSettings) -> io::Result<SerialConnection> {
+    open_with(settings, MONITOR_READ_POLL).await
+}
+
+/// Открывает порт с заданным таймаутом чтения.
+async fn open_with(settings: &SerialSettings, read_poll: Duration) -> io::Result<SerialConnection> {
     settings.validate()?;
     // Прежнее соединение могло ещё не отпустить дескриптор: ждём его асинхронно, чтобы
     // переоткрытие не получило «порт занят» от собственного прошлого открытия.
     wait_for_close(&settings.port).await;
     let settings = settings.clone();
-    tokio::task::spawn_blocking(move || open_blocking(&settings))
+    tokio::task::spawn_blocking(move || open_blocking(&settings, read_poll))
         .await
         .map_err(|err| io::Error::other(format!("the port open thread failed: {err}")))?
 }
 
-fn open_blocking(settings: &SerialSettings) -> io::Result<SerialConnection> {
+fn open_blocking(settings: &SerialSettings, read_poll: Duration) -> io::Result<SerialConnection> {
     let mut port = serialport::new(settings.port.clone(), settings.baud)
         .data_bits(settings.format.data_bits_sp())
         // mark/space в `serialport` нет: выставим их после открытия (FR-11).
         .parity(serialport_parity(settings.format.parity))
         .stop_bits(settings.format.stop_bits_sp())
         .flow_control(settings.flow.serialport())
-        .timeout(READ_POLL)
+        .timeout(read_poll)
         .dtr_on_open(settings.dtr)
         .open_native()
         .map_err(|err| port_error(&settings.port, &err))?;
