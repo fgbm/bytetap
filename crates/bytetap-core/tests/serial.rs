@@ -17,6 +17,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use bytetap_core::journal::{Autoresponder, ClosedBy, Dir, Event, Mode, read_all};
 use bytetap_core::session::{Session, SessionConfig};
+use bytetap_core::transport::port_open_error;
 use bytetap_core::transport::serial::{SerialFormat, SerialSettings};
 
 /// Пара pty от `socat`; дочерний процесс живёт, пока живёт значение.
@@ -152,6 +153,10 @@ async fn a_missing_port_is_a_start_error_before_the_journal() {
     .await
     .expect_err("порта нет");
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    // Отказ порта помечен ядром: интерфейс отличает его от отказа журнала и папки,
+    // а стороны у одиночного порта нет (M3-AC3).
+    let port = port_open_error(&err).expect("отказ порта помечен");
+    assert_eq!(port.side, None, "у одиночного порта стороны нет");
     assert_eq!(
         std::fs::read_dir(dir.path()).expect("папка").count(),
         0,
@@ -169,6 +174,11 @@ async fn broken_port_settings_are_rejected_before_the_journal() {
     .await
     .expect_err("скорость вне диапазона");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    // Настройки порта — тоже про порт, а не про журнал: поле под ошибку другое (FR-11).
+    assert!(
+        port_open_error(&err).is_some(),
+        "отказ настроек порта помечен"
+    );
     assert_eq!(
         std::fs::read_dir(dir.path()).expect("папка").count(),
         0,

@@ -508,16 +508,20 @@ impl std::fmt::Display for MonitorSide {
     }
 }
 
-/// Отказ порта прослушки: какой из двух портов не открылся.
+/// Отказ порта: какой порт не открылся и с какой стороны линии.
+///
+/// Обёртка нужна интерфейсу, чтобы отличить отказ порта от отказа журнала или папки:
+/// причина у них одна и та же (`io::Error`), а поле под ошибку старта — разное (FR-11,
+/// M3-AC3, M5-AC3). Сторона есть только у пары прослушки; у одиночного порта её нет.
 #[derive(Debug)]
-pub struct MonitorPortError {
-    /// Сторона отказавшего порта.
-    pub side: MonitorSide,
+pub struct PortOpenError {
+    /// Сторона отказавшего порта пары; у одиночного порта — `None`.
+    pub side: Option<MonitorSide>,
     /// Причина отказа: та же, что вернул `serial::open`.
     pub error: io::Error,
 }
 
-impl std::fmt::Display for MonitorPortError {
+impl std::fmt::Display for PortOpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Текст отказа порта: он уже называет порт, а сторона уходит отдельным полем
         // события и в интерфейс — через [`monitor_side`].
@@ -525,26 +529,33 @@ impl std::fmt::Display for MonitorPortError {
     }
 }
 
-impl std::error::Error for MonitorPortError {
+impl std::error::Error for PortOpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
 }
 
-/// Сторона прослушки, чей порт отказал, если ошибка — отказ порта (M5-AC3).
+/// Отказ порта, если ошибка о нём ([`PortOpenError`], FR-11, M5-AC3).
+///
+/// Всё, что порт не открыло (нет порта, занят, нет прав, неверные настройки), ядро
+/// помечает этой обёрткой, поэтому непомеченная ошибка старта — про журнал и папку.
+#[must_use]
+pub fn port_open_error(err: &io::Error) -> Option<&PortOpenError> {
+    err.get_ref()?.downcast_ref::<PortOpenError>()
+}
+
+/// Сторона прослушки, чей порт отказал, если ошибка — отказ порта пары (M5-AC3).
 ///
 /// Интерфейс по ней выбирает поле под ошибку старта, а `Next::Retry` по той же ошибке
 /// остаётся обычной серией отказов источника с кодом `serial_open_failed`.
 #[must_use]
 pub fn monitor_side(err: &io::Error) -> Option<MonitorSide> {
-    err.get_ref()?
-        .downcast_ref::<MonitorPortError>()
-        .map(|error| error.side)
+    port_open_error(err)?.side
 }
 
-/// Отказ порта прослушки в обёртке [`io::Error`]; вид ошибки — вид отказа порта.
-fn monitor_port_error(side: MonitorSide, error: io::Error) -> io::Error {
-    io::Error::new(error.kind(), MonitorPortError { side, error })
+/// Отказ порта в обёртке [`io::Error`]; вид ошибки — вид отказа порта.
+fn port_error(side: Option<MonitorSide>, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), PortOpenError { side, error })
 }
 
 /// Один и тот же порт указан с обеих сторон прослушки (M5-AC3).
@@ -581,13 +592,13 @@ fn monitor_same_port_error(port: &str) -> io::Error {
 
 /// `true`, если ошибка — «один и тот же порт с двух сторон» (M5-AC3).
 ///
-/// Ошибка приходит в обёртке [`MonitorPortError`] со стороной порта, поэтому причина
+/// Ошибка приходит в обёртке [`PortOpenError`] со стороной порта, поэтому причина
 /// ищется на обоих уровнях: снаружи — сторона, внутри — сама настройка.
 #[must_use]
 pub fn is_monitor_same_port(err: &io::Error) -> bool {
     let outer = err.get_ref();
     let inner = outer
-        .and_then(|inner| inner.downcast_ref::<MonitorPortError>())
+        .and_then(|inner| inner.downcast_ref::<PortOpenError>())
         .map_or_else(|| outer, |port| port.error.get_ref());
     inner.is_some_and(|inner| inner.is::<MonitorSamePort>())
 }
@@ -637,8 +648,14 @@ impl Source {
                 settings,
                 reconnect,
             } => {
-                settings.validate()?;
-                let connection = serial::open(settings).await?;
+                // Отказ порта помечается, как у прослушки: непомеченная ошибка старта —
+                // журнал или папка, и поле под неё другое (FR-11, M3-AC3).
+                settings
+                    .validate()
+                    .map_err(|error| port_error(None, error))?;
+                let connection = serial::open(settings)
+                    .await
+                    .map_err(|error| port_error(None, error))?;
                 Ok(OpenedSource {
                     source: Box::new(SerialSource {
                         settings: settings.clone(),
@@ -693,7 +710,7 @@ impl Source {
                 // старта до создания журнала, как у COM «вместо ЛИС» (M3-AC3, M5-AC3).
                 let pair = open_monitor_ports(analyzer, lis, OpenOrder::new().order())
                     .await
-                    .map_err(|(side, error)| monitor_port_error(side, error))?;
+                    .map_err(|(side, error)| port_error(Some(side), error))?;
                 // Разрешение таймера живёт столько же, сколько источник, то есть всю
                 // сессию прослушки (M5-AC5).
                 #[cfg(windows)]
@@ -1462,7 +1479,7 @@ impl ConnectionSource for MonitorSource {
                 Some(Ok(Err((side, error)))) => {
                     self.order.failed(side);
                     Next::Retry {
-                        error: monitor_port_error(side, error),
+                        error: port_error(Some(side), error),
                         after,
                         stage: Stage::Open,
                     }

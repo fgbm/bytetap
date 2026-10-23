@@ -23,6 +23,7 @@ use bytetap_core::session::{
 use bytetap_core::transport::serial::SerialSettings;
 use bytetap_core::transport::{
     MonitorSide, Source, is_monitor_same_port, is_proxy_target_is_self, monitor_side,
+    port_open_error,
 };
 use eframe::egui;
 use tokio::sync::{broadcast, watch};
@@ -473,21 +474,24 @@ pub fn start_error(err: &io::Error, source: &Source) -> StartError {
             }
         }
         Source::TcpClient { .. } => StartError::new(ErrorCode::Io, err.to_string()),
-        Source::Serial { settings, .. } => serial_error(err, settings, port_listed),
+        // COM «вместо ЛИС»: порт помечен ядром, поэтому непомеченная ошибка — про журнал
+        // и папку, как у TCP-сервера, а не про порт (M3-AC3).
+        Source::Serial { settings, .. } => {
+            if port_open_error(err).is_some() {
+                serial_error(err, settings, port_listed)
+            } else {
+                journal_error(err)
+            }
+        }
         // Прослушка: ошибка старта несёт сторону отказавшего порта, поэтому текст и поле
         // берутся у того порта, который не открылся (M5-AC3). Один и тот же порт с двух
         // сторон — своя настройка, а не «порт занят» от собственного второго открытия.
         Source::ComMonitor { analyzer, lis, .. } => {
             let Some(side) = monitor_side(err) else {
                 // Стороны нет — ошибка не про порт: ядро оборачивает отказы портов
-                // `MonitorPortError`, а журнал и папка приходят как есть. Тогда это отказ
+                // `PortOpenError`, а журнал и папка приходят как есть. Тогда это отказ
                 // записи, как у TCP-сервера, а не настройка порта.
-                return match ErrorCode::from_io_kind(err.kind()) {
-                    ErrorCode::PermissionDenied => {
-                        StartError::new(ErrorCode::LogDir, err.to_string())
-                    }
-                    _ => StartError::new(ErrorCode::Journal, err.to_string()),
-                };
+                return journal_error(err);
             };
             let settings = match side {
                 MonitorSide::Lis => lis,
@@ -501,6 +505,17 @@ pub fn start_error(err: &io::Error, source: &Source) -> StartError {
             // Сторона в ошибке: интерфейс ставит текст под полем этого порта (M5-AC3).
             serial_error(err, settings, port_listed).with_param("side", side.as_str())
         }
+    }
+}
+
+/// Ошибка старта не про порт: папка журналов и сам журнал.
+///
+/// Ядро помечает отказы портов (`port_open_error`), поэтому непомеченная ошибка — про
+/// запись: нет прав на папку (`log_dir`) или журнал не создан.
+fn journal_error(err: &io::Error) -> StartError {
+    match ErrorCode::from_io_kind(err.kind()) {
+        ErrorCode::PermissionDenied => StartError::new(ErrorCode::LogDir, err.to_string()),
+        _ => StartError::new(ErrorCode::Journal, err.to_string()),
     }
 }
 
@@ -1300,11 +1315,45 @@ mod tests {
         assert_eq!(other.params.get("port").map(String::as_str), Some("COM5"));
     }
 
+    /// COM «вместо ЛИС»: отказ порта помечен ядром и встаёт под полем порта, а отказ
+    /// журнала или папки без метки — под «Папку журналов» и «Старт» (M3-AC3).
+    #[test]
+    fn a_serial_start_error_without_a_port_mark_is_about_the_journal() {
+        use bytetap_core::transport::{PortOpenError, port_open_error};
+
+        let settings = SerialSettings::new("COM5", 9600, SerialFormat::EIGHT_N_ONE);
+        let serial = Source::Serial {
+            settings,
+            reconnect: Duration::from_secs(5),
+        };
+
+        // Отказ порта: ядро пометило его, поле — порт.
+        let port = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            PortOpenError {
+                side: None,
+                error: io::Error::from(io::ErrorKind::PermissionDenied),
+            },
+        );
+        assert!(port_open_error(&port).is_some(), "метка читается");
+        let error = start_error(&port, &serial);
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
+        assert_eq!(error.field(SessionMode::Serial), ErrorField::Serial);
+
+        // Папка только для чтения и полный диск: это не порт, хотя вид ошибки тот же.
+        let denied = start_error(&io::Error::from(io::ErrorKind::PermissionDenied), &serial);
+        assert_eq!(denied.code, ErrorCode::LogDir);
+        assert_eq!(denied.field(SessionMode::Serial), ErrorField::LogDir);
+        let full = start_error(&io::Error::other("no space left on device"), &serial);
+        assert_eq!(full.code, ErrorCode::Journal);
+        assert_eq!(full.field(SessionMode::Serial), ErrorField::Start);
+    }
+
     /// Прослушка: отказ порта приходит со стороной и встаёт под полем своего порта, а
     /// ошибка без стороны — это журнал или папка, как у TCP-сервера (M5-AC3).
     #[test]
     fn a_monitor_start_error_without_a_side_is_about_the_journal() {
-        use bytetap_core::transport::{MonitorPortError, MonitorSide};
+        use bytetap_core::transport::{MonitorSide, PortOpenError};
 
         let analyzer = SerialSettings::new("COM3", 9600, SerialFormat::EIGHT_N_ONE);
         let lis = SerialSettings::new("COM4", 9600, SerialFormat::EIGHT_N_ONE);
@@ -1317,8 +1366,8 @@ mod tests {
         // Отказ порта ЛИС: сторона в ошибке, поле — второго порта.
         let port = io::Error::new(
             io::ErrorKind::PermissionDenied,
-            MonitorPortError {
-                side: MonitorSide::Lis,
+            PortOpenError {
+                side: Some(MonitorSide::Lis),
                 error: io::Error::from(io::ErrorKind::PermissionDenied),
             },
         );
