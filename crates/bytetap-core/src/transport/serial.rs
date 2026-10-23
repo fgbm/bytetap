@@ -50,12 +50,23 @@ const READ_POLL: Duration = Duration::from_millis(50);
 
 /// Сколько ждёт поток порта одного чтения в прослушке (NFR-6, M5-AC5).
 ///
-/// Windows на синхронном handle выполняет `ReadFile` и `WriteFile` одного устройства
-/// по очереди, поэтому запись в порт ждёт текущее чтение — до таймаута чтения. Пятьдесят
-/// миллисекунд, допустимых в режиме «вместо ЛИС» (ADR 0002), в разрыве задерживали бы
-/// чужой обмен; две миллисекунды держат добавку в бюджете NFR-6 и стоят пятисот
-/// пробуждений в секунду на порт. Разбор выбора — в дополнении к ADR 0002.
+/// Только Windows: там порт открыт синхронным handle, и `ReadFile`/`WriteFile` одного
+/// устройства драйвер выполняет по очереди, поэтому запись в порт ждёт текущее чтение —
+/// до таймаута чтения. Пятьдесят миллисекунд, допустимых в режиме «вместо ЛИС» (ADR 0002),
+/// в разрыве задерживали бы чужой обмен. Две миллисекунды — минимальный таймаут, который
+/// имеет смысл просить: драйвер отсчитывает его по системному тику (обычно 15,6 мс), и
+/// точная граница появляется только при поднятом разрешении таймера
+/// ([`crate::transport::TimerResolution`]). Справедливость самой блокировки на синхронном
+/// handle не гарантирована — это риск, записанный в дополнении к ADR 0002.
+///
+/// На Unix чтение и запись терминала независимы, ждать чтение незачем: там порт читается
+/// с обычным [`READ_POLL`].
+#[cfg(windows)]
 pub const MONITOR_READ_POLL: Duration = Duration::from_millis(2);
+
+/// Порт прослушки на Unix: то же чтение, что у режима «вместо ЛИС».
+#[cfg(not(windows))]
+pub const MONITOR_READ_POLL: Duration = READ_POLL;
 
 /// Сколько фрагментов держит очередь от порта к сессии.
 ///
@@ -65,10 +76,23 @@ const READ_QUEUE: usize = 64;
 
 /// Сколько ждёт одна запись в порт, прежде чем ответ считается неотправленным (FR-9).
 ///
-/// Драйвер может не принять байты сразу — `Ok(0)` или таймаут порта не значат потерю:
-/// запись повторяется, пока не примут или не выйдет этот срок. Дольше ждать незачем:
-/// анализатор к тому времени уже не дождётся `ACK`, и честнее закрыть соединение.
+/// Драйвер может не принять байты сразу — `Ok(0)` не значит потерю: запись повторяется,
+/// пока не примут или не выйдет этот срок. Дольше ждать незачем: анализатор к тому времени
+/// уже не дождётся `ACK`, и честнее закрыть соединение.
+///
+/// Срок относится к ответу автоответчика. У прослушки на пути данных искусственных сроков
+/// нет, как у прокси: фрагмент анализатора может быть длиннее, чем линия успеет отдать за
+/// две секунды, и обрывать пару из-за медленной линии нельзя. Выход из цикла записи там —
+/// ошибка порта или «Стоп».
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Окно одной записи в порт прослушки на Windows (`WriteTotalTimeoutConstant`, M5).
+///
+/// Пятьдесят миллисекунд — то же окно, что в режиме «вместо ЛИС». `WriteFile` возвращает
+/// фактически принятое число байт, поэтому окно не ограничивает длину фрагмента: цикл
+/// записи дописывает остаток следующего окна, а «Стоп» проверяется между окнами.
+#[cfg(windows)]
+const WRITE_WINDOW: Duration = Duration::from_millis(50);
 
 /// Пауза перед повтором записи, которую порт не принял: цикл не крутится вхолостую.
 const WRITE_PAUSE: Duration = Duration::from_millis(5);
@@ -532,34 +556,45 @@ const READ_BUFFER: usize = 4096;
 /// Настройки неверны, порт не найден, занят или операционная система отказала
 /// в настройке. Файл журнала к этому моменту ещё не создан (M3-AC3).
 pub async fn open(settings: &SerialSettings) -> io::Result<SerialConnection> {
-    open_with(settings, READ_POLL).await
+    open_with(settings, READ_POLL, false).await
 }
 
-/// Открывает порт для прослушки: то же соединение, но чтение просыпается чаще.
+/// Открывает порт для прослушки: то же соединение, но с таймаутами разрыва.
 ///
-/// Отдельная функция, а не настройка режима: таймаут чтения — плата за синхронный handle
-/// Windows, и в разрыве она стоит дешевле, чем в режиме «вместо ЛИС» (M5-AC5, ADR 0002).
+/// На Windows это короткий таймаут чтения и своё окно записи (`COMMTIMEOUTS`, M5): в разрыве
+/// задержка чтения — задержка чужого обмена, а срок на путь данных там не нужен. На Unix
+/// таймаут чтения прежний, а запись терминала и так не ждёт чтения.
 ///
 /// # Errors
 ///
 /// Те же, что у [`open`].
 pub async fn open_monitor(settings: &SerialSettings) -> io::Result<SerialConnection> {
-    open_with(settings, MONITOR_READ_POLL).await
+    open_with(settings, MONITOR_READ_POLL, true).await
 }
 
 /// Открывает порт с заданным таймаутом чтения.
-async fn open_with(settings: &SerialSettings, read_poll: Duration) -> io::Result<SerialConnection> {
+///
+/// `monitor` — порт прослушки: у него нет срока на путь данных и свои таймауты Windows.
+async fn open_with(
+    settings: &SerialSettings,
+    read_poll: Duration,
+    monitor: bool,
+) -> io::Result<SerialConnection> {
     settings.validate()?;
     // Прежнее соединение могло ещё не отпустить дескриптор: ждём его асинхронно, чтобы
     // переоткрытие не получило «порт занят» от собственного прошлого открытия.
     wait_for_close(&settings.port).await;
     let settings = settings.clone();
-    tokio::task::spawn_blocking(move || open_blocking(&settings, read_poll))
+    tokio::task::spawn_blocking(move || open_blocking(&settings, read_poll, monitor))
         .await
         .map_err(|err| io::Error::other(format!("the port open thread failed: {err}")))?
 }
 
-fn open_blocking(settings: &SerialSettings, read_poll: Duration) -> io::Result<SerialConnection> {
+fn open_blocking(
+    settings: &SerialSettings,
+    read_poll: Duration,
+    monitor: bool,
+) -> io::Result<SerialConnection> {
     let mut port = serialport::new(settings.port.clone(), settings.baud)
         .data_bits(settings.format.data_bits_sp())
         // mark/space в `serialport` нет: выставим их после открытия (FR-11).
@@ -575,10 +610,123 @@ fn open_blocking(settings: &SerialSettings, read_poll: Duration) -> io::Result<S
 
     // Писатель получает свой дескриптор: блокирующее чтение с таймаутом не задерживает
     // ответ, а ответ не задерживает чтение (ADR 0002).
-    let writer = port
-        .try_clone()
-        .map_err(|err| port_error(&settings.port, &err))?;
-    start_threads(Box::new(port), writer, &settings.port)
+    //
+    // Windows: прослушка ставит свои таймауты (чтение короткое, запись — окном), а оба
+    // handle перестают наследоваться дочерними процессами — иначе копию держал бы,
+    // например, `explorer`, открытый из интерфейса, и порт не переоткрылся бы (M5).
+    #[cfg(windows)]
+    let writer: Box<dyn serialport::SerialPort> = {
+        let native = port
+            .try_clone_native()
+            .map_err(|err| port_error(&settings.port, &err))?;
+        if monitor {
+            apply_monitor_timeouts(&port, read_poll)
+                .map_err(|err| io_error(&settings.port, &err))?;
+        }
+        clear_inherit(&port).map_err(|err| io_error(&settings.port, &err))?;
+        clear_inherit(&native).map_err(|err| io_error(&settings.port, &err))?;
+        Box::new(native)
+    };
+    #[cfg(not(windows))]
+    let writer: Box<dyn serialport::SerialPort> = {
+        let _ = monitor;
+        port.try_clone()
+            .map_err(|err| port_error(&settings.port, &err))?
+    };
+
+    start_threads(
+        Box::new(port),
+        writer,
+        &settings.port,
+        monitor.then_some(WRITE_TIMEOUT),
+        monitor,
+    )
+}
+
+/// Значения `COMMTIMEOUTS`, которые прослушка ставит сама (M5-AC5).
+///
+/// `serialport` задаёт одно значение на чтение и запись, поэтому у порта прослушки
+/// таймауты ставятся после открытия: двухмиллисекундное окно записи на медленной линии
+/// принимало бы по два байта за вызов, и фрагмент уходил бы сотнями проб.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PortTimeouts {
+    read_interval: u32,
+    read_total_multiplier: u32,
+    read_total_constant: u32,
+    write_total_multiplier: u32,
+    write_total_constant: u32,
+}
+
+#[cfg(windows)]
+impl PortTimeouts {
+    /// Таймауты порта прослушки: чтение как у `serialport` с `read_poll`, запись окном.
+    fn monitor(read_poll: Duration) -> Self {
+        Self {
+            // `MAXDWORD` в interval и multiplier: чтение возвращается сразу, как только
+            // есть байты, и ждёт не дольше `read_poll`, когда их нет.
+            read_interval: u32::MAX,
+            read_total_multiplier: u32::MAX,
+            read_total_constant: millis(read_poll),
+            // Multiplier 0: окно записи не зависит от длины фрагмента — пятьдесят
+            // миллисекунд на вызов `WriteFile`; остаток дописывает цикл записи по
+            // фактически принятому числу байт. Per-byte multiplier считал бы срок по
+            // скорости и для большого фрагмента держал бы вызов секундами, не давая
+            // проверить остановку между окнами.
+            write_total_multiplier: 0,
+            write_total_constant: millis(WRITE_WINDOW),
+        }
+    }
+}
+
+/// Миллисекунды для `COMMTIMEOUTS`: `u32::MAX` драйвер не принимает в constant.
+#[cfg(windows)]
+fn millis(duration: Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX - 1)
+}
+
+/// Ставит таймауты прослушки на открытый порт.
+#[cfg(windows)]
+fn apply_monitor_timeouts(port: &serialport::COMPort, read_poll: Duration) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Devices::Communication::{COMMTIMEOUTS, SetCommTimeouts};
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    let timeouts = PortTimeouts::monitor(read_poll);
+    let native = COMMTIMEOUTS {
+        ReadIntervalTimeout: timeouts.read_interval,
+        ReadTotalTimeoutMultiplier: timeouts.read_total_multiplier,
+        ReadTotalTimeoutConstant: timeouts.read_total_constant,
+        WriteTotalTimeoutMultiplier: timeouts.write_total_multiplier,
+        WriteTotalTimeoutConstant: timeouts.write_total_constant,
+    };
+    let handle = port.as_raw_handle() as HANDLE;
+    // SAFETY: `handle` открыт портом, `native` — заполненная структура таймаутов.
+    if unsafe { SetCommTimeouts(handle, &native) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Снимает наследование handle порта: дочерние процессы не должны держать порт (M5).
+///
+/// `serialport::COMPort::try_clone` дублирует handle как наследуемый (`DuplicateHandle`
+/// с `bInheritHandle = TRUE`). Запущенный из интерфейса `explorer` («Открыть папку»)
+/// получил бы копию и держал порт после закрытия bytetap — переоткрыть его было бы нельзя.
+/// Флаг снимается у обоих handle сразу после клонирования, во всех режимах COM.
+#[cfg(windows)]
+fn clear_inherit(port: &serialport::COMPort) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+    let handle = port.as_raw_handle() as HANDLE;
+    // SAFETY: `handle` открыт портом; `HANDLE_FLAG_INHERIT` с нулём в flags снимает флаг.
+    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn serialport_parity(parity: Parity) -> serialport::Parity {
@@ -714,10 +862,15 @@ fn apply_parity(port: &serialport::COMPort, parity: Parity) -> io::Result<()> {
 /// Оба выходят по флагу остановки; последний вышедший отмечает, что порт закрыт, и будит
 /// переоткрытие. Потоки не соединяются при остановке: [`SerialConnection`] только
 /// сигналит, а ждать их никто не обязан (NFR-5).
+///
+/// `write_deadline` — сколько может идти одна запись: у ответа автоответчика
+/// [`WRITE_TIMEOUT`], у прослушки `None` — на пути данных сроков нет (как у прокси).
 fn start_threads(
     reader: Box<dyn serialport::SerialPort>,
     writer: Box<dyn serialport::SerialPort>,
     name: &str,
+    write_deadline: Option<Duration>,
+    monitor: bool,
 ) -> io::Result<SerialConnection> {
     let (read_tx, read_rx) = mpsc::channel(READ_QUEUE);
     let (write_tx, write_rx) = sync_mpsc::channel();
@@ -750,7 +903,7 @@ fn start_threads(
             let alive = Arc::clone(&alive);
             let closed = Arc::clone(&closed);
             move || {
-                run_writer(writer, &writer_name, write_rx, &stop);
+                run_writer(writer, &writer_name, write_rx, &stop, write_deadline);
                 finish_thread(&alive, &closed);
             }
         });
@@ -776,8 +929,10 @@ fn start_threads(
         reads: read_rx,
         writes: Some(write_tx),
         pending: None,
+        pending_error: None,
         leftover: Vec::new(),
         stop,
+        monitor,
     })
 }
 
@@ -894,54 +1049,116 @@ fn run_reader(
     }
 }
 
-/// Команда записи: байты ответа и канал, куда вернуть результат.
+/// Команда записи: байты, счётчик принятого и канал, куда вернуть итог.
 struct WriteCommand {
     bytes: Vec<u8>,
-    done: tokio::sync::oneshot::Sender<io::Result<()>>,
+    /// Сколько байт порт принял к этому моменту: `poll_write` отдаёт прирост ещё до конца.
+    progress: Arc<Progress>,
+    /// Итог записи: сколько всего принято и ошибка, если запись не закончилась.
+    done: tokio::sync::oneshot::Sender<WriteOutcome>,
+}
+
+/// Сколько байт команды порт принял к этому моменту, и кто ждёт прогресса.
+///
+/// Прогресс нужен, чтобы «Стоп» не терял из журнала уже переданное: насос, отменивший
+/// запись, читает свой счётчик отправленного, а он наполняется только тем, что
+/// `poll_write` успел вернуть. Поток записи будит ожидающего после каждого принятого куска.
+#[derive(Debug, Default)]
+struct Progress {
+    accepted: AtomicUsize,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+impl Progress {
+    /// Порт принял `accepted` байт команды: отметка и пробуждение ожидающего.
+    fn accepted(&self, accepted: usize) {
+        self.accepted.store(accepted, Ordering::Relaxed);
+        let waker = self.waker.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Сколько байт принято: ожидающий записан, чтобы его разбудили на следующем куске.
+    fn poll(&self, cx: &mut std::task::Context<'_>) -> usize {
+        if let Ok(mut slot) = self.waker.lock() {
+            *slot = Some(cx.waker().clone());
+        }
+        self.accepted.load(Ordering::Relaxed)
+    }
+}
+
+/// Итог одной записи в порт: сколько байт принято и чем она кончилась.
+///
+/// Число байт есть всегда, даже при ошибке: драйвер возвращает фактически принятое, и
+/// задвоить хвост повторной записью нельзя — байты уже ушли в линию.
+struct WriteOutcome {
+    /// Сколько байт порт принял.
+    written: usize,
+    /// Ошибка порта, если запись не доехала до конца.
+    error: Option<io::Error>,
+}
+
+impl WriteOutcome {
+    /// Всё принято, ошибки нет.
+    fn complete(written: usize) -> Self {
+        Self {
+            written,
+            error: None,
+        }
+    }
 }
 
 /// Пишет байты в порт, повторяя попытку, пока драйвер их не примет.
 ///
-/// `Ok(0)` и таймаут порта — не потеря, а занятый драйвер: попытка повторяется, пока не
-/// выйдет [`WRITE_TIMEOUT`] или не выставят флаг остановки. Таймаут порта не говорит,
-/// сколько байт драйвер всё же взял: повтор может продублировать ответ, но зависший ответ
-/// хуже — анализатор не получит `ACK` и не узнает, что с ним стало.
+/// `Ok(0)` — не потеря, а занятый или медленный драйвер: попытка повторяется, пока не
+/// выйдет `deadline` или не выставят флаг остановки. Каждый принятый кусок сразу виден в
+/// `progress`, поэтому отменённая запись не прячет уже переданное. Драйвер возвращает
+/// фактически принятое число байт, и остаток пишется с этого места: хвост не задваивается.
 fn write_bytes(
     port: &mut dyn serialport::SerialPort,
     name: &str,
     bytes: &[u8],
+    progress: &Progress,
     stop: &AtomicBool,
-) -> io::Result<()> {
-    let deadline = std::time::Instant::now() + WRITE_TIMEOUT;
+    deadline: Option<Duration>,
+) -> WriteOutcome {
+    let deadline = deadline.map(|limit| std::time::Instant::now() + limit);
     let mut written = 0;
     while written < bytes.len() {
         if stop.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                format!(
-                    "serial port {name}: the write is stopped at {written} of {} bytes",
-                    bytes.len()
-                ),
-            ));
+            // Остановка: остаток не пишется и в журнал не попадает.
+            return WriteOutcome::complete(written);
         }
-        if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "serial port {name} did not take the answer in {} s: {written} of {} bytes written",
-                    WRITE_TIMEOUT.as_secs(),
-                    bytes.len()
-                ),
-            ));
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return WriteOutcome {
+                written,
+                error: Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "serial port {name} did not take the answer in {} s: {written} of {} bytes written",
+                        WRITE_TIMEOUT.as_secs(),
+                        bytes.len()
+                    ),
+                )),
+            };
         }
         match port.write(&bytes[written..]) {
             Ok(0) => std::thread::sleep(WRITE_PAUSE),
-            Ok(len) => written += len,
+            Ok(len) => {
+                written += len;
+                progress.accepted(written);
+            }
             Err(err) if err.kind() == io::ErrorKind::TimedOut => std::thread::sleep(WRITE_PAUSE),
-            Err(err) => return Err(io_error(name, &err)),
+            Err(err) => {
+                return WriteOutcome {
+                    written,
+                    error: Some(io_error(name, &err)),
+                };
+            }
         }
     }
-    Ok(())
+    WriteOutcome::complete(written)
 }
 
 /// Поток записи: пишет ответы в порт и возвращает результат записи [`SerialConnection`].
@@ -953,6 +1170,7 @@ fn run_writer(
     name: &str,
     writes: sync_mpsc::Receiver<WriteCommand>,
     stop: &AtomicBool,
+    deadline: Option<Duration>,
 ) {
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -960,11 +1178,18 @@ fn run_writer(
         }
         match writes.recv_timeout(READ_POLL) {
             Ok(command) => {
-                let result = write_bytes(port.as_mut(), name, &command.bytes, stop);
-                let failed = result.is_err();
+                let outcome = write_bytes(
+                    port.as_mut(),
+                    name,
+                    &command.bytes,
+                    &command.progress,
+                    stop,
+                    deadline,
+                );
+                let failed = outcome.error.is_some();
                 // Результат уходит в `poll_write`: ответ не считается отправленным, пока
                 // порт не принял байты.
-                let _ = command.done.send(result);
+                let _ = command.done.send(outcome);
                 if failed {
                     // Ошибка записи закрывает соединение: источник переоткроет порт.
                     return;
@@ -976,20 +1201,36 @@ fn run_writer(
     }
 }
 
+/// Запись, которую ждёт `poll_write`: длина исходного буфера и сколько уже отдано.
+///
+/// Длина нужна, чтобы не спутать результат отменённой записи с новой: `poll_write` по
+/// контракту повторяет тот же буфер, пока не вернул `Ready`, то есть приходит с остатком.
+struct PendingWrite {
+    /// Сколько байт было в исходном буфере команды.
+    total: usize,
+    /// Сколько из них уже отдано вызывающему.
+    reported: usize,
+    /// Счётчик принятого этой командой.
+    progress: Arc<Progress>,
+    /// Итог записи от потока писателя.
+    done: tokio::sync::oneshot::Receiver<WriteOutcome>,
+}
+
 /// Асинхронная сторона COM-порта: одно открытие порта (FR-9).
 pub struct SerialConnection {
     name: String,
     reads: mpsc::Receiver<io::Result<Vec<u8>>>,
     /// Очередь команд записи; `None` после остановки.
     writes: Option<sync_mpsc::Sender<WriteCommand>>,
-    /// Результат записи, которую ждёт `poll_write`, и длина её буфера.
-    ///
-    /// Длина нужна, чтобы не спутать результат отменённой записи с новой: `poll_write`
-    /// по контракту повторяет тот же буфер, пока не вернул `Ready`.
-    pending: Option<(usize, tokio::sync::oneshot::Receiver<io::Result<()>>)>,
+    /// Запись, которую ждёт `poll_write`.
+    pending: Option<PendingWrite>,
+    /// Ошибка записи, ещё не отданная вызывающему: байты до неё уже приняты.
+    pending_error: Option<io::Error>,
     /// Остаток последнего прочитанного куска, не влезший в буфер вызывающего.
     leftover: Vec<u8>,
     stop: Arc<AtomicBool>,
+    /// Порт прослушки: в описании ошибок и в отчёте о пути данных.
+    monitor: bool,
 }
 
 impl SerialConnection {
@@ -997,6 +1238,12 @@ impl SerialConnection {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Порт прослушки: у него нет срока на путь данных.
+    #[must_use]
+    pub fn is_monitor(&self) -> bool {
+        self.monitor
     }
 
     /// Сигнал остановки потокам порта; очередь записи закрывается, ответов больше нет.
@@ -1074,13 +1321,19 @@ impl AsyncWrite for SerialConnection {
         if self
             .pending
             .as_ref()
-            .is_some_and(|(len, _)| *len != buf.len())
+            .is_some_and(|pending| pending.total - pending.reported != buf.len())
         {
             // Буфер сменился: прошлая запись была отменена вместе со своим будущим,
-            // а её результат уже никому не нужен.
+            // а её результат уже никому не нужен. Её байты могут ещё доехать до линии —
+            // отменяют запись только при закрытии пары, сразу после которого порт
+            // закрывается и поток писателя останавливается.
             self.pending = None;
         }
         if self.pending.is_none() {
+            if let Some(error) = self.pending_error.take() {
+                // Байты до ошибки уже отданы вызывающему, а порт сломался.
+                return Poll::Ready(Err(error));
+            }
             let Some(writes) = self.writes.as_ref() else {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -1088,9 +1341,11 @@ impl AsyncWrite for SerialConnection {
                 )));
             };
             let (done, wait) = tokio::sync::oneshot::channel();
+            let progress = Arc::new(Progress::default());
             if writes
                 .send(WriteCommand {
                     bytes: buf.to_vec(),
+                    progress: Arc::clone(&progress),
                     done,
                 })
                 .is_err()
@@ -1100,29 +1355,70 @@ impl AsyncWrite for SerialConnection {
                     "the serial port writer has stopped",
                 )));
             }
-            self.pending = Some((buf.len(), wait));
+            self.pending = Some(PendingWrite {
+                total: buf.len(),
+                reported: 0,
+                progress,
+                done: wait,
+            });
         }
-        // Ждём фактический результат записи: ошибка порта не должна выглядеть отправкой.
-        let outcome = match self.pending.as_mut() {
-            Some((_, pending)) => std::pin::Pin::new(pending).poll(cx),
-            None => Poll::Ready(Ok(Ok(()))),
+
+        let Some(pending) = self.pending.as_mut() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the serial port writer has stopped",
+            )));
         };
-        match outcome {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(Ok(()))) => {
-                self.pending = None;
-                Poll::Ready(Ok(buf.len()))
-            }
-            Poll::Ready(Ok(Err(err))) => {
-                self.pending = None;
-                Poll::Ready(Err(err))
-            }
+        // Сначала итог: порт мог принять всё и сразу.
+        let outcome = match std::pin::Pin::new(&mut pending.done).poll(cx) {
+            Poll::Pending => None,
+            Poll::Ready(Ok(outcome)) => Some(outcome),
             Poll::Ready(Err(_)) => {
                 self.pending = None;
-                Poll::Ready(Err(io::Error::new(
+                return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "the serial port writer stopped before the answer was written",
+                )));
+            }
+        };
+        // Прирост принятого: отдаётся вызывающему ещё до конца записи, чтобы «Стоп»
+        // не терял из журнала уже переданное.
+        let accepted = match &outcome {
+            Some(outcome) => outcome.written,
+            None => pending.progress.poll(cx),
+        };
+        let fresh = accepted.saturating_sub(pending.reported);
+        pending.reported += fresh;
+        match outcome {
+            Some(outcome) => {
+                let finished = pending.reported >= pending.total;
+                self.pending = None;
+                if let Some(error) = outcome.error {
+                    if fresh > 0 {
+                        // Байты до ошибки ушли в линию: они отдаются вызывающему, а ошибка
+                        // всплывёт на следующей записи.
+                        self.pending_error = Some(error);
+                        return Poll::Ready(Ok(fresh));
+                    }
+                    return Poll::Ready(Err(error));
+                }
+                if fresh > 0 {
+                    return Poll::Ready(Ok(fresh));
+                }
+                if finished {
+                    return Poll::Ready(Ok(0));
+                }
+                // Поток писателя вернулся без ошибки и без прогресса: его остановили.
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the serial port write is stopped",
                 )))
+            }
+            None => {
+                if fresh > 0 {
+                    return Poll::Ready(Ok(fresh));
+                }
+                Poll::Pending
             }
         }
     }
@@ -1423,6 +1719,13 @@ mod tests {
         Fail,
         /// Сначала `Ok(0)`, потом таймаут порта, дальше пишет: занятый драйвер.
         Busy,
+        /// Принимает по `chunk` байт за вызов; `stop_after`/`fail_after` — сколько байт
+        /// порт примет, прежде чем выставить остановку или отказать.
+        Partial {
+            chunk: usize,
+            stop_after: Option<usize>,
+            fail_after: Option<usize>,
+        },
     }
 
     /// Фейковый порт поверх `serialport::SerialPort`: без железа и без pty.
@@ -1440,6 +1743,9 @@ mod tests {
         attempts: Mutex<usize>,
         /// Заданные чтения по порядку: фрагмент или ошибка; когда очередь пуста, порт молчит.
         reads: Mutex<VecDeque<io::Result<Vec<u8>>>>,
+        /// Флаг остановки, который выставляет [`FakeWrite::Partial`] с `stop_after`:
+        /// так проверяется, что остановка посреди записи не прячет принятое.
+        stop: Arc<AtomicBool>,
     }
 
     impl FakeState {
@@ -1450,6 +1756,7 @@ mod tests {
                 written: Mutex::new(Vec::new()),
                 attempts: Mutex::new(0),
                 reads: Mutex::new(VecDeque::new()),
+                stop: Arc::new(AtomicBool::new(false)),
             })
         }
 
@@ -1540,6 +1847,33 @@ mod tests {
                         .expect("замок")
                         .extend_from_slice(buf);
                     Ok(buf.len())
+                }
+                FakeWrite::Partial {
+                    chunk,
+                    stop_after,
+                    fail_after,
+                } => {
+                    let mut written = self.state.written.lock().expect("замок");
+                    let taken = written.len();
+                    if fail_after.is_some_and(|limit| taken >= limit) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "the adapter is gone",
+                        ));
+                    }
+                    let take = chunk.min(buf.len());
+                    written.extend_from_slice(&buf[..take]);
+                    let total = written.len();
+                    drop(written);
+                    // Медленный драйвер: поток писателя успевает отчитаться о принятом
+                    // до конца фрагмента, как на линии 9600.
+                    std::thread::sleep(Duration::from_millis(2));
+                    if stop_after.is_some_and(|limit| total >= limit) {
+                        self.state
+                            .stop
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(take)
                 }
             }
         }
@@ -1656,6 +1990,187 @@ mod tests {
         }
     }
 
+    /// Таймауты прослушки на Windows: чтение короткое, запись окном (M5-AC5).
+    #[cfg(windows)]
+    #[test]
+    fn monitor_timeouts_give_a_short_read_and_a_write_window() {
+        let timeouts = PortTimeouts::monitor(MONITOR_READ_POLL);
+        assert_eq!(
+            timeouts.read_interval,
+            u32::MAX,
+            "чтение отдаёт сразу, что есть"
+        );
+        assert_eq!(timeouts.read_total_multiplier, u32::MAX);
+        assert_eq!(
+            timeouts.read_total_constant, 2,
+            "ожидание чтения — MONITOR_READ_POLL"
+        );
+        assert_eq!(
+            timeouts.write_total_multiplier, 0,
+            "окно не зависит от длины"
+        );
+        assert_eq!(timeouts.write_total_constant, 50, "окно записи — 50 мс");
+    }
+
+    /// Запись отдаёт по частям ровно то, что порт принял: «Стоп» не теряет переданное.
+    #[test]
+    fn a_partial_write_reports_exactly_what_the_port_took() {
+        let state = FakeState::new();
+        let (_, mut port) = fake_pair(
+            &state,
+            FakeWrite::Partial {
+                chunk: 3,
+                stop_after: None,
+                fail_after: None,
+            },
+        );
+        let progress = Progress::default();
+        let stop = AtomicBool::new(false);
+        let outcome = write_bytes(
+            port.as_mut(),
+            "FAKE-PART",
+            b"0123456789",
+            &progress,
+            &stop,
+            None,
+        );
+        assert_eq!(outcome.written, 10, "все байты приняты по частям");
+        assert!(outcome.error.is_none(), "ошибки нет");
+        assert_eq!(
+            progress.accepted.load(std::sync::atomic::Ordering::Relaxed),
+            10
+        );
+        assert_eq!(*state.written.lock().expect("замок"), b"0123456789");
+    }
+
+    /// Остановка посреди записи: отчёт — принятая часть, и хвост не задваивается.
+    #[test]
+    fn a_stopped_write_reports_the_part_that_reached_the_port() {
+        let state = FakeState::new();
+        let (_, mut port) = fake_pair(
+            &state,
+            FakeWrite::Partial {
+                chunk: 3,
+                stop_after: Some(6),
+                fail_after: None,
+            },
+        );
+        let progress = Progress::default();
+        let stop = Arc::clone(&state.stop);
+        let outcome = write_bytes(
+            port.as_mut(),
+            "FAKE-STOP-PART",
+            b"0123456789",
+            &progress,
+            &stop,
+            None,
+        );
+        assert_eq!(outcome.written, 6, "столько порт принял до остановки");
+        assert!(outcome.error.is_none(), "остановка — не ошибка порта");
+        assert_eq!(
+            progress.accepted.load(std::sync::atomic::Ordering::Relaxed),
+            6
+        );
+        assert_eq!(*state.written.lock().expect("замок"), b"012345");
+    }
+
+    /// Ошибка после частичной записи: число байт остаётся, а не превращается в ноль.
+    #[test]
+    fn a_write_error_after_a_part_keeps_the_written_count() {
+        let state = FakeState::new();
+        let (_, mut port) = fake_pair(
+            &state,
+            FakeWrite::Partial {
+                chunk: 4,
+                stop_after: None,
+                fail_after: Some(4),
+            },
+        );
+        let progress = Progress::default();
+        let stop = AtomicBool::new(false);
+        let outcome = write_bytes(
+            port.as_mut(),
+            "FAKE-FAIL-PART",
+            b"0123456789",
+            &progress,
+            &stop,
+            None,
+        );
+        assert_eq!(outcome.written, 4, "первый кусок уже в линии");
+        let error = outcome.error.expect("отказ порта");
+        assert!(error.to_string().contains("is disconnected"), "{error}");
+    }
+
+    /// Соединение отдаёт вызывающему прирост по мере записи, а не только в конце.
+    #[tokio::test]
+    async fn the_connection_reports_partial_writes_to_the_caller() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let state = FakeState::new();
+        let (reader, writer) = fake_pair(
+            &state,
+            FakeWrite::Partial {
+                chunk: 4,
+                stop_after: None,
+                fail_after: None,
+            },
+        );
+        let mut connection =
+            start_threads(reader, writer, "FAKE-REPORT", None, true).expect("потоки порта");
+        let payload = b"0123456789";
+        let mut sent = Vec::new();
+        let mut at = 0;
+        while at < payload.len() {
+            let accepted = connection.write(&payload[at..]).await.expect("запись");
+            assert!(accepted > 0, "нулевой прогресс не возвращается");
+            sent.push(accepted);
+            at += accepted;
+        }
+        assert_eq!(at, payload.len(), "записано всё");
+        assert!(
+            sent.iter().any(|accepted| *accepted < payload.len()),
+            "запись отдаётся частями: {sent:?}"
+        );
+        assert_eq!(*state.written.lock().expect("замок"), payload);
+        connection.shutdown().await.expect("остановка");
+    }
+
+    /// Ошибка порта приходит вызывающему после того, как отдана принятая часть.
+    #[tokio::test]
+    async fn a_write_error_comes_after_the_accepted_part() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let state = FakeState::new();
+        let (reader, writer) = fake_pair(
+            &state,
+            FakeWrite::Partial {
+                chunk: 4,
+                stop_after: None,
+                fail_after: Some(4),
+            },
+        );
+        let mut connection =
+            start_threads(reader, writer, "FAKE-PART-FAIL", None, true).expect("потоки порта");
+        let payload = b"0123456789";
+        let mut sent = 0;
+        loop {
+            match connection.write(&payload[sent..]).await {
+                Ok(accepted) => sent += accepted,
+                Err(error) => {
+                    assert_eq!(sent, 4, "принятая часть отдана до ошибки");
+                    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe, "{error}");
+                    break;
+                }
+            }
+            assert!(
+                sent < payload.len(),
+                "ошибка должна была прийти раньше конца"
+            );
+        }
+        assert_eq!(*state.written.lock().expect("замок"), b"0123");
+        connection.shutdown().await.expect("остановка");
+    }
+
     #[tokio::test]
     async fn a_port_that_does_not_take_the_answer_at_once_is_written_again() {
         use tokio::io::AsyncWriteExt as _;
@@ -1663,7 +2178,8 @@ mod tests {
         // `Ok(0)` и таймаут порта — не потеря: ответ дописывается целиком.
         let state = FakeState::new();
         let (reader, writer) = fake_pair(&state, FakeWrite::Busy);
-        let mut connection = start_threads(reader, writer, "FAKE-BUSY").expect("потоки порта");
+        let mut connection = start_threads(reader, writer, "FAKE-BUSY", Some(WRITE_TIMEOUT), false)
+            .expect("потоки порта");
 
         connection
             .write_all(b"answer")
@@ -1717,7 +2233,8 @@ mod tests {
 
         let state = FakeState::new();
         let (reader, writer) = fake_pair(&state, FakeWrite::Block);
-        let mut connection = start_threads(reader, writer, "FAKE-STOP").expect("потоки порта");
+        let mut connection = start_threads(reader, writer, "FAKE-STOP", Some(WRITE_TIMEOUT), false)
+            .expect("потоки порта");
 
         {
             // Ответ висит в порту: поток писателя заблокирован в `write`.
@@ -1752,7 +2269,8 @@ mod tests {
 
         let state = FakeState::new();
         let (reader, writer) = fake_pair(&state, FakeWrite::Fail);
-        let mut connection = start_threads(reader, writer, "FAKE-FAIL").expect("потоки порта");
+        let mut connection = start_threads(reader, writer, "FAKE-FAIL", Some(WRITE_TIMEOUT), false)
+            .expect("потоки порта");
 
         let error = connection
             .write_all(b"answer")
@@ -1772,7 +2290,9 @@ mod tests {
 
         let state = FakeState::new();
         let (reader, writer) = fake_pair(&state, FakeWrite::Block);
-        let mut connection = start_threads(reader, writer, "FAKE-REOPEN").expect("потоки порта");
+        let mut connection =
+            start_threads(reader, writer, "FAKE-REOPEN", Some(WRITE_TIMEOUT), false)
+                .expect("потоки порта");
 
         {
             // Писатель заходит в `write` и висит там: дескриптор не отпущен.
@@ -1809,8 +2329,10 @@ mod tests {
             reads: read_rx,
             writes: Some(write_tx),
             pending: None,
+            pending_error: None,
             leftover: Vec::new(),
             stop: Arc::new(AtomicBool::new(false)),
+            monitor: false,
         };
         read_tx
             .send(Ok(b"abcdef".to_vec()))
