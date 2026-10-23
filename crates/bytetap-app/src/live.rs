@@ -478,15 +478,21 @@ pub fn start_error(err: &io::Error, source: &Source) -> StartError {
         // берутся у того порта, который не открылся (M5-AC3). Один и тот же порт с двух
         // сторон — своя настройка, а не «порт занят» от собственного второго открытия.
         Source::ComMonitor { analyzer, lis, .. } => {
-            let settings = match monitor_side(err) {
-                Some(MonitorSide::Lis) => lis,
-                Some(MonitorSide::Analyzer) | None => analyzer,
+            let side = match monitor_side(err) {
+                Some(MonitorSide::Lis) => MonitorSide::Lis,
+                Some(MonitorSide::Analyzer) | None => MonitorSide::Analyzer,
+            };
+            let settings = match side {
+                MonitorSide::Lis => lis,
+                MonitorSide::Analyzer => analyzer,
             };
             if is_monitor_same_port(err) {
                 return StartError::new(ErrorCode::MonitorSamePort, err.to_string())
-                    .with_param("port", &settings.port);
+                    .with_param("port", &settings.port)
+                    .with_param("side", side.as_str());
             }
-            serial_error(err, settings, port_listed)
+            // Сторона в ошибке: интерфейс ставит текст под полем этого порта (M5-AC3).
+            serial_error(err, settings, port_listed).with_param("side", side.as_str())
         }
     }
 }

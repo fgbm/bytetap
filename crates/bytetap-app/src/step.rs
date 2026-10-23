@@ -72,12 +72,22 @@ fn flow_text(flow: Flow) -> &'static str {
 /// тогда ошибка встаёт под «Старт». Адрес у сервера — интерфейс прослушивания, у прокси —
 /// адрес второй стороны.
 pub fn shown_field(field: ErrorField, mode: SessionMode) -> ErrorField {
+    // Поля двух портов есть только у прослушки: в остальных режимах ошибка встаёт под
+    // «Старт» (M5-AC3).
+    if mode != SessionMode::ComMonitor && matches!(field, ErrorField::SerialA | ErrorField::SerialB)
+    {
+        return ErrorField::Start;
+    }
     match (field, mode) {
         (ErrorField::Port | ErrorField::Address | ErrorField::Interface, SessionMode::Serial)
         | (ErrorField::Serial | ErrorField::Interface, SessionMode::TcpClient) => ErrorField::Start,
         // У сервера единственное поле адреса — интерфейс прослушивания.
         (ErrorField::Address, SessionMode::TcpServer) => ErrorField::Interface,
-        (ErrorField::Serial, SessionMode::TcpServer | SessionMode::Proxy) => ErrorField::Start,
+        // У прослушки один порт ошибки не бывает: там пара портов, своё поле у каждой.
+        (
+            ErrorField::Serial,
+            SessionMode::TcpServer | SessionMode::Proxy | SessionMode::ComMonitor,
+        ) => ErrorField::Start,
         (
             ErrorField::TargetPort,
             SessionMode::TcpServer | SessionMode::TcpClient | SessionMode::Serial,
@@ -163,6 +173,86 @@ fn scroll_to_focus(ui: &Ui) {
     }
 }
 
+/// Сторона прослушки: у порта анализатора и у порта ЛИС свои поля и свои ошибки
+/// (M5-AC3, M5-В2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonitorPort {
+    Analyzer,
+    Lis,
+}
+
+impl MonitorPort {
+    /// Поле ошибки старта этой стороны.
+    fn error(self) -> ErrorField {
+        match self {
+            Self::Analyzer => ErrorField::SerialA,
+            Self::Lis => ErrorField::SerialB,
+        }
+    }
+
+    /// Подпись поля: «Порт анализатора» или «Порт ЛИС».
+    fn label(self) -> &'static str {
+        match self {
+            Self::Analyzer => t!("form.monitorAnalyzerPort"),
+            Self::Lis => t!("form.monitorLisPort"),
+        }
+    }
+
+    /// Идентификаторы полей: у двух списков портов они разные.
+    fn id(self) -> &'static str {
+        match self {
+            Self::Analyzer => "bt-monitor-port-a",
+            Self::Lis => "bt-monitor-port-b",
+        }
+    }
+
+    fn baud_id(self) -> &'static str {
+        match self {
+            Self::Analyzer => "bt-monitor-baud-a",
+            Self::Lis => "bt-monitor-baud-b",
+        }
+    }
+
+    fn format_id(self) -> &'static str {
+        match self {
+            Self::Analyzer => "bt-monitor-format-a",
+            Self::Lis => "bt-monitor-format-b",
+        }
+    }
+
+    /// Настройки порта этой стороны.
+    fn serial(self, cfg: &crate::settings::AppConfig) -> &crate::settings::SerialSettings {
+        match self {
+            Self::Analyzer => &cfg.serial,
+            Self::Lis => &cfg.monitor_lis,
+        }
+    }
+
+    /// Имя выбранного порта этой стороны.
+    fn port(self, cfg: &crate::settings::AppConfig) -> &str {
+        &self.serial(cfg).port
+    }
+
+    fn baud(self, cfg: &crate::settings::AppConfig) -> u32 {
+        self.serial(cfg).baud
+    }
+
+    fn baud_other(self, form: &crate::form::FormState) -> bool {
+        match self {
+            Self::Analyzer => form.baud_other,
+            Self::Lis => form.lis_baud_other,
+        }
+    }
+
+    /// Текст «другой скорости» этой стороны.
+    fn baud_text(self, form: &mut crate::form::FormState) -> &mut String {
+        match self {
+            Self::Analyzer => &mut form.baud_text,
+            Self::Lis => &mut form.lis_baud_text,
+        }
+    }
+}
+
 impl BytetapApp {
     /// Две колонки с промежутком 16px; высота строки — по более высокой колонке.
     fn row(
@@ -231,6 +321,7 @@ impl BytetapApp {
                 SessionMode::TcpClient => self.client_fields(ui, &p),
                 SessionMode::Serial => self.serial_fields(ui, &p),
                 SessionMode::Proxy => self.proxy_fields(ui, &p),
+                SessionMode::ComMonitor => self.monitor_fields(ui, &p),
             }
             self.more(ui, &p, mode);
             ui.add_space(SPACE_4);
@@ -774,6 +865,274 @@ impl BytetapApp {
         self.responder_field(ui, p);
     }
 
+    /// Правка скорости или формата анализатора: второй порт повторяет её, пока его не
+    /// трогали (M5-В2).
+    fn analyzer_changed(&mut self, change: impl FnOnce(&mut crate::settings::AppConfig)) {
+        let mut config = self.settings.config.clone();
+        change(&mut config);
+        self.form.analyzer_settings_changed(&mut config);
+        self.settings_mut().config = config;
+    }
+
+    /// (д) Встать в разрыв COM-кабеля (FR-10): два порта, скорость и формат у каждого,
+    /// строка о выключенном автоответе и о том, кто занимает порты (M5-AC11).
+    fn monitor_fields(&mut self, ui: &mut Ui, p: &Palette) {
+        self.monitor_port_field(ui, p, MonitorPort::Analyzer);
+        ui.add_space(SPACE_3);
+        self.row(
+            ui,
+            |app, ui| app.monitor_baud_field(ui, p, MonitorPort::Analyzer),
+            |app, ui| app.monitor_format_field(ui, p, MonitorPort::Analyzer),
+        );
+        ui.add_space(SPACE_3);
+        self.monitor_port_field(ui, p, MonitorPort::Lis);
+        ui.add_space(SPACE_3);
+        self.row(
+            ui,
+            |app, ui| app.monitor_baud_field(ui, p, MonitorPort::Lis),
+            |app, ui| app.monitor_format_field(ui, p, MonitorPort::Lis),
+        );
+        // Автоответчика в прослушке нет: байты идут как есть, ответы приходят от ЛИС
+        // (FR-10). Второй строкой — кто держит порты: в разрыве это только bytetap.
+        ui.add_space(SPACE_3);
+        widgets::hint(ui, p, t!("form.noResponderInProxy"));
+        ui.add_space(SPACE_1);
+        widgets::hint(ui, p, t!("form.portsLocked"));
+        ui.add_space(SPACE_1);
+    }
+
+    /// Порт одной стороны прослушки: список с описанием и «Обновить» (FR-12).
+    fn monitor_port_field(&mut self, ui: &mut Ui, p: &Palette, side: MonitorPort) {
+        let error = self.error_text(side.error());
+        let ctx = ui.ctx().clone();
+        let label = side.label();
+        field(ui, p, label, error.as_deref(), |ui, _| {
+            let mut ports = self.ports.ready().cloned().unwrap_or_default();
+            let saved = side.port(&self.settings.config).to_owned();
+            // Пропавший порт не исчезает из списка сам: он сохранён в настройках.
+            if !saved.is_empty() && !ports.iter().any(|port| port.name == saved) {
+                ports.push(bytetap_core::transport::serial::PortInfo {
+                    name: saved.clone(),
+                    description: saved.clone(),
+                });
+            }
+            let mut options = vec![t!("form.serialChoose").to_owned()];
+            options.extend(
+                ports
+                    .iter()
+                    .map(|port| format!("{} ({})", port.description, port.name)),
+            );
+            let current = if saved.is_empty() {
+                0
+            } else {
+                ports
+                    .iter()
+                    .position(|port| port.name == saved)
+                    .map_or(0, |index| index + 1)
+            };
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = SPACE_2;
+                let width = ui.available_width() - 28.0 - SPACE_2;
+                ui.allocate_ui(vec2(width, widgets::FIELD_HEIGHT), |ui| {
+                    let look = FieldLook {
+                        error: error.is_some(),
+                        ..FieldLook::default()
+                    };
+                    let (_, chosen) = widgets::select(
+                        ui,
+                        p,
+                        Id::unique(side.id()),
+                        label,
+                        &options,
+                        Some(current),
+                        look,
+                    );
+                    if let Some(index) = chosen {
+                        let name = index
+                            .checked_sub(1)
+                            .and_then(|index| ports.get(index))
+                            .map(|port| port.name.clone())
+                            .unwrap_or_default();
+                        match side {
+                            MonitorPort::Analyzer => {
+                                self.form.touched.serial = true;
+                                self.settings_mut().config.serial.port = name;
+                            }
+                            MonitorPort::Lis => {
+                                self.form.touched.serial_b = true;
+                                self.settings_mut().config.monitor_lis.port = name;
+                            }
+                        }
+                    }
+                });
+                if widgets::icon_button(ui, p, Icon::RefreshCw, 15.0, t!("form.refreshPorts"))
+                    .clicked()
+                {
+                    self.refresh_ports(&ctx);
+                }
+            });
+        });
+    }
+
+    /// Скорость одной стороны прослушки: у второго порта своя (M5-В2).
+    fn monitor_baud_field(&mut self, ui: &mut Ui, p: &Palette, side: MonitorPort) {
+        field(ui, p, t!("form.baud"), None, |ui, label| {
+            let other = side.baud_other(&self.form);
+            if other {
+                let text = side.baud_text(&mut self.form);
+                let response = widgets::text_input(
+                    ui,
+                    p,
+                    Id::unique(side.baud_id()),
+                    text,
+                    label,
+                    "",
+                    FieldLook {
+                        mono: true,
+                        ..FieldLook::default()
+                    },
+                );
+                if response.changed() {
+                    let baud = check_baud(side.baud_text(&mut self.form));
+                    if let Some(baud) = baud {
+                        match side {
+                            MonitorPort::Analyzer => {
+                                self.analyzer_changed(|cfg| cfg.serial.baud = baud)
+                            }
+                            MonitorPort::Lis => {
+                                self.form.touched.serial_b = true;
+                                self.form.lis_follows = false;
+                                self.settings_mut().config.monitor_lis.baud = baud;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            let mut options: Vec<String> = BAUD_RATES.iter().map(ToString::to_string).collect();
+            options.push(t!("form.baudOther").to_owned());
+            let current = BAUD_RATES
+                .iter()
+                .position(|rate| *rate == side.baud(&self.settings.config));
+            let (_, chosen) = widgets::select(
+                ui,
+                p,
+                Id::unique(side.baud_id()),
+                t!("form.baud"),
+                &options,
+                current,
+                FieldLook {
+                    mono: true,
+                    ..FieldLook::default()
+                },
+            );
+            if let Some(index) = chosen {
+                match BAUD_RATES.get(index) {
+                    Some(rate) => match side {
+                        MonitorPort::Analyzer => {
+                            self.form.touched.serial = true;
+                            self.analyzer_changed(|cfg| cfg.serial.baud = *rate);
+                        }
+                        MonitorPort::Lis => {
+                            self.form.touched.serial_b = true;
+                            self.form.lis_follows = false;
+                            self.settings_mut().config.monitor_lis.baud = *rate;
+                        }
+                    },
+                    None => match side {
+                        MonitorPort::Analyzer => self.form.baud_other = true,
+                        MonitorPort::Lis => self.form.lis_baud_other = true,
+                    },
+                }
+            }
+        });
+    }
+
+    /// Формат одной стороны прослушки: `8N1`, `7E2` и прочие из списка (FR-11).
+    fn monitor_format_field(&mut self, ui: &mut Ui, p: &Palette, side: MonitorPort) {
+        field(ui, p, t!("form.format"), None, |ui, _| {
+            let options: Vec<String> = FORMATS.iter().map(|f| (*f).to_owned()).collect();
+            let format = serial_format(side.serial(&self.settings.config));
+            let current = FORMATS.iter().position(|f| *f == format);
+            let (_, chosen) = widgets::select(
+                ui,
+                p,
+                Id::unique(side.format_id()),
+                t!("form.format"),
+                &options,
+                current,
+                FieldLook {
+                    mono: true,
+                    ..FieldLook::default()
+                },
+            );
+            if let Some(index) = chosen {
+                match side {
+                    MonitorPort::Analyzer => {
+                        self.analyzer_changed(|cfg| apply_format(&mut cfg.serial, FORMATS[index]));
+                    }
+                    MonitorPort::Lis => {
+                        self.form.touched.serial_b = true;
+                        self.form.lis_follows = false;
+                        apply_format(&mut self.settings_mut().config.monitor_lis, FORMATS[index]);
+                    }
+                }
+            }
+        });
+    }
+
+    /// «Поток и линии» прослушки: поток и два флажка одной строкой, под ней —
+    /// предупреждение о том, что насквозь они не идут (M5-В2, М5-В3).
+    fn monitor_flow_lines(&mut self, ui: &mut Ui, p: &Palette) {
+        widgets::field_label(ui, p, t!("form.flowLines"));
+        ui.add_space(SPACE_1);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = SPACE_2;
+            let width = ui.available_width() / 2.0;
+            ui.allocate_ui(vec2(width, widgets::FIELD_HEIGHT), |ui| {
+                let options: Vec<String> = FLOWS.iter().map(|f| flow_text(*f).to_owned()).collect();
+                let current = FLOWS
+                    .iter()
+                    .position(|f| *f == self.settings.config.serial.flow);
+                let (_, chosen) = widgets::select(
+                    ui,
+                    p,
+                    Id::unique("bt-monitor-flow"),
+                    t!("form.flow"),
+                    &options,
+                    current,
+                    FieldLook::default(),
+                );
+                if let Some(index) = chosen {
+                    let flow = FLOWS[index];
+                    self.settings_mut().config.serial.flow = flow;
+                    self.settings_mut().config.monitor_lis.flow = flow;
+                }
+            });
+            let mut dtr = self.settings.config.serial.dtr;
+            if widgets::checkbox(ui, p, &mut dtr, t!("form.dtrOn")).changed() {
+                self.settings_mut().config.serial.dtr = dtr;
+                self.settings_mut().config.monitor_lis.dtr = dtr;
+            }
+            let mut rts = self.settings.config.serial.rts;
+            if widgets::checkbox(ui, p, &mut rts, t!("form.rtsOn")).changed() {
+                self.settings_mut().config.serial.rts = rts;
+                self.settings_mut().config.monitor_lis.rts = rts;
+            }
+        });
+        // Линии управления не передаются сквозь bytetap: CTS, DSR и DCD каждой стороны —
+        // её собственные линии, а XON/XOFF драйвер съедает из обмена (М5-В3).
+        let warning = match self.settings.config.serial.flow {
+            Flow::None => None,
+            Flow::Rtscts => Some(t!("form.flowNotForwarded")),
+            Flow::Xonxoff => Some(t!("form.flowNotForwardedXonxoff")),
+        };
+        if let Some(text) = warning {
+            ui.add_space(SPACE_1);
+            widgets::field_error(ui, p.warn, text);
+        }
+    }
+
     /// Адрес, с которого bytetap выходит к цели (FR-8).
     ///
     /// Сначала — фактический адрес из первого `open` записи (`link.local` исходящего
@@ -912,6 +1271,37 @@ impl BytetapApp {
                 );
                 ui.add_space(SPACE_3);
             }
+            // Прослушка: поток и линии общие для обоих портов (M5-В2), под строкой —
+            // предупреждение о том, что насквозь они не идут (М5-В3).
+            SessionMode::ComMonitor => {
+                self.monitor_flow_lines(ui, p);
+                ui.add_space(SPACE_3);
+                self.row(
+                    ui,
+                    |app, ui| {
+                        field(ui, p, t!("form.reconnect"), None, |ui, label| {
+                            let response = widgets::text_input(
+                                ui,
+                                p,
+                                Id::unique("bt-monitor-reconnect"),
+                                &mut app.form.reconnect_text,
+                                label,
+                                "",
+                                FieldLook {
+                                    mono: true,
+                                    ..FieldLook::default()
+                                },
+                            );
+                            if response.changed() {
+                                let sec = parse_reconnect(&app.form.reconnect_text);
+                                app.settings_mut().config.reconnect_sec = sec;
+                            }
+                        });
+                    },
+                    |_, _| {},
+                );
+                ui.add_space(SPACE_3);
+            }
             SessionMode::Serial => {
                 self.row(
                     ui,
@@ -993,7 +1383,9 @@ impl BytetapApp {
         let responder = self.settings.config.responder;
         // В прокси автоответчика нет вовсе: «NAK на неверную сумму ASTM» к нему не
         // относится, поля в режиме нет (FR-6, M4-В6).
-        if mode != SessionMode::Proxy && matches!(responder, Responder::Auto | Responder::Astm) {
+        if !matches!(mode, SessionMode::Proxy | SessionMode::ComMonitor)
+            && matches!(responder, Responder::Auto | Responder::Astm)
+        {
             ui.add_space(SPACE_3);
             let mut nak = self.settings.config.astm_nak_on_bad_checksum;
             if widgets::checkbox(ui, p, &mut nak, t!("form.nak")).changed() {

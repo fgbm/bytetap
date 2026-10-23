@@ -117,10 +117,17 @@ pub fn review_fixtures() -> Fixtures {
                 addr: "172.16.4.21".into(),
             },
         ],
-        ports: vec![PortInfo {
-            name: "COM3".into(),
-            description: "USB-SERIAL CH340".into(),
-        }],
+        // Два адаптера — так выглядит разрыв линии: COM3 у анализатора, COM4 у ЛИС.
+        ports: vec![
+            PortInfo {
+                name: "COM3".into(),
+                description: "USB-SERIAL CH340".into(),
+            },
+            PortInfo {
+                name: "COM4".into(),
+                description: "USB-SERIAL FT232R".into(),
+            },
+        ],
         recents: vec![
             journal(
                 "bytetap-20261019101500-tcp_server.jsonl",
@@ -471,11 +478,15 @@ impl BytetapApp {
 
     /// Тестовый хук смоука (CI, [`AUTOSTART_ENV`]): `tcp_server:<адрес>` — запись
     /// TCP-сервера с автоответом «Авто», `proxy:<адрес>><цель>:<роль>` — запись прокси
-    /// (`proxy:127.0.0.1:0>127.0.0.1:5000:analyzer_client`). Папка журналов — из настроек,
-    /// старт сразу после запуска.
+    /// (`proxy:127.0.0.1:0>127.0.0.1:5000:analyzer_client`), `monitor:virtual` —
+    /// прослушка двух портов на виртуальной паре в процессе. Папка журналов — из
+    /// настроек, старт сразу после запуска.
     #[must_use]
     #[cfg(feature = "test-hooks")]
     pub fn with_test_autostart(mut self, ctx: &egui::Context, spec: &str) -> Self {
+        if spec == "monitor:virtual" {
+            return self.with_test_monitor_autostart(ctx);
+        }
         if let Some(rest) = spec.strip_prefix("proxy:") {
             return self.with_test_proxy_autostart(ctx, rest, spec);
         }
@@ -550,6 +561,48 @@ impl BytetapApp {
         self
     }
 
+    /// Прослушка на виртуальной паре портов (CI, M5-AC9): `monitor:virtual`.
+    ///
+    /// `windows-latest` виртуальных COM-портов не даёт, поэтому сквозной смоук идёт парой
+    /// портов в процессе: сессия берёт один конец, задача в runtime держит другой и
+    /// разыгрывает обмен ASTM E1381 — «анализатор» шлёт ENQ и кадр, «ЛИС» отвечает ACK.
+    /// Настоящий COM проверяется ручным смоуком владельца (M5-AC5).
+    #[must_use]
+    #[cfg(feature = "test-hooks")]
+    fn with_test_monitor_autostart(mut self, ctx: &egui::Context) -> Self {
+        use bytetap_core::transport::serial::{SerialFormat, SerialSettings as CoreSerial};
+
+        let format = SerialFormat::EIGHT_N_ONE;
+        let analyzer = CoreSerial::new("COM3", 9600, format);
+        let lis = CoreSerial::new("COM4", 9600, format);
+        let retry = Duration::from_secs(u64::from(crate::settings::DEFAULT_RECONNECT_SEC));
+        let ends =
+            match bytetap_core::transport::virtual_monitor(analyzer.clone(), lis.clone(), retry, 1)
+            {
+                Ok((_source, ends)) => ends,
+                Err(err) => {
+                    diag::error(format!(
+                        "{AUTOSTART_ENV}: виртуальная пара прослушки не создана: {err}"
+                    ));
+                    return self;
+                }
+            };
+        diag::info(format!(
+            "{AUTOSTART_ENV}: прослушка на виртуальной паре COM3 ⇄ COM4"
+        ));
+        let mut cfg = self.settings.config.clone();
+        cfg.mode = SessionMode::ComMonitor;
+        cfg.serial.port = "COM3".into();
+        cfg.monitor_lis.port = "COM4".into();
+        if let Some(runtime) = self.runtime.clone() {
+            runtime.spawn(play_virtual_monitor(ends));
+        }
+        let config =
+            SessionConfig::com_monitor(analyzer, lis, retry).with_log_dir(cfg.log_dir.clone());
+        self.launch(ctx, config, cfg);
+        self
+    }
+
     /// Экран по имени тестового хука (CI, [`SCREEN_ENV`]): `<экран>-<тема>`, например
     /// `start-light`, `serial-more-dark`, `recording-hex-light`, `viewing-text-dark`.
     ///
@@ -581,6 +634,23 @@ impl BytetapApp {
             "server" => self.show_step(SessionMode::TcpServer, false),
             "client" => self.show_step(SessionMode::TcpClient, false),
             "serial" => self.show_step(SessionMode::Serial, false),
+            // Прослушка: два порта из набора снимков; «Дополнительно» и ошибка у второго
+            // порта — как в макете M5-3 (M5-AC11).
+            "monitor" | "monitor-more" | "monitor-error" => {
+                self.settings.config.serial.port = "COM3".into();
+                self.settings.config.monitor_lis.port = "COM4".into();
+                self.show_step(SessionMode::ComMonitor, name != "monitor");
+                if name != "monitor" {
+                    self.start_error = Some(
+                        crate::errors::StartError::new(
+                            crate::errors::ErrorCode::PortBusy,
+                            "Access is denied (os error 5)",
+                        )
+                        .with_param("port", "COM4")
+                        .with_param("side", "lis"),
+                    );
+                }
+            }
             "serial-more" => self.show_step(SessionMode::Serial, true),
             "errors" => {
                 // Ошибка старта по коду: адреса прослушивания нет на машине.
@@ -593,6 +663,14 @@ impl BytetapApp {
                     )
                     .with_param("addr", "eth0"),
                 );
+            }
+            "recording-monitor" => {
+                self.settings.config.mode = SessionMode::ComMonitor;
+                self.settings.config.serial.port = "COM3".into();
+                self.settings.config.monitor_lis.port = "COM4".into();
+                self.rec = Some(RecordingView::detached(self.settings.config.clone()));
+                self.phase = Phase::Recording;
+                self.screen = Screen::Recording;
             }
             "recording-text" | "recording-hex" => {
                 self.settings.feed.view = if name == "recording-hex" {
@@ -2165,6 +2243,47 @@ pub(crate) fn centered<R>(ui: &mut Ui, max_width: f32, add: impl FnOnce(&mut Ui)
         add,
     )
     .inner
+}
+
+/// Оба конца виртуальной пары прослушки: «анализатор» и «ЛИС» в смоуке (M5-AC9).
+///
+/// Обмен ASTM E1381, как у макета M5-4: `ENQ` → `ACK`, кадр `STX…ETX` с контрольной суммой
+/// → `ACK`, `EOT`. Порты остаются открытыми до закрытия окна: штатная остановка — это
+/// закрытие окна, а не конец обмена.
+#[cfg(feature = "test-hooks")]
+async fn play_virtual_monitor(ends: Vec<bytetap_core::transport::VirtualMonitorEnds>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let Some(pair) = ends.into_iter().next() else {
+        return;
+    };
+    let mut analyzer = pair.analyzer;
+    let mut lis = pair.lis;
+    let mut buffer = [0u8; 4096];
+    let exchange = async {
+        // Запрос: ENQ ждёт подтверждения, подтвердив, анализатор шлёт кадр.
+        analyzer.write_all(b"\x05").await?;
+        lis.read_exact(&mut buffer[..1]).await?;
+        lis.write_all(b"\x06").await?;
+        analyzer.read_exact(&mut buffer[..1]).await?;
+        analyzer
+            .write_all(
+                b"\x020H|\\^&|||ANALYZER-3^1.0|||||||P|E1394-97|20261026101503\rP|1|000123|PATIENT^TEST\rL|1|N\r\x037A\r\n",
+            )
+            .await?;
+        // Кадр и ответы читаются целиком по одному подтверждению: `read_exact` ждёт ровно
+        // тот байт, который шлёт вторая сторона, и обмен не рвётся на частичном чтении.
+        let _ = lis.read(&mut buffer).await?;
+        lis.write_all(b"\x06").await?;
+        let _ = analyzer.read(&mut buffer).await?;
+        analyzer.write_all(b"\x04").await?;
+        let _ = lis.read(&mut buffer).await?;
+        Ok::<(), std::io::Error>(())
+    };
+    if let Err(err) = exchange.await {
+        diag::error(format!("{AUTOSTART_ENV}: обмен виртуальной пары: {err}"));
+    }
+    std::future::pending::<()>().await;
 }
 
 /// Тёмная ли тема: выбор пользователя, а при «системной» — тема ОС (без неё — светлая).

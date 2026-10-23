@@ -321,17 +321,19 @@ pub fn notes_line(header_note: &str, appended: &[String]) -> String {
     parts.join(" · ")
 }
 
-/// Пара сторон журнала прокси: по режиму и `settings.role` заголовка (M4-AC13).
+/// Пара сторон журнала: у прокси — по `settings.role` заголовка (M4-AC13), у прослушки —
+/// всегда пара двух портов (M5-В8).
 ///
 /// У остальных режимов пары нет, и строки ленты остаются прежними: «#1 отключился · ЛИС».
 #[must_use]
 pub fn pair_of_journal(header: &Session) -> Pair {
-    if header.mode != Mode::Proxy {
-        return Pair::None;
-    }
-    match role_of_journal(header) {
-        ProxyMode::AnalyzerClient => Pair::TargetLis,
-        ProxyMode::AnalyzerServer => Pair::TargetAnalyzer,
+    match header.mode {
+        Mode::ComMonitor => Pair::Monitor,
+        Mode::Proxy => match role_of_journal(header) {
+            ProxyMode::AnalyzerClient => Pair::TargetLis,
+            ProxyMode::AnalyzerServer => Pair::TargetAnalyzer,
+        },
+        _ => Pair::None,
     }
 }
 
@@ -527,6 +529,9 @@ mod tests {
             journal_meta(&header, 6_120_000),
             "анализатор COM3 ⇄ ЛИС COM4 · 00:00:06"
         );
+        // Строки ленты прослушки — пара портов: «#1 открыто: анализатор COM3 → ЛИС COM4»
+        // и «#1 закрыто: ЛИС, порт пропал» (M5-В8).
+        assert_eq!(pair_of_journal(&header), Pair::Monitor);
         header.analyzer = Some("ANALYZER".into());
         assert_eq!(
             journal_meta(&header, 6_120_000),

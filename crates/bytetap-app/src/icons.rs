@@ -28,6 +28,7 @@ pub enum Icon {
     Square,
     Sun,
     TriangleAlert,
+    Unplug,
     Usb,
     X,
 }
@@ -56,6 +57,7 @@ impl Icon {
             Self::Square => egui::include_image!("../assets/icons/square.svg"),
             Self::Sun => egui::include_image!("../assets/icons/sun.svg"),
             Self::TriangleAlert => egui::include_image!("../assets/icons/triangle-alert.svg"),
+            Self::Unplug => egui::include_image!("../assets/icons/unplug.svg"),
             Self::Usb => egui::include_image!("../assets/icons/usb.svg"),
             Self::X => egui::include_image!("../assets/icons/x.svg"),
         }

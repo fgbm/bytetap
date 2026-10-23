@@ -564,6 +564,14 @@ impl RecordingView {
                 self.sides.0.as_deref(),
                 self.sides.1.as_deref(),
             ),
+            // Сводка прослушки — два порта и bytetap посередине (M5-AC11, M5-В8).
+            SessionMode::ComMonitor => monitor_summary(
+                self.sides.0.as_deref().unwrap_or(cfg.serial.port.as_str()),
+                self.sides
+                    .1
+                    .as_deref()
+                    .unwrap_or(cfg.monitor_lis.port.as_str()),
+            ),
         }
     }
 
@@ -580,20 +588,31 @@ impl RecordingView {
     /// Сводка шапки галлеей: у прокси адреса моноширинным, подписи сторон muted,
     /// разделители faint — как в макете M4-4. У остальных режимов — одна строка.
     pub fn summary_job(&self, p: &Palette, stats: &Stats) -> LayoutJob {
-        if self.config.mode != SessionMode::Proxy {
-            return LayoutJob::single_section(
-                self.summary(stats),
-                text_format(theme::sans(TEXT_DATA), p.text_muted),
-            );
-        }
         let cfg = &self.config;
-        let pieces = pair_pieces(
-            cfg.proxy_role,
-            &self.listen_port(),
-            &format!("{}:{}", cfg.proxy_host, cfg.proxy_port),
-            self.sides.0.as_deref(),
-            self.sides.1.as_deref(),
-        );
+        // У пары — прокси и прослушки — адреса сторон моноширинным, подписи muted,
+        // разделители faint; у остальных режимов сводка одной строкой.
+        let pieces = match cfg.mode {
+            SessionMode::Proxy => pair_pieces(
+                cfg.proxy_role,
+                &self.listen_port(),
+                &format!("{}:{}", cfg.proxy_host, cfg.proxy_port),
+                self.sides.0.as_deref(),
+                self.sides.1.as_deref(),
+            ),
+            SessionMode::ComMonitor => monitor_pieces(
+                self.sides.0.as_deref().unwrap_or(cfg.serial.port.as_str()),
+                self.sides
+                    .1
+                    .as_deref()
+                    .unwrap_or(cfg.monitor_lis.port.as_str()),
+            ),
+            _ => {
+                return LayoutJob::single_section(
+                    self.summary(stats),
+                    text_format(theme::sans(TEXT_DATA), p.text_muted),
+                );
+            }
+        };
         let mut job = LayoutJob::default();
         for piece in &pieces {
             let format = match piece {
@@ -746,6 +765,31 @@ fn pair_pieces(
             ],
         },
     }
+}
+
+/// Кусок сводки прослушки: «анализатор COM3 ⇄ bytetap ⇄ ЛИС COM4» (M5-AC11).
+///
+/// Оба порта известны с самого старта — в отличие от прокси, где вторая сторона
+/// появляется только со своим соединением, — поэтому адресов у bytetap в этой сводке нет.
+fn monitor_pieces(analyzer: &str, lis: &str) -> Vec<PairPiece> {
+    vec![
+        PairPiece::Label(t!("feed.byAnalyzer").to_owned()),
+        PairPiece::Address(analyzer.to_owned()),
+        PairPiece::Separator,
+        PairPiece::Label(t!("feed.byApp").to_owned()),
+        PairPiece::Separator,
+        PairPiece::Label(t!("feed.byLis").to_owned()),
+        PairPiece::Address(lis.to_owned()),
+    ]
+}
+
+/// Сводка прослушки строкой: ею пользуются шапка записи и подсказка обрезанной сводки.
+pub(crate) fn monitor_summary(analyzer: &str, lis: &str) -> String {
+    let text: String = monitor_pieces(analyzer, lis)
+        .iter()
+        .map(PairPiece::text)
+        .collect();
+    text.trim_end().to_owned()
 }
 
 /// Сводка пары прокси строкой: ею пользуются шапка записи, шапка просмотра журнала и
@@ -2050,6 +2094,37 @@ mod tests {
         assert_eq!(
             failure_reason(JournalFailureCode::DiskFull),
             "на диске нет места"
+        );
+    }
+
+    /// Сводка прослушки: «анализатор COM3 ⇄ bytetap ⇄ ЛИС COM4» — оба порта известны с
+    /// самого старта, а `open` пары только уточняет их имена (M5-AC11, M5-В8).
+    #[test]
+    fn the_monitor_summary_names_both_ports() {
+        let mut cfg = AppConfig::with_log_dir("C:/logs");
+        cfg.mode = SessionMode::ComMonitor;
+        cfg.serial.port = "COM3".into();
+        cfg.monitor_lis.port = "COM4".into();
+        let mut view = RecordingView::detached(cfg);
+        let stats = Stats::default();
+        assert_eq!(view.summary(&stats), "анализатор COM3 ⇄ bytetap ⇄ ЛИС COM4");
+        // Пара из `open` называет порты так, как их открыли: сводка следует за записью.
+        view.remember_sides(&FeedEvent {
+            time: "10:15:03.000".into(),
+            mono_us: Some(0),
+            conn: Some(1),
+            kind: FeedKind::Open {
+                peer: r"\\.\COM3".into(),
+                link: Some(bytetap_core::journal::Link {
+                    role: bytetap_core::journal::LinkRole::Lis,
+                    peer: r"\\.\COM4".into(),
+                    local: String::new(),
+                }),
+            },
+        });
+        assert_eq!(
+            view.summary(&stats),
+            r"анализатор \\.\COM3 ⇄ bytetap ⇄ ЛИС \\.\COM4"
         );
     }
 

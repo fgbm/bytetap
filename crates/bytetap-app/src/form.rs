@@ -251,6 +251,13 @@ pub fn last_run_of(cfg: &AppConfig) -> LastRun {
             host: String::new(),
             baud: cfg.serial.baud,
         },
+        // У прослушки сторон две, и обе — порты: анализатор и ЛИС (M5-AC11).
+        SessionMode::ComMonitor => LastRun {
+            mode: cfg.mode,
+            port: cfg.serial.port.clone(),
+            host: cfg.monitor_lis.port.clone(),
+            baud: cfg.serial.baud,
+        },
         // У прокси сторона две: порт прослушивания и цель — карточка показывает обе.
         // Пустая цель не показывается: карточка говорит только о порте.
         SessionMode::Proxy => LastRun {
@@ -278,6 +285,8 @@ pub struct Touched {
     pub port: bool,
     pub address: bool,
     pub serial: bool,
+    /// Второй порт прослушки: своё поле — своя ошибка (M5-AC3).
+    pub serial_b: bool,
     /// Порт цели прокси: своё поле — своя ошибка.
     pub target_port: bool,
     /// Фильтр по адресу: своё поле — своя ошибка.
@@ -304,6 +313,13 @@ pub struct FormState {
     pub baud_text: String,
     /// Скорость вне типового списка: поле ввода вместо списка.
     pub baud_other: bool,
+    /// Скорость второго порта прослушки: у него своя (M5-В2).
+    pub lis_baud_text: String,
+    /// Скорость второго порта вне типового списка.
+    pub lis_baud_other: bool,
+    /// Второй порт ещё повторяет скорость и формат первого: правка первого переносится во
+    /// второй, пока его самого не тронули (M5-В2).
+    pub lis_follows: bool,
     /// Радио-паре топологии вернуть фокус на следующем кадре: стрелка переключает пару,
     /// но egui успевает увести фокус по своей навигации до того, как пара запрётся.
     pub radio_focus: Option<crate::settings::ProxyMode>,
@@ -329,6 +345,9 @@ impl FormState {
             reconnect_text: String::new(),
             baud_text: String::new(),
             baud_other: false,
+            lis_baud_text: String::new(),
+            lis_baud_other: false,
+            lis_follows: true,
             radio_focus: None,
             more: false,
             attempted: false,
@@ -355,6 +374,12 @@ impl FormState {
         self.reconnect_text = cfg.reconnect_sec.to_string();
         self.baud_text = cfg.serial.baud.to_string();
         self.baud_other = !BAUD_RATES.contains(&cfg.serial.baud);
+        self.lis_baud_text = cfg.monitor_lis.baud.to_string();
+        self.lis_baud_other = !BAUD_RATES.contains(&cfg.monitor_lis.baud);
+        // Второй порт повторяет первый, пока их скорость и формат совпадают: так форма
+        // открывается у нового профиля и так же после правки профиля (M5-В2).
+        self.lis_follows = cfg.monitor_lis.baud == cfg.serial.baud
+            && serial_format(&cfg.monitor_lis) == serial_format(&cfg.serial);
     }
 
     fn serial_port_missing(cfg: &AppConfig) -> bool {
@@ -366,6 +391,30 @@ impl FormState {
             check_baud(&self.baud_text)
         } else {
             Some(cfg.serial.baud)
+        }
+    }
+
+    /// Скорость второго порта прослушки.
+    fn lis_baud_value(&self, cfg: &AppConfig) -> Option<u32> {
+        if self.lis_baud_other {
+            check_baud(&self.lis_baud_text)
+        } else {
+            Some(cfg.monitor_lis.baud)
+        }
+    }
+
+    /// Второй порт не выбран.
+    fn lis_port_missing(cfg: &AppConfig) -> bool {
+        cfg.monitor_lis.port.trim().is_empty()
+    }
+
+    /// Первый порт изменили: пока второй не трогали, он повторяет скорость и формат.
+    pub fn analyzer_settings_changed(&mut self, cfg: &mut AppConfig) {
+        if self.lis_follows {
+            cfg.monitor_lis.baud = cfg.serial.baud;
+            apply_format(&mut cfg.monitor_lis, &serial_format(&cfg.serial));
+            self.lis_baud_text = cfg.monitor_lis.baud.to_string();
+            self.lis_baud_other = !BAUD_RATES.contains(&cfg.monitor_lis.baud);
         }
     }
 
@@ -448,6 +497,8 @@ impl FormState {
                 ErrorField::TargetPort => self.touched.target_port,
                 ErrorField::AllowFrom => self.touched.allow_from,
                 ErrorField::Serial => self.touched.serial,
+                ErrorField::SerialA => self.touched.serial,
+                ErrorField::SerialB => self.touched.serial_b,
                 // Ошибка интерфейса приходит только от старта; своя проверка не нужна.
                 ErrorField::Interface | ErrorField::LogDir | ErrorField::Start => false,
             };
@@ -489,6 +540,30 @@ impl FormState {
                     None
                 }
             }
+            // Порт анализатора в прослушке: своё поле со своим текстом (M5-AC3).
+            ErrorField::SerialA => {
+                if Self::serial_port_missing(cfg) {
+                    Some(t!("form.serialRequired"))
+                } else if self.baud_value(cfg).is_none() {
+                    Some(t!("form.baudRange"))
+                } else {
+                    None
+                }
+            }
+            // Порт ЛИС: не выбран, повторяет первый порт или скорость вне границ.
+            ErrorField::SerialB => {
+                let port = cfg.monitor_lis.port.trim();
+                if port.is_empty() {
+                    Some(t!("form.serialLisRequired"))
+                } else if monitor_same_port(cfg) {
+                    // Порт уже виден в самом поле: текст говорит, что делать.
+                    Some(t!("form.monitorSamePort"))
+                } else if self.lis_baud_value(cfg).is_none() {
+                    Some(t!("form.baudRange"))
+                } else {
+                    None
+                }
+            }
             ErrorField::Interface | ErrorField::LogDir | ErrorField::Start => None,
         }
     }
@@ -509,6 +584,15 @@ impl FormState {
             }
             SessionMode::Serial => {
                 !Self::serial_port_missing(cfg) && self.baud_value(cfg).is_some()
+            }
+            // Прослушка: два порта, у каждого своя скорость, и порты должны быть разными
+            // (M5-AC3).
+            SessionMode::ComMonitor => {
+                !Self::serial_port_missing(cfg)
+                    && self.baud_value(cfg).is_some()
+                    && !Self::lis_port_missing(cfg)
+                    && self.lis_baud_value(cfg).is_some()
+                    && !monitor_same_port(cfg)
             }
         }
     }
@@ -531,7 +615,19 @@ impl FormState {
         if let Some(baud) = self.baud_value(cfg) {
             cfg.serial.baud = baud;
         }
+        if let Some(baud) = self.lis_baud_value(cfg) {
+            cfg.monitor_lis.baud = baud;
+        }
     }
+}
+
+/// Один и тот же порт с двух сторон прослушки: в разрыве нужны два разных (M5-AC3).
+///
+/// Имена COM сравниваются без регистра, а пробелы по краям не порт: `COM3` и `com3` —
+/// один порт, и второй его открыть не даст.
+pub fn monitor_same_port(cfg: &AppConfig) -> bool {
+    let analyzer = cfg.serial.port.trim();
+    !analyzer.is_empty() && analyzer.eq_ignore_ascii_case(cfg.monitor_lis.port.trim())
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -648,6 +744,14 @@ fn serial_settings(serial: &SerialSettings) -> Result<CoreSerial, StartError> {
         .with_lines(serial.dtr, serial.rts))
 }
 
+/// Настройки COM-порта ядра со стороной прослушки в ошибке (M5-AC3).
+///
+/// Сторона уходит подстановкой ошибки старта: интерфейс по ней выбирает поле — «Порт
+/// анализатора» или «Порт ЛИС».
+fn serial_settings_side(serial: &SerialSettings, side: &str) -> Result<CoreSerial, StartError> {
+    serial_settings(serial).map_err(|error| error.with_param("side", side))
+}
+
 /// Конфигурация сессии ядра из настроек формы: только поля выбранного режима.
 ///
 /// `default_log_dir` — папка по умолчанию, когда поле пусто; `None` — её не определить.
@@ -682,6 +786,39 @@ pub fn session_config(
             serial_settings(&cfg.serial)?,
             Duration::from_secs(SERIAL_RECONNECT_SEC),
         ),
+        // Прослушка — пятый источник (FR-10): два порта, байты идут без изменений.
+        // Скорость и формат у портов свои, поток и линии общие — из блока анализатора
+        // (M5-В2). Автоответчика здесь нет, и `with_responder` на прослушку не действует.
+        SessionMode::ComMonitor => {
+            if cfg.reconnect_sec > MAX_RECONNECT_SEC {
+                return Err(StartError::new(
+                    ErrorCode::Io,
+                    format!(
+                        "reconnect interval {} s is over {MAX_RECONNECT_SEC} s",
+                        cfg.reconnect_sec
+                    ),
+                ));
+            }
+            if monitor_same_port(cfg) {
+                return Err(StartError::new(
+                    ErrorCode::MonitorSamePort,
+                    "the monitor needs two ports",
+                )
+                .with_param("port", cfg.monitor_lis.port.trim())
+                .with_param("side", "lis"));
+            }
+            let lis = SerialSettings {
+                flow: cfg.serial.flow,
+                dtr: cfg.serial.dtr,
+                rts: cfg.serial.rts,
+                ..cfg.monitor_lis.clone()
+            };
+            SessionConfig::com_monitor(
+                serial_settings_side(&cfg.serial, "analyzer")?,
+                serial_settings_side(&lis, "lis")?,
+                Duration::from_secs(u64::from(cfg.reconnect_sec)),
+            )
+        }
         // Прокси — четвёртый источник (FR-5): слушать одну сторону и подключаться к
         // другой. Автоответчика в нём нет, `with_responder` ниже на прокси не действует.
         SessionMode::Proxy => {
@@ -1294,6 +1431,134 @@ mod tests {
         assert_eq!(error.field(cfg.mode), ErrorField::Serial);
     }
 
+    /// Прослушка: два порта, у каждого своя скорость и формат, а поток и линии общие —
+    /// из блока анализатора (M5-AC3, М5-В2).
+    #[test]
+    fn the_monitor_config_carries_both_ports() {
+        let mut cfg = config(SessionMode::ComMonitor);
+        cfg.serial.port = "COM3".into();
+        cfg.serial.baud = 19200;
+        apply_format(&mut cfg.serial, "7E2");
+        cfg.monitor_lis.port = "COM4".into();
+        cfg.monitor_lis.baud = 9600;
+        apply_format(&mut cfg.monitor_lis, "8N1");
+        cfg.serial.flow = Flow::Rtscts;
+        cfg.serial.dtr = false;
+        cfg.serial.rts = true;
+        cfg.reconnect_sec = 7;
+        let core = session_config(&cfg, None).expect("прослушка");
+        let Source::ComMonitor {
+            analyzer,
+            lis,
+            retry,
+        } = &core.source
+        else {
+            panic!("ожидалась прослушка, а не {:?}", core.source);
+        };
+        assert_eq!(analyzer.port, "COM3");
+        assert_eq!(analyzer.baud, 19200);
+        assert_eq!(analyzer.format.to_string(), "7E2");
+        assert_eq!(lis.port, "COM4");
+        assert_eq!(lis.baud, 9600, "у ЛИС своя скорость");
+        assert_eq!(lis.format.to_string(), "8N1", "у ЛИС свой формат");
+        // Поток и линии в разрыве общие: у второго порта те же значения (М5-В2).
+        assert_eq!(lis.flow, core_serial::Flow::RtsCts);
+        assert!(!lis.dtr);
+        assert!(lis.rts);
+        assert_eq!(*retry, Duration::from_secs(7));
+        // Автоответчика в прослушке нет, какой бы профиль ни стоял в настройках
+        // (FR-10, M5-AC4).
+        assert_eq!(core.header_responder(), Autoresponder::None);
+    }
+
+    /// Два порта прослушки: пустой порт — ошибка у своего поля, одинаковые порты —
+    /// у «Порт ЛИС», ошибка ядра — под полем отказавшей стороны (M5-AC3).
+    #[test]
+    fn the_monitor_needs_two_different_ports() {
+        let mut cfg = config(SessionMode::ComMonitor);
+        let mut form = FormState::new(&cfg);
+        form.attempted = true;
+        assert!(!form.valid(&cfg));
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::SerialA),
+            Some("Выберите порт")
+        );
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::SerialB),
+            Some("Выберите порт ЛИС")
+        );
+
+        cfg.serial.port = "COM3".into();
+        cfg.monitor_lis.port = "com3".into();
+        assert!(!form.valid(&cfg), "регистр в имени COM не значит ничего");
+        assert_eq!(
+            form.local_error(&cfg, ErrorField::SerialB),
+            Some(
+                "Этот порт указан и у анализатора. В прослушке нужны два разных порта: анализатор на одном, ЛИС на другом."
+            )
+        );
+
+        cfg.monitor_lis.port = "COM4".into();
+        assert!(form.valid(&cfg));
+        form.commit(&mut cfg);
+        let core = session_config(&cfg, None).expect("прослушка");
+        assert!(matches!(
+            &core.source,
+            Source::ComMonitor { analyzer, lis, .. }
+                if analyzer.port == "COM3" && lis.port == "COM4"
+        ));
+
+        // Ядро тоже отвергает одинаковые порты, и поле — у второго.
+        let mut same = cfg.clone();
+        same.monitor_lis.port = "COM3".into();
+        let error = session_config(&same, None).expect_err("один порт с двух сторон");
+        assert_eq!(error.code, ErrorCode::MonitorSamePort);
+        assert_eq!(error.field(SessionMode::ComMonitor), ErrorField::SerialB);
+
+        // Порт ЛИС не выбран — настройка порта, и поле тоже своё.
+        let mut missing = cfg.clone();
+        missing.monitor_lis.port = String::new();
+        let error = session_config(&missing, None).expect_err("порт ЛИС не выбран");
+        assert_eq!(error.code, ErrorCode::PortSettings);
+        assert_eq!(error.field(SessionMode::ComMonitor), ErrorField::SerialB);
+
+        // Порт анализатора не выбран — под первым полем.
+        let mut missing = cfg.clone();
+        missing.serial.port = String::new();
+        let error = session_config(&missing, None).expect_err("порт анализатора не выбран");
+        assert_eq!(error.code, ErrorCode::PortSettings);
+        assert_eq!(error.field(SessionMode::ComMonitor), ErrorField::SerialA);
+    }
+
+    /// Второй порт прослушки повторяет скорость и формат первого, пока его самого не
+    /// тронули; профиль с одинаковыми значениями включает повтор снова (М5-В2).
+    #[test]
+    fn the_second_port_repeats_the_first_until_it_is_changed() {
+        let cfg = config(SessionMode::ComMonitor);
+        let mut form = FormState::new(&cfg);
+        assert!(form.lis_follows, "новый профиль повторяет первый порт");
+
+        let mut changed = cfg.clone();
+        changed.serial.baud = 19200;
+        apply_format(&mut changed.serial, "7E2");
+        form.analyzer_settings_changed(&mut changed);
+        assert_eq!(changed.monitor_lis.baud, 19200);
+        assert_eq!(serial_format(&changed.monitor_lis), "7E2");
+        assert_eq!(form.lis_baud_text, "19200");
+
+        // Скорость второго порта поменяли — дальше он живёт своей.
+        form.lis_follows = false;
+        changed.serial.baud = 4800;
+        form.analyzer_settings_changed(&mut changed);
+        assert_eq!(changed.monitor_lis.baud, 19200, "у ЛИС своя скорость");
+
+        // Профиль вернул одинаковые значения — повтор включается снова.
+        let mut same = changed.clone();
+        same.monitor_lis.baud = same.serial.baud;
+        apply_format(&mut same.monitor_lis, &serial_format(&same.serial));
+        assert!(FormState::new(&same).lis_follows);
+    }
+
     #[test]
     fn an_empty_log_dir_takes_the_default_or_fails() {
         let mut cfg = config(SessionMode::TcpServer);
@@ -1320,6 +1585,15 @@ mod tests {
         cfg.serial.port = "COM3".into();
         let run = last_run_of(&cfg);
         assert_eq!((run.port.as_str(), run.baud), ("COM3", 9600));
+        // Прослушка: карточка показывает оба порта — анализатор и ЛИС (M5-AC11).
+        cfg.mode = SessionMode::ComMonitor;
+        cfg.monitor_lis.port = "COM4".into();
+        let run = last_run_of(&cfg);
+        assert_eq!(
+            (run.port.as_str(), run.host.as_str()),
+            ("COM3", "COM4"),
+            "порт анализатора и порт ЛИС"
+        );
         cfg.mode = SessionMode::TcpServer;
         assert_eq!(last_run_of(&cfg).port, "5000");
         // Прокси: порт прослушивания и цель — на карточке обе стороны.

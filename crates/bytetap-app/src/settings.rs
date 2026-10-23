@@ -48,6 +48,11 @@ pub enum SessionMode {
     TcpClient,
     Proxy,
     Serial,
+    /// Прослушка двух COM-портов: bytetap в разрыве линии (FR-10, M5).
+    ///
+    /// Значение совпадает с `mode` журнала (`com_monitor`), чтобы настройки, форма и
+    /// запись называли режим одним словом.
+    ComMonitor,
 }
 
 /// Топология прокси (FR-5, M4-В1): кто из двух сторон приходит на порт bytetap.
@@ -171,7 +176,14 @@ pub struct AppConfig {
     pub proxy_port: u16,
     /// Прокси принимает входящие только с этого адреса; пусто — с любого (FR-8).
     pub proxy_allow_from: String,
+    /// Порт стороны анализатора: единственный порт «Кабеля COM-порта» и первый порт
+    /// прослушки (FR-10, FR-11). Скорость и формат у второго порта свои, а поток и линии
+    /// берутся из этого же блока — в разрыве они общие (M5-В2).
     pub serial: SerialSettings,
+    /// Порт стороны ЛИС в прослушке (FR-10): свой порт, скорость и формат. Поля потока и
+    /// линий здесь те же, что у анализатора, и в файле их значения повторяются, а не
+    /// выбираются отдельно (M5-В2).
+    pub monitor_lis: SerialSettings,
     pub responder: Responder,
     pub astm_nak_on_bad_checksum: bool,
     pub analyzer: String,
@@ -193,6 +205,7 @@ impl AppConfig {
             proxy_port: 0,
             proxy_allow_from: String::new(),
             serial: SerialSettings::default(),
+            monitor_lis: SerialSettings::default(),
             responder: Responder::Auto,
             astm_nak_on_bad_checksum: false,
             analyzer: String::new(),
@@ -371,6 +384,9 @@ pub fn normalize_config(raw: Option<&Value>, fallback: &AppConfig) -> AppConfig 
             .trim()
             .to_owned(),
         serial: serial(raw.get("serial"), &fallback.serial),
+        // Второй порт прослушки: в файле прошлой версии его нет — тогда умолчание, и
+        // форма предзаполнит скорость и формат по анализатору (M5-AC3).
+        monitor_lis: serial(raw.get("monitorLis"), &fallback.monitor_lis),
         responder: choice(raw.get("responder"), fallback.responder),
         astm_nak_on_bad_checksum: flag(
             raw.get("astmNakOnBadChecksum"),
@@ -1114,6 +1130,60 @@ mod tests {
             "пробелы режутся"
         );
         assert_eq!(settings.profiles[0].config.proxy_allow_from, "10.0.0.5");
+    }
+
+    /// Второй порт прослушки читается из файла и переживает запись; файл прошлой версии
+    /// без него читается умолчаниями, а не ошибкой (M5-AC3).
+    #[test]
+    fn the_monitor_settings_are_read_and_normalized() {
+        let raw = json!({
+            "config": {
+                "mode": "com_monitor",
+                "serial": {
+                    "port": "COM3", "baud": 19200, "dataBits": 7, "parity": "even",
+                    "stopBits": 2, "flow": "rtscts", "dtr": false, "rts": true
+                },
+                "monitorLis": {
+                    "port": "COM4", "baud": 9600, "dataBits": 8, "parity": "none",
+                    "stopBits": 1, "flow": "rtscts", "dtr": false, "rts": true
+                },
+                "reconnectSec": 7
+            },
+            "lastRun": { "mode": "com_monitor", "port": "COM3", "host": "COM4", "baud": 19200 }
+        });
+        let settings = normalize(&raw, "");
+        let config = &settings.config;
+        assert_eq!(config.mode, SessionMode::ComMonitor);
+        assert_eq!(config.serial.port, "COM3");
+        assert_eq!(config.serial.baud, 19200);
+        assert_eq!(config.monitor_lis.port, "COM4");
+        assert_eq!(config.monitor_lis.baud, 9600);
+        assert_eq!(config.reconnect_sec, 7);
+        assert_eq!(
+            settings.last_run,
+            Some(LastRun {
+                mode: SessionMode::ComMonitor,
+                port: "COM3".into(),
+                host: "COM4".into(),
+                baud: 19200,
+            })
+        );
+        // Поля второго порта — те же имена, что у первого: файл пишется и читается одним
+        // набором полей (FR-11).
+        let value = serde_json::to_value(&settings).expect("json");
+        assert_eq!(value["config"]["monitorLis"]["port"], "COM4");
+        assert_eq!(value["config"]["monitorLis"]["dataBits"], 8);
+        assert_eq!(value["config"]["monitorLis"]["stopBits"], 1);
+        assert_eq!(normalize(&value, ""), settings, "запись читается обратно");
+
+        // Файл прошлой версии: второго порта нет — порт пустой, скорость и формат по
+        // умолчанию, и форма предзаполнит их по анализатору (M5-В2).
+        let old = json!({ "config": { "mode": "com_monitor", "serial": { "port": "COM3" } } });
+        let settings = normalize(&old, "");
+        assert_eq!(settings.config.monitor_lis.port, "");
+        assert_eq!(settings.config.monitor_lis.baud, DEFAULT_BAUD);
+        assert_eq!(settings.config.monitor_lis.data_bits, 8);
+        assert_eq!(settings.config.monitor_lis.flow, Flow::None);
     }
 
     #[test]

@@ -114,6 +114,10 @@ pub enum ErrorField {
     /// машине. У прокси это поле стоит рядом с портом, у сервера — в «Дополнительно».
     Interface,
     Serial,
+    /// Порт стороны анализатора в прослушке (FR-10): у пары портов своё поле у каждого.
+    SerialA,
+    /// Порт стороны ЛИС в прослушке: занятый, отсутствующий или повторённый порт.
+    SerialB,
     LogDir,
     Start,
 }
@@ -137,13 +141,20 @@ pub fn error_field(code: ErrorCode, mode: SessionMode) -> ErrorField {
         ErrorCode::ProxyTargetSelf => ErrorField::TargetPort,
         // Отказ фильтра — под полем фильтра, а не под адресом цели (FR-8).
         ErrorCode::AllowFromInvalid => ErrorField::AllowFrom,
-        // Опечатка в портах прослушки — настройка порта, а не общий «Старт»: шаг 2
-        // поставит её под своим полем COM-A или COM-B (M5-AC3).
+        // Опечатка в портах прослушки — настройка порта, а не общий «Старт». По умолчанию
+        // порт анализатора: сторону отказавшего порта называет ошибка старта, и поле
+        // выбирается по ней (M5-AC3).
+        ErrorCode::PortNotFound | ErrorCode::PortBusy | ErrorCode::PortSettings
+            if mode == SessionMode::ComMonitor =>
+        {
+            ErrorField::SerialA
+        }
         ErrorCode::PortNotFound
         | ErrorCode::PortBusy
         | ErrorCode::PortSettings
-        | ErrorCode::MonitorSamePort
         | ErrorCode::Serial => ErrorField::Serial,
+        // Один и тот же порт с двух сторон: поле второго порта — там его и правят.
+        ErrorCode::MonitorSamePort => ErrorField::SerialB,
         ErrorCode::LogDir | ErrorCode::JournalOpen => ErrorField::LogDir,
         ErrorCode::AlreadyRunning | ErrorCode::Journal | ErrorCode::Io => ErrorField::Start,
     }
@@ -174,6 +185,15 @@ impl StartError {
     }
 
     pub fn field(&self, mode: SessionMode) -> ErrorField {
+        // У прослушки ошибка несёт сторону отказавшего порта: текст встаёт под полем
+        // этого порта, а не под общим «Старт» (M5-AC3).
+        if mode == SessionMode::ComMonitor {
+            match self.params.get("side").map(String::as_str) {
+                Some("lis") => return ErrorField::SerialB,
+                Some("analyzer") => return ErrorField::SerialA,
+                _ => {}
+            }
+        }
         error_field(self.code, mode)
     }
 

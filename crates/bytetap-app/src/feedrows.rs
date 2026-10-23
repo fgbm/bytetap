@@ -60,6 +60,8 @@ pub enum Pair {
     TargetLis,
     /// Цель прокси — анализатор (топология «анализатор — сервер»).
     TargetAnalyzer,
+    /// Прослушка двух портов: стороны — физические роли портов, а не топология (M5-В4).
+    Monitor,
 }
 
 impl Pair {
@@ -70,6 +72,7 @@ impl Pair {
                 ProxyMode::AnalyzerClient => Self::TargetLis,
                 ProxyMode::AnalyzerServer => Self::TargetAnalyzer,
             },
+            SessionMode::ComMonitor => Self::Monitor,
             SessionMode::TcpServer | SessionMode::TcpClient | SessionMode::Serial => Self::None,
         }
     }
@@ -84,7 +87,7 @@ impl Pair {
         match self {
             Self::TargetLis => t!("feed.byLis"),
             Self::TargetAnalyzer => t!("feed.byAnalyzer"),
-            Self::None => "",
+            Self::None | Self::Monitor => "",
         }
     }
 
@@ -93,7 +96,7 @@ impl Pair {
         match self {
             Self::TargetLis => t!("feed.byAnalyzer"),
             Self::TargetAnalyzer => t!("feed.byLis"),
-            Self::None => "",
+            Self::None | Self::Monitor => "",
         }
     }
 }
@@ -104,7 +107,20 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
     match &event.kind {
         FeedKind::Data(data) => (RowClass::Data(data.dir), String::new()),
         FeedKind::Open { peer, link } => {
-            if pair.is_pair() {
+            if pair == Pair::Monitor {
+                // У прослушки обе стороны — порты: принятая сторона это порт анализатора,
+                // `link` — порт ЛИС (M5-В8).
+                let lis = link.as_ref().map_or("", |link| link.peer.as_str());
+                (
+                    RowClass::Service,
+                    t!(
+                        "feed.openedMonitor",
+                        conn = conn,
+                        analyzer = peer,
+                        lis = lis
+                    ),
+                )
+            } else if pair.is_pair() {
                 // Направление пары — по роли исходящей стороны: роль стороны в журнале
                 // не зависит от того, кто инициировал соединение (FR-5).
                 let (from, to) = match link.as_ref().map(|link| link.role) {
@@ -124,7 +140,22 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
             }
         }
         FeedKind::Close { by, reason } => {
-            let text = if pair.is_pair() {
+            let text = if pair == Pair::Monitor {
+                // У порта нет соединения, которое кто-то закрывает: пара закрывается,
+                // когда пропал порт одной стороны или запись остановили (M5-В8).
+                let what = match reason.as_str() {
+                    "stop" => t!("feed.closedMonitorStop").to_owned(),
+                    "error" => t!("feed.closedMonitorLost").to_owned(),
+                    "eof" => t!("feed.closedMonitorEnd").to_owned(),
+                    _ => t!("feed.closedMonitorOther", reason = reason.as_str()),
+                };
+                t!(
+                    "feed.closedMonitor",
+                    conn = conn,
+                    by = closed_by(*by),
+                    what = what
+                )
+            } else if pair.is_pair() {
                 match by {
                     ClosedBy::Analyzer => t!("feed.closedPairAnalyzer", conn = conn),
                     ClosedBy::Lis => t!("feed.closedPairLis", conn = conn),
@@ -151,10 +182,19 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
             code,
             peer,
             message,
-        } => (
-            RowClass::Error,
-            event_text(code.as_deref(), message, pair, None, peer.as_deref()),
-        ),
+        } => {
+            // Повтор открытия портов в прослушке — состояние, а не новая ошибка обмена:
+            // пропавший порт назван строкой выше, и дальше запись идёт (M5-В8).
+            let class = if pair == Pair::Monitor && code.as_deref() == Some("serial_open_failed") {
+                RowClass::Event
+            } else {
+                RowClass::Error
+            };
+            (
+                class,
+                event_text(code.as_deref(), message, pair, None, peer.as_deref()),
+            )
+        }
         FeedKind::Info {
             code,
             message,
@@ -162,7 +202,10 @@ pub fn row_text(event: &FeedEvent, pair: Pair) -> (RowClass, String) {
         } => {
             // Переполнение очереди писателя — не ошибка обмена, но и не спокойная строка:
             // инженеру стоит знать, что журнал отстаёт (M4-AC12).
-            let class = if code.as_deref() == Some("journal_backlog_warning") {
+            let class = if matches!(
+                code.as_deref(),
+                Some("journal_backlog_warning" | "control_flow_not_forwarded")
+            ) {
                 RowClass::Warning
             } else {
                 RowClass::Event
@@ -200,6 +243,12 @@ pub fn event_text(
     if let Some(text) = repeating_text(code, repeats) {
         return text;
     }
+    // Прослушка: сторона ошибки — порт, и строка называет именно его (M5-В8).
+    if pair == Pair::Monitor
+        && let Some(text) = monitor_text(code, peer)
+    {
+        return text;
+    }
     // Адрес отвергнутого — из поля события, а не из английского `message` (FR-8).
     if code == Some("proxy_peer_rejected")
         && let Some(addr) = peer
@@ -228,6 +277,29 @@ pub fn event_text(
     text.to_owned()
 }
 
+/// Строка ошибки или замечания прослушки: пропавший порт, повтор открытия, замечания
+/// источника о таймере и линиях управления (M5-В3, M5-В8).
+///
+/// Имя пропавшего порта берётся из поля `peer` события: ядро пишет туда порт отказавшей
+/// стороны, и строка называет его, не разбирая английский `message`. Журнал без поля
+/// (старая запись) говорит «порт пропал» без имени.
+fn monitor_text(code: Option<&str>, peer: Option<&str>) -> Option<String> {
+    match code {
+        Some("connection_read_failed" | "connection_write_failed") => Some(match peer {
+            Some(port) => t!("events.monitor_port_lost", port = port),
+            None => t!("events.monitor_port_lost_unnamed").to_owned(),
+        }),
+        // Повтор открытия идёт с паузой из настроек сценария: числа в тексте нет, потому
+        // что в журнале пауза не записана.
+        Some("serial_open_failed") => Some(t!("events.serial_open_failed_monitor").to_owned()),
+        Some("timer_resolution") => Some(t!("events.timer_resolution").to_owned()),
+        Some("control_flow_not_forwarded") => {
+            Some(t!("events.control_flow_not_forwarded").to_owned())
+        }
+        _ => None,
+    }
+}
+
 /// Фраза о серии ошибок источника с числом повторов: своя у каждого из трёх кодов.
 ///
 /// Число в каталоге стоит в конце фразы — «повторов подряд было: 2», — чтобы русское
@@ -251,8 +323,10 @@ fn proxy_failure_text(pair: Pair, refused: bool) -> &'static str {
         (Pair::TargetAnalyzer, true) => t!("events.proxy_connect_failed_analyzer"),
         (Pair::TargetLis, false) => t!("events.proxy_connect_timeout_lis"),
         (Pair::TargetAnalyzer, false) => t!("events.proxy_connect_timeout_analyzer"),
-        (Pair::None, true) => t!("events.proxy_connect_failed"),
-        (Pair::None, false) => t!("events.proxy_connect_timeout"),
+        // У прослушки нет цели прокси: эти коды сюда не приходят, и строка остаётся
+        // прежней общей.
+        (Pair::None | Pair::Monitor, true) => t!("events.proxy_connect_failed"),
+        (Pair::None | Pair::Monitor, false) => t!("events.proxy_connect_timeout"),
     }
 }
 
@@ -733,6 +807,104 @@ mod tests {
             reason: "eof".into(),
         });
         assert_eq!(row_text(&close, Pair::None).1, "#1 отключился · ЛИС");
+    }
+
+    /// Строки прослушки: открытие пары портов, закрытие со стороной и причиной, пропажа
+    /// порта по имени и замечания источника (M5-В8, M5-В3).
+    #[test]
+    fn the_monitor_rows_name_the_ports() {
+        let opened = event(FeedKind::Open {
+            peer: "COM3".into(),
+            link: Some(Link {
+                role: LinkRole::Lis,
+                peer: "COM4".into(),
+                local: String::new(),
+            }),
+        });
+        assert_eq!(
+            row_text(&opened, Pair::Monitor),
+            (
+                RowClass::Service,
+                "#1 открыто: анализатор COM3 → ЛИС COM4".into()
+            )
+        );
+
+        // Закрытие: у порта нет соединения, которое кто-то закрывает, — есть сторона и
+        // причина (М5-В8).
+        for (by, reason, text) in [
+            (ClosedBy::Lis, "error", "#1 закрыто: ЛИС, порт пропал"),
+            (
+                ClosedBy::Analyzer,
+                "error",
+                "#1 закрыто: анализатор, порт пропал",
+            ),
+            (ClosedBy::Bytetap, "stop", "#1 закрыто: bytetap, стоп"),
+            (
+                ClosedBy::Analyzer,
+                "eof",
+                "#1 закрыто: анализатор, конец данных",
+            ),
+        ] {
+            let close = event(FeedKind::Close {
+                by,
+                reason: reason.into(),
+            });
+            assert_eq!(row_text(&close, Pair::Monitor).1, text);
+        }
+
+        // Пропавший порт назван в строке ошибки; журнал без поля говорит без имени.
+        let lost = |port: Option<&str>| {
+            event(FeedKind::Error {
+                code: Some("connection_read_failed".into()),
+                peer: port.map(str::to_owned),
+                message: "monitor read failed: The device is not connected".into(),
+            })
+        };
+        let (class, text) = row_text(&lost(Some("COM4")), Pair::Monitor);
+        assert_eq!(class, RowClass::Error);
+        assert_eq!(text, "COM4 пропал — жду подключения");
+        assert_eq!(
+            row_text(&lost(None), Pair::Monitor).1,
+            "Порт пропал — жду подключения"
+        );
+
+        // Повтор открытия и замечания источника: свои фразы по кодам (M5-AC5, М5-В3).
+        let open_failed = event(FeedKind::Error {
+            code: Some("serial_open_failed".into()),
+            peer: None,
+            message: "serial port open failed".into(),
+        });
+        let (class, text) = row_text(&open_failed, Pair::Monitor);
+        assert_eq!(
+            class,
+            RowClass::Event,
+            "повтор — состояние, не ошибка обмена"
+        );
+        assert!(text.contains("повторяю"), "{text}");
+
+        let timer = event(FeedKind::Info {
+            code: Some("timer_resolution".into()),
+            message: "the system timer resolution is raised".into(),
+            repeats: None,
+        });
+        let (class, text) = row_text(&timer, Pair::Monitor);
+        assert_eq!(class, RowClass::Event);
+        assert!(text.contains("таймера"), "{text}");
+
+        let flow = event(FeedKind::Info {
+            code: Some("control_flow_not_forwarded".into()),
+            message: "control flow rtscts on COM3 does not pass through bytetap".into(),
+            repeats: None,
+        });
+        let (class, text) = row_text(&flow, Pair::Monitor);
+        assert_eq!(class, RowClass::Warning, "о линиях стоит знать");
+        assert!(text.contains("насквозь"), "{text}");
+
+        // Пара из настроек сценария: прослушка — всегда пара портов.
+        assert_eq!(
+            Pair::of(SessionMode::ComMonitor, ProxyMode::AnalyzerClient),
+            Pair::Monitor
+        );
     }
 
     /// Недоступная цель: строка называет вторую сторону пары и остаётся `danger`, а не

@@ -1,9 +1,9 @@
 //! Стартовый экран — выбор сценария (FR-25, U1-AC9), как `ScenariosView.vue`.
 //!
-//! Четыре карточки отвечают на один вопрос: как анализатор связан с ноутбуком. Карточка
-//! последнего запуска обведена и показывает его порт, а у прокси — обе стороны. ↑/↓ ходят
-//! по карточкам, Enter открывает выбранную. Ниже — до трёх последних записей папки
-//! журналов.
+//! Пять карточек отвечают на один вопрос: как анализатор связан с ноутбуком. Карточка
+//! последнего запуска обведена и показывает его порт, а у прокси и у прослушки — обе
+//! стороны. ↑/↓ ходят по карточкам, Enter открывает выбранную. Ниже — до трёх последних
+//! записей папки журналов.
 
 use bytetap_core::journal::RecentJournal;
 use chrono::{DateTime, TimeZone};
@@ -23,11 +23,12 @@ use crate::theme::{self, Palette, radius};
 use crate::widgets;
 
 /// Карточки сценариев в порядке экрана.
-pub const CARDS: [SessionMode; 4] = [
+pub const CARDS: [SessionMode; 5] = [
     SessionMode::TcpServer,
     SessionMode::TcpClient,
     SessionMode::Serial,
     SessionMode::Proxy,
+    SessionMode::ComMonitor,
 ];
 
 fn card_id(index: usize) -> egui::Id {
@@ -44,6 +45,7 @@ pub fn mode_title(mode: SessionMode) -> &'static str {
         SessionMode::TcpClient => t!("scenarios.clientTitle"),
         SessionMode::Serial => t!("scenarios.serialTitle"),
         SessionMode::Proxy => t!("scenarios.proxyTitle"),
+        SessionMode::ComMonitor => t!("scenarios.monitorTitle"),
     }
 }
 
@@ -53,6 +55,7 @@ fn mode_description(mode: SessionMode) -> &'static str {
         SessionMode::TcpClient => t!("scenarios.clientDescription"),
         SessionMode::Serial => t!("scenarios.serialDescription"),
         SessionMode::Proxy => t!("scenarios.proxyDescription"),
+        SessionMode::ComMonitor => t!("scenarios.monitorDescription"),
     }
 }
 
@@ -62,6 +65,8 @@ fn mode_icon(mode: SessionMode) -> Icon {
         SessionMode::TcpClient => Icon::Network,
         SessionMode::Serial => Icon::Usb,
         SessionMode::Proxy => Icon::ArrowRightLeft,
+        // В разрыв кабеля встают с двумя USB-RS232: линия разрезана (M5-В1).
+        SessionMode::ComMonitor => Icon::Unplug,
     }
 }
 
@@ -74,6 +79,8 @@ pub fn last_detail(run: Option<&LastRun>, mode: SessionMode) -> Option<String> {
         SessionMode::TcpServer => t!("scenarios.lastPort", port = run.port),
         // У прокси две стороны: порт прослушивания и цель, а не один порт (M4-В2).
         SessionMode::Proxy => format!(":{} → {}", run.port, run.host),
+        // У прослушки обе стороны — порты: анализатор и ЛИС (M5-AC11).
+        SessionMode::ComMonitor => t!("scenarios.lastPorts", analyzer = run.port, lis = run.host),
     };
     Some(t!("scenarios.lastTime", detail = detail))
 }
