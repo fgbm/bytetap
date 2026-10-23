@@ -414,6 +414,50 @@ fn a_filter_keeps_hidden_rows_out_of_the_block() {
     );
 }
 
+/// Под фильтром Shift+↑/↓ расширяют и сужают один диапазон между видимыми строками, а
+/// не рвут его на хвосты, ушедшие в базу Ctrl-отметок (MAJOR контрольного ревью шага 2).
+#[test]
+fn a_filtered_shift_arrow_keeps_one_range() {
+    let mut harness = harness_of(two_conns());
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "#1")
+        .click();
+    harness.run_steps(2);
+    // Видны F00, F02, F04: стрелки ходят по ним, а не по спрятанным строкам #2.
+    click_row(&mut harness, "F00", Modifiers::NONE);
+    harness.key_press_modifiers(Modifiers::SHIFT, Key::ArrowDown);
+    harness.run_steps(2);
+    assert_eq!(selection_count(&harness), 2, "F00 и F02");
+    harness.key_press_modifiers(Modifiers::SHIFT, Key::ArrowDown);
+    harness.run_steps(2);
+    assert_eq!(selection_count(&harness), 3, "F00, F02, F04");
+    harness.key_press_modifiers(Modifiers::SHIFT, Key::ArrowUp);
+    harness.run_steps(2);
+    assert_eq!(
+        selection_count(&harness),
+        2,
+        "диапазон сузился до F00 и F02, а не развалился"
+    );
+    harness.get_by_label_contains("выбрано 2 · Ctrl+C");
+}
+
+/// Под фильтром Shift+клик по третьей видимой строке, потом по второй: диапазон
+/// заменяется, а не дописывается к прежнему (MAJOR контрольного ревью шага 2).
+#[test]
+fn a_filtered_shift_click_replaces_the_range() {
+    let mut harness = harness_of(two_conns());
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "#1")
+        .click();
+    harness.run_steps(2);
+    click_row(&mut harness, "F00", Modifiers::NONE);
+    click_row(&mut harness, "F04", Modifiers::SHIFT);
+    assert_eq!(selection_count(&harness), 3, "F00, F02, F04");
+    click_row(&mut harness, "F02", Modifiers::SHIFT);
+    assert_eq!(selection_count(&harness), 2, "F00 и F02");
+    harness.get_by_label_contains("выбрано 2 · Ctrl+C");
+}
+
 /// Ctrl+клик снимает строку с выделения, но курсор и панель переезжают на неё — как в
 /// Проводнике (m4).
 #[test]
@@ -627,6 +671,32 @@ fn a_journal_selection_waits_for_pages_before_copying() {
     assert_eq!(copied.lines().count(), 900, "весь блок, а не половина");
     assert!(copied.contains("JEV00000"), "первая строка блока");
     assert!(copied.contains("JEV00899"), "последняя строка блока");
+}
+
+/// Страница, которую прочитать не удалось: её строки в буфер не попадают, а панель
+/// фильтров говорит, сколько строк не прочитано (L1-AC14).
+#[test]
+fn an_unreadable_page_is_reported_after_copy() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let mut harness = journal_harness(dir.path(), 1200);
+    wait_for_row(&mut harness, "JEV00000");
+    let view = harness.state_mut().viewing_mut().expect("журнал открыт");
+    // Вторая страница не прочитается никогда: очередь пула закрыта.
+    let generation = view.source.request_page(1);
+    view.source.page_lost(1, generation);
+    view.selection.select_all(0..900);
+    harness.event(egui::Event::Copy);
+    // Первая страница в памяти, вторая отмечена битой: копирование заканчивается этим
+    // же кадром, и в буфере только прочитанные строки.
+    harness.run_steps(1);
+    let copied = copied_text(&harness).expect("буфер обмена");
+    assert_eq!(copied.lines().count(), 500, "только первая страница");
+    assert!(
+        !copied.contains("JEV00500"),
+        "строки битой страницы не скопированы"
+    );
+    harness.run_steps(1);
+    harness.get_by_label_contains("не прочитано: 400 строк");
 }
 
 /// Кадры до копирования: страницы журнала читает фоновый пул, и строки копятся по

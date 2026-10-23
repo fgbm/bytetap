@@ -31,15 +31,22 @@ const NARROW_MAX: usize = 100_000;
 /// выделение диапазоном от якоря, но не сбрасывает «базу» — отметки, сделанные
 /// Ctrl+кликом. Выделение — это `marks ∪ span`, а `marks` помнит и то, что было
 /// отмечено до установки якоря.
+///
+/// Диапазон хранится дважды: `span` — как его задал инженер (якорь и цель), и
+/// `visible` — те его части, что проходят фильтр соединения. Заменяет и сужает
+/// диапазон всегда `span`: хвосты, которые фильтр спрятал, остаются частью диапазона
+/// и в «базу» Ctrl-отметок не уходят (находка MAJOR контрольного ревью шага 2).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
     /// Отметки Ctrl+клика: база, которую не сбрасывает Shift+клик.
     marks: Vec<(u64, u64)>,
-    /// Диапазон Shift+клика и Shift+стрелок: от якоря до цели.
+    /// Диапазон Shift+клика и Shift+стрелок, как его задали: от якоря до цели.
     span: Option<(u64, u64)>,
+    /// Части диапазона, проходящие фильтр: по ним считают, подсвечивают и копируют.
+    visible: Vec<(u64, u64)>,
     /// Якорь: строка, от которой строится диапазон.
     anchor: Option<u64>,
-    /// Склеенные `marks ∪ span` по возрастанию: их и обходят `seqs` и копирование.
+    /// Склеенные `marks ∪ visible` по возрастанию: их и обходят `seqs`.
     merged: Vec<(u64, u64)>,
     /// Сколько событий выделено: пересчитывается только при правке, не в кадре.
     count: usize,
@@ -71,6 +78,7 @@ impl Selection {
     pub fn clear(&mut self) {
         self.marks.clear();
         self.span = None;
+        self.visible.clear();
         self.anchor = None;
         self.recount();
     }
@@ -80,7 +88,7 @@ impl Selection {
     /// Отметки Ctrl+клика клик снимает: новая выделенная строка — это новое выделение.
     pub fn click(&mut self, seq: u64) {
         self.marks.clear();
-        self.span = Some((seq, seq));
+        self.set_span(seq, seq);
         self.anchor = Some(seq);
         self.recount();
     }
@@ -91,8 +99,15 @@ impl Selection {
     /// сбрасывает. Shift+↑ после Shift+↓ поэтому сужает диапазон, а не расширяет его.
     pub fn extend(&mut self, seq: u64) {
         let anchor = *self.anchor.get_or_insert(seq);
-        self.span = Some((anchor.min(seq), anchor.max(seq)));
+        self.set_span(anchor.min(seq), anchor.max(seq));
         self.recount();
+    }
+
+    /// Новый диапазон от `from` до `to`: он заменяет прежний целиком, а фильтр
+    /// применяется к нему заново — спрятанные строки остаются частью диапазона.
+    fn set_span(&mut self, from: u64, to: u64) {
+        self.span = Some((from, to));
+        self.visible = vec![(from, to)];
     }
 
     /// Ctrl+Shift+клик: диапазон от якоря добавляется к базе, прежнее выделение остаётся.
@@ -113,9 +128,12 @@ impl Selection {
     /// Диапазон Shift+клика при этом становится базой: иначе снятие одной строки в нём
     /// сбросило бы весь диапазон.
     pub fn toggle(&mut self, seq: u64) {
-        if let Some(span) = self.span.take() {
-            self.marks = merge(self.marks.iter().copied().chain(std::iter::once(span)));
+        // Диапазон становится базой уже суженным: отметка — это то, что видно.
+        let span = std::mem::take(&mut self.visible);
+        if !span.is_empty() {
+            self.marks = merge(self.marks.iter().copied().chain(span));
         }
+        self.span = None;
         let was = self.contains(seq);
         if was {
             self.marks = remove(self.marks.iter().copied(), seq);
@@ -141,6 +159,7 @@ impl Selection {
         numbers.dedup();
         self.marks = merge(numbers.into_iter().map(|seq| (seq, seq)));
         self.span = None;
+        self.visible.clear();
         self.anchor = self.marks.first().map(|(start, _)| *start);
         self.recount();
     }
@@ -155,6 +174,7 @@ impl Selection {
             .span
             .map(|(start, end)| (start.max(first), end))
             .filter(|(start, end)| start <= end);
+        self.visible = clamp_from(self.visible.iter().copied(), first);
         self.recount();
         if self.anchor.is_some_and(|anchor| anchor < first) {
             self.anchor = None;
@@ -173,15 +193,9 @@ impl Selection {
             return;
         }
         self.marks = keep_each(self.marks.iter().copied(), &keep);
-        if let Some(span) = self.span.take() {
-            // Диапазон сужается и остаётся диапазоном, пока спрятанные строки не
-            // разорвут его на части: тогда его хвосты уходят в базу.
-            let ranges = keep_each(std::iter::once(span), &keep);
-            self.span = ranges.first().copied();
-            if ranges.len() > 1 {
-                self.marks = merge(self.marks.iter().copied().chain(ranges.into_iter().skip(1)));
-            }
-        }
+        // Суженный диапазон — отдельно от того, как его задали: следующий Shift+клик
+        // заменит `span` целиком и сузит новый диапазон заново.
+        self.visible = keep_each(self.visible.iter().copied(), &keep);
         self.recount();
         if self.anchor.is_some_and(|anchor| !keep(anchor)) {
             self.anchor = None;
@@ -195,7 +209,11 @@ impl Selection {
 
     /// Пересобрать склейку и счётчик после правки.
     fn recount(&mut self) {
-        let all = self.marks.iter().copied().chain(self.span.iter().copied());
+        let all = self
+            .marks
+            .iter()
+            .copied()
+            .chain(self.visible.iter().copied());
         self.merged = merge(all);
         self.count = self
             .merged
@@ -616,20 +634,49 @@ mod tests {
         assert_eq!(selection.count(), 3);
     }
 
-    /// Фильтр рвёт диапазон Shift+клика: остаются видимые строки, а не только начало.
+    /// Фильтр прячет строки диапазона, но **не** превращает их хвосты в Ctrl-отметки:
+    /// диапазон остаётся диапазоном от якоря, и следующий Shift+клик заменяет его
+    /// целиком (находка MAJOR контрольного ревью шага 2).
     #[test]
-    fn a_filter_narrows_the_span_without_losing_its_tail() {
+    fn a_filter_narrows_the_span_but_keeps_it_a_span() {
         let mut selection = Selection::default();
         selection.click(1);
         selection.extend(9);
-        selection.retain(|seq| seq != 2 && (3..=7).contains(&seq));
-        assert_eq!(selected(&selection), (3..=7).collect::<Vec<u64>>());
-        // Дырка в середине: хвост диапазона остаётся в выделении.
-        let mut selection = Selection::default();
-        selection.click(1);
+        // Видны только 1, 3, 5, 7, 9 — как при фильтре соединения.
+        selection.retain(|seq| seq % 2 == 1);
+        assert_eq!(selected(&selection), [1, 3, 5, 7, 9]);
+        assert_eq!(selection.count(), 5);
+        // Shift+клик ближе к якорю заменяет диапазон, а не добавляет к нему.
+        selection.extend(5);
+        selection.retain(|seq| seq % 2 == 1);
+        assert_eq!(selected(&selection), [1, 3, 5]);
+        // Shift+клик дальше якоря снова расширяет от него.
         selection.extend(9);
-        selection.retain(|seq| seq != 5);
-        assert_eq!(selected(&selection), [1, 2, 3, 4, 6, 7, 8, 9]);
+        selection.retain(|seq| seq % 2 == 1);
+        assert_eq!(selected(&selection), [1, 3, 5, 7, 9]);
+    }
+
+    /// Ctrl-отметки под фильтром остаются базой и Shift+кликом не сбрасываются.
+    #[test]
+    fn a_filter_keeps_the_ctrl_marks() {
+        let mut selection = Selection::default();
+        selection.toggle(9);
+        // Якорь ставит Ctrl+клик, отметки остаются базой; простой клик начал бы заново.
+        selection.toggle(1);
+        selection.extend(5);
+        selection.retain(|seq| seq % 2 == 1);
+        assert_eq!(
+            selected(&selection),
+            [1, 3, 5, 9],
+            "отметка 9 и диапазон 1..5"
+        );
+        selection.extend(3);
+        selection.retain(|seq| seq % 2 == 1);
+        assert_eq!(
+            selected(&selection),
+            [1, 3, 9],
+            "диапазон заменился, база осталась"
+        );
     }
 
     /// Комментарий с переводами строк остаётся одной строкой копирования: переводы
