@@ -599,3 +599,86 @@ async fn a_missing_lis_port_is_a_start_error_on_the_lis_side() {
         "журнал не создан"
     );
 }
+
+/// Пара прослушки не рвётся, когда ЛИС не читает дольше двух секунд (M5-AC5, NFR-6).
+///
+/// У ответа автоответчика срок записи есть (2 с), у пути данных прослушки его нет: иначе
+/// медленная или притормозившая сторона закрывала бы пару посреди обмена. Тест пишет
+/// больше, чем вмещают буферы pty и `socat`, не читает конец ЛИС две с половиной секунды
+/// и проверяет, что пара жива; потом читает — байты приходят целиком и совпадают с журналом.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires socat"]
+async fn the_pair_survives_a_lis_that_does_not_read() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let analyzer = match Socat::start(dir.path(), "analyzer") {
+        Some(socat) => socat,
+        None => return,
+    };
+    let lis = Socat::start(dir.path(), "lis").expect("вторая пара pty");
+    let settings = |port: &Path| {
+        SerialSettings::new(port.to_string_lossy(), 9600, SerialFormat::EIGHT_N_ONE)
+            .with_lines(false, false)
+    };
+    let handle = Session::start(
+        SessionConfig::com_monitor(settings(&analyzer.first), settings(&lis.first), RETRY)
+            .with_log_dir(dir.path()),
+    )
+    .await
+    .expect("оба порта открываются");
+    let path = handle.journal_path().to_path_buf();
+
+    // Синтетическая запись, повторённая так, чтобы переполнить буферы pty и socat.
+    let record = b"H|\\^&|||ANALYZER|||||||P|E1394-97\rL|1|N\r";
+    let payload: Vec<u8> = record.iter().copied().cycle().take(64 * 1024).collect();
+
+    let analyzer_end = analyzer.second.clone();
+    let lis_end = lis.second.clone();
+    let writer = {
+        let payload = payload.clone();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let mut port = open_end(&analyzer_end)?;
+            port.write_all(&payload)?;
+            port.flush()?;
+            Ok(())
+        })
+    };
+
+    // Конец ЛИС не читает: запись в порт ЛИС встаёт, но пара остаётся живой.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(
+        !handle.is_finished(),
+        "сессия остановилась, хотя пара должна была ждать читателя"
+    );
+    let outcome = read_all(&path).expect("журнал читается");
+    assert!(
+        !outcome
+            .lines
+            .iter()
+            .any(|line| matches!(line.event, Event::Close(_))),
+        "пара закрылась, пока ЛИС не читала"
+    );
+
+    // Читатель появился: байты доходят целиком и ровно те, что в журнале.
+    let expected = payload.len();
+    let reader = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+        let mut port = open_end(&lis_end)?;
+        let mut received = vec![0u8; expected];
+        port.read_exact(&mut received)?;
+        Ok(received)
+    });
+    writer
+        .await
+        .expect("поток анализатора")
+        .expect("запись анализатора");
+    let received = reader.await.expect("поток ЛИС").expect("чтение ЛИС");
+    assert_eq!(received, payload, "ЛИС получила ровно отправленное");
+    wait_for_bytes(&path, 1, Dir::AnalyzerToLis, payload.len()).await;
+    assert_eq!(
+        recorded_bytes(&path, 1, Dir::AnalyzerToLis),
+        payload,
+        "журнал совпадает с переданным"
+    );
+
+    let stats = handle.stop().await.expect("остановка");
+    assert_eq!(stats.bytes_analyzer_to_lis, payload.len() as u64);
+}
