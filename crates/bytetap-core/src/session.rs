@@ -160,6 +160,27 @@ pub static TEST_PUMP_EOF_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "test-hooks")]
 pub static TEST_PUMP_EOF_DELAY_SIDE: AtomicU64 = AtomicU64::new(0);
 
+/// Тестовый хук: чья задача насоса пары падает, `1` — анализатора, `2` — ЛИС, `0` — выкл.
+///
+/// Появляется только со сборкой feature `test-hooks`: падение задачи насоса — не штатное
+/// закрытие пары, и тест проверяет, что в журнале видно `error` с кодом (M4-AC5).
+#[cfg(feature = "test-hooks")]
+pub static TEST_PUMP_PANIC_SIDE: AtomicU64 = AtomicU64::new(0);
+
+/// Тестовый хук: задержка падения задачи насоса, миллисекунды.
+///
+/// Задержка делает падение второй стороны: первая успевает закрыться штатно, и падение
+/// приходится уже на дожитие пары (M4-AC5).
+#[cfg(feature = "test-hooks")]
+pub static TEST_PUMP_PANIC_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Тестовый хук: сколько насос не слышит сигнала пары о закрытии, миллисекунды.
+///
+/// Появляется только со сборкой feature `test-hooks`: так проверяется, что ошибка обмена
+/// второй стороны после истечения [`PROXY_LINGER`] попадает в журнал (M4-AC10).
+#[cfg(feature = "test-hooks")]
+pub static TEST_PUMP_HANGUP_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Пора закончить сессию самой: хук [`TEST_END_AFTER_EVENTS`] сработал.
 #[cfg(feature = "test-hooks")]
 fn test_hook_end() -> bool {
@@ -1659,13 +1680,9 @@ async fn serve_pair(
 
     let mut close = match pumps.join_next().await {
         Some(Ok(ended)) => PairClose::new(&shared, conn, &ended, ports.as_ref()),
-        // Насосов не осталось или задача упала: пары больше нет.
-        None | Some(Err(_)) => PairClose {
-            seq: None,
-            by: ClosedBy::Bytetap,
-            reason: "error",
-            linger: Duration::ZERO,
-        },
+        // Насосов не осталось или задача упала: пары больше нет, и это ошибка, а не
+        // штатное закрытие (M4-AC5).
+        None | Some(Err(_)) => PairClose::failed(&shared, conn),
     };
     // Прослушка не доживает обратное направление: у порта нет `FIN`, и закрытая пара —
     // это закрытые оба порта (M5-AC2).
@@ -1681,11 +1698,15 @@ async fn serve_pair(
         // Вторая сторона закрывается сразу: `FIN` уже не пересылать, `RST`, «Стоп» или
         // отказ журнала.
         let _ = hangup.send(true);
-        if let Some(ended) = settle(&mut pumps).await {
-            // Конец второй стороны — тоже событие журнала, а `close` называет ту сторону,
-            // которая закончилась раньше по времени (M4-AC5).
-            close.absorb(&shared, conn, &ended, ports.as_ref());
-            reset_pair = reset_pair || is_reset_outcome(&ended.outcome);
+        match settle(&mut pumps).await {
+            Settled::Ended(ended) => {
+                // Конец второй стороны — тоже событие журнала, а `close` называет ту
+                // сторону, которая закончилась раньше по времени (M4-AC5).
+                close.absorb(&shared, conn, &ended, ports.as_ref());
+                reset_pair = reset_pair || is_reset_outcome(&ended.outcome);
+            }
+            Settled::Failed => close = PairClose::failed(&shared, conn),
+            Settled::TimedOut => {}
         }
     } else {
         // `FIN` одной стороны: обратное направление доживает до своего `FIN`;
@@ -1700,8 +1721,9 @@ async fn serve_pair(
                 // там, где собеседник видел сброс.
                 reset_pair = reset_pair || is_reset_outcome(&ended.outcome);
             }
-            // Насосов не осталось или задача упала: закрывать уже нечего.
-            Ok(_) => {}
+            // Насосов не осталось или задача упала: пару закрывает ошибка, а не
+            // штатный `eof` первой стороны (M4-AC5).
+            Ok(_) => close = PairClose::failed(&shared, conn),
             Err(_elapsed) => {
                 // Срок истёк: пару закрывает bytetap, итог второго насоса его не меняет.
                 close.by = ClosedBy::Bytetap;
@@ -1709,8 +1731,12 @@ async fn serve_pair(
                 close.seq = None;
                 let _ = hangup.send(true);
                 // Но ошибка обмена второго насоса — по-прежнему событие журнала.
-                if let Some(ended) = settle(&mut pumps).await {
-                    let _ = pair_end(&shared, conn, &ended.outcome, ports.as_ref());
+                match settle(&mut pumps).await {
+                    Settled::Ended(ended) => {
+                        let _ = pair_end(&shared, conn, &ended.outcome, ports.as_ref());
+                    }
+                    Settled::Failed => close = PairClose::failed(&shared, conn),
+                    Settled::TimedOut => {}
                 }
             }
         }
@@ -1761,6 +1787,25 @@ impl PairClose {
             by,
             reason,
             linger,
+        }
+    }
+
+    /// Пара закрыта ошибкой: задача насоса упала или пропала.
+    ///
+    /// Паника задачи — не штатное закрытие: в журнале остаётся `error` с кодом, а `close`
+    /// называет `bytetap` с причиной `error` (M4-AC5). Номера конца нет — уточнять
+    /// нечем, и второй конец такой `close` не перекрывает.
+    fn failed(shared: &Shared, conn: u32) -> Self {
+        shared.error_with_code(
+            Some(conn),
+            Some("connection_task_failed"),
+            "the pair pump task failed".to_owned(),
+        );
+        Self {
+            seq: None,
+            by: ClosedBy::Bytetap,
+            reason: "error",
+            linger: Duration::ZERO,
         }
     }
 
@@ -1870,19 +1915,29 @@ fn pair_end(
     }
 }
 
+/// Чем кончилось дожидание второго насоса.
+enum Settled {
+    /// Насос вернулся сам.
+    Ended(PumpEnd),
+    /// Задача насоса упала или пропала: это ошибка пары, а не штатное закрытие (M4-AC5).
+    Failed,
+    /// Предел ожидания истёк: задачи прерваны.
+    TimedOut,
+}
+
 /// Дожидается второго насоса после сигнала: он вернётся сам, записав отправленное.
 ///
 /// `abort` здесь не годится: прерванная посреди записи задача не успела бы записать
 /// в журнал байты, которые адресат получил (M4-AC10). Предел — тот же, что у остановки
 /// сессии; дольше ждать незачем, и тогда задачи прерываются. Итог второго насоса решает
 /// вызывающий: он уточняет `close`, если её сторона закончилась раньше (M4-AC5).
-async fn settle(pumps: &mut JoinSet<PumpEnd>) -> Option<PumpEnd> {
+async fn settle(pumps: &mut JoinSet<PumpEnd>) -> Settled {
     match timeout(CONNECTIONS_SHUTDOWN_TIMEOUT, pumps.join_next()).await {
-        Ok(Some(Ok(ended))) => Some(ended),
-        Ok(_) => None,
+        Ok(Some(Ok(ended))) => Settled::Ended(ended),
+        Ok(_) => Settled::Failed,
         Err(_elapsed) => {
             pumps.shutdown().await;
-            None
+            Settled::TimedOut
         }
     }
 }
@@ -1918,6 +1973,7 @@ async fn pump(
         mut failure,
         mut hangup,
     } = signals;
+    test_hook_pump_fault(role).await;
     let mut buffer = vec![0u8; READ_BUFFER];
     loop {
         // Отказ журнала останавливает пересылку: обмен, которого нет в записи, дальше
@@ -2019,10 +2075,11 @@ async fn pump(
 
 /// Ждёт сигнала пары о закрытии (или выгрузки отправителя).
 async fn wait_for_hangup(hangup: &mut watch::Receiver<bool>) {
-    if *hangup.borrow_and_update() {
-        return;
+    if !*hangup.borrow_and_update() {
+        let _ = hangup.changed().await;
     }
-    let _ = hangup.changed().await;
+    // Хук: насос «не слышит» пришедший сигнал ещё столько-то миллисекунд.
+    test_hook_hangup_delay().await;
 }
 
 /// Задержка выхода насоса после `FIN` на стороне из хука [`TEST_PUMP_EOF_DELAY_SIDE`].
@@ -2041,6 +2098,36 @@ async fn test_hook_pump_eof_delay(role: LinkRole) {
 
 #[cfg(not(feature = "test-hooks"))]
 async fn test_hook_pump_eof_delay(_role: LinkRole) {}
+
+/// Падение задачи насоса по хуку [`TEST_PUMP_PANIC_SIDE`]: пара закрывается ошибкой.
+#[cfg(feature = "test-hooks")]
+async fn test_hook_pump_fault(role: LinkRole) {
+    let side = TEST_PUMP_PANIC_SIDE.load(Ordering::Relaxed);
+    let ours = (side == 1 && role == LinkRole::Analyzer) || (side == 2 && role == LinkRole::Lis);
+    if !ours {
+        return;
+    }
+    let millis = TEST_PUMP_PANIC_MS.load(Ordering::Relaxed);
+    if millis > 0 {
+        tokio::time::sleep(Duration::from_millis(millis)).await;
+    }
+    panic!("тестовый хук: задача насоса пары упала");
+}
+
+#[cfg(not(feature = "test-hooks"))]
+async fn test_hook_pump_fault(_role: LinkRole) {}
+
+/// Глухота насоса к сигналу пары по хуку [`TEST_PUMP_HANGUP_DELAY_MS`].
+#[cfg(feature = "test-hooks")]
+async fn test_hook_hangup_delay() {
+    let millis = TEST_PUMP_HANGUP_DELAY_MS.load(Ordering::Relaxed);
+    if millis > 0 {
+        tokio::time::sleep(Duration::from_millis(millis)).await;
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+async fn test_hook_hangup_delay() {}
 
 /// Сброс ли это: ошибка сокета, после которой пару закрывают `RST`, а не `FIN` (FR-7).
 fn is_reset_kind(error: &io::Error) -> bool {
