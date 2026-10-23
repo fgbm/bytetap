@@ -128,6 +128,18 @@ pub enum ErrorField {
 pub fn error_field(code: ErrorCode, mode: SessionMode) -> ErrorField {
     let serial = mode == SessionMode::Serial;
     match code {
+        // Опечатка в портах прослушки — настройка порта, а не общий «Старт». По умолчанию
+        // порт анализатора: сторону отказавшего порта называет ошибка старта, и поле
+        // выбирается по ней (M5-AC3).
+        ErrorCode::PortNotFound
+        | ErrorCode::PortBusy
+        | ErrorCode::PortSettings
+        | ErrorCode::PermissionDenied
+        | ErrorCode::Serial
+            if mode == SessionMode::ComMonitor =>
+        {
+            ErrorField::SerialA
+        }
         ErrorCode::PortInUse | ErrorCode::PermissionDenied if serial => ErrorField::Serial,
         ErrorCode::PortInUse | ErrorCode::PermissionDenied => ErrorField::Port,
         ErrorCode::AddressUnavailable
@@ -141,14 +153,6 @@ pub fn error_field(code: ErrorCode, mode: SessionMode) -> ErrorField {
         ErrorCode::ProxyTargetSelf => ErrorField::TargetPort,
         // Отказ фильтра — под полем фильтра, а не под адресом цели (FR-8).
         ErrorCode::AllowFromInvalid => ErrorField::AllowFrom,
-        // Опечатка в портах прослушки — настройка порта, а не общий «Старт». По умолчанию
-        // порт анализатора: сторону отказавшего порта называет ошибка старта, и поле
-        // выбирается по ней (M5-AC3).
-        ErrorCode::PortNotFound | ErrorCode::PortBusy | ErrorCode::PortSettings
-            if mode == SessionMode::ComMonitor =>
-        {
-            ErrorField::SerialA
-        }
         ErrorCode::PortNotFound
         | ErrorCode::PortBusy
         | ErrorCode::PortSettings
@@ -247,7 +251,7 @@ mod tests {
     #[test]
     fn codes_are_bound_to_their_fields() {
         use ErrorCode::*;
-        use SessionMode::{Proxy, Serial as Com, TcpClient, TcpServer};
+        use SessionMode::{ComMonitor, Proxy, Serial as Com, TcpClient, TcpServer};
         let cases = [
             (PortInUse, TcpServer, ErrorField::Port),
             (PortInUse, Com, ErrorField::Serial),
@@ -267,6 +271,16 @@ mod tests {
             (PortBusy, Com, ErrorField::Serial),
             (PortSettings, Com, ErrorField::Serial),
             (Serial, Com, ErrorField::Serial),
+            // Прослушка: любая ошибка порта — своё поле, а сторону уточняет ошибка старта.
+            (PortBusy, ComMonitor, ErrorField::SerialA),
+            (PortNotFound, ComMonitor, ErrorField::SerialA),
+            (PortSettings, ComMonitor, ErrorField::SerialA),
+            (Serial, ComMonitor, ErrorField::SerialA),
+            (PermissionDenied, ComMonitor, ErrorField::SerialA),
+            (MonitorSamePort, ComMonitor, ErrorField::SerialB),
+            // Журнал и общий отказ остаются общими и у прослушки.
+            (LogDir, ComMonitor, ErrorField::LogDir),
+            (Journal, ComMonitor, ErrorField::Start),
             (LogDir, TcpClient, ErrorField::LogDir),
             (JournalOpen, TcpServer, ErrorField::LogDir),
             (AlreadyRunning, TcpServer, ErrorField::Start),
