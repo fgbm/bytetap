@@ -1,6 +1,6 @@
 {
   "name": "bytetap",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "description": "Запись «сырого» обмена между лабораторным анализатором и ЛИС",
   "license": "MIT",
