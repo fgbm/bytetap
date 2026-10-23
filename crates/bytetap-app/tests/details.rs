@@ -402,9 +402,8 @@ fn copied_text(harness: &Harness<'static, BytetapApp>) -> Option<String> {
         })
 }
 
-/// Панель открывается и в просмотре журнала: номер события — индекс журнала, а не `seq`.
-#[test]
-fn the_panel_works_in_the_journal_view() {
+/// Журнал из трёх событий для просмотра: номер события — индекс журнала.
+fn journal_harness() -> (tempfile::TempDir, Harness<'static, BytetapApp>) {
     use bytetap_app::journal::{JournalCache, JournalOpen};
 
     let dir = tempfile::tempdir().expect("временная папка");
@@ -453,6 +452,13 @@ fn the_panel_works_in_the_journal_view() {
                 .with_journal_fixture(view)
         });
     harness.run_steps(3);
+    (dir, harness)
+}
+
+/// Панель открывается и в просмотре журнала: номер события — индекс журнала, а не `seq`.
+#[test]
+fn the_panel_works_in_the_journal_view() {
+    let (_dir, mut harness) = journal_harness();
     click_row(&mut harness, "JMSG1");
     let title = harness
         .get_by_label_contains("Детали события")
@@ -578,8 +584,7 @@ fn an_open_panel_keeps_the_selected_row_where_it_was() {
         .next()
         .expect("последняя строка видна");
     click_row(&mut harness, "EVT0199");
-    // Прокрутка ленты после клика успокаивается за несколько кадров: ждём её.
-    harness.run_steps(40);
+    harness.run_steps(3);
     let before = row_rect(&harness, "EVT0199").expect("выбранная строка видна");
     // 50 новых событий: лента не прилипает к концу, строка стоит, счётчик считает.
     let texts: Vec<String> = (0..50)
@@ -997,5 +1002,166 @@ fn the_panel_returns_to_its_height_when_the_window_grows() {
     assert!(
         (again - height).abs() < 1.0,
         "панель вернулась к выбранной высоте: {height} → {again}"
+    );
+}
+
+/// Клик по строке при уже открытой панели только меняет выбор: лента не дёргается
+/// и строка остаётся на своём месте (находка контрольного ревью шага 1).
+#[test]
+fn a_click_with_the_panel_open_keeps_the_row_in_place() {
+    let mut harness = harness_with(settings(), many_events(200));
+    harness.run_steps(2);
+    click_row(&mut harness, "EVT0199");
+    harness.run_steps(3);
+    // Строка внизу видимой области: её и нажимаем вторым кликом.
+    let low = row_rect(&harness, "EVT0197").expect("нижняя видимая строка");
+    let panel_top = harness.get_by_label_contains("Детали события").rect().top();
+    assert!(
+        low.bottom() <= panel_top,
+        "строка {low:?} над панелью {panel_top}"
+    );
+    click_row(&mut harness, "EVT0197");
+    harness.run_steps(3);
+    let after = row_rect(&harness, "EVT0197").expect("строка на месте");
+    assert_eq!(
+        after, low,
+        "клик при открытой панели не двигает ленту: {low:?} → {after:?}"
+    );
+    assert!(
+        panel_text(&harness).contains("EVT0197"),
+        "выбрано новое событие"
+    );
+}
+
+/// Escape при открытом меню шапки закрывает меню, а не панель (L1-AC9).
+#[test]
+fn escape_closes_the_header_menu_but_not_the_panel() {
+    let mut harness = harness();
+    click_row(&mut harness, "MSG0001");
+    harness.get_by_label("Меню записи").click();
+    harness.run_steps(2);
+    harness.get_by_label("Скопировать путь к журналу");
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label("Скопировать путь к журналу")
+            .is_none(),
+        "меню закрылось"
+    );
+    assert!(
+        harness.query_by_label_contains("Детали события").is_some(),
+        "панель осталась открытой"
+    );
+}
+
+/// Escape при открытом списке выбора в просмотре журнала закрывает список, а не панель.
+#[test]
+fn escape_in_the_journal_closes_the_list_but_not_the_panel() {
+    let (_dir, mut harness) = journal_harness();
+    click_row(&mut harness, "JMSG1");
+    harness.get_by_label("Кодировка").click();
+    harness.run_steps(2);
+    harness.get_by_label("ASCII");
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(harness.query_by_label("ASCII").is_none(), "список закрылся");
+    assert!(
+        harness.query_by_label_contains("Детали события").is_some(),
+        "панель осталась открытой"
+    );
+}
+
+/// Разделитель панели один — свой, с русской подписью; Tab доходит до него, стрелки
+/// меняют высоту, а выбор в ленте и фокус остаются на месте (L1-AC2, L1-AC8).
+#[test]
+fn the_splitter_is_one_and_its_arrows_change_the_height() {
+    use egui_kittest::kittest::NodeT as _;
+
+    let mut harness = harness();
+    click_row(&mut harness, "MSG0001");
+    harness.run_steps(2);
+    let splitters: Vec<String> = harness
+        .query_all_by_role(egui::accesskit::Role::Splitter)
+        .map(|node| node.accesskit_node().label().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        splitters,
+        ["Высота панели"],
+        "разделитель один и назван по-русски"
+    );
+    // Tab доходит до разделителя: панель идёт после строк ленты.
+    let mut focused = String::new();
+    for _ in 0..40 {
+        harness.key_press(Key::Tab);
+        harness.run_steps(1);
+        if let Some(node) = harness
+            .root()
+            .children_recursive()
+            .find(egui_kittest::Node::is_focused)
+        {
+            focused = node.accesskit_node().label().unwrap_or_default();
+        }
+        if focused == "Высота панели" {
+            break;
+        }
+    }
+    assert_eq!(focused, "Высота панели", "Tab дошёл до разделителя");
+    let title = harness
+        .get_by_label_contains("Детали события")
+        .accesskit_node()
+        .label()
+        .unwrap_or_default();
+    let before = harness
+        .get_by_label_contains("Детали события")
+        .rect()
+        .height();
+    harness.key_press(Key::ArrowUp);
+    harness.run_steps(1);
+    harness.key_press(Key::ArrowUp);
+    harness.run_steps(2);
+    let after = harness
+        .get_by_label_contains("Детали события")
+        .rect()
+        .height();
+    assert!(
+        (after - before - 32.0).abs() < 1.0,
+        "два шага по 16 точек: {before} → {after}"
+    );
+    assert!(
+        row_rect(&harness, "MSG0001").is_some(),
+        "строка ленты не ушла из-за стрелок"
+    );
+    assert_eq!(
+        harness
+            .get_by_label_contains("Детали события")
+            .accesskit_node()
+            .label()
+            .unwrap_or_default(),
+        title,
+        "выбор не переехал"
+    );
+    let focused = harness
+        .root()
+        .children_recursive()
+        .find(egui_kittest::Node::is_focused)
+        .expect("фокус на месте");
+    assert_eq!(
+        focused.accesskit_node().label().as_deref(),
+        Some("Высота панели"),
+        "фокус остался на разделителе"
+    );
+    // Диктор двигает высоту действием Increment — тем же шагом, что и стрелка.
+    harness
+        .get_by_role(egui::accesskit::Role::Splitter)
+        .increment_accesskit();
+    harness.run_steps(2);
+    let grown = harness
+        .get_by_label_contains("Детали события")
+        .rect()
+        .height();
+    assert!(
+        (grown - after - 16.0).abs() < 1.0,
+        "шаг диктора 16 точек: {after} → {grown}"
     );
 }

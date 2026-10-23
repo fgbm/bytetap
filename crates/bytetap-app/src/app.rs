@@ -1873,6 +1873,10 @@ impl BytetapApp {
         let ctx = ui.ctx().clone();
         self.poll_background(&ctx);
         self.poll_view(&ctx);
+        // Открытое меню или выпадающий список закрывает Esc сам — уже во время отрисовки
+        // шапки. Поэтому «что-то открыто» снимается здесь, до шапки: иначе Esc закрывал
+        // бы вместе с меню и панель деталей (L1-AC9).
+        let popup_open = egui::Popup::is_any_open(&ctx);
         // Края — раньше шапки: нажатие на краю не должно достаться кнопкам под ним.
         titlebar::resize_edges(ui.ctx());
         let p = self.pal();
@@ -1897,7 +1901,7 @@ impl BytetapApp {
         self.stop_error_notice(ui);
         self.settings_warning(ui);
         if recording {
-            let added = self.recording_screen(ui);
+            let added = self.recording_screen(ui, popup_open);
             if self.live.is_some() {
                 // Период кадра выбирается по цене прошлых кадров: аппаратный растр
                 // держит 30 кадров в секунду, WARP — 10 и реже (NFR-5, U1-AC24).
@@ -1939,7 +1943,7 @@ impl BytetapApp {
                 crate::viewscreen::notice(self, ui);
                 crate::viewscreen::map(self, ui);
                 crate::viewscreen::bar(self, ui);
-                crate::viewscreen::feed(self, ui);
+                crate::viewscreen::feed(self, ui, popup_open);
             }
         } else {
             egui::ScrollArea::vertical()

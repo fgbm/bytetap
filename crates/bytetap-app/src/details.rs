@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, Align, CursorIcon, Frame, Id, Key, Layout, Modifiers, Rect, Response, Role, ScrollArea,
-    Sense, Stroke, TextEdit, Ui, UiBuilder, WidgetInfo,
+    self, Align, CursorIcon, EventFilter, Frame, Id, Key, Layout, Modifiers, Rect, Response, Role,
+    ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, WidgetInfo,
     text::{CCursorRange, LayoutJob, TextWrapping},
     vec2,
 };
@@ -97,6 +97,9 @@ struct TextLayout {
     dark: bool,
     wrap: f32,
     pixels_per_point: f32,
+    /// Размер атласа шрифта: при его росте egui укладывает глифы заново, и старые
+    /// `uv_rect` в галлее показывали бы чужие глифы.
+    atlas: [usize; 2],
     text: Arc<str>,
     galley: Arc<egui::Galley>,
 }
@@ -119,8 +122,12 @@ pub struct Details {
     evicted: bool,
     /// Выделенные строки дампа в HEX-вкладке.
     hex: Option<HexRange>,
-    /// Событие сменилось: поле, выделение и прокрутка начинают с чистого листа.
+    /// Событие сменилось: поле и выделение начинают с чистого листа.
     stale: bool,
+    /// Событие, для которого нарисована каждая вкладка: у нового фрагмента прокрутка
+    /// начинается с начала, и у «Текста», и у «HEX» — даже если вкладку не открывали.
+    text_scroll_for: Option<u64>,
+    hex_scroll_for: Option<u64>,
     text: Option<TextLayout>,
 }
 
@@ -136,6 +143,8 @@ impl Default for Details {
             evicted: false,
             hex: None,
             stale: false,
+            text_scroll_for: None,
+            hex_scroll_for: None,
             text: None,
         }
     }
@@ -201,6 +210,9 @@ impl Details {
         self.hex = None;
         self.text = None;
         self.stale = true;
+        // У нового фрагмента обе вкладки начинают сверху, даже если их не открывали.
+        self.text_scroll_for = None;
+        self.hex_scroll_for = None;
         // У простого события (открытие, закрытие, замечание) HEX-дампа нет — вкладка одна.
         if self
             .event
@@ -219,6 +231,10 @@ impl Details {
         self.hex = None;
         self.text = None;
         self.stale = true;
+        // Панель закрыли посреди перетаскивания: признак не должен пережить её.
+        self.dragging = false;
+        self.text_scroll_for = None;
+        self.hex_scroll_for = None;
     }
 
     /// Событие вытеснено из кольцевой ленты: панель остаётся с прочитанным текстом.
@@ -229,7 +245,12 @@ impl Details {
     }
 
     /// Раскладка полного текста события: пересобирается только при смене события,
-    /// кодировки, темы, ширины или масштаба экрана — не каждый кадр.
+    /// кодировки, темы, ширины, масштаба экрана или атласа шрифта — не каждый кадр.
+    ///
+    /// Признака «атлас очищен» у egui нет: есть только его размер (`FontsView::
+    /// font_image_size`), и рост размера — единственный случай, когда egui заново
+    /// укладывает глифы. Сброс атласа меняет и размер, поэтому сравнение размера
+    /// закрывает оба случая.
     fn text_layout(
         &mut self,
         ui: &Ui,
@@ -241,11 +262,13 @@ impl Details {
     ) -> &TextLayout {
         let dark = ui.visuals().dark_mode;
         let pixels_per_point = ui.ctx().pixels_per_point();
+        let atlas = ui.ctx().fonts(|fonts| fonts.font_image_size());
         let stale = self.text.as_ref().is_none_or(|cache| {
             cache.key != (key, encoding)
                 || cache.dark != dark
                 || (cache.wrap - wrap).abs() > 0.5
                 || cache.pixels_per_point != pixels_per_point
+                || cache.atlas != atlas
         });
         if stale {
             let text = data.shown_text(encoding);
@@ -256,6 +279,7 @@ impl Details {
                 dark,
                 wrap,
                 pixels_per_point,
+                atlas,
                 text,
                 galley,
             });
@@ -398,6 +422,27 @@ pub struct Place {
     max: f32,
 }
 
+impl Place {
+    /// Верхняя граница панели: она же низ ленты.
+    #[must_use]
+    pub fn top(self) -> f32 {
+        self.rect.top()
+    }
+
+    /// На сколько строк поднять ленту, чтобы строка `rect` осталась видна над панелью.
+    ///
+    /// Строка встаёт низом на верхнюю границу панели — минимальный сдвиг, без прыжка
+    /// на самый верх: клик по нижней строке не переставляет ленту целиком.
+    /// `rect` — положение строки в прошлом кадре, до того как панель забрала низ.
+    pub fn reveal_rows(self, rect: Rect, row_height: f32) -> usize {
+        let hidden = rect.bottom() - self.rect.top();
+        if hidden <= 0.0 || row_height <= 0.0 {
+            return 0;
+        }
+        (hidden / row_height).ceil() as usize
+    }
+}
+
 /// Забирает у ленты высоту панели снизу; `None` — событие не выбрано.
 pub fn reserve(ui: &mut Ui, p: &Palette, details: &Details) -> Option<Place> {
     if !details.is_open() {
@@ -410,6 +455,9 @@ pub fn reserve(ui: &mut Ui, p: &Palette, details: &Details) -> Option<Place> {
     // ужатая маленьким окном панель оставалась такой же и в развёрнутом (L1-AC2).
     let response = egui::Panel::bottom("bt-details")
         .exact_size(height)
+        // Свой разделитель — в теле панели: разделитель egui рисовал бы английскую
+        // подпись «Resize panel» и тянул высоту мимо настроек.
+        .resizable(false)
         .show_separator_line(false)
         .frame(
             Frame::NONE
@@ -471,60 +519,117 @@ pub fn show(
         encoding,
         pair,
     };
-    body(&mut body_ui, p, details, &panel, place, fresh)
+    body(&mut body_ui, p, details, &panel, place)
 }
 
-/// Разделитель панели: верхняя граница тянется мышью и стрелками с клавиатуры.
+/// Идентификатор разделителя панели: по нему видно, что стрелки принадлежат ему.
+fn resizer_id() -> Id {
+    Id::unique("bt-details-resize")
+}
+
+/// Фокус на разделителе панели: стрелки двигают высоту, а не выбор в ленте.
+pub fn resizer_focused(ui: &Ui) -> bool {
+    ui.ctx().memory(|memory| memory.focused()) == Some(resizer_id())
+}
+
+/// Разделитель панели: верхняя граница тянется мышью, стрелками и средствами AccessKit.
 fn resizer(ui: &mut Ui, p: &Palette, details: &mut Details, place: Place) {
     let rect = ui.max_rect();
     let edge = Rect::from_min_max(
         egui::pos2(rect.left(), rect.top() - RESIZE_GRAB),
         egui::pos2(rect.right(), rect.top() + RESIZE_GRAB),
     );
-    let response = ui.interact(
-        edge,
-        Id::unique("bt-details-resize"),
-        Sense::click_and_drag(),
-    );
+    let response = ui.interact(edge, resizer_id(), Sense::click_and_drag());
     response.widget_info(|| {
         let mut info = WidgetInfo::labeled(Role::Splitter, true, t!("details.resize"));
-        info.value = Some(f64::from(
-            (details.height / place.max.max(1.0)).clamp(0.0, 1.0),
-        ));
+        info.value = Some(f64::from(details.height));
         info
     });
+    // Границы и действия для диктора: значение — высота в точках, шаг — как у стрелок.
+    ui.ctx().accesskit_node_builder(response.id, |builder| {
+        builder.set_orientation(egui::accesskit::Orientation::Horizontal);
+        builder.set_min_numeric_value(f64::from(PANEL_MIN));
+        builder.set_max_numeric_value(f64::from(place.max));
+        builder.set_numeric_value_step(f64::from(RESIZE_STEP));
+        builder.add_action(egui::accesskit::Action::SetValue);
+        if details.height < place.max {
+            builder.add_action(egui::accesskit::Action::Increment);
+        }
+        if details.height > PANEL_MIN {
+            builder.add_action(egui::accesskit::Action::Decrement);
+        }
+    });
+    let mut height = details.height;
+    // Высоту выбрали клавишами или диктором: её запоминаем этим же кадром. Разделитель,
+    // который тянут мышью, пишется в настройки один раз — на отпускании.
+    let mut by_keys = false;
     if response.dragged()
         && let Some(pos) = response.interact_pointer_pos()
     {
-        details.height = (rect.bottom() - pos.y).clamp(PANEL_MIN, place.max);
+        height = rect.bottom() - pos.y;
         details.dragging = true;
     }
     if response.has_focus() {
-        // Стрелки сдвигают высоту шагом: без мыши разделитель иначе недоступен.
-        let (up, down) = ui.input(|input| {
-            (
-                input.key_pressed(Key::ArrowUp),
-                input.key_pressed(Key::ArrowDown),
-            )
+        // Стрелки не уводят фокус: разделитель держит их себе, пока он в фокусе.
+        ui.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                response.id,
+                EventFilter {
+                    vertical_arrows: true,
+                    ..EventFilter::default()
+                },
+            );
         });
-        if up || down {
-            let step = if up { RESIZE_STEP } else { -RESIZE_STEP };
-            details.height = (details.height + step).clamp(PANEL_MIN, place.max);
+        let step = ui.input(|input| {
+            let up = input.key_pressed(Key::ArrowUp);
+            let down = input.key_pressed(Key::ArrowDown);
+            (up as i32 - down as i32) as f32
+        });
+        if step != 0.0 {
+            height += step * RESIZE_STEP;
+            by_keys = true;
+        }
+    }
+    // Средства AccessKit: шаг и точное значение, как у ползунка.
+    let (steps, set_value) = ui.input(|input| {
+        let steps = input
+            .num_accesskit_action_requests(response.id, egui::accesskit::Action::Increment)
+            as f32
+            - input.num_accesskit_action_requests(response.id, egui::accesskit::Action::Decrement)
+                as f32;
+        let set_value = input
+            .accesskit_action_requests(response.id, egui::accesskit::Action::SetValue)
+            .filter_map(|request| match request.data {
+                Some(egui::accesskit::ActionData::NumericValue(value)) => Some(value as f32),
+                _ => None,
+            })
+            .last();
+        (steps, set_value)
+    });
+    if let Some(value) = set_value {
+        height = value;
+        by_keys = true;
+    }
+    if steps != 0.0 {
+        height += steps * RESIZE_STEP;
+        by_keys = true;
+    }
+    if (height - details.height).abs() > 0.5 {
+        details.height = height.clamp(PANEL_MIN, place.max);
+        if by_keys {
             details.height_saved = true;
         }
+    }
+    if !response.dragged() && details.dragging {
+        // Перетаскивание кончилось на прошлом кадре: высоту запоминаем один раз.
+        details.dragging = false;
+        details.height_saved = true;
     }
     if response.dragged() || response.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
-    if !response.dragged() {
-        // Перетаскивание кончилось на прошлом кадре: высоту запоминаем один раз.
-        if details.dragging {
-            details.dragging = false;
-            details.height_saved = true;
-        }
-    }
-    if response.hovered() || response.dragged() {
-        // Полоска разделителя подсвечивается, когда за неё берутся.
+    if response.hovered() || response.dragged() || response.has_focus() {
+        // Полоска разделителя подсвечивается, когда за неё берутся или она в фокусе.
         let width = if response.dragged() { 2.0 } else { 1.0 };
         ui.painter()
             .hline(rect.x_range(), rect.top() + 0.5, Stroke::new(width, p.ctrl));
@@ -532,14 +637,7 @@ fn resizer(ui: &mut Ui, p: &Palette, details: &mut Details, place: Place) {
 }
 
 /// Тело панели: шапка, содержимое вкладки и строка подсказки.
-fn body(
-    ui: &mut Ui,
-    p: &Palette,
-    details: &mut Details,
-    panel: &Panel<'_>,
-    place: Place,
-    fresh: bool,
-) -> bool {
+fn body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>, place: Place) -> bool {
     let Panel {
         key, meta, title, ..
     } = *panel;
@@ -643,8 +741,8 @@ fn body(
     content_ui.spacing_mut().item_spacing.y = 0.0;
     content_ui.visuals_mut().selection.bg_fill = p.selection_strong;
     match (details.tab, data) {
-        (Tab::Hex, Some(data)) => hex_body(&mut content_ui, p, details, data, fresh),
-        _ => text_body(&mut content_ui, p, details, panel, fresh),
+        (Tab::Hex, Some(data)) => hex_body(&mut content_ui, p, details, data, key),
+        _ => text_body(&mut content_ui, p, details, panel),
     }
     // Подсказка внизу — как в макете; вытеснение из ленты её заменяет (Л-В6).
     let (text, color) = if details.evicted() {
@@ -697,9 +795,7 @@ fn tab_button(ui: &mut Ui, p: &Palette, text: &str, on: bool) -> Response {
 }
 
 /// Вкладка «Текст»: полный фрагмент в поле только для чтения, с выделением мышью.
-///
-/// `fresh` — событие сменилось: поле начинает с начала, без прокрутки прошлого.
-fn text_body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>, fresh: bool) {
+fn text_body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>) {
     let key = panel.key;
     let encoding = panel.encoding;
     let Some(data) = panel.data() else {
@@ -727,8 +823,9 @@ fn text_body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>,
     let mut scroll = ScrollArea::vertical()
         .id_salt("bt-details-text")
         .auto_shrink([false, false]);
-    if fresh {
+    if details.text_scroll_for != Some(key) {
         // Новая строка — новый фрагмент: прокрутка прошлого к нему не относится.
+        details.text_scroll_for = Some(key);
         scroll = scroll.vertical_scroll_offset(0.0);
     }
     scroll.show(ui, |ui| {
@@ -776,7 +873,7 @@ fn read_only(
 }
 
 /// Вкладка «HEX»: полный дамп по 16 байт, строки выделяются кликом и Shift+кликом.
-fn hex_body(ui: &mut Ui, p: &Palette, details: &mut Details, data: &DataPayload, fresh: bool) {
+fn hex_body(ui: &mut Ui, p: &Palette, details: &mut Details, data: &DataPayload, key: u64) {
     let lines = feed::hex_line_count(data.bytes.len());
     let bytes = data.bytes.as_slice();
     let mut clicked = None;
@@ -784,7 +881,9 @@ fn hex_body(ui: &mut Ui, p: &Palette, details: &mut Details, data: &DataPayload,
     let mut scroll = ScrollArea::vertical()
         .id_salt("bt-details-hex")
         .auto_shrink([false, false]);
-    if fresh {
+    if details.hex_scroll_for != Some(key) {
+        // Новый фрагмент — дамп с начала, а не с места, где кончился прошлый.
+        details.hex_scroll_for = Some(key);
         scroll = scroll.vertical_scroll_offset(0.0);
     }
     scroll.show_rows(ui, feedrows::HEX_ROW_HEIGHT, lines, |ui, range| {

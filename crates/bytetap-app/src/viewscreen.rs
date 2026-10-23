@@ -395,14 +395,15 @@ fn view_button(ui: &mut Ui, p: &Palette, text: &str, name: &str) -> egui::Respon
 /// Клик по строке выбирает событие и открывает панель деталей, ↑/↓ ходят по ленте, Esc
 /// снимает выбор (L1-AC4, L1-AC9). Событие в панели — копия: страницу журнала окно
 /// может выгрузить из памяти, а прочитанный текст остаётся.
-pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
+pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     let p = app.pal();
     let hex = app.settings.feed.view == FeedView::Hex;
     let encoding = app.settings.feed.encoding;
     let panel_height = app.settings.feed.panel_height;
-    let escape = ui.input(|input| input.key_pressed(egui::Key::Escape))
-        && app.note.is_none()
-        && !egui::Popup::is_any_open(ui.ctx());
+    // «Что-то открыто» снято в начале кадра, до отрисовки шапки: меню и списки Esc
+    // закрывает сам, и панель не должна уйти вместе с ними (L1-AC9).
+    let escape =
+        ui.input(|input| input.key_pressed(egui::Key::Escape)) && app.note.is_none() && !popup_open;
     let Some(view) = &mut app.viewing else {
         return;
     };
@@ -431,9 +432,11 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     // Пара двух сторон — у журнала прокси: «#1 открыто: анализатор → ЛИС».
     let pair = pair_of_journal(&view.summary.header);
     view.details.set_default_height(panel_height);
+    // Панель была открыта до этого кадра: клик только меняет выбор, ленту не двигает.
+    let was_open = view.details.is_open();
     // ↑/↓ — до прокрутки: выбранная строка подтягивается в видимую область тем же
-    // кадром. В поле панели стрелки принадлежат тексту.
-    if view.details.is_open() && !ui.ctx().text_edit_focused() {
+    // кадром. В поле панели стрелки принадлежат тексту, а на разделителе — высоте панели.
+    if view.details.is_open() && !ui.ctx().text_edit_focused() && !details::resizer_focused(ui) {
         let step = ui.input_mut(|input| {
             if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
                 -1
@@ -455,6 +458,13 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     // Панель деталей: место снизу лента уступает до того, как её нарисовать, а тело
     // панели идёт после ленты — тогда Tab обходит сначала строки, потом панель.
     let place = details::reserve(ui, &p, &view.details);
+    // Строка, по которой кликнули, могла уйти под только что открывшуюся панель: лента
+    // поднимается ровно настолько, чтобы низ строки встал на верхнюю границу панели.
+    if let Some(rect) = view.reveal.take()
+        && let Some(place) = place
+    {
+        view.scroll.scroll_rows(place.reveal_rows(rect, row_height));
+    }
     // Прокрутка копируется на кадр: замыкание строк держит изменяемую ссылку на журнал.
     let mut scroll = view.scroll;
     let mut clicked = None;
@@ -489,19 +499,19 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
                     text_row(ui, &p, &event, multi, pair, encoding, selected)
                 };
                 if response.clicked() {
-                    clicked = Some((index, std::sync::Arc::new(event), row, response.rect));
+                    clicked = Some((index, std::sync::Arc::new(event), response.rect));
                 }
             }
         },
     );
     view.scroll = scroll;
     view.feed_rect = Some(out.inner);
-    if let Some((index, event, row, rect)) = clicked {
+    if let Some((index, event, rect)) = clicked {
         view.details.open(index as u64, event);
-        // Панель забрала низ ленты и могла закрыть строку, по которой кликнули:
-        // подтягиваем её со следующего кадра, когда лента станет ниже.
-        if rect.bottom() > out.inner.bottom() - view.details.height() {
-            view.scroll.set_top(row);
+        // Подтягиваем строку только когда панель открылась этим кликом: при уже
+        // открытой панели лента стоит на месте, иначе она дёргалась бы под каждым кликом.
+        if !was_open {
+            view.reveal = Some(rect);
         }
     }
     if let Some(place) = place

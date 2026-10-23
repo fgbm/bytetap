@@ -145,6 +145,15 @@ pub struct RecordingView {
     jump_bottom: bool,
     /// Прокрутить ленту к событию: его строка встанет в верхнюю треть видимой области.
     jump_row: Option<usize>,
+    /// Строка, по которой кликнули при закрытой панели: её место на экране до того, как
+    /// панель забрала низ ленты. Подтягивается со следующего кадра — уже по высоте панели.
+    reveal: Option<Rect>,
+    /// Смещение прокрутки и её предел в прошлом кадре: подтягивание считается от них.
+    offset: f32,
+    max_offset: f32,
+    /// Сдвиг прокрутки к строке под панелью, посчитанный по её высоте: применяется
+    /// следующим кадром, когда предел прокрутки уже знает новую высоту ленты.
+    reveal_offset: Option<f32>,
     /// Выбранное событие и панель деталей (L1).
     pub(crate) details: Details,
     counters: Option<SessionCounters>,
@@ -190,6 +199,10 @@ impl RecordingView {
             filter: None,
             jump_bottom: false,
             jump_row: None,
+            reveal: None,
+            offset: 0.0,
+            max_offset: 0.0,
+            reveal_offset: None,
             details: Details::default(),
             counters: None,
             fixed_stats: Stats::default(),
@@ -328,6 +341,8 @@ impl RecordingView {
         self.follow = true;
         self.pending = 0;
         self.jump_bottom = true;
+        self.reveal = None;
+        self.reveal_offset = None;
     }
 
     pub fn set_filter(&mut self, filter: Option<u32>) {
@@ -837,17 +852,15 @@ impl BytetapApp {
     /// Тело экрана записи под шапкой: трасса, панель ленты, лента.
     /// Экран записи: шапка, трасса, панель и лента. Возвращает, сколько событий пришло
     /// в ленту за этот кадр: без новых окно не просит следующий кадр так часто.
-    pub(crate) fn recording_screen(&mut self, ui: &mut Ui) -> u64 {
+    pub(crate) fn recording_screen(&mut self, ui: &mut Ui, popup_open: bool) -> u64 {
         let p = self.pal();
         let hex = self.settings.feed.view == FeedView::Hex;
         let encoding = self.settings.feed.encoding;
         let panel_height = self.settings.feed.panel_height;
         // Esc закрывает панель, но не диалог комментария и не открытое меню: там Esc
-        // закрывает их. Смотрим состояние меню в начале кадра — за этот кадр оно
-        // закроется само.
-        let escape = ui.input(|input| input.key_pressed(Key::Escape))
-            && self.note.is_none()
-            && !Popup::is_any_open(ui.ctx());
+        // закрывает их. «Что-то открыто» снято в начале кадра, до отрисовки шапки.
+        let escape =
+            ui.input(|input| input.key_pressed(Key::Escape)) && self.note.is_none() && !popup_open;
         let Some(rec) = &mut self.rec else {
             return 0;
         };
@@ -863,7 +876,7 @@ impl BytetapApp {
         // панели идёт после ленты — тогда Tab обходит сначала строки, потом панель.
         let pair = rec.pair();
         let place = details::reserve(ui, &p, &rec.details);
-        feed_list(ui, &p, rec, hex, encoding, added);
+        feed_list(ui, &p, rec, hex, encoding, added, place);
         if let Some(place) = place
             && details::show(ui, &p, &mut rec.details, encoding, pair, place)
         {
@@ -1352,6 +1365,7 @@ fn feed_list(
     hex: bool,
     encoding: Encoding,
     added: u64,
+    place: Option<details::Place>,
 ) {
     let total = rec.rows.rows();
     let area = ui.available_rect_before_wrap();
@@ -1375,9 +1389,11 @@ fn feed_list(
     let row_height = if hex { HEX_ROW_HEIGHT } else { TEXT_ROW_HEIGHT };
     let multi = rec.conns.len() > 1;
     let pair = rec.pair();
+    // Панель была открыта до этого кадра: клик только меняет выбор, ленту не двигает.
+    let was_open = rec.details.is_open();
     // ↑/↓ — до прокрутки: выбранная строка должна попасть в видимую область в этом же
-    // кадре. В поле панели стрелки принадлежат тексту, поэтому там лента их не берёт.
-    if rec.details.is_open() && !ui.ctx().text_edit_focused() {
+    // кадре. В поле панели стрелки принадлежат тексту, а на разделителе — высоте панели.
+    if rec.details.is_open() && !ui.ctx().text_edit_focused() && !details::resizer_focused(ui) {
         let step = ui.input_mut(|input| {
             if input.consume_key(Modifiers::NONE, Key::ArrowUp) {
                 -1
@@ -1392,6 +1408,17 @@ fn feed_list(
         }
     }
     ui.spacing_mut().item_spacing.y = 0.0;
+    // Строка, по которой кликнули, могла уйти под только что открывшуюся панель.
+    // Высоту панели знает кадр после клика (`place`), а предел прокрутки для новой
+    // высоты ленты — кадр после него: тогда сдвиг не выходит за конец ленты и не
+    // пружинит. Строка встаёт низом на верхнюю границу панели — минимальный сдвиг.
+    let reveal = rec.reveal_offset.take();
+    if let (Some(rect), Some(place)) = (rec.reveal.take(), place) {
+        let rows = place.reveal_rows(rect, row_height);
+        if rows > 0 {
+            rec.reveal_offset = Some(rec.offset + rows as f32 * row_height);
+        }
+    }
     // Прилипание к концу — только пока лента догоняет: `stick_to_bottom` перебивает и
     // прокрутку к выбранной строке, и открытую панель, и тогда лента уезжала бы вниз
     // вместе с новыми событиями (Л-В9).
@@ -1399,14 +1426,17 @@ fn feed_list(
         .id_salt("bt-feed")
         .auto_shrink(false)
         .stick_to_bottom(rec.follow && !rec.details.is_open());
+    // Смещение всегда в пределах ленты: за её концом прокрутка пружинит и уезжает
+    // обратно, а строка не остаётся там, куда её поставили.
     if rec.jump_bottom {
-        // Ниже конца содержимого: область прижмёт прокрутку к последней строке.
-        scroll = scroll.vertical_scroll_offset(total as f32 * row_height + area.height());
+        scroll = scroll.vertical_scroll_offset(rec.max_offset);
         rec.jump_bottom = false;
     } else if let Some(row) = rec.jump_row.take() {
         // Строка встаёт в верхнюю треть: видно и её, и соседние.
         let offset = row as f32 * row_height - area.height() / 3.0;
-        scroll = scroll.vertical_scroll_offset(offset.max(0.0));
+        scroll = scroll.vertical_scroll_offset(offset.clamp(0.0, rec.max_offset));
+    } else if let Some(offset) = reveal {
+        scroll = scroll.vertical_scroll_offset(offset.clamp(0.0, rec.max_offset));
     }
     let selected_key = rec.details.key();
     let mut clicked = None;
@@ -1425,16 +1455,18 @@ fn feed_list(
                 text_row(ui, p, &event, multi, pair, encoding, selected)
             };
             if response.clicked() {
-                clicked = Some((seq, event, row, response.rect));
+                clicked = Some((seq, event, response.rect));
             }
         }
     });
-    if let Some((seq, event, row, rect)) = clicked {
+    rec.offset = output.state.clamped_offset().y;
+    rec.max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
+    if let Some((seq, event, rect)) = clicked {
         rec.details.open(seq, event);
-        // Панель забрала низ ленты и могла закрыть строку, по которой кликнули:
-        // подтягиваем её со следующего кадра, когда лента станет ниже.
-        if rect.bottom() > output.inner_rect.bottom() - rec.details.height() {
-            rec.jump_row = Some(row);
+        // Подтягиваем строку только когда панель открылась этим кликом: при уже
+        // открытой панели лента стоит на месте, иначе она дёргалась бы под каждым кликом.
+        if !was_open {
+            rec.reveal = Some(rect);
         }
     }
 

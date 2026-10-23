@@ -41,6 +41,9 @@ pub struct JournalView {
     pub visible: Option<(f32, f32)>,
     /// Прокрутка к номеру события: `None` — не прокручивать.
     pub seek: Option<usize>,
+    /// Строка, по которой кликнули при закрытой панели: её место на экране до того, как
+    /// панель забрала низ ленты. Подтягивается со следующего кадра — по высоте панели.
+    pub reveal: Option<Rect>,
     /// Прокрутка ленты в единицах строк: смещение не теряет точность на миллионах строк.
     pub scroll: FeedScroll,
     /// Видимая область ленты без полосы прокрутки: по ней видно, помещается ли строка
@@ -69,6 +72,7 @@ impl JournalView {
             first_event,
             visible: None,
             seek: None,
+            reveal: None,
             scroll: FeedScroll::default(),
             feed_rect: None,
             hex_prefix: None,
