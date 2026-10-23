@@ -11,14 +11,16 @@
 #![cfg(unix)]
 
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
+use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use base64::Engine as _;
 use bytetap_core::journal::{Autoresponder, ClosedBy, Dir, Event, Mode, read_all};
 use bytetap_core::session::{Session, SessionConfig};
 use bytetap_core::transport::port_open_error;
-use bytetap_core::transport::serial::{SerialFormat, SerialSettings};
+use bytetap_core::transport::serial::{SerialFormat, SerialSettings, TEST_HOLD_WRITE_REPORT};
 
 /// Пара pty от `socat`; дочерний процесс живёт, пока живёт значение.
 struct Socat {
@@ -290,4 +292,122 @@ async fn an_astm_exchange_goes_through_a_pty_pair() {
         })
         .collect();
     assert!(notes.is_empty(), "обмен без замечаний: {notes:?}");
+}
+
+/// Пара pty без `socat`: ведущая сторона остаётся у теста, ведомая открывается как порт.
+///
+/// `socat` для этого не нужен: псевдотерминал создаёт `openpty`, а `ttyname` называет путь
+/// ведомой стороны, который открывает `serialport` — тот же драйверный путь, что у
+/// настоящего COM-порта (M3-AC11).
+struct Pty {
+    /// Ведущая сторона: то, что «прибор» пишет в линию и читает из неё.
+    master: std::fs::File,
+    /// Путь ведомой стороны: его открывает сессия как порт.
+    slave: String,
+}
+
+impl Pty {
+    fn open() -> io::Result<Self> {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        // SAFETY: `openpty` заполняет два дескриптора; termios и размер окна — по умолчанию.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buffer = [0 as libc::c_char; 256];
+        // SAFETY: буфер и дескриптор ведомой стороны валидны.
+        let named = unsafe { libc::ttyname_r(slave, buffer.as_mut_ptr(), buffer.len()) };
+        if named != 0 {
+            // SAFETY: дескрипторы получены из `openpty` и больше не нужны.
+            unsafe {
+                libc::close(master);
+                libc::close(slave);
+            }
+            return Err(io::Error::from_raw_os_error(named));
+        }
+        // SAFETY: `ttyname_r` завершил строку нулём.
+        let path = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: дескриптор ведомой стороны больше не нужен — его открывает сессия.
+        unsafe { libc::close(slave) };
+        // SAFETY: дескриптор ведущей стороны получен из `openpty` и теперь принадлежит Files.
+        let master = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(master) });
+        Ok(Self {
+            master,
+            slave: path,
+        })
+    }
+}
+
+/// Снимает хук при выходе из теста, даже если проверка упала.
+struct HookGuard;
+
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        TEST_HOLD_WRITE_REPORT.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Ответ, ушедший в линию прямо перед «Стоп», попадает в журнал (M3-AC2, M4-AC10).
+///
+/// Отчёт о записи у порта отстаёт от самой записи: байты в драйвере отдаёт поток писателя.
+/// Остановка, пришедшая в этот промежуток, заставала счётчик отправленного нулевым, и `ACK`,
+/// уже ушедший в линию, не попадал в журнал. Хук `TEST_HOLD_WRITE_REPORT` держит отчёт до
+/// тех пор, пока тест не отпустит его — уже во время остановки.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_sent_before_stop_is_in_the_journal() {
+    let _hooks = HookGuard;
+    TEST_HOLD_WRITE_REPORT.store(true, Ordering::Relaxed);
+    let mut pty = Pty::open().expect("пара pty");
+    let dir = tempfile::tempdir().expect("временная папка");
+    let settings =
+        SerialSettings::new(&pty.slave, 9600, SerialFormat::EIGHT_N_ONE).with_lines(false, false);
+    let handle = Session::start(
+        SessionConfig::serial(settings, Duration::from_secs(1))
+            .with_responder(Autoresponder::AstmE1381)
+            .with_log_dir(dir.path()),
+    )
+    .await
+    .expect("порт открывается");
+    let path = handle.journal_path().to_path_buf();
+
+    // `ENQ`: автоответчик отвечает `ACK`, и он уходит в линию — отчёт о записи ещё держат.
+    pty.master.write_all(&[0x05]).expect("ENQ в линию");
+    let mut ack = [0u8; 1];
+    pty.master.read_exact(&mut ack).expect("ACK в линии");
+    assert_eq!(ack[0], 0x06, "ACK пришёл в линию");
+
+    // Остановка начинается сейчас, а отчёт отпускается уже во время неё.
+    let release = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(20));
+        TEST_HOLD_WRITE_REPORT.store(false, Ordering::Relaxed);
+    });
+    handle.stop().await.expect("остановка");
+    release.join().expect("отпускание отчёта");
+
+    let outcome = read_all(&path).expect("журнал читается");
+    let mut answers = Vec::new();
+    for line in &outcome.lines {
+        if let Event::Data(data) = &line.event
+            && data.dir == Dir::LisToAnalyzer
+        {
+            assert!(data.synthetic, "ответ автоответчика синтетический");
+            answers.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&data.b64)
+                    .expect("b64"),
+            );
+        }
+    }
+    assert_eq!(answers, [0x06], "ушедший в линию ACK записан в журнал");
 }

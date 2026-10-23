@@ -1120,6 +1120,26 @@ impl WriteOutcome {
     }
 }
 
+/// Тестовый хук: держать отчёт о принятых портом байтах, пока он выставлен.
+///
+/// Появляется только со сборкой feature `test-hooks`. Отчёт отстаёт от записи в линию —
+/// так проверяется, что ответ, ушедший прямо перед «Стоп», попадает в журнал (M3-AC2,
+/// M4-AC10): тест снимает флаг, когда остановка уже началась.
+#[cfg(feature = "test-hooks")]
+pub static TEST_HOLD_WRITE_REPORT: AtomicBool = AtomicBool::new(false);
+
+/// Ждёт, пока тест не отпустит отчёт о записи; без feature — сразу.
+#[cfg(feature = "test-hooks")]
+fn test_hook_hold_write_report() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while TEST_HOLD_WRITE_REPORT.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn test_hook_hold_write_report() {}
+
 /// Пишет байты в порт, повторяя попытку, пока драйвер их не примет.
 ///
 /// `Ok(0)` — не потеря, а занятый или медленный драйвер: попытка повторяется, пока не
@@ -1158,6 +1178,8 @@ fn write_bytes(
             Ok(0) => std::thread::sleep(WRITE_PAUSE),
             Ok(len) => {
                 written += len;
+                // Байты уже у драйвера: отчёт об этом отстаёт на время хука.
+                test_hook_hold_write_report();
                 progress.accepted(written);
             }
             Err(err) if err.kind() == io::ErrorKind::TimedOut => std::thread::sleep(WRITE_PAUSE),

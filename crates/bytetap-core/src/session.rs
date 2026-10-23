@@ -89,6 +89,14 @@ pub const PROXY_LINGER: Duration = Duration::from_secs(5);
 /// машину, но меньше, чем анализатор ждёт ответа.
 const CONNECTIONS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Сколько ждать отчёта о записи, которую прервала остановка или закрытие пары, миллисекунды.
+///
+/// Порт отдаёт принятые байты отдельным потоком (`serial::run_writer`): к моменту сигнала
+/// ответ уже мог уйти в линию, а счётчик отправленного ещё нулевой. Без этого срока
+/// ушедший ответ не попал бы в журнал, и «в журнале ровно переданное» нарушилось бы
+/// (M3-AC2, M4-AC10, M5-AC2).
+const WRITE_REPORT_GRACE: Duration = Duration::from_millis(100);
+
 /// Сколько остановка ждёт, пока писатель журнала допишет пачку и зафиксирует файл.
 ///
 /// Медленный диск, забитый буфер записи или сетевой путь могут держать `sync_data`
@@ -1962,6 +1970,12 @@ async fn pump(
                     () = wait_for_hangup(&mut hangup) => None,
                     result = &mut write => Some(result),
                 };
+                if outcome.is_none() && shared.mode == Mode::ComMonitor {
+                    // У порта байты уже в линии, а отчёт о них идёт потоком писателя:
+                    // без короткого срока прослушка потеряла бы из журнала переданное
+                    // прямо перед закрытием пары (M4-AC10, M5-AC2).
+                    let _ = timeout(WRITE_REPORT_GRACE, &mut write).await;
+                }
                 let sent = sent.load(Ordering::Relaxed).min(payload.len());
                 shared.counters.add(role.dir(), sent as u64);
                 let forwarded = Data::new(t, mono_us, conn, role.dir(), false, &payload[..sent]);
@@ -2099,15 +2113,22 @@ async fn apply(
                 }
                 let sent = AtomicUsize::new(0);
                 let write = write_counted(transport, &payload, &sent);
+                tokio::pin!(write);
+                // `None` — запись прервана сигналом, `Some` — она закончилась сама.
                 let outcome = tokio::select! {
                     biased;
-                    _ = wait_for_stop(stop) => {
-                        // Остановка посреди ответа: отправленное уже не отменить.
-                        record_answer(shared, conn, &payload, sent.load(Ordering::Relaxed));
-                        return Some((ClosedBy::Bytetap, "stop"));
-                    }
-                    _ = wait_for_failure(failure) => return Some((ClosedBy::Bytetap, "stop")),
-                    outcome = timeout(WRITE_TIMEOUT, write) => outcome,
+                    () = wait_for_stop(stop) => None,
+                    () = wait_for_failure(failure) => None,
+                    outcome = timeout(WRITE_TIMEOUT, write.as_mut()) => Some(outcome),
+                };
+                let Some(outcome) = outcome else {
+                    // Остановка посреди ответа: отправленное уже не отменить, а байты,
+                    // которые порт успел принять, обязаны попасть в журнал — записи даётся
+                    // короткий срок отчитаться, иначе ушедший в линию ответ пропадёт
+                    // из записи (M3-AC2, M4-AC10).
+                    let _ = timeout(WRITE_REPORT_GRACE, write.as_mut()).await;
+                    record_answer(shared, conn, &payload, sent.load(Ordering::Relaxed));
+                    return Some((ClosedBy::Bytetap, "stop"));
                 };
                 match outcome {
                     Err(_elapsed) => {
