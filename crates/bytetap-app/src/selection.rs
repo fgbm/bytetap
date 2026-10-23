@@ -14,6 +14,7 @@
 use crate::feed::FeedEvent;
 use crate::feedrows::{self, Pair, RowClass};
 use crate::settings::Encoding;
+use crate::t;
 
 /// Сколько строк максимум уходит в буфер обмена за одно копирование.
 pub const COPY_MAX_ROWS: usize = 10_000;
@@ -24,15 +25,24 @@ pub const COPY_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// фильтра не нужен.
 const NARROW_MAX: usize = 100_000;
 
-/// Выделенные строки ленты: диапазоны номеров событий, счётчик и якорь.
+/// Выделенные строки ленты: отметки, диапазон от якоря, счётчик и якорь.
+///
+/// Как в Проводнике Windows (решение владельца 2026-10-23): Shift+клик заменяет
+/// выделение диапазоном от якоря, но не сбрасывает «базу» — отметки, сделанные
+/// Ctrl+кликом. Выделение — это `marks ∪ span`, а `marks` помнит и то, что было
+/// отмечено до установки якоря.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
-    /// Непересекающиеся диапазоны `(первый, последний)` включительно, по возрастанию.
-    ranges: Vec<(u64, u64)>,
+    /// Отметки Ctrl+клика: база, которую не сбрасывает Shift+клик.
+    marks: Vec<(u64, u64)>,
+    /// Диапазон Shift+клика и Shift+стрелок: от якоря до цели.
+    span: Option<(u64, u64)>,
+    /// Якорь: строка, от которой строится диапазон.
+    anchor: Option<u64>,
+    /// Склеенные `marks ∪ span` по возрастанию: их и обходят `seqs` и копирование.
+    merged: Vec<(u64, u64)>,
     /// Сколько событий выделено: пересчитывается только при правке, не в кадре.
     count: usize,
-    /// Якорь Shift+клика и Shift+стрелок: от него строится диапазон.
-    anchor: Option<u64>,
 }
 
 impl Selection {
@@ -53,48 +63,72 @@ impl Selection {
 
     /// Строка `seq` выделена: двоичный поиск по диапазонам, не проход по номерам.
     pub fn contains(&self, seq: u64) -> bool {
-        let index = self.ranges.partition_point(|(start, _)| *start <= seq);
-        index > 0 && self.ranges[index - 1].1 >= seq
+        let index = self.merged.partition_point(|(start, _)| *start <= seq);
+        index > 0 && self.merged[index - 1].1 >= seq
     }
 
     /// Снять выделение целиком (Esc).
     pub fn clear(&mut self) {
-        self.ranges.clear();
-        self.count = 0;
+        self.marks.clear();
+        self.span = None;
         self.anchor = None;
+        self.recount();
     }
 
     /// Клик: одна строка, и она же якорь следующего Shift+клика.
+    ///
+    /// Отметки Ctrl+клика клик снимает: новая выделенная строка — это новое выделение.
     pub fn click(&mut self, seq: u64) {
-        self.ranges.clear();
-        self.ranges.push((seq, seq));
-        self.count = 1;
+        self.marks.clear();
+        self.span = Some((seq, seq));
         self.anchor = Some(seq);
+        self.recount();
     }
 
-    /// Shift+клик и Shift+стрелки: диапазон от якоря до `seq` добавляется к выделению.
+    /// Shift+клик и Shift+стрелки: диапазон от якоря **заменяет** прежний диапазон.
     ///
-    /// Диапазоны складываются, а не заменяют друг друга: Shift+клик после Ctrl+клика
-    /// не теряет отмеченные строки, а повторный Shift+клик ближе к якорю выделение не
-    /// сужает. Снять лишнее можно Ctrl+кликом по строке или Esc.
+    /// База (`marks`) остаётся: отметки Ctrl+клика до установки якоря Shift+клик не
+    /// сбрасывает. Shift+↑ после Shift+↓ поэтому сужает диапазон, а не расширяет его.
     pub fn extend(&mut self, seq: u64) {
-        let anchor = self.anchor.unwrap_or(seq);
-        let (from, to) = if anchor <= seq {
-            (anchor, seq)
-        } else {
-            (seq, anchor)
-        };
-        self.add_range(from, to);
+        let anchor = *self.anchor.get_or_insert(seq);
+        self.span = Some((anchor.min(seq), anchor.max(seq)));
+        self.recount();
+    }
+
+    /// Ctrl+Shift+клик: диапазон от якоря добавляется к базе, прежнее выделение остаётся.
+    pub fn extend_add(&mut self, seq: u64) {
+        let anchor = *self.anchor.get_or_insert(seq);
+        let (from, to) = (anchor.min(seq), anchor.max(seq));
+        self.marks = merge(
+            self.marks
+                .iter()
+                .copied()
+                .chain(std::iter::once((from, to))),
+        );
+        self.recount();
     }
 
     /// Ctrl+клик: строка добавляется к выделению или убирается из него.
+    ///
+    /// Диапазон Shift+клика при этом становится базой: иначе снятие одной строки в нём
+    /// сбросило бы весь диапазон.
     pub fn toggle(&mut self, seq: u64) {
-        if self.contains(seq) {
-            self.remove_seq(seq);
+        if let Some(span) = self.span.take() {
+            self.marks = merge(self.marks.iter().copied().chain(std::iter::once(span)));
+        }
+        let was = self.contains(seq);
+        if was {
+            self.marks = remove(self.marks.iter().copied(), seq);
         } else {
-            self.add_range(seq, seq);
+            self.marks = merge(
+                self.marks
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once((seq, seq))),
+            );
         }
         self.anchor = Some(seq);
+        self.recount();
     }
 
     /// Ctrl+A: выделить перечисленные события (видимые строки ленты).
@@ -105,15 +139,10 @@ impl Selection {
         let mut numbers: Vec<u64> = seqs.into_iter().collect();
         numbers.sort_unstable();
         numbers.dedup();
-        self.ranges.clear();
-        for seq in numbers {
-            match self.ranges.last_mut() {
-                Some((_, end)) if *end + 1 == seq => *end = seq,
-                _ => self.ranges.push((seq, seq)),
-            }
-        }
+        self.marks = merge(numbers.into_iter().map(|seq| (seq, seq)));
+        self.span = None;
+        self.anchor = self.marks.first().map(|(start, _)| *start);
         self.recount();
-        self.anchor = self.ranges.first().map(|(start, _)| *start);
     }
 
     /// События, номера которых меньше `first`, ушли из кольца: их больше не выделить.
@@ -121,14 +150,11 @@ impl Selection {
         if self.count == 0 {
             return;
         }
-        let mut ranges = Vec::with_capacity(self.ranges.len());
-        for (start, end) in self.ranges.drain(..) {
-            let start = start.max(first);
-            if start <= end {
-                ranges.push((start, end));
-            }
-        }
-        self.ranges = ranges;
+        self.marks = clamp_from(self.marks.iter().copied(), first);
+        self.span = self
+            .span
+            .map(|(start, end)| (start.max(first), end))
+            .filter(|(start, end)| start <= end);
         self.recount();
         if self.anchor.is_some_and(|anchor| anchor < first) {
             self.anchor = None;
@@ -146,24 +172,16 @@ impl Selection {
             self.clear();
             return;
         }
-        let mut ranges: Vec<(u64, u64)> = Vec::new();
-        for (start, end) in self.ranges.drain(..) {
-            let mut run: Option<(u64, u64)> = None;
-            for seq in start..=end {
-                if keep(seq) {
-                    run = Some(match run {
-                        Some((from, _)) => (from, seq),
-                        None => (seq, seq),
-                    });
-                } else if let Some(run) = run.take() {
-                    ranges.push(run);
-                }
-            }
-            if let Some(run) = run {
-                ranges.push(run);
+        self.marks = keep_each(self.marks.iter().copied(), &keep);
+        if let Some(span) = self.span.take() {
+            // Диапазон сужается и остаётся диапазоном, пока спрятанные строки не
+            // разорвут его на части: тогда его хвосты уходят в базу.
+            let ranges = keep_each(std::iter::once(span), &keep);
+            self.span = ranges.first().copied();
+            if ranges.len() > 1 {
+                self.marks = merge(self.marks.iter().copied().chain(ranges.into_iter().skip(1)));
             }
         }
-        self.ranges = ranges;
         self.recount();
         if self.anchor.is_some_and(|anchor| !keep(anchor)) {
             self.anchor = None;
@@ -172,63 +190,84 @@ impl Selection {
 
     /// Выделенные номера по возрастанию: порядок копирования — порядок ленты.
     pub fn seqs(&self) -> impl Iterator<Item = u64> + '_ {
-        self.ranges.iter().flat_map(|(start, end)| *start..=*end)
+        self.merged.iter().flat_map(|(start, end)| *start..=*end)
     }
 
-    /// Добавить диапазон `from..=to` с объединением пересекающихся.
-    fn add_range(&mut self, from: u64, to: u64) {
-        let mut ranges = Vec::with_capacity(self.ranges.len() + 1);
-        let mut merged = (from, to);
-        let mut inserted = false;
-        for &(start, end) in &self.ranges {
-            if end.saturating_add(1) < merged.0 {
-                ranges.push((start, end));
-            } else if start > merged.1.saturating_add(1) {
-                if !inserted {
-                    ranges.push(merged);
-                    inserted = true;
-                }
-                ranges.push((start, end));
-            } else {
-                // Диапазоны соприкасаются или пересекаются: склеиваем в один.
-                merged = (merged.0.min(start), merged.1.max(end));
-            }
-        }
-        if !inserted {
-            ranges.push(merged);
-        }
-        self.ranges = ranges;
-        self.recount();
-    }
-
-    /// Убрать один номер, разорвав диапазон на два, если он был внутри.
-    fn remove_seq(&mut self, seq: u64) {
-        let Some(index) = self
-            .ranges
-            .iter()
-            .position(|(start, end)| *start <= seq && seq <= *end)
-        else {
-            return;
-        };
-        let (start, end) = self.ranges.remove(index);
-        if start < seq {
-            self.ranges.insert(index, (start, seq - 1));
-        }
-        if seq < end {
-            self.ranges
-                .insert(index + usize::from(start < seq), (seq + 1, end));
-        }
-        self.recount();
-    }
-
-    /// Счётчик выделенного — сумма длин диапазонов.
+    /// Пересобрать склейку и счётчик после правки.
     fn recount(&mut self) {
+        let all = self.marks.iter().copied().chain(self.span.iter().copied());
+        self.merged = merge(all);
         self.count = self
-            .ranges
+            .merged
             .iter()
             .map(|(start, end)| (end - start + 1) as usize)
             .sum();
     }
+}
+
+/// Склеить диапазоны по возрастанию, без пересечений и соприкосновений.
+fn merge(ranges: impl Iterator<Item = (u64, u64)>) -> Vec<(u64, u64)> {
+    let mut sorted: Vec<(u64, u64)> = ranges.filter(|(start, end)| start <= end).collect();
+    sorted.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match out.last_mut() {
+            Some((_, last)) if start <= last.saturating_add(1) => *last = (*last).max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+/// Убрать один номер, разорвав диапазон на два.
+fn remove(ranges: impl Iterator<Item = (u64, u64)>, seq: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for (start, end) in ranges {
+        if seq < start || seq > end {
+            out.push((start, end));
+            continue;
+        }
+        if start < seq {
+            out.push((start, seq - 1));
+        }
+        if seq < end {
+            out.push((seq + 1, end));
+        }
+    }
+    out
+}
+
+/// Сдвинуть начало диапазонов к `first`, выбросив пустые.
+fn clamp_from(ranges: impl Iterator<Item = (u64, u64)>, first: u64) -> Vec<(u64, u64)> {
+    ranges
+        .map(|(start, end)| (start.max(first), end))
+        .filter(|(start, end)| start <= end)
+        .collect()
+}
+
+/// Оставить в диапазонах только номера, прошедшие `keep`.
+fn keep_each(
+    ranges: impl Iterator<Item = (u64, u64)>,
+    keep: &impl Fn(u64) -> bool,
+) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in ranges {
+        let mut run: Option<(u64, u64)> = None;
+        for seq in start..=end {
+            if keep(seq) {
+                run = Some(match run {
+                    Some((from, _)) => (from, seq),
+                    None => (seq, seq),
+                });
+            } else if let Some(run) = run.take() {
+                out.push(run);
+            }
+        }
+        if let Some(run) = run {
+            out.push(run);
+        }
+    }
+    out
 }
 
 /// Что ушло в буфер обмена и упёрлось ли копирование в предел.
@@ -251,7 +290,7 @@ pub struct CopyOut {
 /// замечание, комментарий) копируется её строка ленты, и номер соединения в ней уже есть.
 pub fn line_text(event: &FeedEvent, pair: Pair, encoding: Encoding) -> String {
     let (class, text) = feedrows::row_text(event, pair);
-    match (class, event.data(), event.conn) {
+    let line = match (class, event.data(), event.conn) {
         (RowClass::Data(dir), Some(data), Some(conn)) => format!(
             "{} {} #{} {}",
             event.time,
@@ -266,7 +305,20 @@ pub fn line_text(event: &FeedEvent, pair: Pair, encoding: Encoding) -> String {
             data.shown_text(encoding)
         ),
         _ => format!("{} {}", event.time, text),
+    };
+    // «Одна строка на событие» держится и для комментария журнала: переводы строк в
+    // его тексте становятся глифами, как управляющие байты фрагмента в ленте.
+    if line.contains(['\n', '\r']) {
+        return line
+            .chars()
+            .map(|ch| match ch {
+                '\n' => "‹LF›".to_owned(),
+                '\r' => "‹CR›".to_owned(),
+                other => other.to_string(),
+            })
+            .collect();
     }
+    line
 }
 
 /// Текст выделенных строк по одной строке на событие, с пределом на копирование.
@@ -278,17 +330,9 @@ pub fn copy_rows<'a>(
     let mut out = CopyOut::default();
     for event in events {
         let line = line_text(event, pair, encoding);
-        if out.rows >= COPY_MAX_ROWS || out.bytes + line.len() > COPY_MAX_BYTES {
-            out.truncated = true;
+        if !push_line(&mut out, &line) {
             break;
         }
-        if out.rows > 0 {
-            out.text.push('\n');
-            out.bytes += 1;
-        }
-        out.bytes += line.len();
-        out.text.push_str(&line);
-        out.rows += 1;
     }
     out
 }
@@ -300,21 +344,14 @@ pub fn copy_rows<'a>(
 pub fn copy_rows_hex<'a>(events: impl Iterator<Item = &'a FeedEvent>) -> CopyOut {
     let mut out = CopyOut::default();
     for event in events {
-        let Some(data) = event.data() else {
-            continue;
-        };
-        let line = crate::feed::hex_string(&data.bytes);
-        if out.rows >= COPY_MAX_ROWS || out.bytes + line.len() > COPY_MAX_BYTES {
-            out.truncated = true;
-            break;
+        match line_for(event, CopyKind::Hex, Pair::None, Encoding::Ascii) {
+            Some(line) => {
+                if !push_line(&mut out, &line) {
+                    break;
+                }
+            }
+            None => continue,
         }
-        if out.rows > 0 {
-            out.text.push('\n');
-            out.bytes += 1;
-        }
-        out.bytes += line.len();
-        out.text.push_str(&line);
-        out.rows += 1;
     }
     out
 }
@@ -323,23 +360,87 @@ pub fn copy_rows_hex<'a>(events: impl Iterator<Item = &'a FeedEvent>) -> CopyOut
 pub fn copy_rows_base64<'a>(events: impl Iterator<Item = &'a FeedEvent>) -> CopyOut {
     let mut out = CopyOut::default();
     for event in events {
-        let Some(data) = event.data() else {
-            continue;
-        };
-        let line = crate::feed::base64_string(&data.bytes);
-        if out.rows >= COPY_MAX_ROWS || out.bytes + line.len() > COPY_MAX_BYTES {
-            out.truncated = true;
-            break;
+        match line_for(event, CopyKind::Base64, Pair::None, Encoding::Ascii) {
+            Some(line) => {
+                if !push_line(&mut out, &line) {
+                    break;
+                }
+            }
+            None => continue,
         }
-        if out.rows > 0 {
-            out.text.push('\n');
-            out.bytes += 1;
-        }
-        out.bytes += line.len();
-        out.text.push_str(&line);
-        out.rows += 1;
     }
     out
+}
+
+/// Строка события для буфера обмена; `None` — у события нет байтов (HEX и Base64
+/// служебной строки пропускаются).
+pub fn line_for(
+    event: &FeedEvent,
+    kind: CopyKind,
+    pair: Pair,
+    encoding: Encoding,
+) -> Option<String> {
+    match kind {
+        CopyKind::Text => Some(line_text(event, pair, encoding)),
+        CopyKind::Hex => event
+            .data()
+            .map(|data| crate::feed::hex_string(&data.bytes)),
+        CopyKind::Base64 => event
+            .data()
+            .map(|data| crate::feed::base64_string(&data.bytes)),
+    }
+}
+
+/// Дописать строку в копирование: перевод строки между событиями, предел строк и байт.
+///
+/// `false` — предел сработал, строку не добавляли; `truncated` в ответе это отмечает.
+/// Перевод строки между событиями считается в пределе байт: он тоже уходит в буфер.
+#[must_use]
+pub fn push_line(out: &mut CopyOut, line: &str) -> bool {
+    let separator = usize::from(out.rows > 0);
+    if out.rows >= COPY_MAX_ROWS || out.bytes + separator + line.len() > COPY_MAX_BYTES {
+        out.truncated = true;
+        return false;
+    }
+    if separator > 0 {
+        out.text.push('\n');
+    }
+    out.bytes += separator + line.len();
+    out.text.push_str(line);
+    out.rows += 1;
+    true
+}
+
+/// Число строк с разделителями разрядов и падежом: «10 000 строк», «201 строка».
+///
+/// Русское склонение считает само сообщение: «в буфер вошло 201 строка из 250 строк»
+/// читается, а «201 строк» — нет.
+pub fn rows_count(count: usize) -> String {
+    let digits = count.to_string();
+    let mut separated = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        // Разделитель разрядов — перед каждой третьей цифрой с конца.
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            separated.push(' ');
+        }
+        separated.push(ch);
+    }
+    format!("{separated} {}", rows_word(count))
+}
+
+/// Падеж слова «строка» для числа: одна строка, две строки, пять строк.
+fn rows_word(count: usize) -> &'static str {
+    let last_two = count % 100;
+    let last = count % 10;
+    if (11..=14).contains(&last_two) {
+        t!("feed.rowsMany")
+    } else if last == 1 {
+        t!("feed.rowsOne")
+    } else if (2..=4).contains(&last) {
+        t!("feed.rowsFew")
+    } else {
+        t!("feed.rowsMany")
+    }
 }
 
 /// Что копировать из выделения.
@@ -432,6 +533,50 @@ mod tests {
         assert_eq!(selected(&selection), [5, 6, 7, 9]);
     }
 
+    /// Как в Проводнике: Shift+клик заменяет диапазон, а не складывает его с прежним.
+    #[test]
+    fn a_shift_click_replaces_the_range() {
+        let mut selection = Selection::default();
+        selection.click(10);
+        selection.extend(30);
+        assert_eq!(selection.count(), 21);
+        selection.extend(20);
+        assert_eq!(selected(&selection), (10..=20).collect::<Vec<u64>>());
+        assert_eq!(selection.count(), 11, "10 → Shift 30 → Shift 20 = 11 строк");
+        // Shift+↑ после Shift+↓ сужает диапазон обратно.
+        selection.click(10);
+        selection.extend(11);
+        selection.extend(12);
+        assert_eq!(selection.count(), 3);
+        selection.extend(11);
+        assert_eq!(selection.count(), 2, "Shift+↓↓↑ = 2 строки");
+    }
+
+    /// База — отметки Ctrl+клика — Shift+клик не сбрасывает, а Ctrl+Shift+клик
+    /// добавляет к ней второй диапазон.
+    #[test]
+    fn the_ctrl_marks_survive_a_shift_click() {
+        let mut selection = Selection::default();
+        selection.toggle(5);
+        selection.toggle(10);
+        // Якорь — последняя отмеченная строка, база {5, 10} остаётся.
+        selection.extend(20);
+        assert_eq!(selected(&selection), {
+            let mut want: Vec<u64> = vec![5];
+            want.extend(10..=20);
+            want
+        });
+        assert_eq!(selection.count(), 12);
+        // Ctrl+Shift+клик добавляет ещё один диапазон, не сбрасывая прежние.
+        selection.toggle(50);
+        selection.extend_add(52);
+        assert_eq!(selection.count(), 15, "5 + 10..20 + 50..52");
+        assert!(selection.contains(5) && selection.contains(15) && selection.contains(51));
+        // Простой клик начинает выделение заново: база сбрасывается.
+        selection.click(40);
+        assert_eq!(selection.count(), 1);
+    }
+
     /// Ctrl+A выделяет перечисленные строки, Esc снимает выделение целиком.
     #[test]
     fn select_all_and_clear() {
@@ -469,6 +614,53 @@ mod tests {
         selection.retain(|seq| seq % 2 == 0);
         assert_eq!(selected(&selection), [2, 4, 6]);
         assert_eq!(selection.count(), 3);
+    }
+
+    /// Фильтр рвёт диапазон Shift+клика: остаются видимые строки, а не только начало.
+    #[test]
+    fn a_filter_narrows_the_span_without_losing_its_tail() {
+        let mut selection = Selection::default();
+        selection.click(1);
+        selection.extend(9);
+        selection.retain(|seq| seq != 2 && (3..=7).contains(&seq));
+        assert_eq!(selected(&selection), (3..=7).collect::<Vec<u64>>());
+        // Дырка в середине: хвост диапазона остаётся в выделении.
+        let mut selection = Selection::default();
+        selection.click(1);
+        selection.extend(9);
+        selection.retain(|seq| seq != 5);
+        assert_eq!(selected(&selection), [1, 2, 3, 4, 6, 7, 8, 9]);
+    }
+
+    /// Комментарий с переводами строк остаётся одной строкой копирования: переводы
+    /// строк становятся глифами, как управляющие байты в ленте.
+    #[test]
+    fn a_comment_with_newlines_stays_one_line() {
+        let event = FeedEvent {
+            time: "10:15:03.000".into(),
+            mono_us: Some(0),
+            conn: None,
+            kind: FeedKind::Note {
+                text: "первая\nвторая\r\nтретья".into(),
+            },
+        };
+        let line = line_text(&event, Pair::None, Encoding::Cp1251);
+        assert_eq!(line, "10:15:03.000 первая‹LF›вторая‹CR›‹LF›третья");
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    /// Числа в сообщениях — с разделителями разрядов и в нужном падеже.
+    #[test]
+    fn counts_are_written_with_separators_and_plurals() {
+        assert_eq!(rows_count(1), "1 строка");
+        assert_eq!(rows_count(3), "3 строки");
+        assert_eq!(rows_count(5), "5 строк");
+        assert_eq!(rows_count(11), "11 строк");
+        assert_eq!(rows_count(21), "21 строка");
+        assert_eq!(rows_count(201), "201 строка");
+        assert_eq!(rows_count(1_000), "1 000 строк");
+        assert_eq!(rows_count(10_000), "10 000 строк");
+        assert_eq!(rows_count(12_500), "12 500 строк");
     }
 
     /// Строка копирования: время, направление, номер соединения и полный текст.
@@ -536,6 +728,15 @@ mod tests {
         );
         assert!(out.truncated);
         assert!(out.bytes <= COPY_MAX_BYTES);
+        // Перевод строки между событиями тоже занимает место в пределе.
+        let half = COPY_MAX_BYTES / 2;
+        assert_eq!(half * 2, COPY_MAX_BYTES);
+        let mut out = CopyOut::default();
+        assert!(push_line(&mut out, &"x".repeat(half)));
+        // Две строки по половине предела без перевода строки влезли бы, а с ним — нет.
+        assert!(!push_line(&mut out, &"x".repeat(half)));
+        assert!(out.truncated);
+        assert_eq!(out.bytes, half);
     }
 
     /// HEX и Base64 идут по строке на событие; у служебной строки байтов нет.
@@ -569,9 +770,10 @@ mod tests {
         assert!(selection.contains(9_999));
         assert!(!selection.contains(10_000));
         // Ровно один диапазон: Shift+клик по всей ленте — не 10 000 записей.
-        assert_eq!(selection.ranges.len(), 1);
+        assert_eq!(selection.merged.len(), 1);
         selection.toggle(5_000);
-        assert_eq!(selection.ranges.len(), 2);
+        assert_eq!(selection.merged.len(), 2, "снятая строка рвёт диапазон");
         assert!(!selection.contains(5_000));
+        assert_eq!(selection.count(), 9_999);
     }
 }
