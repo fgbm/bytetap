@@ -378,12 +378,12 @@ pub fn proxy_summary(header: &Session) -> Option<String> {
     ))
 }
 
-/// Сводка прослушки из заголовка журнала: оба порта из `settings` (M5-AC6).
+/// Порты прослушки из заголовка журнала: анализатор и ЛИС (M5-AC6).
 ///
 /// Пара портов известна целиком с самого старта — в отличие от прокси, где вторая сторона
-/// появляется только со своим соединением. Поэтому подпись строится по заголовку:
-/// «анализатор COM3 ⇄ ЛИС COM4».
-fn monitor_summary(header: &Session) -> Option<String> {
+/// появляется только со своим соединением. Сводку по ним собирает та же функция, что у
+/// шапки записи (`recording::monitor_summary`), чтобы подписи не расходились.
+fn monitor_ports(header: &Session) -> Option<(String, String)> {
     if header.mode != Mode::ComMonitor {
         return None;
     }
@@ -395,13 +395,7 @@ fn monitor_summary(header: &Session) -> Option<String> {
             .as_str()
             .map(str::to_owned)
     };
-    let analyzer = port("analyzer")?;
-    let lis = port("lis")?;
-    Some(format!(
-        "{} {analyzer} ⇄ {} {lis}",
-        t!("feed.byAnalyzer"),
-        t!("feed.byLis")
-    ))
+    Some((port("analyzer")?, port("lis")?))
 }
 
 /// Подпись журнала в шапке просмотра: «ANALYZER · 00:42:18»; у журнала прокси вместо
@@ -411,7 +405,9 @@ fn monitor_summary(header: &Session) -> Option<String> {
 pub fn journal_meta(header: &Session, duration_us: u64) -> String {
     let span = duration(duration_us);
     let analyzer = header.analyzer.clone().filter(|value| !value.is_empty());
-    match monitor_summary(header).or_else(|| proxy_summary(header)) {
+    let monitor = monitor_ports(header)
+        .map(|(analyzer, lis)| crate::recording::monitor_summary(&analyzer, &lis));
+    match monitor.or_else(|| proxy_summary(header)) {
         Some(summary) => match analyzer {
             Some(analyzer) => format!("{analyzer} · {summary} · {span}"),
             None => format!("{summary} · {span}"),
@@ -527,7 +523,8 @@ mod tests {
         );
         assert_eq!(
             journal_meta(&header, 6_120_000),
-            "анализатор COM3 ⇄ ЛИС COM4 · 00:00:06"
+            "анализатор COM3 ⇄ bytetap ⇄ ЛИС COM4 · 00:00:06",
+            "сводка та же, что в шапке записи"
         );
         // Строки ленты прослушки — пара портов: «#1 открыто: анализатор COM3 → ЛИС COM4»
         // и «#1 закрыто: ЛИС, порт пропал» (M5-В8).
@@ -535,7 +532,7 @@ mod tests {
         header.analyzer = Some("ANALYZER".into());
         assert_eq!(
             journal_meta(&header, 6_120_000),
-            "ANALYZER · анализатор COM3 ⇄ ЛИС COM4 · 00:00:06"
+            "ANALYZER · анализатор COM3 ⇄ bytetap ⇄ ЛИС COM4 · 00:00:06"
         );
         // Заголовок без портов не выдумывает сводку: остаётся имя анализатора и время.
         header.settings = serde_json::json!({});
