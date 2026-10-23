@@ -107,34 +107,54 @@ enum Command {
     },
 }
 
-/// Параметры записи: ровно один источник — прослушивание, подключение, COM-порт или прокси.
+/// Параметры записи: ровно один источник — прослушивание, подключение, COM-порт, прокси
+/// или прослушка двух COM-портов.
 #[derive(Debug, clap::Args)]
 #[command(group(
     ArgGroup::new("source")
         .required(true)
         .multiple(false)
-        .args(["listen", "connect", "serial", "proxy"])
+        .args(["listen", "connect", "serial", "proxy", "monitor"])
+))]
+#[command(group(
+    // `--to` — цель пары: адрес у прокси, имя порта у прослушки (M5-AC12).
+    ArgGroup::new("pair")
+        .multiple(true)
+        .args(["proxy", "monitor"])
+        .requires("to")
+))]
+#[command(group(
+    // Настройки порта относятся к `--serial` и к порту анализатора в `--monitor`.
+    ArgGroup::new("port")
+        .multiple(true)
+        .args(["serial", "monitor"])
+))]
+#[command(group(
+    // Интервал переподключения нужен там, где bytetap сам открывает соединение.
+    ArgGroup::new("reconnect")
+        .multiple(true)
+        .args(["connect", "monitor"])
 ))]
 struct CaptureArgs {
     /// Адрес и порт прослушивания, например `0.0.0.0:5000`
     #[arg(
         long,
         value_name = "ADDR",
-        conflicts_with_all = ["connect", "serial", "proxy"]
+        conflicts_with_all = ["connect", "serial", "proxy", "monitor"]
     )]
     listen: Option<SocketAddr>,
     /// Адрес анализатора-сервера, к которому подключаться, например `192.168.1.50:5000`
     #[arg(
         long,
         value_name = "HOST:PORT",
-        conflicts_with_all = ["listen", "serial", "proxy"]
+        conflicts_with_all = ["listen", "serial", "proxy", "monitor"]
     )]
     connect: Option<String>,
     /// Имя COM-порта, например `COM5` или `/dev/ttyUSB0`
     #[arg(
         long,
         value_name = "NAME",
-        conflicts_with_all = ["listen", "connect", "proxy"],
+        conflicts_with_all = ["listen", "connect", "proxy", "monitor"],
         requires_all = ["baud", "format"]
     )]
     serial: Option<String>,
@@ -143,11 +163,19 @@ struct CaptureArgs {
         long,
         value_name = "ADDR",
         requires_all = ["to", "role"],
-        conflicts_with_all = ["listen", "connect", "serial"]
+        conflicts_with_all = ["listen", "connect", "serial", "monitor"]
     )]
     proxy: Option<SocketAddr>,
-    /// Цель прокси — адрес второй стороны, например `192.168.1.50:5000`
-    #[arg(long, value_name = "HOST:PORT", requires = "proxy", value_parser = parse_target)]
+    /// Порт стороны анализатора в прослушке, например `COM3` или `/dev/ttyUSB0`
+    #[arg(
+        long,
+        value_name = "NAME",
+        requires = "to",
+        conflicts_with_all = ["listen", "connect", "serial", "proxy"]
+    )]
+    monitor: Option<String>,
+    /// Вторая сторона пары: цель прокси `HOST:PORT` или имя порта ЛИС в прослушке
+    #[arg(long, value_name = "HOST:PORT | NAME")]
     to: Option<String>,
     /// Топология прокси: `analyzer-client` — анализатор приходит сам,
     /// `analyzer-server` — bytetap подключается к анализатору
@@ -162,48 +190,68 @@ struct CaptureArgs {
     /// без флага — с любого адреса сети
     #[arg(long, value_name = "IP", requires = "proxy")]
     allow_from: Option<IpAddr>,
-    /// Скорость порта: 1…4 000 000, типовые 300–115200
+    /// Скорость порта анализатора: 1…4 000 000, типовые 300–115200
     #[arg(
         long,
         value_name = "N",
-        requires = "serial",
+        requires = "port",
         value_parser = clap::value_parser!(u32).range(1..=4_000_000)
     )]
     baud: Option<u32>,
-    /// Формат порта: `<биты><чётность><стоп>`, например `8N1`, `7E2`, `8M1`
-    #[arg(long, value_name = "FORMAT", requires = "serial")]
+    /// Формат порта анализатора: `<биты><чётность><стоп>`, например `8N1`, `7E2`, `8M1`
+    #[arg(long, value_name = "FORMAT", requires = "port")]
     format: Option<SerialFormat>,
     /// Управление потоком: `none`, `rtscts`, `xonxoff`
-    #[arg(long, value_name = "FLOW", requires = "serial")]
+    #[arg(long, value_name = "FLOW", requires = "port")]
     flow: Option<Flow>,
     /// Начальное состояние DTR: `on` или `off`
-    #[arg(long, value_name = "on|off", requires = "serial", value_parser = parse_switch)]
+    #[arg(long, value_name = "on|off", requires = "port", value_parser = parse_switch)]
     dtr: Option<bool>,
     /// Начальное состояние RTS: `on` или `off`
-    #[arg(long, value_name = "on|off", requires = "serial", value_parser = parse_switch)]
+    #[arg(long, value_name = "on|off", requires = "port", value_parser = parse_switch)]
     rts: Option<bool>,
-    /// Интервал переподключения к анализатору, секунды: 0…3600 (по умолчанию 5);
+    /// Скорость порта ЛИС в прослушке; без флага — как у порта анализатора
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "monitor",
+        value_parser = clap::value_parser!(u32).range(1..=4_000_000)
+    )]
+    to_baud: Option<u32>,
+    /// Формат порта ЛИС в прослушке; без флага — как у порта анализатора
+    #[arg(long, value_name = "FORMAT", requires = "monitor")]
+    to_format: Option<SerialFormat>,
+    /// Управление потоком порта ЛИС; без флага — как у порта анализатора
+    #[arg(long, value_name = "FLOW", requires = "monitor")]
+    to_flow: Option<Flow>,
+    /// Начальное состояние DTR порта ЛИС; без флага — как у порта анализатора
+    #[arg(long, value_name = "on|off", requires = "monitor", value_parser = parse_switch)]
+    to_dtr: Option<bool>,
+    /// Начальное состояние RTS порта ЛИС; без флага — как у порта анализатора
+    #[arg(long, value_name = "on|off", requires = "monitor", value_parser = parse_switch)]
+    to_rts: Option<bool>,
+    /// Интервал переподключения, секунды: 0…3600 (по умолчанию 5);
     /// пауза короче 100 мс всё равно выдерживается как 100 мс
     #[arg(
         long,
         value_name = "SEC",
-        requires = "connect",
+        requires = "reconnect",
         value_parser = clap::value_parser!(u64).range(0..=3600)
     )]
     reconnect_sec: Option<u64>,
     /// Профиль автоответчика: `auto`, `hl7`, `astm` или `none`;
-    /// с `--proxy` несовместим — в прокси автоответчика нет (FR-6)
+    /// с `--proxy` и `--monitor` несовместим — там автоответчика нет (FR-6, FR-10)
     #[arg(
         long,
         value_name = "PROFILE",
         value_parser = ["auto", "hl7", "astm", "none"],
-        required_unless_present = "proxy",
-        conflicts_with = "proxy"
+        required_unless_present_any = ["proxy", "monitor"],
+        conflicts_with_all = ["proxy", "monitor"]
     )]
     responder: Option<String>,
     /// ASTM: отвечать `NAK` на неверную контрольную сумму вместо `ACK`;
-    /// с `--proxy` несовместим — ASTM-автомата в прокси нет (FR-6)
-    #[arg(long, conflicts_with = "proxy")]
+    /// с `--proxy` и `--monitor` несовместим — ASTM-автомата там нет (FR-6, FR-10)
+    #[arg(long, conflicts_with_all = ["proxy", "monitor"])]
     astm_nak: bool,
     /// Папка журналов вместо папки по умолчанию
     #[arg(long, value_name = "DIR")]
@@ -225,7 +273,10 @@ const fn astm_nak_applies(responder: Autoresponder) -> bool {
 ///
 /// Проверка на старте, а не при первом подключении: опечатка в адресе иначе выглядела бы
 /// в журнале отказом недоступной ЛИС и всплыла бы уже во время записи (M4-AC14).
-fn parse_target(value: &str) -> Result<String, String> {
+///
+/// Проверяется разбором аргументов, а не `clap`: `--to` у прослушки — имя порта, и один
+/// разборщик на две формы не годится (M5-AC12).
+fn proxy_target(value: &str) -> Result<String, String> {
     let text = value.trim();
     let Some((host, port)) = text.rsplit_once(':') else {
         return Err(format!("`{value}`: нужен адрес вида HOST:PORT"));
@@ -238,6 +289,45 @@ fn parse_target(value: &str) -> Result<String, String> {
         Ok(_) => Ok(text.to_owned()),
         Err(_) => Err(format!("`{value}`: порт — число 1…65535")),
     }
+}
+
+/// Имя второго порта прослушки: непустое и без пробелов (M5-AC12).
+fn monitor_port(value: &str) -> Result<String, String> {
+    let text = value.trim();
+    if text.is_empty() || text.contains(char::is_whitespace) {
+        return Err(format!(
+            "`{value}`: нужно имя COM-порта, например COM4 или /dev/ttyUSB1"
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+/// Настройки двух портов прослушки и общий поток (М5-В2, М5-В3).
+///
+/// Порт, скорость и формат у каждого свои; второй порт повторяет первый, если для него
+/// ничего не задано: в разрыве одной линии скорость и формат почти всегда те же. Поток,
+/// DTR и RTS общие — их `--to-*` уточняют для второго порта, но в разрыве они совпадают.
+fn monitor_settings(
+    args: &CaptureArgs,
+    analyzer_port: &str,
+    lis_port: &str,
+) -> (SerialSettings, SerialSettings, Flow) {
+    let baud = args.baud.unwrap_or(9600);
+    let format = args.format.unwrap_or(SerialFormat::EIGHT_N_ONE);
+    let flow = args.flow.unwrap_or(Flow::None);
+    let dtr = args.dtr.unwrap_or(true);
+    let rts = args.rts.unwrap_or(true);
+    let analyzer = SerialSettings::new(analyzer_port, baud, format)
+        .with_flow(flow)
+        .with_lines(dtr, rts);
+    let lis = SerialSettings::new(
+        lis_port,
+        args.to_baud.unwrap_or(baud),
+        args.to_format.unwrap_or(format),
+    )
+    .with_flow(args.to_flow.unwrap_or(flow))
+    .with_lines(args.to_dtr.unwrap_or(dtr), args.to_rts.unwrap_or(rts));
+    (analyzer, lis, flow)
 }
 
 /// Ошибка аргументов: `--allow-from` другого семейства, чем `--proxy` (FR-8).
@@ -304,18 +394,25 @@ fn capture(args: CaptureArgs) -> ExitCode {
         );
     }
     let proxy = args.proxy.is_some();
-    let (mut config, target) = match (&args.listen, &args.connect, &args.serial, &args.proxy) {
-        (Some(listen), None, None, None) => {
+    let monitor = args.monitor.is_some();
+    let (mut config, target) = match (
+        &args.listen,
+        &args.connect,
+        &args.serial,
+        &args.proxy,
+        &args.monitor,
+    ) {
+        (Some(listen), None, None, None, None) => {
             (SessionConfig::new(*listen), format!("Слушаю {listen}"))
         }
-        (None, Some(connect), None, None) => {
+        (None, Some(connect), None, None, None) => {
             let reconnect = Duration::from_secs(args.reconnect_sec.unwrap_or(5));
             (
                 SessionConfig::tcp_client(connect.clone(), reconnect),
                 format!("Подключаюсь к {connect}"),
             )
         }
-        (None, None, Some(serial), None) => {
+        (None, None, Some(serial), None, None) => {
             let format = args.format.unwrap_or(SerialFormat::EIGHT_N_ONE);
             let baud = args.baud.unwrap_or(9600);
             let settings = SerialSettings::new(serial.clone(), baud, format)
@@ -326,9 +423,15 @@ fn capture(args: CaptureArgs) -> ExitCode {
                 format!("Порт {serial}"),
             )
         }
-        (None, None, None, Some(proxy)) => {
+        (None, None, None, Some(proxy), None) => {
             // `--to` и `--role` обязательны с `--proxy`: clap не пропустит их отсутствие.
-            let to = args.to.clone().unwrap_or_default();
+            let to = match proxy_target(args.to.as_deref().unwrap_or_default()) {
+                Ok(to) => to,
+                Err(problem) => {
+                    warn!("ошибка: {problem}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let role = match args.role.as_deref() {
                 Some("analyzer-server") => ProxyRole::AnalyzerServer,
                 _ => ProxyRole::AnalyzerClient,
@@ -356,10 +459,43 @@ fn capture(args: CaptureArgs) -> ExitCode {
                 format!("Слушаю {proxy} → {to} ({title}){filter}"),
             )
         }
+        (None, None, None, None, Some(analyzer_port)) => {
+            // `--to` обязателен с `--monitor`: clap не пропустит его отсутствие.
+            let lis_port = match monitor_port(args.to.as_deref().unwrap_or_default()) {
+                Ok(port) => port,
+                Err(problem) => {
+                    warn!("ошибка: {problem}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if analyzer_port.eq_ignore_ascii_case(&lis_port) {
+                warn!(
+                    "ошибка: прослушке нужны два разных порта, а {analyzer_port} указан с обеих сторон"
+                );
+                return ExitCode::FAILURE;
+            }
+            let (analyzer, lis, flow) = monitor_settings(&args, analyzer_port, &lis_port);
+            // Линии управления сквозь bytetap не передаются: поток и линии — свои у каждой
+            // стороны, и об этом надо сказать до записи (М5-В3, M5-AC5).
+            if flow != Flow::None {
+                warn!(
+                    "Предупреждение: поток {flow} не передаётся сквозь bytetap — CTS/DSR/DCD остаются линиями самих портов, а XON/XOFF драйвер съедает из обмена. В разрыве линии поток обычно выключают."
+                );
+            }
+            let retry = Duration::from_secs(args.reconnect_sec.unwrap_or(5));
+            (
+                SessionConfig::com_monitor(analyzer, lis, retry),
+                format!(
+                    "Прослушка: {analyzer_port} ⇄ {lis_port} ({} {}, поток {flow})",
+                    args.baud.unwrap_or(9600),
+                    args.format.unwrap_or(SerialFormat::EIGHT_N_ONE)
+                ),
+            )
+        }
         // clap требует ровно один источник: сюда не попадает ни один набор аргументов.
-        (listen, connect, serial, proxy) => {
+        (listen, connect, serial, proxy, monitor) => {
             warn!(
-                "ошибка: нужен ровно один источник соединений — --listen, --connect, --serial или --proxy (получено: listen={listen:?}, connect={connect:?}, serial={serial:?}, proxy={proxy:?})"
+                "ошибка: нужен ровно один источник соединений — --listen, --connect, --serial, --proxy или --monitor (получено: listen={listen:?}, connect={connect:?}, serial={serial:?}, proxy={proxy:?}, monitor={monitor:?})"
             );
             return ExitCode::FAILURE;
         }
@@ -451,8 +587,8 @@ fn capture(args: CaptureArgs) -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(CaptureError::Journal(reason)) if proxy => {
-            // В прокси автоответчика нет: после сбоя останавливается пересылка.
+        Err(CaptureError::Journal(reason)) if proxy || monitor => {
+            // В прокси и прослушке автоответчика нет: после сбоя останавливается пересылка.
             warn!("Запись в журнал прервана: {reason}. Сессия остановлена, пересылка прекращена.");
             ExitCode::FAILURE
         }
@@ -1183,29 +1319,18 @@ mod tests {
             "10.0.0.5:0",
             "10.0.0.5:port",
         ] {
-            let parsed = Cli::try_parse_from([
-                "bytetap-cli",
-                "capture",
-                "--proxy",
-                "0.0.0.0:50025",
-                "--to",
-                bad_target,
-                "--role",
-                "analyzer-client",
-            ]);
-            assert!(parsed.is_err(), "`{bad_target}` — не HOST:PORT");
+            // `--to` у прослушки — имя порта, поэтому адрес цели проверяется разбором
+            // аргументов при запуске, а не `clap` (M5-AC12).
+            assert!(
+                proxy_target(bad_target).is_err(),
+                "`{bad_target}` — не HOST:PORT"
+            );
         }
-        let named = Cli::try_parse_from([
-            "bytetap-cli",
-            "capture",
-            "--proxy",
-            "0.0.0.0:50025",
-            "--to",
-            "lab-lis.local:5000",
-            "--role",
-            "analyzer-client",
-        ]);
-        assert!(named.is_ok(), "имя узла допустимо: {:?}", named.err());
+        assert_eq!(
+            proxy_target(" lab-lis.local:5000 ").as_deref(),
+            Ok("lab-lis.local:5000"),
+            "имя узла допустимо"
+        );
 
         let with_listen = Cli::try_parse_from([
             "bytetap-cli",
@@ -1331,6 +1456,171 @@ mod tests {
             .render_help()
             .to_string();
         for flag in ["--proxy", "--to", "--role", "--allow-from"] {
+            assert!(capture.contains(flag), "в справке нет {flag}: {capture}");
+        }
+    }
+
+    /// Прослушка двух портов (FR-10, M5-AC12): ровно один источник, `--to` — имя второго
+    /// порта, параметры второго порта повторяют первый, автоответчика нет.
+    #[test]
+    fn capture_takes_a_monitor_with_two_ports() {
+        let parsed = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--monitor",
+            "COM3",
+            "--to",
+            "COM4",
+        ])
+        .expect("прослушка без --responder: автоответчика в ней нет");
+        let Command::Capture(args) = parsed.command else {
+            panic!("ожидался capture");
+        };
+        assert_eq!(args.monitor.as_deref(), Some("COM3"));
+        assert_eq!(args.to.as_deref(), Some("COM4"));
+        assert!(args.responder.is_none());
+        let (analyzer, lis, flow) = monitor_settings(&args, "COM3", "COM4");
+        assert_eq!(analyzer.port, "COM3");
+        assert_eq!(analyzer.baud, 9600);
+        assert_eq!(analyzer.format(), SerialFormat::EIGHT_N_ONE);
+        assert_eq!(flow, Flow::None);
+        assert_eq!(lis.port, "COM4", "второй порт повторяет первый");
+        assert_eq!(lis.baud, analyzer.baud);
+        assert_eq!(lis.format(), analyzer.format());
+        assert!(lis.dtr && lis.rts, "DTR и RTS по умолчанию подняты");
+
+        // Второй порт со своими скоростью и форматом: адаптеры бывают разные (М5-В2).
+        let parsed = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--monitor",
+            "COM3",
+            "--to",
+            "COM4",
+            "--baud",
+            "19200",
+            "--format",
+            "7E2",
+            "--to-baud",
+            "9600",
+            "--to-format",
+            "8N1",
+            "--flow",
+            "xonxoff",
+            "--dtr",
+            "off",
+        ])
+        .expect("параметры обоих портов");
+        let Command::Capture(args) = parsed.command else {
+            panic!("ожидался capture");
+        };
+        let (analyzer, lis, flow) = monitor_settings(&args, "COM3", "COM4");
+        assert_eq!(analyzer.baud, 19200);
+        assert_eq!(analyzer.format().to_string(), "7E2");
+        assert_eq!(lis.baud, 9600);
+        assert_eq!(lis.format().to_string(), "8N1");
+        assert_eq!(flow, Flow::XonXoff, "поток общий");
+        assert_eq!(lis.flow, Flow::XonXoff, "второй порт наследует поток");
+        assert!(!analyzer.dtr, "--dtr относится к обоим портам");
+        assert!(!lis.dtr);
+        assert!(lis.rts);
+
+        let config = SessionConfig::com_monitor(analyzer, lis, Duration::from_secs(5));
+        assert_eq!(config.header_responder(), Autoresponder::None);
+        assert_eq!(
+            config.source.mode(),
+            bytetap_core::journal::Mode::ComMonitor
+        );
+    }
+
+    #[test]
+    fn capture_requires_both_monitor_ports() {
+        let without_to = Cli::try_parse_from(["bytetap-cli", "capture", "--monitor", "COM3"]);
+        assert!(without_to.is_err(), "--to обязателен с --monitor");
+
+        let without_port = Cli::try_parse_from(["bytetap-cli", "capture", "--to", "COM4"]);
+        assert!(without_port.is_err(), "--to без источника");
+
+        // Автоответчика в прослушке нет: `--responder` — ошибка аргументов (M5-AC4).
+        let with_responder = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--monitor",
+            "COM3",
+            "--to",
+            "COM4",
+            "--responder",
+            "astm",
+        ]);
+        assert!(with_responder.is_err(), "--responder с --monitor");
+
+        let with_astm_nak = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--monitor",
+            "COM3",
+            "--to",
+            "COM4",
+            "--astm-nak",
+        ]);
+        assert!(with_astm_nak.is_err(), "--astm-nak с --monitor");
+
+        // Параметры второго порта без прослушки не значат ничего.
+        let to_baud_alone = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--serial",
+            "COM5",
+            "--baud",
+            "9600",
+            "--format",
+            "8N1",
+            "--to-baud",
+            "19200",
+        ]);
+        assert!(to_baud_alone.is_err(), "--to-baud только с --monitor");
+
+        // Два источника одновременно.
+        let two = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--monitor",
+            "COM3",
+            "--to",
+            "COM4",
+            "--serial",
+            "COM5",
+            "--baud",
+            "9600",
+            "--format",
+            "8N1",
+        ]);
+        assert!(two.is_err(), "два источника одновременно");
+
+        for bad in ["", " ", "COM 4"] {
+            assert!(monitor_port(bad).is_err(), "`{bad}` — не имя порта");
+        }
+        assert_eq!(
+            monitor_port(" /dev/ttyUSB1 ").as_deref(),
+            Ok("/dev/ttyUSB1")
+        );
+    }
+
+    #[test]
+    fn the_monitor_flags_are_described_in_help() {
+        let capture = Cli::command()
+            .find_subcommand_mut("capture")
+            .expect("команда capture")
+            .render_help()
+            .to_string();
+        for flag in [
+            "--monitor",
+            "--to-baud",
+            "--to-format",
+            "--to-flow",
+            "--to-dtr",
+            "--to-rts",
+        ] {
             assert!(capture.contains(flag), "в справке нет {flag}: {capture}");
         }
     }
