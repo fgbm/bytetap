@@ -400,7 +400,9 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     let hex = app.settings.feed.view == FeedView::Hex;
     let encoding = app.settings.feed.encoding;
     let panel_height = app.settings.feed.panel_height;
-    let escape = ui.input(|input| input.key_pressed(egui::Key::Escape)) && app.note.is_none();
+    let escape = ui.input(|input| input.key_pressed(egui::Key::Escape))
+        && app.note.is_none()
+        && !egui::Popup::is_any_open(ui.ctx());
     let Some(view) = &mut app.viewing else {
         return;
     };
@@ -450,15 +452,9 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
         let target = if hex { view.hex_row_of(event) } else { event };
         view.scroll.set_top(target);
     }
-    // Панель деталей — до ленты: она забирает высоту снизу, лента получает остаток.
-    let closed = details::show(ui, &p, &mut view.details, encoding, pair);
-    if closed {
-        view.details.close();
-    }
-    if escape && view.details.is_open() {
-        view.details.close();
-        ui.ctx().request_repaint();
-    }
+    // Панель деталей: место снизу лента уступает до того, как её нарисовать, а тело
+    // панели идёт после ленты — тогда Tab обходит сначала строки, потом панель.
+    let place = details::reserve(ui, &p, &view.details);
     // Прокрутка копируется на кадр: замыкание строк держит изменяемую ссылку на журнал.
     let mut scroll = view.scroll;
     let mut clicked = None;
@@ -493,15 +489,29 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
                     text_row(ui, &p, &event, multi, pair, encoding, selected)
                 };
                 if response.clicked() {
-                    clicked = Some((index, std::sync::Arc::new(event)));
+                    clicked = Some((index, std::sync::Arc::new(event), row, response.rect));
                 }
             }
         },
     );
     view.scroll = scroll;
     view.feed_rect = Some(out.inner);
-    if let Some((index, event)) = clicked {
+    if let Some((index, event, row, rect)) = clicked {
         view.details.open(index as u64, event);
+        // Панель забрала низ ленты и могла закрыть строку, по которой кликнули:
+        // подтягиваем её со следующего кадра, когда лента станет ниже.
+        if rect.bottom() > out.inner.bottom() - view.details.height() {
+            view.scroll.set_top(row);
+        }
+    }
+    if let Some(place) = place
+        && details::show(ui, &p, &mut view.details, encoding, pair, place)
+    {
+        view.details.close();
+    }
+    if escape && view.details.is_open() {
+        view.details.close();
+        ui.ctx().request_repaint();
     }
     // Видимая область — рамка на карте сессии; страницы — по событиям, а не по строкам:
     // одна строка HEX — кусок события, и номер строки не номер события.
@@ -515,18 +525,14 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui) {
     let start = view.fraction_at_event(first_event);
     let end = (view.fraction_at_event(last_event.saturating_sub(1)) + 1.0 / DENSITY_BUCKETS as f32)
         .min(1.0);
-    let height = view
-        .details
-        .take_height_changed()
-        .then(|| view.details.height());
+    // Высоту, выбранную разделителем, запоминаем один раз — на отпускании мыши.
+    let height = view.details.take_height_saved();
     app.set_visible(Some((start, end)));
     let ctx = ui.ctx().clone();
     app.request_pages(&ctx, first_event, last_event.max(first_event + 1));
     if let Some(height) = height {
         app.settings.feed.panel_height = height;
-        if ui.input(|input| input.pointer.any_released()) {
-            app.save_settings();
-        }
+        app.save_settings();
     }
     if let Some(pause) = app.retry_pages() {
         ctx.request_repaint_after(pause);

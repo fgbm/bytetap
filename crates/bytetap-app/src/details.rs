@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, Align, CursorIcon, Frame, Id, Key, Layout, Modifiers, Rangef, Rect, Response, Role,
-    ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, WidgetInfo,
+    self, Align, CursorIcon, Frame, Id, Key, Layout, Modifiers, Rect, Response, Role, ScrollArea,
+    Sense, Stroke, TextEdit, Ui, UiBuilder, WidgetInfo,
     text::{CCursorRange, LayoutJob, TextWrapping},
     vec2,
 };
@@ -36,6 +36,10 @@ pub const PANEL_MIN: f32 = 140.0;
 pub const PANEL_DEFAULT: f32 = 252.0;
 /// Доля высоты ленты, больше которой панель не тянется.
 const PANEL_MAX_SHARE: f32 = 0.7;
+/// Полоса захвата разделителя панели: по половине вверх и вниз от её верхней границы.
+const RESIZE_GRAB: f32 = 4.0;
+/// Шаг высоты панели стрелками с клавиатуры, когда разделитель в фокусе.
+const RESIZE_STEP: f32 = 16.0;
 
 /// Вкладка панели.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -80,12 +84,19 @@ impl HexRange {
     }
 }
 
-/// Раскладка полного текста: строится один раз на событие, кодировку, тему и ширину.
+/// Раскладка полного текста: строится один раз на событие, кодировку, тему, ширину
+/// и масштаб экрана.
+///
+/// Масштаб — часть ключа: epaint мерит глифы в точках, но их шаг считается от
+/// физического пикселя, и при смене `pixels_per_point` ширина строки меняется.
+/// Дешевле держать его в ключе, чем раскладывать `layout_job` каждый кадр через кеш
+/// egui: тот переживает сброс атласа, но сам разбор 16 КБ и спанов стоит дороже.
 struct TextLayout {
     /// Событие и кодировка, для которых построена раскладка.
     key: (u64, Encoding),
     dark: bool,
     wrap: f32,
+    pixels_per_point: f32,
     text: Arc<str>,
     galley: Arc<egui::Galley>,
 }
@@ -97,14 +108,19 @@ pub struct Details {
     /// Копия события: панель переживает вытеснение из кольца и выгрузку страницы.
     event: Option<Arc<FeedEvent>>,
     tab: Tab,
-    /// Высота панели в точках: тянется разделителем и запоминается в настройках.
+    /// Выбранная инженером высота панели в точках: тянется разделителем и попадает
+    /// в настройки на отпускании мыши.
     height: f32,
-    /// Высоту изменили разделителем — экран запишет её в настройки.
-    height_changed: bool,
+    /// Разделитель тянут прямо сейчас.
+    dragging: bool,
+    /// Перетаскивание закончилось: высоту пора записать в настройки (один раз).
+    height_saved: bool,
     /// Событие вытеснено из ленты: текст остался, а строки в ленте уже нет (Л-В6).
     evicted: bool,
     /// Выделенные строки дампа в HEX-вкладке.
     hex: Option<HexRange>,
+    /// Событие сменилось: поле, выделение и прокрутка начинают с чистого листа.
+    stale: bool,
     text: Option<TextLayout>,
 }
 
@@ -115,9 +131,11 @@ impl Default for Details {
             event: None,
             tab: Tab::default(),
             height: PANEL_DEFAULT,
-            height_changed: false,
+            dragging: false,
+            height_saved: false,
             evicted: false,
             hex: None,
+            stale: false,
             text: None,
         }
     }
@@ -153,9 +171,12 @@ impl Details {
         self.height
     }
 
-    /// Высота изменилась разделителем с прошлого кадра.
-    pub fn take_height_changed(&mut self) -> bool {
-        std::mem::take(&mut self.height_changed)
+    /// Высоту выбрали разделителем и отпустили мышь: экран запишет её в настройки.
+    ///
+    /// Возвращается один раз на перетаскивание, а не на каждый кадр: файл настроек
+    /// не переписывается, пока разделитель тянут.
+    pub fn take_height_saved(&mut self) -> Option<f32> {
+        std::mem::take(&mut self.height_saved).then_some(self.height)
     }
 
     pub fn evicted(&self) -> bool {
@@ -179,6 +200,7 @@ impl Details {
         self.evicted = false;
         self.hex = None;
         self.text = None;
+        self.stale = true;
         // У простого события (открытие, закрытие, замечание) HEX-дампа нет — вкладка одна.
         if self
             .event
@@ -196,6 +218,7 @@ impl Details {
         self.evicted = false;
         self.hex = None;
         self.text = None;
+        self.stale = true;
     }
 
     /// Событие вытеснено из кольцевой ленты: панель остаётся с прочитанным текстом.
@@ -206,7 +229,7 @@ impl Details {
     }
 
     /// Раскладка полного текста события: пересобирается только при смене события,
-    /// кодировки, темы или ширины — не каждый кадр.
+    /// кодировки, темы, ширины или масштаба экрана — не каждый кадр.
     fn text_layout(
         &mut self,
         ui: &Ui,
@@ -217,8 +240,12 @@ impl Details {
         wrap: f32,
     ) -> &TextLayout {
         let dark = ui.visuals().dark_mode;
+        let pixels_per_point = ui.ctx().pixels_per_point();
         let stale = self.text.as_ref().is_none_or(|cache| {
-            cache.key != (key, encoding) || cache.dark != dark || (cache.wrap - wrap).abs() > 0.5
+            cache.key != (key, encoding)
+                || cache.dark != dark
+                || (cache.wrap - wrap).abs() > 0.5
+                || cache.pixels_per_point != pixels_per_point
         });
         if stale {
             let text = data.shown_text(encoding);
@@ -228,6 +255,7 @@ impl Details {
                 key: (key, encoding),
                 dark,
                 wrap,
+                pixels_per_point,
                 text,
                 galley,
             });
@@ -356,15 +384,56 @@ impl Panel<'_> {
     }
 }
 
-/// Рисует панель, если событие выбрано; `true` — панель закрыли.
+/// Место панели под лентой: прямоугольник, который она у неё забрала, и предел высоты.
 ///
-/// Экран зовёт панель до ленты: панель забирает высоту снизу, и лента получает остаток.
+/// Экран сначала просит место, рисует ленту и только потом тело панели: Tab обходит
+/// строки ленты раньше панели, как они и стоят на экране.
+#[derive(Clone, Copy, Debug)]
+pub struct Place {
+    /// Прямоугольник панели: низ экрана, выбранная инженером высота.
+    rect: Rect,
+    /// Больше этой высоты панель не тянется: 70 % ленты.
+    max: f32,
+}
+
+/// Забирает у ленты высоту панели снизу; `None` — событие не выбрано.
+pub fn reserve(ui: &mut Ui, p: &Palette, details: &Details) -> Option<Place> {
+    if !details.is_open() {
+        return None;
+    }
+    let available = ui.available_height();
+    let max = (available * PANEL_MAX_SHARE).max(PANEL_MIN + 1.0);
+    let height = details.height.clamp(PANEL_MIN, max);
+    // Высота задаётся каждый кадр выбранной: своей памяти о высоте у панели нет, иначе
+    // ужатая маленьким окном панель оставалась такой же и в развёрнутом (L1-AC2).
+    let response = egui::Panel::bottom("bt-details")
+        .exact_size(height)
+        .show_separator_line(false)
+        .frame(
+            Frame::NONE
+                .fill(p.surface_0)
+                .inner_margin(egui::Margin::ZERO),
+        )
+        .show(ui, |ui| {
+            // Панель занимает всю высоту, которую ей дали: иначе кадр панели
+            // сжимается до пустого содержимого и места под тело не остаётся.
+            ui.expand_to_include_rect(ui.max_rect());
+        });
+    Some(Place {
+        rect: response.response.rect,
+        max,
+    })
+}
+
+/// Тело панели: разделитель, шапка, содержимое вкладки и строка подсказки.
+/// `true` — панель закрыли «×».
 pub fn show(
     ui: &mut Ui,
     p: &Palette,
     details: &mut Details,
     encoding: Encoding,
     pair: Pair,
+    place: Place,
 ) -> bool {
     let Some(event) = details.event.clone() else {
         return false;
@@ -372,49 +441,103 @@ pub fn show(
     let Some(key) = details.key() else {
         return false;
     };
+    // Поле панели одно на оба экрана и на все события: своё состояние (выделение,
+    // история отмены) оно получает заново при открытии и закрытии панели (L1-AC6).
+    let fresh = std::mem::take(&mut details.stale);
+    if fresh {
+        ui.ctx().memory_mut(|memory| {
+            memory
+                .data
+                .remove::<egui::widgets::text_edit::TextEditState>(field_id());
+            memory.surrender_focus(field_id());
+        });
+    }
     let meta = meta_line(&event, pair, encoding);
     let title = t!("details.panel", meta = &meta);
-    let available = ui.available_height();
-    let max = (available * PANEL_MAX_SHARE).max(PANEL_MIN + 1.0);
-    let default = details.height.clamp(PANEL_MIN, max);
-    let mut height = default;
-    let mut closed = false;
-    egui::Panel::bottom("bt-details")
-        .resizable(true)
-        .show_separator_line(false)
-        .frame(
-            Frame::NONE
-                .fill(p.surface_0)
-                .inner_margin(egui::Margin::ZERO),
-        )
-        .default_size(default)
-        .size_range(Rangef::new(PANEL_MIN, max))
-        .show(ui, |ui| {
-            // Панель занимает всю высоту, которую ей дали: без этого кадр панели
-            // сжимается до содержимого, и разделитель не тянет ничего.
-            ui.expand_to_include_rect(ui.max_rect());
-            height = ui.max_rect().height();
-            let panel = Panel {
-                event: &event,
-                key,
-                meta: &meta,
-                title: &title,
-                encoding,
-                pair,
-            };
-            closed = body(ui, p, details, &panel);
-        });
-    if (height - details.height).abs() > 0.5 {
-        // Запоминается высота, которую выбрал инженер, а не та, что получилась от
-        // уменьшения окна: разделитель тянут мышью.
-        details.height_changed = ui.input(|input| input.pointer.any_down());
-        details.height = height;
+    let mut body_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(place.rect)
+            .id_salt("bt-details-body")
+            .layout(Layout::top_down(Align::Min)),
+    );
+    body_ui.spacing_mut().item_spacing.y = 0.0;
+    let panel = Panel {
+        event: &event,
+        key,
+        meta: &meta,
+        title: &title,
+        encoding,
+        pair,
+    };
+    body(&mut body_ui, p, details, &panel, place, fresh)
+}
+
+/// Разделитель панели: верхняя граница тянется мышью и стрелками с клавиатуры.
+fn resizer(ui: &mut Ui, p: &Palette, details: &mut Details, place: Place) {
+    let rect = ui.max_rect();
+    let edge = Rect::from_min_max(
+        egui::pos2(rect.left(), rect.top() - RESIZE_GRAB),
+        egui::pos2(rect.right(), rect.top() + RESIZE_GRAB),
+    );
+    let response = ui.interact(
+        edge,
+        Id::unique("bt-details-resize"),
+        Sense::click_and_drag(),
+    );
+    response.widget_info(|| {
+        let mut info = WidgetInfo::labeled(Role::Splitter, true, t!("details.resize"));
+        info.value = Some(f64::from(
+            (details.height / place.max.max(1.0)).clamp(0.0, 1.0),
+        ));
+        info
+    });
+    if response.dragged()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        details.height = (rect.bottom() - pos.y).clamp(PANEL_MIN, place.max);
+        details.dragging = true;
     }
-    closed
+    if response.has_focus() {
+        // Стрелки сдвигают высоту шагом: без мыши разделитель иначе недоступен.
+        let (up, down) = ui.input(|input| {
+            (
+                input.key_pressed(Key::ArrowUp),
+                input.key_pressed(Key::ArrowDown),
+            )
+        });
+        if up || down {
+            let step = if up { RESIZE_STEP } else { -RESIZE_STEP };
+            details.height = (details.height + step).clamp(PANEL_MIN, place.max);
+            details.height_saved = true;
+        }
+    }
+    if response.dragged() || response.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+    }
+    if !response.dragged() {
+        // Перетаскивание кончилось на прошлом кадре: высоту запоминаем один раз.
+        if details.dragging {
+            details.dragging = false;
+            details.height_saved = true;
+        }
+    }
+    if response.hovered() || response.dragged() {
+        // Полоска разделителя подсвечивается, когда за неё берутся.
+        let width = if response.dragged() { 2.0 } else { 1.0 };
+        ui.painter()
+            .hline(rect.x_range(), rect.top() + 0.5, Stroke::new(width, p.ctrl));
+    }
 }
 
 /// Тело панели: шапка, содержимое вкладки и строка подсказки.
-fn body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>) -> bool {
+fn body(
+    ui: &mut Ui,
+    p: &Palette,
+    details: &mut Details,
+    panel: &Panel<'_>,
+    place: Place,
+    fresh: bool,
+) -> bool {
     let Panel {
         key, meta, title, ..
     } = *panel;
@@ -422,15 +545,16 @@ fn body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>) -> b
     // Панель снизу: её верхняя граница — разделитель, за который тянут высоту.
     ui.painter()
         .hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, p.border));
+    resizer(ui, p, details, place);
     let data = panel.data();
     let mut closed = false;
     let mut chosen = None;
     {
         let head = Rect::from_min_size(rect.min, vec2(rect.width(), HEAD_HEIGHT));
-        // Шапка — регион для AccessKit: диктор называет выбранное событие целиком. Регион
-        // регистрируется до кнопок: иначе он лежит поверх них и забирает клики.
-        let head_response = ui.interact(head, Id::unique(("bt-details-head", key)), Sense::hover());
-        head_response.widget_info(|| WidgetInfo::labeled(Role::Region, ui.is_enabled(), title));
+        // Панель — регион для AccessKit: диктор называет выбранное событие целиком.
+        // Регион регистрируется до кнопок: иначе он лежит поверх них и забирает клики.
+        let region = ui.interact(rect, Id::unique(("bt-details-region", key)), Sense::hover());
+        region.widget_info(|| WidgetInfo::labeled(Role::Region, ui.is_enabled(), title));
         let inner = Rect::from_min_max(
             egui::pos2(head.left() + SPACE_3, head.top()),
             egui::pos2(head.right() - SPACE_3, head.bottom()),
@@ -497,7 +621,7 @@ fn body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>) -> b
         // С вкладки «Текст» уходим с фокусом в поле: иначе он остаётся у невидимого
         // поля и Ctrl+A/C на вкладке HEX не доходят до панели.
         ui.ctx()
-            .memory_mut(|memory| memory.surrender_focus(text_id(key)));
+            .memory_mut(|memory| memory.surrender_focus(field_id()));
     }
     shortcuts(ui, details, panel);
 
@@ -517,8 +641,8 @@ fn body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>) -> b
     content_ui.spacing_mut().item_spacing.y = 0.0;
     content_ui.visuals_mut().selection.bg_fill = p.selection_strong;
     match (details.tab, data) {
-        (Tab::Hex, Some(data)) => hex_body(&mut content_ui, p, details, data),
-        _ => text_body(&mut content_ui, p, details, panel),
+        (Tab::Hex, Some(data)) => hex_body(&mut content_ui, p, details, data, fresh),
+        _ => text_body(&mut content_ui, p, details, panel, fresh),
     }
     // Подсказка внизу — как в макете; вытеснение из ленты её заменяет (Л-В6).
     let (text, color) = if details.evicted() {
@@ -571,130 +695,154 @@ fn tab_button(ui: &mut Ui, p: &Palette, text: &str, on: bool) -> Response {
 }
 
 /// Вкладка «Текст»: полный фрагмент в поле только для чтения, с выделением мышью.
-fn text_body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>) {
+///
+/// `fresh` — событие сменилось: поле начинает с начала, без прокрутки прошлого.
+fn text_body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>, fresh: bool) {
     let key = panel.key;
     let encoding = panel.encoding;
     let Some(data) = panel.data() else {
         // Служебная строка: текста фрагмента нет, показываем строку ленты целиком.
         let (_, text) = feedrows::row_text(panel.event, panel.pair);
         let mut buffer: &str = &text;
-        ui.add(
+        let response = ui.add(
             TextEdit::multiline(&mut buffer)
-                .id(text_id(key))
+                .id(field_id())
                 .frame(Frame::NONE)
                 .margin(egui::Margin::ZERO)
                 .desired_width(f32::INFINITY)
                 .text_color(p.text),
         );
+        // Диктору поле называется так же, как подсказка внизу: значение — текст строки.
+        response.widget_info(|| {
+            WidgetInfo::labeled(
+                Role::MultilineTextInput,
+                ui.is_enabled(),
+                t!("details.field"),
+            )
+        });
         return;
     };
-    ScrollArea::vertical()
+    let mut scroll = ScrollArea::vertical()
         .id_salt("bt-details-text")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let width = ui.available_width().max(1.0);
-            let text = details
-                .text_layout(ui, p, key, data, encoding, width)
-                .text
-                .clone();
-            let buffer: &str = &text;
-            let mut layouter = |ui: &Ui, _text: &dyn egui::TextBuffer, wrap_width: f32| {
-                details
-                    .text_layout(ui, p, key, data, encoding, wrap_width)
-                    .galley
-                    .clone()
-            };
-            read_only(ui, p, key, buffer, &mut layouter);
-        });
+        .auto_shrink([false, false]);
+    if fresh {
+        // Новая строка — новый фрагмент: прокрутка прошлого к нему не относится.
+        scroll = scroll.vertical_scroll_offset(0.0);
+    }
+    scroll.show(ui, |ui| {
+        let width = ui.available_width().max(1.0);
+        let text = details
+            .text_layout(ui, p, key, data, encoding, width)
+            .text
+            .clone();
+        let buffer: &str = &text;
+        let mut layouter = |ui: &Ui, _text: &dyn egui::TextBuffer, wrap_width: f32| {
+            details
+                .text_layout(ui, p, key, data, encoding, wrap_width)
+                .galley
+                .clone()
+        };
+        read_only(ui, p, buffer, &mut layouter);
+    });
 }
 
 /// Поле только для чтения: выделение, Ctrl+A и Ctrl+C даёт сам `TextEdit`.
 fn read_only(
     ui: &mut Ui,
     p: &Palette,
-    key: u64,
     buffer: &str,
     layouter: &mut dyn FnMut(&Ui, &dyn egui::TextBuffer, f32) -> Arc<egui::Galley>,
 ) {
     let mut buffer = buffer;
-    ui.add(
+    let response = ui.add(
         TextEdit::multiline(&mut buffer)
-            .id(text_id(key))
+            .id(field_id())
             .frame(Frame::NONE)
             .margin(egui::Margin::ZERO)
             .desired_width(f32::INFINITY)
             .text_color(p.text)
             .layouter(layouter),
     );
+    // Подпись поля для диктора; значение (весь фрагмент) уже стоит в узле от `TextEdit`.
+    response.widget_info(|| {
+        WidgetInfo::labeled(
+            Role::MultilineTextInput,
+            ui.is_enabled(),
+            t!("details.field"),
+        )
+    });
 }
 
 /// Вкладка «HEX»: полный дамп по 16 байт, строки выделяются кликом и Shift+кликом.
-fn hex_body(ui: &mut Ui, p: &Palette, details: &mut Details, data: &DataPayload) {
+fn hex_body(ui: &mut Ui, p: &Palette, details: &mut Details, data: &DataPayload, fresh: bool) {
     let lines = feed::hex_line_count(data.bytes.len());
     let bytes = data.bytes.as_slice();
     let mut clicked = None;
     let shift = ui.input(|i| i.modifiers.shift);
-    ScrollArea::vertical()
+    let mut scroll = ScrollArea::vertical()
         .id_salt("bt-details-hex")
-        .auto_shrink([false, false])
-        .show_rows(ui, feedrows::HEX_ROW_HEIGHT, lines, |ui, range| {
-            for line in range {
-                let selected = details.hex.is_some_and(|hex| hex.contains(line));
-                let (rect, response) = ui.allocate_exact_size(
-                    vec2(ui.available_width(), feedrows::HEX_ROW_HEIGHT),
-                    Sense::click(),
-                );
-                let dump = feed::hex_line(bytes, line);
-                if selected {
-                    ui.painter().rect_filled(rect, 0, p.selection);
-                } else if response.hovered() {
-                    ui.painter().rect_filled(rect, 0, p.hover);
-                }
-                let name = format!(
-                    "{} {} {}",
-                    dump.offset,
-                    dump.bytes
-                        .iter()
-                        .map(|(value, _)| value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    dump.ascii
-                );
-                response.widget_info(|| WidgetInfo::selected(Role::Label, true, selected, &name));
-                let font = theme::mono(TEXT_XS);
-                let mut job = LayoutJob::default();
-                job.append(
-                    &dump.offset,
-                    0.0,
-                    feedrows::text_format(font.clone(), p.text_faint),
-                );
-                for (index, (value, control)) in dump.bytes.iter().enumerate() {
-                    let format = if *control {
-                        feedrows::text_format(theme::mono_medium(TEXT_XS), p.ctrl)
-                    } else {
-                        feedrows::text_format(font.clone(), p.text)
-                    };
-                    job.append(
-                        value,
-                        if index == 0 { SPACE_2 } else { 2.0 },
-                        format.clone(),
-                    );
-                    job.append(" ", 0.0, format);
-                }
-                job.append(
-                    &dump.ascii,
-                    SPACE_2,
-                    feedrows::text_format(font, p.text_muted),
-                );
-                let galley = truncated(ui, job, rect.width() - SPACE_2);
-                let y = rect.center().y - galley.size().y / 2.0;
-                ui.painter()
-                    .galley(egui::pos2(rect.left(), y), galley, p.text);
-                if response.clicked() {
-                    clicked = Some((line, shift));
-                }
+        .auto_shrink([false, false]);
+    if fresh {
+        scroll = scroll.vertical_scroll_offset(0.0);
+    }
+    scroll.show_rows(ui, feedrows::HEX_ROW_HEIGHT, lines, |ui, range| {
+        for line in range {
+            let selected = details.hex.is_some_and(|hex| hex.contains(line));
+            let (rect, response) = ui.allocate_exact_size(
+                vec2(ui.available_width(), feedrows::HEX_ROW_HEIGHT),
+                Sense::click(),
+            );
+            let dump = feed::hex_line(bytes, line);
+            if selected {
+                ui.painter().rect_filled(rect, 0, p.selection);
+            } else if response.hovered() {
+                ui.painter().rect_filled(rect, 0, p.hover);
             }
-        });
+            let name = format!(
+                "{} {} {}",
+                dump.offset,
+                dump.bytes
+                    .iter()
+                    .map(|(value, _)| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                dump.ascii
+            );
+            response.widget_info(|| WidgetInfo::selected(Role::Label, true, selected, &name));
+            let font = theme::mono(TEXT_XS);
+            let mut job = LayoutJob::default();
+            job.append(
+                &dump.offset,
+                0.0,
+                feedrows::text_format(font.clone(), p.text_faint),
+            );
+            for (index, (value, control)) in dump.bytes.iter().enumerate() {
+                let format = if *control {
+                    feedrows::text_format(theme::mono_medium(TEXT_XS), p.ctrl)
+                } else {
+                    feedrows::text_format(font.clone(), p.text)
+                };
+                job.append(
+                    value,
+                    if index == 0 { SPACE_2 } else { 2.0 },
+                    format.clone(),
+                );
+                job.append(" ", 0.0, format);
+            }
+            job.append(
+                &dump.ascii,
+                SPACE_2,
+                feedrows::text_format(font, p.text_muted),
+            );
+            let galley = truncated(ui, job, rect.width() - SPACE_2);
+            let y = rect.center().y - galley.size().y / 2.0;
+            ui.painter()
+                .galley(egui::pos2(rect.left(), y), galley, p.text);
+            if response.clicked() {
+                clicked = Some((line, shift));
+            }
+        }
+    });
     if let Some((line, extend)) = clicked {
         details.hex = Some(match (details.hex, extend) {
             (Some(hex), true) => hex.to(line),
@@ -703,41 +851,39 @@ fn hex_body(ui: &mut Ui, p: &Palette, details: &mut Details, data: &DataPayload)
     }
 }
 
-/// Ctrl+A и Ctrl+C панели: в поле их ловит `TextEdit`, в HEX-дампе и без фокуса — панель.
+/// Ctrl+A и Ctrl+C панели: в поле их ловит `TextEdit`, в HEX-дампе — панель.
+///
+/// Чужое поле в фокусе (диалог комментария, поле шапки) забирает клавиши себе: панель
+/// молчит, даже если открыта под ним.
 fn shortcuts(ui: &Ui, details: &mut Details, panel: &Panel<'_>) {
-    let key = panel.key;
-    let encoding = panel.encoding;
-    let data = panel.data();
-    let in_field = ui.ctx().text_edit_focused() && details.tab == Tab::Text;
-    if in_field {
+    let foreign_field = ui
+        .ctx()
+        .memory(|memory| memory.focused())
+        .is_some_and(|id| {
+            id != field_id()
+                && egui::widgets::text_edit::TextEditState::load(ui.ctx(), id).is_some()
+        });
+    if foreign_field {
         return;
     }
-    let select_all = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A));
-    let copy = ui.input(|i| i.events.contains(&egui::Event::Copy));
     match details.tab {
         Tab::Text => {
-            let Some(data) = data else {
-                return;
-            };
-            let text = data.shown_text(encoding);
-            if select_all {
-                select_all_text(ui, text_id(key), &text);
-            }
-            if copy {
-                let text =
-                    selected_text(ui, text_id(key), &text).unwrap_or_else(|| text.to_string());
-                ui.ctx().copy_text(text);
+            // Ctrl+A выделяет весь фрагмент и отдаёт фокус полю; Ctrl+C дальше ловит
+            // `TextEdit` и кладёт выделение. «Копировать» кладёт фрагмент целиком.
+            if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) {
+                let text = panel_text(panel);
+                select_all_text(ui, field_id(), &text);
             }
         }
         Tab::Hex => {
-            let Some(data) = data else {
+            let Some(data) = panel.data() else {
                 return;
             };
             let lines = feed::hex_line_count(data.bytes.len());
-            if select_all {
+            if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) {
                 details.hex = Some(HexRange::between(0, lines.saturating_sub(1)));
             }
-            if copy {
+            if ui.input(|i| i.events.contains(&egui::Event::Copy)) {
                 let (from, to) = details.hex.map_or((0, lines.saturating_sub(1)), |hex| {
                     (hex.first(), hex.last())
                 });
@@ -747,39 +893,30 @@ fn shortcuts(ui: &Ui, details: &mut Details, panel: &Panel<'_>) {
     }
 }
 
-/// «Копировать» активной вкладки: текст целиком, выделение в нём или строки дампа.
+/// Текст панели целиком: фрагмент по кодировке ленты или строка ленты у служебного
+/// события — то же, что видно в поле вкладки «Текст».
+fn panel_text(panel: &Panel<'_>) -> String {
+    match panel.data() {
+        Some(data) => data.shown_text(panel.encoding).to_string(),
+        None => feedrows::row_text(panel.event, panel.pair).1,
+    }
+}
+
+/// «Копировать» активной вкладки: активная вкладка целиком, а выделение — Ctrl+C.
 fn copy_active_tab(ui: &Ui, details: &Details, panel: &Panel<'_>) {
-    let Some(data) = panel.data() else {
-        return;
-    };
-    let key = panel.key;
-    let encoding = panel.encoding;
     let text = match details.tab {
-        Tab::Text => {
-            let shown = data.shown_text(encoding);
-            selected_text(ui, text_id(key), &shown).unwrap_or_else(|| shown.to_string())
-        }
+        Tab::Text => panel_text(panel),
         Tab::Hex => {
-            let lines = feed::hex_line_count(data.bytes.len());
-            let (from, to) = details.hex.map_or((0, lines.saturating_sub(1)), |hex| {
-                (hex.first(), hex.last())
-            });
-            hex_lines_text(&data.bytes, from, to)
+            let Some(data) = panel.data() else {
+                return;
+            };
+            let last = feed::hex_line_count(data.bytes.len()).saturating_sub(1);
+            hex_lines_text(&data.bytes, 0, last)
         }
     };
     if !text.is_empty() {
         ui.ctx().copy_text(text);
     }
-}
-
-/// Где стоит выделение в поле панели: выделенный текст, если оно есть.
-fn selected_text(ui: &Ui, id: Id, text: &str) -> Option<String> {
-    let state = egui::widgets::text_edit::TextEditState::load(ui.ctx(), id)?;
-    let range = state.cursor.char_range()?;
-    let range = range.as_sorted_char_range();
-    let from = range.start.0;
-    let to = range.end.0.min(text.chars().count());
-    (to > from).then(|| text.chars().skip(from).take(to - from).collect())
 }
 
 /// Выделить весь текст в поле и отдать ему фокус: дальше Ctrl+C ловит `TextEdit`.
@@ -792,10 +929,12 @@ fn select_all_text(ui: &Ui, id: Id, text: &str) {
     state.store(ui.ctx(), id);
 }
 
-/// Идентификатор поля панели: свой у каждого события, чтобы выделение не переезжало
-/// со старого фрагмента на новый.
-fn text_id(key: u64) -> Id {
-    Id::unique(("bt-details-field", key))
+/// Идентификатор поля панели: один на оба экрана и на все события.
+///
+/// Своё состояние — выделение и историю отмены — поле получает заново при открытии и
+/// закрытии панели, поэтому выделение не переезжает со старого фрагмента на новый.
+fn field_id() -> Id {
+    Id::unique("bt-details-field")
 }
 
 /// Строки дампа так, как они видны: смещение, 16 байт и ASCII-колонка.

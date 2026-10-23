@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytetap_app::feed::FeedEvent;
 use bytetap_app::live;
 use bytetap_app::recording::RecordingFixture;
-use bytetap_app::settings::{Encoding, FeedView, Settings};
+use bytetap_app::settings::{Encoding, FeedView, Settings, Store};
 use bytetap_app::{BytetapApp, Fixtures, Screen};
 use bytetap_core::journal::{Data, Dir, Event, Stats};
 use eframe::egui::{self, Key, Modifiers};
@@ -114,14 +114,88 @@ fn harness() -> Harness<'static, BytetapApp> {
     harness_with(settings(), fixture())
 }
 
+/// Приложение с файлом настроек: по нему видно, когда высота панели записана.
+fn harness_store(
+    settings: Settings,
+    fixture: RecordingFixture,
+    store: Store,
+) -> Harness<'static, BytetapApp> {
+    let mut harness = Harness::builder()
+        .with_size(WINDOW)
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings, None, Some(store))
+                .with_fixtures(fixtures())
+                .with_recording_fixture(fixture)
+        });
+    harness.run_steps(3);
+    harness
+}
+
+/// Запись из `count` событий с разным текстом `EVT0000`…: по нему находится строка.
+fn many_events(count: usize) -> RecordingFixture {
+    let events = (0..count)
+        .map(|index| {
+            Event::Data(Data::new(
+                "2026-10-19T10:15:03.000+03:00",
+                index as u64,
+                1,
+                Dir::AnalyzerToLis,
+                false,
+                format!("\x0bMSH|^~\\&|A|B|C|D|E||ORU^R01|EVT{index:04}|P|2.3.1\rOBX|1|NM|GLU||5.4\r\x1c\r").as_bytes(),
+            ))
+        })
+        .collect();
+    RecordingFixture {
+        events,
+        stats: Stats {
+            connections: 1,
+            ..Stats::default()
+        },
+        elapsed: Duration::from_secs(3),
+        local_addr: "0.0.0.0:5000".into(),
+        journal_path: None,
+        dropped: 0,
+    }
+}
+
+/// Строка ленты по её тексту: подпись узла — время, направление и начало фрагмента.
+fn row_rect(harness: &Harness<'static, BytetapApp>, needle: &str) -> Option<egui::Rect> {
+    harness
+        .query_all_by_label_contains(needle)
+        .next()
+        .map(|node| node.rect())
+}
+
+/// Новые события в общий буфер записи: лента принимает их следующим кадром.
+fn push_events(harness: &mut Harness<'static, BytetapApp>, texts: &[String]) {
+    let shared = harness.state().recording().expect("запись").shared();
+    for (index, text) in texts.iter().enumerate() {
+        let event = Event::Data(Data::new(
+            "2026-10-19T10:15:09.000+03:00",
+            6_000_000 + index as u64,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            text.as_bytes(),
+        ));
+        let event: FeedEvent = FeedEvent::from_session(&event).expect("событие ленты");
+        live::lock(&shared).push(Arc::new(event));
+    }
+}
+
 /// Клик по строке ленты с текстом `needle`: так же, как это делает инженер мышью.
+///
+/// Указатель сперва ставится на строку и только следующим кадром нажимается: иначе
+/// прокрутка видит рывок указателя и уезжает по инерции.
 fn click_row(harness: &mut Harness<'static, BytetapApp>, needle: &str) {
-    let node = harness
+    let at = harness
         .get_all_by_label_contains(needle)
         .next()
-        .unwrap_or_else(|| panic!("нет строки «{needle}»"));
-    node.click();
-    harness.run_steps(2);
+        .unwrap_or_else(|| panic!("нет строки «{needle}»"))
+        .rect()
+        .center();
+    click_at(harness, at, Modifiers::NONE);
+    harness.run_steps(1);
 }
 
 /// Полный текст фрагмента из панели: значение поля только для чтения.
@@ -433,6 +507,10 @@ fn the_panel_height_is_dragged_and_remembered() {
         modifiers: Modifiers::NONE,
     });
     harness.run_steps(2);
+    // Панель встаёт на выбранную высоту: её верх после отпускания и сверяется с новым
+    // приложением.
+    let settled = harness.get_by_label_contains("Детали события").rect().top();
+    assert!(settled < top - 40.0, "панель выросла: {top} → {settled}");
     let after = harness.state().settings().feed.panel_height;
     assert!(dragged < top - 40.0, "панель выросла: {top} → {dragged}");
     assert!(after > before + 40.0, "{before} → {after}");
@@ -463,4 +541,330 @@ fn an_evicted_event_keeps_its_text() {
     harness.run_steps(3);
     harness.get_by_label_contains("Событие вытеснено из ленты");
     assert_eq!(panel_text(&harness), text, "прочитанный текст на месте");
+}
+
+/// Пока панель открыта, лента стоит: новые события не сдвигают выбранную строку, а ↑/↓
+/// подтягивают выбор в видимую область (L1-AC7, L1-AC9).
+#[test]
+fn an_open_panel_keeps_the_selected_row_where_it_was() {
+    let mut harness = harness_with(settings(), many_events(200));
+    harness.run_steps(2);
+    // Лента догоняет конец: последняя строка на экране.
+    harness
+        .get_all_by_label_contains("EVT0199")
+        .next()
+        .expect("последняя строка видна");
+    click_row(&mut harness, "EVT0199");
+    // Прокрутка ленты после клика успокаивается за несколько кадров: ждём её.
+    harness.run_steps(40);
+    let before = row_rect(&harness, "EVT0199").expect("выбранная строка видна");
+    // 50 новых событий: лента не прилипает к концу, строка стоит, счётчик считает.
+    let texts: Vec<String> = (0..50)
+        .map(|index| format!("\x0bMSH|^~\\&|A|B|C|D|E||ORU^R01|NEW{index:04}|P|2.3.1\r\x1c\r"))
+        .collect();
+    push_events(&mut harness, &texts);
+    harness.run_steps(3);
+    let after = row_rect(&harness, "EVT0199").expect("строка не уехала");
+    assert!(
+        (after.top() - before.top()).abs() < 0.5,
+        "строка осталась на месте: {before:?} → {after:?}"
+    );
+    harness.get_by_label("50 новых");
+    // 40 шагов вверх: выбор уходит на 40 событий вверх и подтягивается в видимую область.
+    for _ in 0..40 {
+        harness.key_press(Key::ArrowUp);
+        harness.run_steps(1);
+    }
+    let selected = harness
+        .get_all_by_label_contains("EVT0159")
+        .next()
+        .expect("выбранная строка подтянута")
+        .rect();
+    let panel_top = harness.get_by_label_contains("Детали события").rect().top();
+    assert!(
+        selected.top() >= 0.0 && selected.bottom() <= panel_top,
+        "строка видна над панелью: {selected:?}, панель с {panel_top}"
+    );
+    assert!(
+        panel_text(&harness).contains("EVT0159"),
+        "в панели выбранное событие EVT0159"
+    );
+}
+
+/// Высота панели пишется в настройки один раз — на отпускании мыши, а не на каждом
+/// кадре перетаскивания; новое приложение открывает панель той же высоты (L1-AC2).
+#[test]
+fn the_panel_height_is_written_once_and_kept_after_restart() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let store = Store::new(dir.path().join("settings.json"));
+    let mut harness = harness_store(settings(), fixture(), store.clone());
+    click_row(&mut harness, "MSG0001");
+    let before = harness.state().settings().feed.panel_height;
+    // Пока разделитель тянут, файла настроек нет: высота записывается на отпускании.
+    let _ = std::fs::remove_file(store.path());
+    let top = harness.get_by_label_contains("Детали события").rect().top();
+    let x = 600.0;
+    harness.event(egui::Event::PointerMoved(egui::pos2(x, top + 3.0)));
+    harness.run_steps(1);
+    harness.event(egui::Event::PointerButton {
+        pos: egui::pos2(x, top + 3.0),
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Modifiers::NONE,
+    });
+    harness.run_steps(1);
+    for step in 1..=6 {
+        harness.event(egui::Event::PointerMoved(egui::pos2(
+            x,
+            top + 3.0 - 10.0 * step as f32,
+        )));
+        harness.run_steps(1);
+        assert!(
+            !store.path().exists(),
+            "на кадре перетаскивания файл не пишется"
+        );
+    }
+    let dragged = harness.get_by_label_contains("Детали события").rect().top();
+    harness.event(egui::Event::PointerButton {
+        pos: egui::pos2(x, dragged),
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    harness.run_steps(2);
+    // Панель встаёт на выбранную высоту: её верх после отпускания и сверяется с новым
+    // приложением.
+    let settled = harness.get_by_label_contains("Детали события").rect().top();
+    assert!(settled < top - 40.0, "панель выросла: {top} → {settled}");
+    let (loaded, warning) = store.load("");
+    assert_eq!(warning, None);
+    let height = loaded.feed.panel_height;
+    assert!(
+        height > before + 40.0,
+        "высота записана: {before} → {height}"
+    );
+    // Новое приложение с этими настройками открывает панель той же высоты.
+    let mut restarted = harness_with(loaded, fixture());
+    click_row(&mut restarted, "MSG0001");
+    let again = restarted
+        .get_by_label_contains("Детали события")
+        .rect()
+        .top();
+    assert!(
+        (again - settled).abs() < 1.0,
+        "панель той же высоты: {settled} → {again}"
+    );
+}
+
+/// «Копировать» кладёт фрагмент целиком, даже если в поле осталось выделение с прошлого
+/// раза: поле одно на все события, и своё состояние оно получает заново (L1-AC6).
+#[test]
+fn the_copy_button_takes_the_whole_fragment_after_a_selection() {
+    let mut harness = harness();
+    // Длинный фрагмент: первая строка поля — заметно меньше всего текста.
+    click_row(&mut harness, "MSGLONG");
+    let whole = panel_text(&harness);
+    // Ставим каретку в поле и выделяем часть Shift+↓.
+    harness
+        .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+        .next()
+        .expect("поле панели")
+        .click();
+    harness.run_steps(1);
+    // Home и Shift+End выделяют первую строку: часть фрагмента, а не весь он.
+    harness.key_press(Key::Home);
+    harness.run_steps(1);
+    harness.key_press_modifiers(Modifiers::SHIFT, Key::End);
+    harness.run_steps(1);
+    harness.event(egui::Event::Copy);
+    harness.run_steps(1);
+    let selected = copied_text(&harness).expect("буфер обмена");
+    assert!(
+        !selected.is_empty() && selected.len() < whole.len() && whole.contains(selected.as_str()),
+        "выделена часть фрагмента: {} из {} символов: {:?} / {:?}",
+        selected.chars().count(),
+        whole.chars().count(),
+        selected.chars().take(40).collect::<String>(),
+        whole.chars().take(40).collect::<String>()
+    );
+    // Другая строка и обратно: выделение прошлого события к новому не переезжает.
+    click_row(&mut harness, "BT0001");
+    click_row(&mut harness, "MSGLONG");
+    harness.get_by_label("Копировать").click();
+    harness.run_steps(1);
+    assert_eq!(
+        copied_text(&harness).as_deref(),
+        Some(whole.as_str()),
+        "«Копировать» кладёт весь фрагмент"
+    );
+}
+
+/// Escape при открытом выпадающем списке закрывает список, а не панель (L1-AC9).
+#[test]
+fn escape_closes_the_menu_but_not_the_panel() {
+    let mut harness = harness();
+    click_row(&mut harness, "MSG0001");
+    harness.get_by_label("Кодировка").click();
+    harness.run_steps(2);
+    harness.get_by_label("ASCII");
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label("ASCII").is_none(),
+        "Escape закрыл список"
+    );
+    assert!(
+        harness.query_by_label_contains("Детали события").is_some(),
+        "панель осталась открытой"
+    );
+    harness.key_press(Key::Escape);
+    harness.run_steps(2);
+    assert!(
+        harness.query_by_label_contains("Детали события").is_none(),
+        "второй Escape закрыл панель"
+    );
+}
+
+/// Строки дампа выделяются кликом и Shift+кликом: Ctrl+C кладёт только их, Ctrl+A —
+/// весь дамп (L1-AC5).
+#[test]
+fn the_hex_tab_copies_only_the_selected_lines() {
+    let mut harness = harness();
+    click_row(&mut harness, "MSGLONG");
+    harness.get_by_label("HEX").click();
+    harness.run_steps(2);
+    let first = harness
+        .get_all_by_label_contains("0000 0B 4D 53 48")
+        .next()
+        .expect("первая строка дампа")
+        .rect();
+    let second = harness
+        .get_all_by_label_contains("0010 45 52 7C 4C 41")
+        .next()
+        .expect("вторая строка дампа")
+        .rect();
+    click_at(&mut harness, first.center(), Modifiers::NONE);
+    // Shift держим, как настоящую клавишу: Shift+клик расширяет выделение от якоря.
+    harness.event(egui::Event::ModifiersChanged(Modifiers::SHIFT));
+    harness.run_steps(1);
+    click_at(&mut harness, second.center(), Modifiers::SHIFT);
+    harness.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+    harness.run_steps(1);
+    harness.event(egui::Event::Copy);
+    harness.run_steps(1);
+    let copied = copied_text(&harness).expect("буфер обмена");
+    let lines: Vec<&str> = copied.lines().collect();
+    assert_eq!(lines.len(), 2, "только две строки: {copied}");
+    assert!(lines[0].starts_with("0000 0B 4D 53 48"), "{copied}");
+    assert!(lines[1].starts_with("0010 45 52 7C 4C 41"), "{copied}");
+    // Ctrl+A — весь дамп: строк дампа много, первая — с начала фрагмента.
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    harness.run_steps(1);
+    harness.event(egui::Event::Copy);
+    harness.run_steps(1);
+    let all = copied_text(&harness).expect("буфер обмена");
+    assert!(
+        all.lines().count() > 100,
+        "весь дамп: {}",
+        all.lines().count()
+    );
+    assert!(all.starts_with("0000 0B 4D 53 48"), "{all}");
+    let last = all.lines().last().expect("строки дампа");
+    assert!(
+        last.len() > 5 && last.as_bytes()[..4].iter().all(u8::is_ascii_hexdigit),
+        "последняя строка дампа: {last}"
+    );
+}
+
+/// Панель открыта в наименьшем окне 720×560: лента над ней остаётся видимой (L1-AC2).
+#[test]
+fn the_panel_leaves_the_feed_visible_in_a_small_window() {
+    let mut harness = Harness::builder()
+        .with_size((720.0, 560.0))
+        .build_eframe(move |cc| {
+            BytetapApp::new(&cc.egui_ctx, settings(), None, None)
+                .with_fixtures(fixtures())
+                .with_recording_fixture(many_events(200))
+        });
+    harness.run_steps(3);
+    click_row(&mut harness, "EVT0192");
+    harness.run_steps(40);
+    let panel_top = harness.get_by_label_contains("Детали события").rect().top();
+    let row = harness
+        .query_all_by_label_contains("EVT0")
+        .map(|node| node.rect())
+        .find(|rect| rect.bottom() <= panel_top + 0.5 && rect.height() > 0.0);
+    assert!(
+        row.is_some(),
+        "над панелью с {panel_top} видна строка ленты"
+    );
+}
+
+/// Доступность панели: регион на всю панель, подпись поля, Tab — панель после строк
+/// ленты (L1-AC8).
+#[test]
+fn the_panel_follows_the_feed_rows_in_the_tab_order() {
+    use egui_kittest::kittest::NodeT as _;
+
+    let mut harness = harness();
+    click_row(&mut harness, "MSG0001");
+    harness.check_accessibility();
+    // Регион панели — вся панель, а не одна шапка: рамка региона ниже строки ленты.
+    let region = harness.get_by_label_contains("Детали события").rect();
+    let row = row_rect(&harness, "MSG0001").expect("строка ленты");
+    assert!(
+        region.top() > row.bottom(),
+        "регион {region:?}, строка {row:?}"
+    );
+    // У поля есть подпись, а не только значение.
+    harness.get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, "Фрагмент");
+    // Tab идёт по строкам ленты и только потом в панель.
+    let mut order = Vec::new();
+    for _ in 0..24 {
+        harness.key_press(Key::Tab);
+        harness.run_steps(1);
+        let Some(node) = harness
+            .root()
+            .children_recursive()
+            .find(egui_kittest::Node::is_focused)
+        else {
+            continue;
+        };
+        order.push(
+            node.accesskit_node()
+                .label()
+                .or_else(|| node.accesskit_node().value())
+                .unwrap_or_default(),
+        );
+    }
+    let copy = order
+        .iter()
+        .position(|label| label == "Копировать")
+        .unwrap_or_else(|| panic!("панель в обходе Tab: {order:#?}"));
+    let second = order
+        .iter()
+        .position(|label| label.contains("BT0001"))
+        .unwrap_or_else(|| panic!("вторая строка в обходе: {order:#?}"));
+    assert!(second < copy, "панель после строк ленты: {order:#?}");
+}
+
+/// Клик мышью в точку с модификатором: так Shift+клик выделяет диапазон строк дампа.
+fn click_at(harness: &mut Harness<'static, BytetapApp>, at: egui::Pos2, modifiers: Modifiers) {
+    harness.event(egui::Event::PointerMoved(at));
+    // Указатель постоял, пока прокрутка забудет его скорость: иначе лента уезжает по инерции.
+    harness.run_steps(10);
+    harness.event(egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers,
+    });
+    harness.run_steps(1);
+    harness.event(egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers,
+    });
+    harness.run_steps(1);
 }

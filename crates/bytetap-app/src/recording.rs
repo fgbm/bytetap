@@ -833,8 +833,12 @@ impl BytetapApp {
         let hex = self.settings.feed.view == FeedView::Hex;
         let encoding = self.settings.feed.encoding;
         let panel_height = self.settings.feed.panel_height;
-        // Esc закрывает панель, но не диалог комментария: там Esc — отмена ввода.
-        let escape = ui.input(|input| input.key_pressed(Key::Escape)) && self.note.is_none();
+        // Esc закрывает панель, но не диалог комментария и не открытое меню: там Esc
+        // закрывает их. Смотрим состояние меню в начале кадра — за этот кадр оно
+        // закроется само.
+        let escape = ui.input(|input| input.key_pressed(Key::Escape))
+            && self.note.is_none()
+            && !Popup::is_any_open(ui.ctx());
         let Some(rec) = &mut self.rec else {
             return 0;
         };
@@ -846,22 +850,24 @@ impl BytetapApp {
         let mut view = self.settings.feed.view;
         let mut chosen_encoding = encoding;
         feed_bar(ui, &p, rec, &mut view, &mut chosen_encoding);
-        // Панель деталей — до ленты: она забирает высоту снизу, лента получает остаток.
+        // Панель деталей: место снизу лента уступает до того, как её нарисовать, а тело
+        // панели идёт после ленты — тогда Tab обходит сначала строки, потом панель.
         let pair = rec.pair();
-        if details::show(ui, &p, &mut rec.details, encoding, pair) {
+        let place = details::reserve(ui, &p, &rec.details);
+        feed_list(ui, &p, rec, hex, encoding, added);
+        if let Some(place) = place
+            && details::show(ui, &p, &mut rec.details, encoding, pair, place)
+        {
             rec.close_details();
         }
-        feed_list(ui, &p, rec, hex, encoding, added);
         // Esc снимает выбор и возвращает следование (решение владельца, Л-В9).
         if escape && rec.details.is_open() {
             rec.close_details();
             ui.ctx().request_repaint();
         }
-        // Высоту, выбранную разделителем, запоминаем в настройках — на отпускании мыши.
-        let height = rec
-            .details
-            .take_height_changed()
-            .then(|| rec.details.height());
+        // Высоту, выбранную разделителем, запоминаем в настройках один раз — на
+        // отпускании мыши, а не на каждом кадре перетаскивания.
+        let height = rec.details.take_height_saved();
         if view != self.settings.feed.view || chosen_encoding != encoding {
             let feed = &mut self.settings_mut().feed;
             feed.view = view;
@@ -870,9 +876,7 @@ impl BytetapApp {
         }
         if let Some(height) = height {
             self.settings_mut().feed.panel_height = height;
-            if ui.input(|input| input.pointer.any_released()) {
-                self.save_settings();
-            }
+            self.save_settings();
         }
         added
     }
@@ -1379,10 +1383,13 @@ fn feed_list(
         }
     }
     ui.spacing_mut().item_spacing.y = 0.0;
+    // Прилипание к концу — только пока лента догоняет: `stick_to_bottom` перебивает и
+    // прокрутку к выбранной строке, и открытую панель, и тогда лента уезжала бы вниз
+    // вместе с новыми событиями (Л-В9).
     let mut scroll = ScrollArea::vertical()
         .id_salt("bt-feed")
         .auto_shrink(false)
-        .stick_to_bottom(true);
+        .stick_to_bottom(rec.follow && !rec.details.is_open());
     if rec.jump_bottom {
         // Ниже конца содержимого: область прижмёт прокрутку к последней строке.
         scroll = scroll.vertical_scroll_offset(total as f32 * row_height + area.height());
@@ -1409,12 +1416,17 @@ fn feed_list(
                 text_row(ui, p, &event, multi, pair, encoding, selected)
             };
             if response.clicked() {
-                clicked = Some((seq, event));
+                clicked = Some((seq, event, row, response.rect));
             }
         }
     });
-    if let Some((seq, event)) = clicked {
+    if let Some((seq, event, row, rect)) = clicked {
         rec.details.open(seq, event);
+        // Панель забрала низ ленты и могла закрыть строку, по которой кликнули:
+        // подтягиваем её со следующего кадра, когда лента станет ниже.
+        if rect.bottom() > output.inner_rect.bottom() - rec.details.height() {
+            rec.jump_row = Some(row);
+        }
     }
 
     // Догон: внизу — следим; прокрутка вверх выключает догон и копит «новые».
