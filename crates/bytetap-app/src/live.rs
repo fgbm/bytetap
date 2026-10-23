@@ -478,9 +478,16 @@ pub fn start_error(err: &io::Error, source: &Source) -> StartError {
         // берутся у того порта, который не открылся (M5-AC3). Один и тот же порт с двух
         // сторон — своя настройка, а не «порт занят» от собственного второго открытия.
         Source::ComMonitor { analyzer, lis, .. } => {
-            let side = match monitor_side(err) {
-                Some(MonitorSide::Lis) => MonitorSide::Lis,
-                Some(MonitorSide::Analyzer) | None => MonitorSide::Analyzer,
+            let Some(side) = monitor_side(err) else {
+                // Стороны нет — ошибка не про порт: ядро оборачивает отказы портов
+                // `MonitorPortError`, а журнал и папка приходят как есть. Тогда это отказ
+                // записи, как у TCP-сервера, а не настройка порта.
+                return match ErrorCode::from_io_kind(err.kind()) {
+                    ErrorCode::PermissionDenied => {
+                        StartError::new(ErrorCode::LogDir, err.to_string())
+                    }
+                    _ => StartError::new(ErrorCode::Journal, err.to_string()),
+                };
             };
             let settings = match side {
                 MonitorSide::Lis => lis,
@@ -1291,6 +1298,46 @@ mod tests {
         let other = serial(io::ErrorKind::Other, false);
         assert_eq!(other.code, ErrorCode::Serial);
         assert_eq!(other.params.get("port").map(String::as_str), Some("COM5"));
+    }
+
+    /// Прослушка: отказ порта приходит со стороной и встаёт под полем своего порта, а
+    /// ошибка без стороны — это журнал или папка, как у TCP-сервера (M5-AC3).
+    #[test]
+    fn a_monitor_start_error_without_a_side_is_about_the_journal() {
+        use bytetap_core::transport::{MonitorPortError, MonitorSide};
+
+        let analyzer = SerialSettings::new("COM3", 9600, SerialFormat::EIGHT_N_ONE);
+        let lis = SerialSettings::new("COM4", 9600, SerialFormat::EIGHT_N_ONE);
+        let monitor = Source::ComMonitor {
+            analyzer,
+            lis,
+            retry: Duration::from_secs(5),
+        };
+
+        // Отказ порта ЛИС: сторона в ошибке, поле — второго порта.
+        let port = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            MonitorPortError {
+                side: MonitorSide::Lis,
+                error: io::Error::from(io::ErrorKind::PermissionDenied),
+            },
+        );
+        let error = start_error(&port, &monitor);
+        assert_eq!(error.field(SessionMode::ComMonitor), ErrorField::SerialB);
+        assert_eq!(error.params.get("port").map(String::as_str), Some("COM4"));
+
+        // Ошибка без стороны — не про порт: папка журналов и отказ записи.
+        let denied = start_error(&io::Error::from(io::ErrorKind::PermissionDenied), &monitor);
+        assert_eq!(denied.code, ErrorCode::LogDir);
+        assert_ne!(
+            denied.field(SessionMode::ComMonitor),
+            ErrorField::SerialA,
+            "без стороны это не настройка порта"
+        );
+        assert_eq!(denied.field(SessionMode::ComMonitor), ErrorField::LogDir);
+        let journal = start_error(&io::Error::other("journal not created"), &monitor);
+        assert_eq!(journal.code, ErrorCode::Journal);
+        assert_eq!(journal.field(SessionMode::ComMonitor), ErrorField::Start);
     }
 
     fn reason(os: OsFamily, code: i32) -> JournalFailureReason {
