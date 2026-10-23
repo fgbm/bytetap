@@ -827,6 +827,112 @@ jobs:
           }
           if ($failed) { exit 1 }
 
+      # M5-AC9 (FR-10): смоук прослушки двух портов. Тестовый хук `BYTETAP_TEST_AUTOSTART`
+      # в формате `monitor:virtual` поднимает сессию на виртуальной паре портов в процессе:
+      # «анализатор» и «ЛИС» играет сама программа обменом ASTM E1381 (ENQ → ACK, кадр
+      # STX…ETX → ACK, EOT). Виртуальных COM-портов на windows-latest нет, поэтому
+      # настоящий COM здесь не проверяется: это ручной смоук владельца на двух
+      # USB-адаптерах (M5-AC5, docs/dev/testing.md). В журнале — `mode: com_monitor`,
+      # `open` пары с `link` на порт ЛИС, `data` обеих сторон и `session_end`.
+      - name: Смоук — прослушка двух портов на виртуальной паре
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Force -Path smoke
+          $log = Join-Path $env:LOCALAPPDATA 'io.github.fgbm.bytetap\logs\bytetap.log'
+          Remove-Item $log -ErrorAction SilentlyContinue
+          $failed = $false
+          $env:BYTETAP_TEST_HOOKS = '1'
+          $env:BYTETAP_TEST_AUTOSTART = 'monitor:virtual'
+          $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
+          $null = $p.Handle
+          $env:BYTETAP_TEST_AUTOSTART = ''
+          $env:BYTETAP_TEST_HOOKS = ''
+          $journal = $null
+          for ($i = 0; $i -lt 60 -and -not $journal -and -not $p.HasExited; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Test-Path $log) {
+              $found = Select-String -Path $log -Pattern 'запись идёт: адрес ([^,\s]+), журнал (.+)$' -Encoding utf8 | Select-Object -First 1
+              if ($found) { $journal = $found.Matches[0].Groups[2].Value.Trim() }
+            }
+          }
+          if (-not $journal) {
+            Write-Host 'прослушка не поднялась: записи нет'
+            $failed = $true
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          } else {
+            Write-Host "прослушка: журнал $journal"
+            # Обмен идёт сразу после старта: ждём фрагменты обеих сторон в журнале.
+            $both = $false
+            for ($i = 0; $i -lt 80 -and -not $both; $i++) {
+              Start-Sleep -Milliseconds 250
+              if (Test-Path $journal) {
+                $lines = Get-Content -Encoding utf8 $journal
+                $a2l = @($lines | Where-Object { $_ -match '"dir":"analyzer_to_lis"' })
+                $l2a = @($lines | Where-Object { $_ -match '"dir":"lis_to_analyzer"' })
+                $both = ($a2l.Count -gt 0) -and ($l2a.Count -gt 0)
+              }
+            }
+            Write-Host "фрагменты обеих сторон в журнале: $both"
+            if (-not $both) { $failed = $true }
+            if (-not $p.HasExited) {
+              Start-Sleep -Seconds 1
+              $p.Refresh()
+              [void]$p.CloseMainWindow()
+              if (-not $p.WaitForExit(30000)) {
+                Write-Host 'bytetap.exe не закрылся за 30 с'
+                Stop-Process -Id $p.Id -Force
+                $failed = $true
+              } elseif ($p.ExitCode -ne 0) {
+                Write-Host "bytetap.exe закрылся, код $($p.ExitCode)"
+                $failed = $true
+              } else {
+                Write-Host "bytetap.exe закрылся, код $($p.ExitCode)"
+              }
+            } else {
+              Write-Host "bytetap.exe завершился сам, код $($p.ExitCode)"
+              $failed = $true
+            }
+          }
+          if (Test-Path $log) {
+            Copy-Item $log (Join-Path $out 'bytetap-monitor.log')
+            Get-Content -Encoding utf8 $log
+            if (-not (Select-String -Path $log -Pattern 'интерфейс готов' -Quiet -Encoding utf8)) {
+              Write-Host 'в журнале запуска нет «интерфейс готов»'
+              $failed = $true
+            }
+          } else {
+            Write-Host 'журнала запуска нет'
+            $failed = $true
+          }
+          if ($journal -and (Test-Path $journal)) {
+            # Журнал синтетический: обмен разыгран самой программой на виртуальной паре,
+            # данных приборов в нём нет.
+            Copy-Item $journal (Join-Path $out 'monitor-session.jsonl')
+            $lines = Get-Content -Encoding utf8 $journal
+            $lines | Select-Object -Last 5
+            $header = $lines | Select-Object -First 1
+            if ($header -notmatch '"mode":"com_monitor"') { Write-Host 'режим журнала не com_monitor'; $failed = $true }
+            if ($header -notmatch '"autoresponder":"none"') { Write-Host 'в заголовке есть автоответ'; $failed = $true }
+            $open = $lines | Where-Object { $_ -match '"type":"open"' } | Select-Object -First 1
+            if (-not ($open -and $open -match '"link":\{"role":"lis","peer":"COM4"')) {
+              Write-Host "в журнале нет open с link на порт ЛИС: $open"
+              $failed = $true
+            }
+            if ($lines[-1] -notmatch '"type":"session_end"') { Write-Host 'журнал не закончен session_end'; $failed = $true }
+            $dirs = ($lines | Where-Object { $_ -match '"type":"data"' } | ForEach-Object {
+              if ($_ -match '"dir":"analyzer_to_lis"') { 'a2l' } elseif ($_ -match '"dir":"lis_to_analyzer"') { 'l2a' }
+            })
+            Write-Host "направления в журнале прослушки: $($dirs -join ', ')"
+            if (-not ($dirs -contains 'a2l' -and $dirs -contains 'l2a')) {
+              Write-Host 'в журнале нет фрагментов обеих сторон'
+              $failed = $true
+            }
+          } else {
+            Write-Host "журнала прослушки $journal нет"
+            $failed = $true
+          }
+          if ($failed) { exit 1 }
+
       # U1-AC24 (NFR-5): CPU живого процесса. В простое окно не рисует кадров, и
       # процесс почти не занимает ядро; во время записи кадр рисуется ~30 раз в
       # секунду, и его цена на WARP — это цена интерфейса. Оба числа пишутся в
@@ -1025,9 +1131,12 @@ jobs:
             'client-light', 'client-dark',
             'serial-light', 'serial-dark',
             'serial-more-light', 'serial-more-dark',
+            'monitor-light', 'monitor-dark',
+            'monitor-more-light', 'monitor-more-dark',
             'errors-light', 'errors-dark',
             'recording-text-light', 'recording-text-dark',
             'recording-hex-light', 'recording-hex-dark',
+            'recording-monitor-light', 'recording-monitor-dark',
             'failure-light', 'failure-dark',
             'viewing-text-light', 'viewing-text-dark',
             'viewing-hex-light', 'viewing-hex-dark',
@@ -1046,7 +1155,7 @@ jobs:
             $env:BYTETAP_TEST_SCREEN = $name
             $env:BYTETAP_TEST_JOURNAL = ''
             $env:BYTETAP_TEST_AUTOSTART = ''
-            if ($name -match '^(recording|menu-record|note)') { $env:BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0' }
+            if ($name -match '^(recording-(text|hex)|menu-record|note)') { $env:BYTETAP_TEST_AUTOSTART = 'tcp_server:127.0.0.1:0' }
             if ($name -match '^viewing-' -and $journal) { $env:BYTETAP_TEST_JOURNAL = $journal }
             $p = Start-Process -FilePath 'target\release\bytetap.exe' -PassThru
             $null = $p.Handle
