@@ -364,11 +364,14 @@ impl RecordingView {
     /// часть строк: спрятанная строка не должна ни считаться выделенной, ни попадать в
     /// буфер (находка M1 ревью шага 2).
     fn narrow_selection(&mut self) {
-        let filter = self.filter;
+        // Без фильтра все строки видны: сужать нечего, и проход по выделению не нужен.
+        let Some(filter) = self.filter else {
+            return;
+        };
         let feed = &self.feed;
         self.selection.retain(|seq| {
             feed.get(seq)
-                .is_some_and(|event| feed::passes(event, filter))
+                .is_some_and(|event| feed::passes(event, Some(filter)))
         });
     }
 

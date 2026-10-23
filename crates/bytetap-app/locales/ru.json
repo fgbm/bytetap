@@ -289,7 +289,8 @@
     "rowPending": "…",
     "rowUnreadable": "Строка не прочитана: страница журнала не читается",
     "copyWaiting": "читаю строки журнала: {count}",
-    "copySkipped": "скопировано {copied} из {total}, не прочитано: {skipped}"
+    "copySkipped": "скопировано {copied} из {total}, не прочитано: {skipped}",
+    "copyLimitedSkipped": "в буфер вошло {copied} из {total} — предел копирования; не прочитано: {skipped}"
   },
   "trace": {
     "a2l": "анализатор → ЛИС",

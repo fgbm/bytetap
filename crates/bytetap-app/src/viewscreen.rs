@@ -606,6 +606,9 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
         && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
     {
         view.selection.select_all(visible);
+        // Новое выделение отменяет незаконченное копирование: в буфер пойдёт то, что
+        // инженер выделил последним (решение записано в L1).
+        view.copy_job = None;
         view.copy_notice = None;
     }
     // Ctrl+C по выделенным строкам: строки на незагруженных страницах сперва
@@ -666,6 +669,8 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
                 view.reveal = Some(rect);
             }
         }
+        // Клик — новое выделение: незаконченное копирование прежнего не дописываем.
+        view.copy_job = None;
         view.copy_notice = None;
     }
     match action {
@@ -770,12 +775,15 @@ fn copy_step(
         }
         let Some(event) = view.source.event(index) else {
             // Страница ещё едет: ждём её и одну вперёд — следующая понадобится сразу.
+            // Вперёд считается страница, а не «номер плюс PAGE_SIZE»: иначе просился бы
+            // кусок через страницу, а соседняя оставалась бы непрочитанной.
             view.copy_notice = Some(t!(
                 "journal.copyWaiting",
                 count = selection::rows_count(job.total)
             ));
-            let ahead = (index + crate::journal::PAGE_SIZE).min(total);
-            return Some((index, ahead));
+            let page = index / crate::journal::PAGE_SIZE;
+            let ahead = (page + 1) * crate::journal::PAGE_SIZE + 1;
+            return Some((index, ahead.min(total).max(index + 1)));
         };
         job.cursor += 1;
         let Some(event) = crate::viewing::feed_event(event) else {
@@ -805,21 +813,26 @@ fn copy_step(
     if !text.is_empty() {
         ctx.copy_text(text);
     }
-    let notice = if job.truncated {
-        Some(t!(
+    let notice = match (job.truncated, job.skipped > 0) {
+        // Оба факта сразу: блок обрезан пределом и часть строк не прочиталась.
+        (true, true) => Some(t!(
+            "journal.copyLimitedSkipped",
+            copied = selection::rows_count(job.rows),
+            total = selection::rows_count(job.total),
+            skipped = selection::rows_count(job.skipped)
+        )),
+        (true, false) => Some(t!(
             "feed.copyLimited",
             copied = selection::rows_count(job.rows),
             total = selection::rows_count(job.total)
-        ))
-    } else if job.skipped > 0 {
-        Some(t!(
+        )),
+        (false, true) => Some(t!(
             "journal.copySkipped",
             copied = selection::rows_count(job.rows),
             total = selection::rows_count(job.total),
             skipped = selection::rows_count(job.skipped)
-        ))
-    } else {
-        None
+        )),
+        (false, false) => None,
     };
     view.copy_notice = notice;
     view.copy_job = None;
