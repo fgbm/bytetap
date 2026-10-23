@@ -868,3 +868,78 @@ fn click_at(harness: &mut Harness<'static, BytetapApp>, at: egui::Pos2, modifier
     });
     harness.run_steps(1);
 }
+
+/// Служебная строка (открытие соединения): вкладка одна, «Копировать» кладёт текст
+/// строки ленты, а Ctrl+A выделяет его в поле (L1-AC6).
+#[test]
+fn a_service_row_copies_its_text() {
+    use bytetap_core::journal::Open;
+
+    let mut harness = harness();
+    let shared = harness.state().recording().expect("запись").shared();
+    let open = Event::Open(Open {
+        t: "2026-10-19T10:15:09.000+03:00".into(),
+        mono_us: 6_000_000,
+        conn: 1,
+        peer: "192.168.1.51:49152".into(),
+        local: "0.0.0.0:5000".into(),
+        link: None,
+    });
+    let open: FeedEvent = FeedEvent::from_session(&open).expect("событие ленты");
+    live::lock(&shared).push(Arc::new(open));
+    harness.run_steps(3);
+    click_row(&mut harness, "подключился");
+    // В шапке панели номер соединения не повторяется: он уже есть в тексте строки.
+    let title = harness
+        .get_by_label_contains("Детали события")
+        .accesskit_node()
+        .label()
+        .unwrap_or_default();
+    assert_eq!(title.matches("#1").count(), 1, "{title}");
+    let text = panel_text(&harness);
+    assert!(text.contains("подключился 192.168.1.51:49152"), "{text}");
+    harness.get_by_label("Копировать").click();
+    harness.run_steps(1);
+    assert_eq!(copied_text(&harness).as_deref(), Some(text.as_str()));
+    // Ctrl+A выделяет текст строки и в служебном событии.
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    harness.run_steps(1);
+    harness.event(egui::Event::Copy);
+    harness.run_steps(1);
+    assert_eq!(copied_text(&harness).as_deref(), Some(text.as_str()));
+}
+
+/// Окно снова выросло: панель возвращается к высоте, которую выбрал инженер, а не
+/// остаётся ужатой маленьким окном (L1-AC2).
+#[test]
+fn the_panel_returns_to_its_height_when_the_window_grows() {
+    // Панель выше 70 % ленты маленького окна: там её ужимает предел, а не выбор.
+    let mut settings = settings();
+    settings.feed.panel_height = 400.0;
+    let mut harness = harness_with(settings, fixture());
+    click_row(&mut harness, "MSG0001");
+    harness.run_steps(2);
+    let rect = harness.get_by_label_contains("Детали события").rect();
+    let height = rect.height();
+    assert!(height > 140.0, "панель открыта: {height}");
+    harness.set_size(egui::vec2(720.0, 560.0));
+    harness.run_steps(4);
+    let small = harness
+        .get_by_label_contains("Детали события")
+        .rect()
+        .height();
+    assert!(
+        small < height,
+        "в маленьком окне панель ниже: {small} < {height}"
+    );
+    harness.set_size(egui::vec2(WINDOW.0, WINDOW.1));
+    harness.run_steps(4);
+    let again = harness
+        .get_by_label_contains("Детали события")
+        .rect()
+        .height();
+    assert!(
+        (again - height).abs() < 1.0,
+        "панель вернулась к выбранной высоте: {height} → {again}"
+    );
+}
