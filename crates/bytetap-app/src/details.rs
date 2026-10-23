@@ -118,6 +118,8 @@ pub struct Details {
     dragging: bool,
     /// Перетаскивание закончилось: высоту пора записать в настройки (один раз).
     height_saved: bool,
+    /// Высоту меняют стрелками: пишется в настройки, когда клавишу отпустили.
+    keys: bool,
     /// Событие вытеснено из ленты: текст остался, а строки в ленте уже нет (Л-В6).
     evicted: bool,
     /// Выделенные строки дампа в HEX-вкладке.
@@ -140,6 +142,7 @@ impl Default for Details {
             height: PANEL_DEFAULT,
             dragging: false,
             height_saved: false,
+            keys: false,
             evicted: false,
             hex: None,
             stale: false,
@@ -233,6 +236,7 @@ impl Details {
         self.stale = true;
         // Панель закрыли посреди перетаскивания: признак не должен пережить её.
         self.dragging = false;
+        self.keys = false;
         self.text_scroll_for = None;
         self.hex_scroll_for = None;
     }
@@ -534,9 +538,13 @@ fn resizer(ui: &mut Ui, p: &Palette, details: &mut Details, place: Place) {
         egui::pos2(rect.right(), rect.top() + RESIZE_GRAB),
     );
     let response = ui.interact(edge, resizer_id(), Sense::click_and_drag());
+    // Высота, с которой разделитель начинает: выбранная, но не больше нынешнего предела.
+    // Окно уменьшили — панель ужата, и стрелка вверх не должна прыгать на выбранное
+    // значение, которого в этом окне не видно (L1-AC2).
+    let start = details.height.min(place.max);
     response.widget_info(|| {
         let mut info = WidgetInfo::labeled(Role::Splitter, true, t!("details.resize"));
-        info.value = Some(f64::from(details.height));
+        info.value = Some(f64::from(start));
         info
     });
     // Границы и действия для диктора: значение — высота в точках, шаг — как у стрелок.
@@ -553,9 +561,10 @@ fn resizer(ui: &mut Ui, p: &Palette, details: &mut Details, place: Place) {
             builder.add_action(egui::accesskit::Action::Decrement);
         }
     });
-    let mut height = details.height;
-    // Высоту выбрали клавишами или диктором: её запоминаем этим же кадром. Разделитель,
-    // который тянут мышью, пишется в настройки один раз — на отпускании.
+    let mut height = start;
+    // Высоту выбрали клавишами или диктором. Стрелки пишутся в настройки один раз —
+    // когда клавишу отпустили, а не на каждый шаг: иначе файл настроек переписывался
+    // бы на каждый кадр удержания. Мышь — так же, на отпускании.
     let mut by_keys = false;
     if response.dragged()
         && let Some(pos) = response.interact_pointer_pos()
@@ -608,15 +617,20 @@ fn resizer(ui: &mut Ui, p: &Palette, details: &mut Details, place: Place) {
         height += steps * RESIZE_STEP;
         by_keys = true;
     }
-    if (height - details.height).abs() > 0.5 {
+    if (height - start).abs() > 0.5 {
         details.height = height.clamp(PANEL_MIN, place.max);
-        if by_keys {
-            details.height_saved = true;
-        }
+        details.keys = details.keys || by_keys;
     }
     if !response.dragged() && details.dragging {
         // Перетаскивание кончилось на прошлом кадре: высоту запоминаем один раз.
         details.dragging = false;
+        details.height_saved = true;
+    }
+    // Стрелку отпустили или разделитель потерял фокус — высота от клавиш готова.
+    let holding = response.has_focus()
+        && ui.input(|input| input.key_down(Key::ArrowUp) || input.key_down(Key::ArrowDown));
+    if details.keys && !holding {
+        details.keys = false;
         details.height_saved = true;
     }
     if response.dragged() || response.hovered() {
@@ -1183,6 +1197,40 @@ mod tests {
         hex = HexRange::between(9, 7);
         assert_eq!((hex.first(), hex.last()), (7, 9));
         assert!(hex.contains(8));
+    }
+
+    /// Открытие другого события начинает обе вкладки сверху: прокрутка не переезжает
+    /// со старого фрагмента на новый, даже если вкладку не открывали (L1-AC6).
+    #[test]
+    fn opening_another_event_resets_the_tab_scroll() {
+        let mut details = Details::default();
+        details.open(1, Arc::new(data_event(b"\x0bMSH|A\r", 1)));
+        details.text_scroll_for = Some(1);
+        details.hex_scroll_for = Some(1);
+        // То же событие: панель не переоткрывается, прокрутка остаётся.
+        details.open(1, Arc::new(data_event(b"\x0bMSH|A\r", 1)));
+        assert_eq!(details.text_scroll_for, Some(1));
+        details.open(2, Arc::new(data_event(b"\x0bMSH|B\r", 1)));
+        assert_eq!(details.text_scroll_for, None, "текст с начала");
+        assert_eq!(details.hex_scroll_for, None, "дамп с начала");
+    }
+
+    /// Закрытая панель не помнит ни перетаскивания разделителя, ни высоты от стрелок:
+    /// признак не должен пережить её и записать высоту в настройки (L1-AC2).
+    #[test]
+    fn closing_the_panel_forgets_the_splitter() {
+        let mut details = Details::default();
+        details.open(1, Arc::new(data_event(b"\x0bMSH|A\r", 1)));
+        details.dragging = true;
+        details.keys = true;
+        details.close();
+        assert!(!details.dragging, "перетаскивание забыто");
+        assert!(!details.keys, "высота от стрелок забыта");
+        assert_eq!(
+            details.take_height_saved(),
+            None,
+            "в настройки ничего не ушло"
+        );
     }
 
     /// Раскладка панели — тот же текст, что копируется: глифы `‹CR›` на месте, кусков
