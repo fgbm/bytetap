@@ -1222,7 +1222,8 @@ fn the_same_port_on_both_sides_is_reported_under_the_lis_port() {
     assert!(harness.state().pending_session().is_none());
 }
 
-/// Второй порт повторяет скорость и формат первого, пока его самого не тронули (М5-В2).
+/// Второй порт повторяет скорость и формат первого, пока его самого не тронули; «Другая…»
+/// у второго порта — уже своя настройка, и признак повтора снимается (М5-В2).
 #[test]
 fn the_lis_speed_follows_the_analyzer_until_it_is_changed() {
     let mut harness = plain(
@@ -1230,11 +1231,15 @@ fn the_lis_speed_follows_the_analyzer_until_it_is_changed() {
         None,
         Screen::Step(SessionMode::ComMonitor),
     );
-    // Скорость анализатора: второй порт повторяет её.
+    // Диктор различает скорость двух портов, хотя видимая подпись у них одна.
+    harness.get_by_role_and_label(Role::ComboBox, "Скорость порта анализатора");
+    harness.get_by_role_and_label(Role::ComboBox, "Скорость порта ЛИС");
+    harness.get_by_role_and_label(Role::ComboBox, "Формат порта анализатора");
+    harness.get_by_role_and_label(Role::ComboBox, "Формат порта ЛИС");
+
+    // Скорость анализатора: второй порт повторяет её, пока повтор включён.
     harness
-        .get_all_by_role_and_label(Role::ComboBox, "Скорость")
-        .next()
-        .expect("скорость анализатора")
+        .get_by_role_and_label(Role::ComboBox, "Скорость порта анализатора")
         .click();
     harness.run_steps(2);
     harness.get_by_label("19200").click();
@@ -1246,28 +1251,43 @@ fn the_lis_speed_follows_the_analyzer_until_it_is_changed() {
             config.monitor_lis.baud, 19200,
             "второй порт повторяет первый"
         );
+        assert!(config.monitor_lis_follows);
     }
 
-    // Скорость ЛИС своя: правка второго порта не трогает первый.
+    // «Другая…» у ЛИС — уже своя настройка: повтор снят, а скорость не прыгает.
     harness
-        .get_all_by_role_and_label(Role::ComboBox, "Скорость")
-        .nth(1)
-        .expect("скорость ЛИС")
+        .get_by_role_and_label(Role::ComboBox, "Скорость порта ЛИС")
         .click();
     harness.run_steps(2);
-    harness.get_by_label("4800").click();
+    // «Другая…» — последний пункт списка: список прокручивается, и пункт появляется.
+    let option = harness.get_by_label("19200").rect().center();
+    harness.event(egui::Event::PointerMoved(option));
+    harness.run_steps(1);
+    harness.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -240.0),
+        modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Wheel,
+    });
+    harness.run_steps(2);
+    harness.get_by_label("другая…").click();
     harness.run_steps(2);
     {
         let config = &harness.state().settings().config;
-        assert_eq!(config.monitor_lis.baud, 4800);
-        assert_eq!(config.serial.baud, 19200, "у анализатора своя скорость");
+        assert!(!config.monitor_lis_follows, "«Другая…» снимает повтор");
+        assert_eq!(
+            config.monitor_lis.baud, 19200,
+            "в поле и в настройках — та же скорость"
+        );
     }
+    replace_in(&mut harness, "Скорость порта ЛИС", "4800");
+    harness.run_steps(2);
+    assert_eq!(harness.state().settings().config.monitor_lis.baud, 4800);
 
     // Дальше скорость второго порта не следует за первым.
     harness
-        .get_all_by_role_and_label(Role::ComboBox, "Скорость")
-        .next()
-        .expect("скорость анализатора")
+        .get_by_role_and_label(Role::ComboBox, "Скорость порта анализатора")
         .click();
     harness.run_steps(2);
     harness.get_by_label("300").click();
@@ -1324,6 +1344,56 @@ fn the_monitor_flow_warns_about_the_control_lines() {
     harness.run_steps(2);
     harness.get_by_label(
         "XON/XOFF в разрыве искажает запись: драйвер съедает байты 0x11 и 0x13, и они не попадут ни в ленту, ни в журнал, ни в другую сторону. В разрыве поток выключают.",
+    );
+}
+
+/// Интервал переподключения прослушки — 1…3600 с: своя ошибка у поля в «Дополнительно»,
+/// и «Старт» с ней сессию не собирает (M5-AC3).
+#[test]
+fn the_monitor_reconnect_interval_is_checked_in_the_form() {
+    // Окно выше 800 точек: раскрытая форма прослушки в него помещается целиком, и
+    // «Старт» можно нажать без прокрутки.
+    let mut harness = harness_with(
+        monitor_settings(false),
+        None,
+        Screen::Step(SessionMode::ComMonitor),
+        (1200.0, 1000.0),
+        |app| app.with_more(),
+    );
+    replace_in(&mut harness, "Переподключение, с", "0");
+    harness.get_by_label("Переподключение — целое число от 1 до 3 600 с");
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    assert!(
+        harness.state().pending_session().is_none(),
+        "с нулевым интервалом сессия не собирается"
+    );
+    assert_eq!(
+        harness.state().screen,
+        Screen::Step(SessionMode::ComMonitor)
+    );
+
+    replace_in(&mut harness, "Переподключение, с", "3601");
+    harness.get_by_label("Переподключение — целое число от 1 до 3 600 с");
+    replace_in(&mut harness, "Переподключение, с", "15");
+    harness.run_steps(2);
+    assert!(
+        harness
+            .query_by_label("Переподключение — целое число от 1 до 3 600 с")
+            .is_none(),
+        "1…3600 проходит"
+    );
+    assert_eq!(harness.state().settings().config.reconnect_sec, 15);
+    harness.get_by_label("Старт").click();
+    harness.run_steps(2);
+    let config = harness.state().pending_session().expect("сессия собрана");
+    assert!(
+        matches!(
+            &config.source,
+            Source::ComMonitor { retry, .. } if *retry == std::time::Duration::from_secs(15)
+        ),
+        "{:?}",
+        config.source
     );
 }
 
@@ -1984,8 +2054,12 @@ fn monitor_settings(dark: bool) -> Settings {
 }
 
 /// Шаг прослушки: свёрнутое или раскрытое «Дополнительно» и, как в макете M5-3, занятый
-/// порт ЛИС (M5-AC3, M5-AC11).
-fn monitor_step(dark: bool, more: bool, lis_busy: bool) -> Harness<'static, BytetapApp> {
+/// порт ЛИС — или порт анализатора (M5-AC3, M5-AC11).
+fn monitor_step(
+    dark: bool,
+    more: bool,
+    busy: Option<(&'static str, &'static str)>,
+) -> Harness<'static, BytetapApp> {
     harness_with(
         monitor_settings(dark),
         None,
@@ -1993,14 +2067,13 @@ fn monitor_step(dark: bool, more: bool, lis_busy: bool) -> Harness<'static, Byte
         WINDOW,
         move |app| {
             let app = if more { app.with_more() } else { app };
-            if lis_busy {
-                app.with_start_error(
+            match busy {
+                Some((port, side)) => app.with_start_error(
                     StartError::new(ErrorCode::PortBusy, "Access is denied (os error 5)")
-                        .with_param("port", "COM4")
-                        .with_param("side", "lis"),
-                )
-            } else {
-                app
+                        .with_param("port", port)
+                        .with_param("side", side),
+                ),
+                None => app,
             }
         },
     )
@@ -2010,14 +2083,14 @@ fn monitor_step(dark: bool, more: bool, lis_busy: bool) -> Harness<'static, Byte
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_monitor_light() {
     let _gpu = gpu();
-    monitor_step(false, false, false).snapshot_options("step-monitor-light", &options());
+    monitor_step(false, false, None).snapshot_options("step-monitor-light", &options());
 }
 
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_monitor_dark() {
     let _gpu = gpu();
-    monitor_step(true, false, false).snapshot_options("step-monitor-dark", &options());
+    monitor_step(true, false, None).snapshot_options("step-monitor-dark", &options());
 }
 
 /// Раскрытое «Дополнительно» с занятым портом ЛИС — макет M5-3: ошибка у своего поля, а
@@ -2026,14 +2099,34 @@ fn step_monitor_dark() {
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_monitor_more_light() {
     let _gpu = gpu();
-    monitor_step(false, true, true).snapshot_options("step-monitor-more-light", &options());
+    monitor_step(false, true, Some(("COM4", "lis")))
+        .snapshot_options("step-monitor-more-light", &options());
 }
 
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
 fn step_monitor_more_dark() {
     let _gpu = gpu();
-    monitor_step(true, true, true).snapshot_options("step-monitor-more-dark", &options());
+    monitor_step(true, true, Some(("COM4", "lis")))
+        .snapshot_options("step-monitor-more-dark", &options());
+}
+
+/// Занятый порт анализатора: ошибка у первого поля, а не у второго и не под «Старт»
+/// (M5-AC3).
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn step_monitor_analyzer_error_light() {
+    let _gpu = gpu();
+    monitor_step(false, false, Some(("COM3", "analyzer")))
+        .snapshot_options("step-monitor-analyzer-error-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn step_monitor_analyzer_error_dark() {
+    let _gpu = gpu();
+    monitor_step(true, false, Some(("COM3", "analyzer")))
+        .snapshot_options("step-monitor-analyzer-error-dark", &options());
 }
 
 /// Запись прослушки: сводка «анализатор COM3 ⇄ bytetap ⇄ ЛИС COM4», счётчики и лента
@@ -2164,6 +2257,14 @@ fn recording_monitor_lost_light() {
     let _gpu = gpu();
     monitor_recording(false, true, WINDOW)
         .snapshot_options("recording-monitor-lost-light", &options());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "эталоны сняты на Linux (lavapipe)")]
+fn recording_monitor_lost_dark() {
+    let _gpu = gpu();
+    monitor_recording(true, true, WINDOW)
+        .snapshot_options("recording-monitor-lost-dark", &options());
 }
 
 /// Журнал прослушки: шапка со сводкой двух портов из `settings` и лента пары (M5-AC11).
@@ -3323,11 +3424,14 @@ fn every_screen_names_its_widgets() {
     for (role, label) in [
         (Role::ComboBox, "Порт анализатора"),
         (Role::ComboBox, "Порт ЛИС"),
-        (Role::ComboBox, "Скорость"),
-        (Role::ComboBox, "Формат"),
+        (Role::ComboBox, "Скорость порта анализатора"),
+        (Role::ComboBox, "Скорость порта ЛИС"),
+        (Role::ComboBox, "Формат порта анализатора"),
+        (Role::ComboBox, "Формат порта ЛИС"),
         (Role::Button, "Старт"),
         (Role::Button, "Дополнительно"),
-        (Role::Button, "Обновить список портов"),
+        (Role::Button, "Обновить список портов анализатора"),
+        (Role::Button, "Обновить список портов ЛИС"),
     ] {
         assert!(has(&nodes, role, label), "нет {role:?} «{label}»");
     }
@@ -3400,6 +3504,42 @@ fn tab_brings_the_focused_field_into_view() {
     let rect = focused.expect("Tab не дошёл до «Старт»");
     assert!(
         rect.bottom() <= 800.0 + 1.0 && rect.top() >= -1.0,
+        "«Старт» не в видимой области: {rect:?}"
+    );
+}
+
+/// Раскрытое «Дополнительно» прослушки в окно 800 точек не помещается и прокручивается:
+/// Tab до «Старт» подтягивает кнопку в видимую область (M5-AC11, отступление от макета
+/// M5-3, решённое М4-В9).
+#[test]
+fn tab_reaches_start_in_the_monitor_more() {
+    use egui_kittest::kittest::NodeT as _;
+    let mut harness = harness_with(
+        monitor_settings(false),
+        None,
+        Screen::Step(SessionMode::ComMonitor),
+        WINDOW,
+        |app| app.with_more(),
+    );
+    let mut focused = None;
+    for _ in 0..60 {
+        harness.key_press(Key::Tab);
+        harness.run_steps(2);
+        let Some(node) = harness
+            .root()
+            .children_recursive()
+            .find(egui_kittest::Node::is_focused)
+        else {
+            continue;
+        };
+        if node.accesskit_node().label().unwrap_or_default() == "Старт" {
+            focused = Some(node.rect());
+            break;
+        }
+    }
+    let rect = focused.expect("Tab не дошёл до «Старт»");
+    assert!(
+        rect.bottom() <= WINDOW.1 + 1.0 && rect.top() >= -1.0,
         "«Старт» не в видимой области: {rect:?}"
     );
 }
