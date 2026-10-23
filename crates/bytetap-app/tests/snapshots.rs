@@ -1376,6 +1376,31 @@ fn a_monitor_start_error_is_shown_under_its_port() {
         "порт анализатора — своё поле"
     );
     analyzer.get_by_label("Порт COM3 не найден: проверьте кабель и обновите список.");
+
+    // Отказ настроек порта — у своей строки скорости и формата, а не у поля порта:
+    // инженеру видно, что менять (FR-11, M5-AC3).
+    let params = harness_with(
+        monitor_settings(false),
+        None,
+        Screen::Step(SessionMode::ComMonitor),
+        WINDOW,
+        |app| {
+            app.with_start_error(
+                StartError::new(ErrorCode::PortSettings, "unsupported settings")
+                    .with_param("port", "COM4")
+                    .with_param("side", "lis"),
+            )
+        },
+    );
+    assert_eq!(
+        params
+            .state()
+            .start_error()
+            .map(|error| error.field(SessionMode::ComMonitor)),
+        Some(ErrorField::SerialParamsB),
+        "настройки порта ЛИС — у его скорости и формата"
+    );
+    params.get_by_label("Порт COM4 не поддерживает эти настройки.");
 }
 
 /// Карточка прослушки: описание из макета M5-1, оба порта последнего запуска и ошибка

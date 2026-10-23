@@ -118,6 +118,10 @@ pub enum ErrorField {
     SerialA,
     /// Порт стороны ЛИС в прослушке: занятый, отсутствующий или повторённый порт.
     SerialB,
+    /// Скорость и формат порта анализатора: отказ настроек порта (FR-11, M5-AC3).
+    SerialParamsA,
+    /// Скорость и формат порта ЛИС.
+    SerialParamsB,
     LogDir,
     Start,
 }
@@ -131,9 +135,11 @@ pub fn error_field(code: ErrorCode, mode: SessionMode) -> ErrorField {
         // Опечатка в портах прослушки — настройка порта, а не общий «Старт». По умолчанию
         // порт анализатора: сторону отказавшего порта называет ошибка старта, и поле
         // выбирается по ней (M5-AC3).
+        // Настройки порта (скорость, формат, поток) — у своей строки скорости и формата,
+        // остальное про порт — у его поля (FR-11, M5-AC3).
+        ErrorCode::PortSettings if mode == SessionMode::ComMonitor => ErrorField::SerialParamsA,
         ErrorCode::PortNotFound
         | ErrorCode::PortBusy
-        | ErrorCode::PortSettings
         | ErrorCode::PermissionDenied
         | ErrorCode::Serial
             if mode == SessionMode::ComMonitor =>
@@ -192,9 +198,14 @@ impl StartError {
         // У прослушки ошибка несёт сторону отказавшего порта: текст встаёт под полем
         // этого порта, а не под общим «Старт» (M5-AC3).
         if mode == SessionMode::ComMonitor {
-            match self.params.get("side").map(String::as_str) {
-                Some("lis") => return ErrorField::SerialB,
-                Some("analyzer") => return ErrorField::SerialA,
+            // Отказ настроек порта встаёт у скорости и формата своей стороны, остальные
+            // ошибки порта — у его поля (FR-11, M5-AC3).
+            let params = self.code == ErrorCode::PortSettings;
+            match (self.params.get("side").map(String::as_str), params) {
+                (Some("lis"), false) => return ErrorField::SerialB,
+                (Some("analyzer"), false) => return ErrorField::SerialA,
+                (Some("lis"), true) => return ErrorField::SerialParamsB,
+                (Some("analyzer"), true) => return ErrorField::SerialParamsA,
                 _ => {}
             }
         }
@@ -274,7 +285,7 @@ mod tests {
             // Прослушка: любая ошибка порта — своё поле, а сторону уточняет ошибка старта.
             (PortBusy, ComMonitor, ErrorField::SerialA),
             (PortNotFound, ComMonitor, ErrorField::SerialA),
-            (PortSettings, ComMonitor, ErrorField::SerialA),
+            (PortSettings, ComMonitor, ErrorField::SerialParamsA),
             (Serial, ComMonitor, ErrorField::SerialA),
             (PermissionDenied, ComMonitor, ErrorField::SerialA),
             (MonitorSamePort, ComMonitor, ErrorField::SerialB),

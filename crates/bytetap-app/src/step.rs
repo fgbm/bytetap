@@ -182,11 +182,19 @@ enum MonitorPort {
 }
 
 impl MonitorPort {
-    /// Поле ошибки старта этой стороны.
+    /// Поле ошибки старта этой стороны: у порта.
     fn error(self) -> ErrorField {
         match self {
             Self::Analyzer => ErrorField::SerialA,
             Self::Lis => ErrorField::SerialB,
+        }
+    }
+
+    /// Поле ошибки настроек этой стороны: у строки скорости и формата (FR-11).
+    fn params_error(self) -> ErrorField {
+        match self {
+            Self::Analyzer => ErrorField::SerialParamsA,
+            Self::Lis => ErrorField::SerialParamsB,
         }
     }
 
@@ -884,6 +892,11 @@ impl BytetapApp {
             |app, ui| app.monitor_baud_field(ui, p, MonitorPort::Analyzer),
             |app, ui| app.monitor_format_field(ui, p, MonitorPort::Analyzer),
         );
+        // Отказ настроек порта — под своей строкой скорости и формата (FR-11).
+        if let Some(error) = self.error_text(MonitorPort::Analyzer.params_error()) {
+            ui.add_space(SPACE_1);
+            widgets::field_error(ui, p.danger, &error);
+        }
         ui.add_space(SPACE_3);
         self.monitor_port_field(ui, p, MonitorPort::Lis);
         ui.add_space(SPACE_3);
@@ -892,6 +905,10 @@ impl BytetapApp {
             |app, ui| app.monitor_baud_field(ui, p, MonitorPort::Lis),
             |app, ui| app.monitor_format_field(ui, p, MonitorPort::Lis),
         );
+        if let Some(error) = self.error_text(MonitorPort::Lis.params_error()) {
+            ui.add_space(SPACE_1);
+            widgets::field_error(ui, p.danger, &error);
+        }
         // Автоответчика в прослушке нет: байты идут как есть, ответы приходят от ЛИС
         // (FR-10). Второй строкой — кто держит порты: в разрыве это только bytetap.
         ui.add_space(SPACE_3);

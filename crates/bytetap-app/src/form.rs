@@ -497,8 +497,8 @@ impl FormState {
                 ErrorField::TargetPort => self.touched.target_port,
                 ErrorField::AllowFrom => self.touched.allow_from,
                 ErrorField::Serial => self.touched.serial,
-                ErrorField::SerialA => self.touched.serial,
-                ErrorField::SerialB => self.touched.serial_b,
+                ErrorField::SerialA | ErrorField::SerialParamsA => self.touched.serial,
+                ErrorField::SerialB | ErrorField::SerialParamsB => self.touched.serial_b,
                 // Ошибка интерфейса приходит только от старта; своя проверка не нужна.
                 ErrorField::Interface | ErrorField::LogDir | ErrorField::Start => false,
             };
@@ -544,24 +544,35 @@ impl FormState {
             ErrorField::SerialA => {
                 if Self::serial_port_missing(cfg) {
                     Some(t!("form.serialRequired"))
-                } else if self.baud_value(cfg).is_none() {
-                    Some(t!("form.baudRange"))
                 } else {
                     None
                 }
             }
-            // Порт ЛИС: не выбран, повторяет первый порт или скорость вне границ.
+            // Скорость и формат анализатора: отказ настроек порта — у своей строки.
+            ErrorField::SerialParamsA => {
+                if Self::serial_port_missing(cfg) || self.baud_value(cfg).is_some() {
+                    None
+                } else {
+                    Some(t!("form.baudRange"))
+                }
+            }
+            // Порт ЛИС: не выбран или повторяет первый порт.
             ErrorField::SerialB => {
-                let port = cfg.monitor_lis.port.trim();
-                if port.is_empty() {
+                if Self::lis_port_missing(cfg) {
                     Some(t!("form.serialLisRequired"))
                 } else if monitor_same_port(cfg) {
                     // Порт уже виден в самом поле: текст говорит, что делать.
                     Some(t!("form.monitorSamePort"))
-                } else if self.lis_baud_value(cfg).is_none() {
-                    Some(t!("form.baudRange"))
                 } else {
                     None
+                }
+            }
+            // Скорость и формат порта ЛИС.
+            ErrorField::SerialParamsB => {
+                if Self::lis_port_missing(cfg) || self.lis_baud_value(cfg).is_some() {
+                    None
+                } else {
+                    Some(t!("form.baudRange"))
                 }
             }
             ErrorField::Interface | ErrorField::LogDir | ErrorField::Start => None,
@@ -1515,19 +1526,32 @@ mod tests {
         assert_eq!(error.code, ErrorCode::MonitorSamePort);
         assert_eq!(error.field(SessionMode::ComMonitor), ErrorField::SerialB);
 
-        // Порт ЛИС не выбран — настройка порта, и поле тоже своё.
+        // Порт ЛИС не выбран — отказ настроек порта, и он встаёт у скорости и формата
+        // своей стороны (FR-11, M5-AC3).
         let mut missing = cfg.clone();
         missing.monitor_lis.port = String::new();
         let error = session_config(&missing, None).expect_err("порт ЛИС не выбран");
         assert_eq!(error.code, ErrorCode::PortSettings);
-        assert_eq!(error.field(SessionMode::ComMonitor), ErrorField::SerialB);
+        assert_eq!(
+            error.field(SessionMode::ComMonitor),
+            ErrorField::SerialParamsB
+        );
 
-        // Порт анализатора не выбран — под первым полем.
+        // Порт анализатора не выбран — у его скорости и формата.
         let mut missing = cfg.clone();
         missing.serial.port = String::new();
         let error = session_config(&missing, None).expect_err("порт анализатора не выбран");
         assert_eq!(error.code, ErrorCode::PortSettings);
-        assert_eq!(error.field(SessionMode::ComMonitor), ErrorField::SerialA);
+        assert_eq!(
+            error.field(SessionMode::ComMonitor),
+            ErrorField::SerialParamsA
+        );
+
+        // Занятый порт — по стороне: его поле, а не строка скорости.
+        let error = StartError::new(ErrorCode::PortBusy, "busy")
+            .with_param("port", "COM4")
+            .with_param("side", "lis");
+        assert_eq!(error.field(SessionMode::ComMonitor), ErrorField::SerialB);
     }
 
     /// Второй порт прослушки повторяет скорость и формат первого, пока его самого не
