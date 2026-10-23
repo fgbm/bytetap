@@ -140,9 +140,17 @@ fn an_idle_window_asks_for_no_frames() {
     // Загрузка шрифтов и иконок догоняет себя сама; дальше — простой.
     harness.run_steps(8);
     let mut requested = Vec::new();
+    // Причины собираются на каждом шаге: `repaint_causes` помнит только последний проход.
+    let mut causes: Vec<String> = Vec::new();
     for _ in 0..40 {
         harness.step();
         requested.push(repaint_delay(&harness));
+        for cause in harness.ctx.repaint_causes() {
+            let cause = cause.to_string();
+            if !causes.contains(&cause) {
+                causes.push(cause);
+            }
+        }
     }
     let asked: Vec<_> = requested
         .iter()
@@ -151,9 +159,8 @@ fn an_idle_window_asks_for_no_frames() {
     // Кто именно просил кадр, видно по причинам egui: файл, строка и текст запроса.
     assert!(
         asked.is_empty(),
-        "в простое запрошено {} кадров: {asked:?}; причины: {:?}",
-        asked.len(),
-        harness.ctx.repaint_causes()
+        "в простое запрошено {} кадров: {asked:?}; причины: {causes:?}",
+        asked.len()
     );
 }
 
