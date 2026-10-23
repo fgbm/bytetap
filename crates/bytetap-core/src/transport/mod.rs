@@ -1229,8 +1229,10 @@ impl ConnectionSource for SerialSource {
             }
             match serial::open(&self.settings).await {
                 Ok(connection) => self.connected_connection(connection),
+                // Повтор открытия помечается так же, как отказ старта: по метке видно,
+                // что ошибка про порт, а не про журнал (FR-11, M3-AC3).
                 Err(error) => Next::Retry {
-                    error,
+                    error: port_error(None, error),
                     after: reconnect_pause(self.reconnect),
                     stage: Stage::Open,
                 },
