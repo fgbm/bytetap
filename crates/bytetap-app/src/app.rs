@@ -2184,6 +2184,10 @@ fn describe(source: &Source) -> String {
         Source::Serial { settings, .. } => format!("serial {} {}", settings.port, settings.baud),
         // Экран прокси — шаг 2 этапа M4: пока источник только называется в журнале запуска.
         Source::Proxy { target, role, .. } => format!("proxy {} {target}", role.as_str()),
+        // Экран прослушки — шаг 2 этапа M5: источник называется парой портов.
+        Source::ComMonitor { analyzer, lis, .. } => {
+            format!("com_monitor {} -> {}", analyzer.port, lis.port)
+        }
     }
 }
 

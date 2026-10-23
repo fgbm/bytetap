@@ -376,15 +376,40 @@ pub fn proxy_summary(header: &Session) -> Option<String> {
     ))
 }
 
+/// Сводка прослушки из заголовка журнала: оба порта из `settings` (M5-AC6).
+///
+/// Пара портов известна целиком с самого старта — в отличие от прокси, где вторая сторона
+/// появляется только со своим соединением. Поэтому подпись строится по заголовку:
+/// «анализатор COM3 ⇄ ЛИС COM4».
+fn monitor_summary(header: &Session) -> Option<String> {
+    if header.mode != Mode::ComMonitor {
+        return None;
+    }
+    let port = |side: &str| {
+        header
+            .settings
+            .get(side)?
+            .get("port")?
+            .as_str()
+            .map(str::to_owned)
+    };
+    let analyzer = port("analyzer")?;
+    let lis = port("lis")?;
+    Some(format!(
+        "{} {analyzer} ⇄ {} {lis}",
+        t!("feed.byAnalyzer"),
+        t!("feed.byLis")
+    ))
+}
+
 /// Подпись журнала в шапке просмотра: «ANALYZER · 00:42:18»; у журнала прокси вместо
-/// модели анализатора — сводка двух сторон, а имя анализатора, если оно записано,
-/// стоит перед ней: «ANALYZER · bytetap :50025 ⇄ ЛИС 10.0.0.5:5000 · 00:00:06»
-/// (M4-AC13).
+/// модели анализатора — сводка двух сторон, у журнала прослушки — сводка двух портов,
+/// а имя анализатора, если оно записано, стоит перед ней (M4-AC13, M5-AC6).
 #[must_use]
 pub fn journal_meta(header: &Session, duration_us: u64) -> String {
     let span = duration(duration_us);
     let analyzer = header.analyzer.clone().filter(|value| !value.is_empty());
-    match proxy_summary(header) {
+    match monitor_summary(header).or_else(|| proxy_summary(header)) {
         Some(summary) => match analyzer {
             Some(analyzer) => format!("{analyzer} · {summary} · {span}"),
             None => format!("{summary} · {span}"),
@@ -481,6 +506,35 @@ mod tests {
         let bars = density_bars(&[0, 10, 20, 40]);
         assert_eq!(bars, vec![0.0, 0.25, 0.5, 1.0]);
         assert_eq!(density_bars(&[0, 0]), vec![0.0, 0.0]);
+    }
+
+    /// Подпись журнала прослушки: оба порта из заголовка, без сети (M5-AC6).
+    #[test]
+    fn the_meta_of_a_monitor_journal_names_both_ports() {
+        use bytetap_core::journal::{Autoresponder, Host};
+        let mut header = Session::new(
+            Mode::ComMonitor,
+            Autoresponder::None,
+            serde_json::json!({
+                "analyzer": {"port": "COM3", "baud": 9600, "format": "8N1"},
+                "lis": {"port": "COM4", "baud": 9600, "format": "8N1"},
+            }),
+            Host {
+                os: "Windows 11".into(),
+            },
+        );
+        assert_eq!(
+            journal_meta(&header, 6_120_000),
+            "анализатор COM3 ⇄ ЛИС COM4 · 00:00:06"
+        );
+        header.analyzer = Some("ANALYZER".into());
+        assert_eq!(
+            journal_meta(&header, 6_120_000),
+            "ANALYZER · анализатор COM3 ⇄ ЛИС COM4 · 00:00:06"
+        );
+        // Заголовок без портов не выдумывает сводку: остаётся имя анализатора и время.
+        header.settings = serde_json::json!({});
+        assert_eq!(journal_meta(&header, 6_120_000), "ANALYZER · 00:00:06");
     }
 
     /// Подпись журнала прокси: имя анализатора из заголовка, сводка двух сторон и время
