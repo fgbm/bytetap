@@ -695,6 +695,7 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
         }
         MenuAction::Clear => {
             view.selection.clear();
+            view.copy_job = None;
             view.copy_notice = None;
         }
         MenuAction::None => {}
@@ -868,6 +869,9 @@ fn step_selection(view: &mut crate::viewing::JournalView, step: i32, extend: boo
     } else {
         view.selection.click(index as u64);
     }
+    // Новое выделение отменяет незаконченное копирование прежнего: в буфер уйдёт то,
+    // что выделено последним.
+    view.copy_job = None;
     view.copy_notice = None;
     // Панель переезжает на соседа только когда она открыта: при закрытой панели
     // стрелки двигают выделение, а панель не открывается под руками.

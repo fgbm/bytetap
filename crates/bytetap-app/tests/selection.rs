@@ -458,6 +458,36 @@ fn a_filtered_shift_click_replaces_the_range() {
     harness.get_by_label_contains("выбрано 2 · Ctrl+C");
 }
 
+/// Смена фильтра при активном Shift-диапазоне показывает видимые строки этого
+/// диапазона под новым фильтром, а не пересечение со старым (пустое) (L1-AC13).
+#[test]
+fn changing_the_filter_keeps_the_span_under_the_new_filter() {
+    let mut harness = harness_of(two_conns());
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "#1")
+        .click();
+    harness.run_steps(2);
+    click_row(&mut harness, "F00", Modifiers::NONE);
+    click_row(&mut harness, "F04", Modifiers::SHIFT);
+    assert_eq!(
+        selection_count(&harness),
+        3,
+        "F00, F02, F04 под фильтром #1"
+    );
+    // Тот же диапазон 0…4, но теперь видны строки #2: F01 и F03.
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "#2")
+        .click();
+    harness.run_steps(3);
+    assert_eq!(
+        selection_count(&harness),
+        2,
+        "видимые строки диапазона под фильтром #2"
+    );
+    assert!(selected(&harness, "F01") && selected(&harness, "F03"));
+    harness.get_by_label_contains("выбрано 2 · Ctrl+C");
+}
+
 /// Ctrl+клик снимает строку с выделения, но курсор и панель переезжают на неё — как в
 /// Проводнике (m4).
 #[test]
@@ -818,6 +848,99 @@ fn the_close_button_cancels_the_copy() {
     assert!(view.copy_job.is_none(), "задание отменено");
     assert!(view.copy_notice.is_none(), "сообщения не осталось");
     assert_eq!(view.selection.count(), 0, "выделение снято");
+}
+
+/// Журнал с незаконченным копированием: панель открыта, выделены строки на
+/// непрочитанных страницах, Ctrl+C ждёт их.
+fn waiting_copy(dir: &std::path::Path) -> Harness<'static, BytetapApp> {
+    let mut harness = journal_harness(dir, 10_600);
+    wait_for_row(&mut harness, "JEV00000");
+    click_row(&mut harness, "JEV00000", Modifiers::NONE);
+    let view = harness.state_mut().viewing_mut().expect("журнал открыт");
+    view.selection.select_all(300..10_000);
+    // Лента к первой строке выделения: по ней кликают, стреляют и открывают меню.
+    view.scroll.set_top(300);
+    harness.run_steps(3);
+    harness.event(egui::Event::Copy);
+    harness.run_steps(2);
+    assert!(
+        harness
+            .state()
+            .viewing()
+            .expect("журнал открыт")
+            .copy_job
+            .is_some(),
+        "копирование ждёт страниц"
+    );
+    harness
+}
+
+/// Новое выделение отменяет незаконченное копирование: клик, Ctrl+A, стрелка и пункт
+/// «Снять выделение» (L1, шаг 2).
+#[test]
+fn a_new_selection_cancels_a_waiting_copy() {
+    for action in ["клик", "Ctrl+A", "стрелка", "Снять выделение"] {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let mut harness = waiting_copy(dir.path());
+        match action {
+            "клик" => click_row(&mut harness, "JEV00301", Modifiers::NONE),
+            "Ctrl+A" => {
+                harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
+                harness.run_steps(2);
+            }
+            "стрелка" => {
+                harness.key_press(Key::ArrowDown);
+                harness.run_steps(2);
+            }
+            _ => {
+                right_click(&mut harness, "JEV00300");
+                harness.run_steps(2);
+                harness.get_by_label("Снять выделение").click();
+                harness.run_steps(2);
+            }
+        }
+        let view = harness.state().viewing().expect("журнал открыт");
+        assert!(view.copy_job.is_none(), "{action}: копирование отменено");
+        assert!(
+            view.copy_notice.is_none(),
+            "{action}: сообщения не осталось"
+        );
+    }
+}
+
+/// Предел копирования и нечитаемая страница сразу: сообщение говорит оба факта
+/// (L1-AC14).
+#[test]
+fn the_limit_and_the_skipped_rows_are_reported_together() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let mut harness = journal_harness(dir.path(), 10_600);
+    wait_for_row(&mut harness, "JEV00000");
+    let view = harness.state_mut().viewing_mut().expect("журнал открыт");
+    // Вторая страница не прочитается никогда, а выделено больше предела строк.
+    let generation = view.source.request_page(1);
+    view.source.page_lost(1, generation);
+    view.selection.select_all(250..10_600);
+    harness.event(egui::Event::Copy);
+    harness.run_steps(1);
+    // Двадцать страниц: ждём конца копирования, потом читаем сообщение.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while harness
+        .state()
+        .viewing()
+        .expect("журнал открыт")
+        .copy_job
+        .is_some()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "копирование не закончилось"
+        );
+        harness.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    harness.run_steps(2);
+    harness.get_by_label_contains("предел копирования");
+    harness.get_by_label_contains("не прочитано: 500 строк");
 }
 
 /// В просмотре журнала выделение тоже работает: клик, Shift+клик и Ctrl+C кладут

@@ -33,9 +33,11 @@ const NARROW_MAX: usize = 100_000;
 /// отмечено до установки якоря.
 ///
 /// Диапазон хранится дважды: `span` — как его задал инженер (якорь и цель), и
-/// `visible` — те его части, что проходят фильтр соединения. Заменяет и сужает
-/// диапазон всегда `span`: хвосты, которые фильтр спрятал, остаются частью диапазона
-/// и в «базу» Ctrl-отметок не уходят (находка MAJOR контрольного ревью шага 2).
+/// `visible` — те его части, что проходят фильтр соединения. Заменяет диапазон всегда
+/// `span`, а `visible` собирается из него заново при каждой смене фильтра: хвосты,
+/// которые фильтр спрятал, остаются частью диапазона и в «базу» Ctrl-отметок не уходят,
+/// а новый фильтр показывает видимые строки того же диапазона, а не пересечение со
+/// старым (находка MAJOR контрольного ревью шага 2).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
     /// Отметки Ctrl+клика: база, которую не сбрасывает Shift+клик.
@@ -169,6 +171,18 @@ impl Selection {
         if self.count == 0 {
             return;
         }
+        // Самое старое выделенное событие ещё в кольце — вытеснять нечего. Проверка по
+        // началу склейки: она собрана при правке и стоит одного сравнения.
+        if self
+            .merged
+            .first()
+            .is_some_and(|(start, _)| *start >= first)
+        {
+            if self.anchor.is_some_and(|anchor| anchor < first) {
+                self.anchor = None;
+            }
+            return;
+        }
         self.marks = clamp_from(self.marks.iter().copied(), first);
         self.span = self
             .span
@@ -193,9 +207,12 @@ impl Selection {
             return;
         }
         self.marks = keep_each(self.marks.iter().copied(), &keep);
-        // Суженный диапазон — отдельно от того, как его задали: следующий Shift+клик
-        // заменит `span` целиком и сузит новый диапазон заново.
-        self.visible = keep_each(self.visible.iter().copied(), &keep);
+        // Видимые части диапазона собираются из него самого, а не сужаются повторно:
+        // смена фильтра при активном Shift-диапазоне должна показать видимые строки
+        // этого диапазона под новым фильтром, а не пересечение со старым.
+        if let Some(span) = self.span {
+            self.visible = keep_each(std::iter::once(span), &keep);
+        }
         self.recount();
         if self.anchor.is_some_and(|anchor| !keep(anchor)) {
             self.anchor = None;
@@ -632,6 +649,46 @@ mod tests {
         selection.retain(|seq| seq % 2 == 0);
         assert_eq!(selected(&selection), [2, 4, 6]);
         assert_eq!(selection.count(), 3);
+    }
+
+    /// Вытеснение, которому нечего вытеснять, выделение не трогает: проверка по началу
+    /// склейки выходит сразу (L1-AC16).
+    #[test]
+    fn an_early_eviction_keeps_the_selection() {
+        let mut selection = Selection::default();
+        selection.click(5);
+        selection.extend(9);
+        selection.retain_after(5);
+        assert_eq!(
+            selected(&selection),
+            [5, 6, 7, 8, 9],
+            "самое старое ещё в кольце"
+        );
+        selection.retain_after(6);
+        assert_eq!(selected(&selection), [6, 7, 8, 9]);
+        // Якорь ушёл, но выделение цело: вытеснять нечего, а якорь сброшен.
+        let mut selection = Selection::default();
+        selection.click(4);
+        selection.extend(6);
+        selection.toggle(4);
+        assert_eq!(selection.anchor(), Some(4));
+        selection.retain_after(5);
+        assert_eq!(selected(&selection), [5, 6]);
+        assert_eq!(selection.anchor(), None, "якорь вытеснен");
+    }
+
+    /// Смена фильтра собирает видимые части диапазона из него самого, а не сужает
+    /// прежние: под новым фильтром видны его строки, а не пустое пересечение.
+    #[test]
+    fn a_new_filter_rebuilds_the_span() {
+        let mut selection = Selection::default();
+        selection.click(0);
+        selection.extend(4);
+        selection.retain(|seq| seq % 2 == 0);
+        assert_eq!(selected(&selection), [0, 2, 4]);
+        // Фильтр сменился: видны нечётные строки того же диапазона 0…4.
+        selection.retain(|seq| seq % 2 == 1);
+        assert_eq!(selected(&selection), [1, 3]);
     }
 
     /// Фильтр прячет строки диапазона, но **не** превращает их хвосты в Ctrl-отметки:
