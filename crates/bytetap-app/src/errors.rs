@@ -40,6 +40,8 @@ pub enum ErrorCode {
     PortBusy,
     /// Настройки COM-порта неверны.
     PortSettings,
+    /// Один и тот же порт указан с двух сторон прослушки (M5-AC3).
+    MonitorSamePort,
     /// Прочая ошибка COM-порта.
     Serial,
     /// Всё остальное.
@@ -47,7 +49,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::PortInUse,
         Self::AddressUnavailable,
         Self::AddressInvalid,
@@ -61,6 +63,7 @@ impl ErrorCode {
         Self::PortNotFound,
         Self::PortBusy,
         Self::PortSettings,
+        Self::MonitorSamePort,
         Self::Serial,
         Self::Io,
     ];
@@ -81,6 +84,7 @@ impl ErrorCode {
             Self::PortNotFound => t!("errors.port_not_found"),
             Self::PortBusy => t!("errors.port_busy"),
             Self::PortSettings => t!("errors.port_settings"),
+            Self::MonitorSamePort => t!("errors.monitor_same_port"),
             Self::Serial => t!("errors.serial"),
             Self::Io => t!("errors.io"),
         }
@@ -133,9 +137,12 @@ pub fn error_field(code: ErrorCode, mode: SessionMode) -> ErrorField {
         ErrorCode::ProxyTargetSelf => ErrorField::TargetPort,
         // Отказ фильтра — под полем фильтра, а не под адресом цели (FR-8).
         ErrorCode::AllowFromInvalid => ErrorField::AllowFrom,
+        // Опечатка в портах прослушки — настройка порта, а не общий «Старт»: шаг 2
+        // поставит её под своим полем COM-A или COM-B (M5-AC3).
         ErrorCode::PortNotFound
         | ErrorCode::PortBusy
         | ErrorCode::PortSettings
+        | ErrorCode::MonitorSamePort
         | ErrorCode::Serial => ErrorField::Serial,
         ErrorCode::LogDir | ErrorCode::JournalOpen => ErrorField::LogDir,
         ErrorCode::AlreadyRunning | ErrorCode::Journal | ErrorCode::Io => ErrorField::Start,

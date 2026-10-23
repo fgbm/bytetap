@@ -21,7 +21,9 @@ use bytetap_core::session::{
     Session, SessionConfig, SessionCounters, SessionEvent, SessionHandle, journal_failure_reason,
 };
 use bytetap_core::transport::serial::SerialSettings;
-use bytetap_core::transport::{MonitorSide, Source, is_proxy_target_is_self, monitor_side};
+use bytetap_core::transport::{
+    MonitorSide, Source, is_monitor_same_port, is_proxy_target_is_self, monitor_side,
+};
 use eframe::egui;
 use tokio::sync::{broadcast, watch};
 
@@ -473,12 +475,17 @@ pub fn start_error(err: &io::Error, source: &Source) -> StartError {
         Source::TcpClient { .. } => StartError::new(ErrorCode::Io, err.to_string()),
         Source::Serial { settings, .. } => serial_error(err, settings, port_listed),
         // Прослушка: ошибка старта несёт сторону отказавшего порта, поэтому текст и поле
-        // берутся у того порта, который не открылся (M5-AC3).
+        // берутся у того порта, который не открылся (M5-AC3). Один и тот же порт с двух
+        // сторон — своя настройка, а не «порт занят» от собственного второго открытия.
         Source::ComMonitor { analyzer, lis, .. } => {
             let settings = match monitor_side(err) {
                 Some(MonitorSide::Lis) => lis,
                 Some(MonitorSide::Analyzer) | None => analyzer,
             };
+            if is_monitor_same_port(err) {
+                return StartError::new(ErrorCode::MonitorSamePort, err.to_string())
+                    .with_param("port", &settings.port);
+            }
             serial_error(err, settings, port_listed)
         }
     }

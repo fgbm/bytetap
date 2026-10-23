@@ -53,7 +53,7 @@ use crate::journal::{
 use crate::responder::{Action, ControlIdSource, Now, Responder, ResponderEvent, ResponderKind};
 use crate::transport::{
     Connection, ConnectionSource, Link, Next, ProxyRole, ResetSocket, Source, Stage, Transport,
-    is_proxy_peer_rejected, is_proxy_target_is_self, rejected_peer,
+    is_monitor_same_port, is_proxy_peer_rejected, is_proxy_target_is_self, rejected_peer,
 };
 
 /// Сколько событий держат каналы подписчиков.
@@ -475,6 +475,11 @@ impl Session {
             open: Mutex::new(HashSet::new()),
             backlog_warned: AtomicBool::new(false),
         });
+        // Замечания источника идут раньше первого соединения: инженер должен узнать про
+        // разрешение таймера и про линии управления до обмена (M5-AC5, М5-В3).
+        for note in opened.notes {
+            shared.info_with_code(None, Some(note.code), note.message);
+        }
         let task = tokio::spawn(run(
             opened.source,
             mode,
@@ -1097,6 +1102,11 @@ fn after_failure(mode: Mode) -> &'static str {
 fn source_failure_code(mode: Mode, code: &'static str, error: &io::Error) -> &'static str {
     if is_proxy_target_is_self(error) {
         return "proxy_target_is_self";
+    }
+    // Опечатка в настройке прослушки — свой код, а не «порт не поддерживает настройки»
+    // и не «порт занят»: второй `open` того же порта сказал бы именно это (M5-AC3).
+    if is_monitor_same_port(error) {
+        return "monitor_same_port";
     }
     // Входящее с неразрешённого адреса — не сломанный приём: слушатель в порядке,
     // а отказано тому, кто пришёл (FR-8).

@@ -475,6 +475,23 @@ impl MonitorSide {
             Self::Lis => "lis",
         }
     }
+
+    /// Противоположная сторона пары.
+    #[must_use]
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::Analyzer => Self::Lis,
+            Self::Lis => Self::Analyzer,
+        }
+    }
+
+    /// Место стороны в паре: 0 — анализатор, 1 — ЛИС.
+    const fn index(self) -> usize {
+        match self {
+            Self::Analyzer => 0,
+            Self::Lis => 1,
+        }
+    }
 }
 
 impl std::fmt::Display for MonitorSide {
@@ -522,12 +539,59 @@ fn monitor_port_error(side: MonitorSide, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), MonitorPortError { side, error })
 }
 
+/// Один и тот же порт указан с обеих сторон прослушки (M5-AC3).
+///
+/// Свой тип нужен ради своего кода в журнале (`monitor_same_port`): без него второй `open`
+/// вернул бы «порт занят», и инженер искал бы чужую программу вместо опечатки в настройке.
+#[derive(Debug)]
+pub struct MonitorSamePort {
+    /// Порт, указанный дважды.
+    pub port: String,
+}
+
+impl std::fmt::Display for MonitorSamePort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the monitor needs two different ports: {} is given for both sides",
+            self.port
+        )
+    }
+}
+
+impl std::error::Error for MonitorSamePort {}
+
+/// Ошибка «один и тот же порт с двух сторон» в обёртке [`io::Error`].
+fn monitor_same_port_error(port: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        MonitorSamePort {
+            port: port.to_owned(),
+        },
+    )
+}
+
+/// `true`, если ошибка — «один и тот же порт с двух сторон» (M5-AC3).
+///
+/// Ошибка приходит в обёртке [`MonitorPortError`] со стороной порта, поэтому причина
+/// ищется на обоих уровнях: снаружи — сторона, внутри — сама настройка.
+#[must_use]
+pub fn is_monitor_same_port(err: &io::Error) -> bool {
+    let outer = err.get_ref();
+    let inner = outer
+        .and_then(|inner| inner.downcast_ref::<MonitorPortError>())
+        .map_or_else(|| outer, |port| port.error.get_ref());
+    inner.is_some_and(|inner| inner.is::<MonitorSamePort>())
+}
+
 /// Готовый источник: соединения и строка для строки состояния.
 pub struct OpenedSource {
     /// Источник, из которого сессия берёт соединения.
     pub source: Box<dyn ConnectionSource>,
     /// Что показать в строке состояния: адрес слушателя, адрес анализатора или имя порта.
     pub local: String,
+    /// Замечания о старте: сессия пишет их в журнал событиями `info` после заголовка.
+    pub notes: Vec<StartNote>,
 }
 
 impl Source {
@@ -549,6 +613,7 @@ impl Source {
                 Ok(OpenedSource {
                     source: Box::new(TcpServerSource::new(server)),
                     local,
+                    notes: Vec::new(),
                 })
             }
             Self::TcpClient { addr, reconnect } => Ok(OpenedSource {
@@ -558,6 +623,7 @@ impl Source {
                 }),
                 // До первого соединения локального адреса нет: показываем, куда идём.
                 local: addr.clone(),
+                notes: Vec::new(),
             }),
             Self::Serial {
                 settings,
@@ -572,6 +638,7 @@ impl Source {
                         pending: Some(connection),
                     }),
                     local: settings.port.clone(),
+                    notes: Vec::new(),
                 })
             }
             Self::Proxy {
@@ -606,6 +673,7 @@ impl Source {
                         self_loop: Arc::new(AtomicBool::new(false)),
                     }),
                     local,
+                    notes: Vec::new(),
                 })
             }
             Self::ComMonitor {
@@ -615,9 +683,13 @@ impl Source {
             } => {
                 // Оба порта открываются здесь: занятый или отсутствующий порт — ошибка
                 // старта до создания журнала, как у COM «вместо ЛИС» (M3-AC3, M5-AC3).
-                let pair = open_monitor_ports(analyzer, lis)
+                let pair = open_monitor_ports(analyzer, lis, OpenOrder::new().order())
                     .await
                     .map_err(|(side, error)| monitor_port_error(side, error))?;
+                // Разрешение таймера живёт столько же, сколько источник, то есть всю
+                // сессию прослушки (M5-AC5).
+                #[cfg(windows)]
+                let timer = TimerResolution::raise();
                 Ok(OpenedSource {
                     // Строка состояния называет порт анализатора: он же `peer` в `open`.
                     local: analyzer.port.clone(),
@@ -626,7 +698,12 @@ impl Source {
                         lis: lis.clone(),
                         retry: *retry,
                         pending: Some(pair),
+                        order: OpenOrder::new(),
+                        opening: JoinSet::new(),
+                        #[cfg(windows)]
+                        _timer: timer,
                     }),
+                    notes: monitor_start_notes(analyzer, lis),
                 })
             }
         }
@@ -1152,41 +1229,100 @@ struct MonitorPair {
 async fn open_monitor_ports(
     analyzer: &SerialSettings,
     lis: &SerialSettings,
+    order: [MonitorSide; 2],
 ) -> Result<MonitorPair, (MonitorSide, io::Error)> {
     #[cfg(feature = "test-hooks")]
     if let Some(pair) = take_virtual_pair() {
-        return pair.map_err(|error| (MonitorSide::Analyzer, error));
+        let pair = pair.map_err(|error| (MonitorSide::Analyzer, error))?;
+        // Окно открытия: тест отменяет `next` посреди него комментарием (M5-AC13).
+        test_open_delay().await;
+        return Ok(pair);
     }
     analyzer
         .validate()
         .map_err(|error| (MonitorSide::Analyzer, error))?;
     lis.validate().map_err(|error| (MonitorSide::Lis, error))?;
     if analyzer.port.eq_ignore_ascii_case(&lis.port) {
+        return Err((MonitorSide::Lis, monitor_same_port_error(&analyzer.port)));
+    }
+    // Порядок открытия задаёт источник: первой идёт сторона, отказавшая в прошлый раз.
+    let mut opened: [Option<Box<dyn Transport>>; 2] = [None, None];
+    for side in order {
+        let settings = match side {
+            MonitorSide::Analyzer => analyzer,
+            MonitorSide::Lis => lis,
+        };
+        match serial::open_monitor(settings).await {
+            Ok(port) => opened[side.index()] = Some(Box::new(port)),
+            Err(error) => {
+                // Журнала ещё нет, а держать уже открытый порт незачем: соединение
+                // выгружается, и его потоки завершаются сами (ADR 0002).
+                drop(opened);
+                return Err((side, error));
+            }
+        }
+    }
+    let [Some(analyzer_port), Some(lis_port)] = opened else {
         return Err((
             MonitorSide::Lis,
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "the monitor needs two different ports: {} is given for both sides",
-                    analyzer.port
-                ),
-            ),
+            io::Error::other("the monitor pair is incomplete"),
         ));
+    };
+    #[cfg(feature = "test-hooks")]
+    test_open_delay().await;
+    Ok(MonitorPair {
+        analyzer: analyzer_port,
+        lis: lis_port,
+    })
+}
+
+/// Тестовый хук: задержка в окне открытия пары прослушки, миллисекунды.
+///
+/// Появляется только со сборкой feature `test-hooks`: проверка «отмена `next` не теряет
+/// открытую пару» должна открыть окно на сотни миллисекунд, а не ждать настоящий порт.
+#[cfg(feature = "test-hooks")]
+pub static TEST_MONITOR_OPEN_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Задержка открытия, если тест её запросил.
+#[cfg(feature = "test-hooks")]
+async fn test_open_delay() {
+    let millis = TEST_MONITOR_OPEN_DELAY_MS.load(Ordering::Relaxed);
+    if millis > 0 {
+        tokio::time::sleep(Duration::from_millis(millis)).await;
     }
-    let analyzer_port = serial::open_monitor(analyzer)
-        .await
-        .map_err(|error| (MonitorSide::Analyzer, error))?;
-    match serial::open_monitor(lis).await {
-        Ok(lis_port) => Ok(MonitorPair {
-            analyzer: Box::new(analyzer_port),
-            lis: Box::new(lis_port),
-        }),
-        Err(error) => {
-            // Журнала ещё нет, а держать первый порт незачем: соединение выгружается,
-            // и его потоки завершаются сами (ADR 0002).
-            drop(analyzer_port);
-            Err((MonitorSide::Lis, error))
+}
+
+#[cfg(not(feature = "test-hooks"))]
+async fn test_open_delay() {}
+
+/// Порядок открытия пары портов и память об отказавшей стороне (M5-AC5, NFR-5).
+///
+/// Первой открывается сторона, отказавшая в прошлый раз. Если адаптер ЛИС так и не вернулся,
+/// исправный порт анализатора не открывается и не закрывается на каждой попытке: его DTR и
+/// RTS не дёргаются каждые несколько секунд, и прибор на той стороне не видит «разрыв»
+/// каждый интервал переподключения.
+#[derive(Debug)]
+struct OpenOrder {
+    /// С какой стороны начинается следующая попытка.
+    first: MonitorSide,
+}
+
+impl OpenOrder {
+    /// Начальный порядок: анализатор, затем ЛИС.
+    fn new() -> Self {
+        Self {
+            first: MonitorSide::Analyzer,
         }
+    }
+
+    /// Порядок открытия: первая сторона и противоположная ей.
+    fn order(&self) -> [MonitorSide; 2] {
+        [self.first, self.first.opposite()]
+    }
+
+    /// Отказавшая сторона: с неё начнётся следующая попытка.
+    fn failed(&mut self, side: MonitorSide) {
+        self.first = side;
     }
 }
 
@@ -1194,13 +1330,25 @@ async fn open_monitor_ports(
 ///
 /// Как и COM «вместо ЛИС», источник последовательный: следующая пара открывается только
 /// после закрытия предыдущей и по интервалу переподключения. Пара, открытая стартом,
-/// лежит в `pending`, поэтому первое соединение не открывает порты второй раз, а отмена
-/// `next` ничего не теряет — открытие идёт в самом `next`, без задачи (M5-AC13).
+/// лежит в `pending`, поэтому первое соединение не открывает порты второй раз.
+///
+/// Открытие после разрыва идёт задачей в [`JoinSet`], как подключение к цели у прокси:
+/// сессия вызывает `next` в `select!` и отменяет его на комментарии, остановке и отказе
+/// журнала, а отмена посреди открытия не должна ни терять порт, ни начинать второе
+/// открытие того же порта — оно осталось бы с «порт занят» (M5-AC13).
 struct MonitorSource {
     analyzer: SerialSettings,
     lis: SerialSettings,
     retry: Duration,
     pending: Option<MonitorPair>,
+    /// Порядок следующего открытия.
+    order: OpenOrder,
+    /// Открытия, которые уже идут, и их результаты для сессии.
+    opening: JoinSet<Result<MonitorPair, (MonitorSide, io::Error)>>,
+    /// Разрешение системного таймера на время сессии: порт прослушки ждёт чтения 2 мс,
+    /// а драйвер отсчитывает таймаут по тику (M5-AC5).
+    #[cfg(windows)]
+    _timer: Option<TimerResolution>,
 }
 
 impl MonitorSource {
@@ -1221,6 +1369,14 @@ impl MonitorSource {
             reset: None,
         })
     }
+
+    /// Запускает открытие пары отдельной задачей.
+    fn spawn_opening(&mut self) {
+        let (analyzer, lis) = (self.analyzer.clone(), self.lis.clone());
+        let order = self.order.order();
+        self.opening
+            .spawn(async move { open_monitor_ports(&analyzer, &lis, order).await });
+    }
 }
 
 impl ConnectionSource for MonitorSource {
@@ -1237,16 +1393,139 @@ impl ConnectionSource for MonitorSource {
             if let Some(pair) = self.pending.take() {
                 return self.connected_connection(pair);
             }
-            match open_monitor_ports(&self.analyzer, &self.lis).await {
-                Ok(pair) => self.connected_connection(pair),
-                Err((side, error)) => Next::Retry {
-                    error: monitor_port_error(side, error),
-                    after: reconnect_pause(self.retry),
+            if self.opening.is_empty() {
+                self.spawn_opening();
+            }
+            let after = reconnect_pause(self.retry);
+            // Отмена `join_next` задачу не прерывает: результат останется в наборе до
+            // следующего вызова, и порт не откроется второй раз.
+            match self.opening.join_next().await {
+                Some(Ok(Ok(pair))) => self.connected_connection(pair),
+                Some(Ok(Err((side, error)))) => {
+                    self.order.failed(side);
+                    Next::Retry {
+                        error: monitor_port_error(side, error),
+                        after,
+                        stage: Stage::Open,
+                    }
+                }
+                Some(Err(err)) => Next::Retry {
+                    error: io::Error::other(format!("the monitor open task failed: {err}")),
+                    after,
+                    stage: Stage::Open,
+                },
+                None => Next::Retry {
+                    error: io::Error::other("the monitor open task is gone"),
+                    after,
                     stage: Stage::Open,
                 },
             }
         })
     }
+}
+
+/// Разрешение системного таймера на время прослушки (M5-AC5).
+///
+/// Драйвер отсчитывает таймаут `ReadFile` по системному тику, а по умолчанию он 15,6 мс:
+/// двухмиллисекундный [`serial::MONITOR_READ_POLL`] округлился бы вверх к нему, и запись в
+/// порт ждала бы чтение до тика. `timeBeginPeriod(1)` опускает тик до миллисекунды,
+/// `timeEndPeriod(1)` возвращает системную настройку; гард живёт столько же, сколько
+/// источник, то есть всю сессию, и снимается при её остановке.
+///
+/// Справедливость самой блокировки синхронного handle — отдельный риск: система может
+/// отдать текущее чтение раньше, а может и держать запись дольше. Обещание «два
+/// миллисекунды» здесь не гарантия, а ожидание при поднятом разрешении; подробности — в
+/// дополнении к ADR 0002.
+#[cfg(windows)]
+pub struct TimerResolution;
+
+#[cfg(windows)]
+impl TimerResolution {
+    /// Разрешение таймера, миллисекунды: то же число стоит в журнале.
+    pub const MILLIS: u32 = 1;
+
+    /// Поднимает разрешение таймера; `None` — система отказала.
+    pub fn raise() -> Option<Self> {
+        use windows_sys::Win32::Media::timeBeginPeriod;
+
+        // SAFETY: вызов без указателей, `timeEndPeriod` в `Drop` парный этому вызову.
+        (unsafe { timeBeginPeriod(Self::MILLIS) } == 0).then_some(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Media::timeEndPeriod;
+
+        // SAFETY: парный вызов к `timeBeginPeriod` этого гарда.
+        unsafe {
+            timeEndPeriod(Self::MILLIS);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for TimerResolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TimerResolution")
+    }
+}
+
+/// Замечание источника о старте: событие `info` в журнал сразу после заголовка.
+///
+/// Так до журнала доходят вещи, которые видит только источник: например, что прослушка
+/// подняла разрешение системного таймера или что линии управления сквозь неё не идут
+/// (М5-В3). Текст английский, как у остальных событий журнала; код — для интерфейса.
+pub struct StartNote {
+    /// Код события для интерфейса и поиска в журнале.
+    pub code: &'static str,
+    /// Текст события.
+    pub message: String,
+}
+
+/// Замечания прослушки о старте: таймер Windows и линии управления (M5-AC5, М5-В3).
+fn monitor_start_notes(analyzer: &SerialSettings, lis: &SerialSettings) -> Vec<StartNote> {
+    #[allow(unused_mut)]
+    let mut notes = Vec::new();
+    #[cfg(windows)]
+    notes.push(StartNote {
+        code: "timer_resolution",
+        message: format!(
+            "the system timer resolution is raised to {} ms for the monitor",
+            TimerResolution::MILLIS
+        ),
+    });
+    notes.extend(flow_notes(analyzer, lis));
+    notes
+}
+
+/// Замечания о линиях управления: в разрыве они остаются линиями самого bytetap (М5-В3).
+///
+/// Аппаратный поток в разрыве не работает: CTS/DSR/DCD каждой стороны — это линии bytetap,
+/// а не дальней стороны. Программный XON/XOFF хуже: драйвер съедает `0x11` и `0x13` из
+/// обмена, и эти байты не попадают ни в журнал, ни в другую сторону. Инженер должен узнать
+/// это из журнала, а не из «прибор не отвечает».
+fn flow_notes(analyzer: &SerialSettings, lis: &SerialSettings) -> Vec<StartNote> {
+    let mut notes = Vec::new();
+    for settings in [analyzer, lis] {
+        let message = match settings.flow {
+            crate::transport::serial::Flow::None => continue,
+            crate::transport::serial::Flow::RtsCts => format!(
+                "control flow rtscts on {} does not pass through bytetap in a break: CTS, DSR and DCD are the lines of the local port, not of the far side",
+                settings.port
+            ),
+            crate::transport::serial::Flow::XonXoff => format!(
+                "control flow xonxoff on {} does not pass through bytetap: the driver consumes 0x11 and 0x13 from the exchange, so those bytes reach neither the journal nor the other port; turn the flow off in a break",
+                settings.port
+            ),
+        };
+        notes.push(StartNote {
+            code: "control_flow_not_forwarded",
+            message,
+        });
+    }
+    notes
 }
 
 /// Конец виртуального «порта», который держит тест (M5-AC8, M5-AC9).
@@ -1373,6 +1652,34 @@ mod tests {
             client.settings("127.0.0.1:5000"),
             serde_json::json!({"connect": "127.0.0.1:5000", "reconnect_sec": 5})
         );
+    }
+
+    /// Порядок открытия пары: первой идёт сторона, отказавшая в прошлый раз (M5-AC5).
+    ///
+    /// Так исправный порт анализатора не открывается и не закрывается на каждой попытке,
+    /// пока адаптер ЛИС не вернулся: его DTR и RTS не дёргаются каждый интервал.
+    #[test]
+    fn the_monitor_opens_the_side_that_failed_last_first() {
+        let mut order = OpenOrder::new();
+        assert_eq!(
+            order.order(),
+            [MonitorSide::Analyzer, MonitorSide::Lis],
+            "старт: сначала анализатор"
+        );
+        order.failed(MonitorSide::Lis);
+        assert_eq!(
+            order.order(),
+            [MonitorSide::Lis, MonitorSide::Analyzer],
+            "ЛИС отказала — следующая попытка начинается с неё"
+        );
+        order.failed(MonitorSide::Analyzer);
+        assert_eq!(
+            order.order(),
+            [MonitorSide::Analyzer, MonitorSide::Lis],
+            "анализатор отказал — с него и начинаем"
+        );
+        assert_eq!(MonitorSide::Analyzer.opposite(), MonitorSide::Lis);
+        assert_eq!(MonitorSide::Lis.opposite(), MonitorSide::Analyzer);
     }
 
     #[test]

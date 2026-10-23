@@ -14,13 +14,17 @@
 //! Настоящий COM проверяется на pty (`monitor_pty.rs`) и в ручном смоуке на железе.
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use base64::Engine as _;
 use bytetap_core::journal::{Autoresponder, Close, ClosedBy, Dir, Event, LinkRole, Mode, read_all};
 use bytetap_core::session::{Session, SessionConfig, SessionHandle};
-use bytetap_core::transport::serial::{SerialFormat, SerialSettings};
-use bytetap_core::transport::{VirtualMonitorEnds, reset_virtual_monitor, virtual_monitor};
+use bytetap_core::transport::serial::{Flow, SerialFormat, SerialSettings};
+use bytetap_core::transport::{
+    MonitorSide, TEST_MONITOR_OPEN_DELAY_MS, VirtualMonitorEnds, is_monitor_same_port,
+    monitor_side, reset_virtual_monitor, virtual_monitor,
+};
 use bytetap_testkit::emulator::{Fragmentation, fragment_bounds, frame};
 use bytetap_testkit::fixtures_dir;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -464,4 +468,206 @@ fn the_monitor_config_has_no_autoresponder() {
             },
         })
     );
+}
+
+/// Ошибка старта прослушки несёт сторону порта, а журнал не создаётся (M5-AC3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_monitor_start_error_names_the_port_side() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let missing = "/dev/bytetap-no-such-port";
+    let err = Session::start(
+        SessionConfig::com_monitor(
+            SerialSettings::new(missing, 9600, SerialFormat::EIGHT_N_ONE),
+            SerialSettings::new("COM4", 9600, SerialFormat::EIGHT_N_ONE),
+            RETRY,
+        )
+        .with_log_dir(dir.path()),
+    )
+    .await
+    .expect_err("порта анализатора нет");
+    assert_eq!(
+        monitor_side(&err),
+        Some(MonitorSide::Analyzer),
+        "сторона отказавшего порта: {err}"
+    );
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    assert!(
+        err.to_string().contains(missing),
+        "ошибка называет порт: {err}"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("папка").count(),
+        0,
+        "журнал не создан"
+    );
+
+    // Неверные настройки — ошибка своего порта, а не общего «Старт».
+    let err = Session::start(
+        SessionConfig::com_monitor(
+            SerialSettings::new("COM3", 9600, SerialFormat::EIGHT_N_ONE),
+            SerialSettings::new("COM4", 0, SerialFormat::EIGHT_N_ONE),
+            RETRY,
+        )
+        .with_log_dir(dir.path()),
+    )
+    .await
+    .expect_err("скорость ЛИС вне диапазона");
+    assert_eq!(monitor_side(&err), Some(MonitorSide::Lis), "{err}");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("папка").count(),
+        0,
+        "журнал не создан"
+    );
+}
+
+/// Один и тот же порт с двух сторон — свой код ошибки, а не «порт занят» (M5-AC3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_port_on_both_sides_is_its_own_error() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let err = Session::start(
+        SessionConfig::com_monitor(
+            SerialSettings::new("COM3", 9600, SerialFormat::EIGHT_N_ONE),
+            SerialSettings::new("com3", 9600, SerialFormat::EIGHT_N_ONE),
+            RETRY,
+        )
+        .with_log_dir(dir.path()),
+    )
+    .await
+    .expect_err("один и тот же порт");
+    assert!(is_monitor_same_port(&err), "{err}");
+    assert_eq!(monitor_side(&err), Some(MonitorSide::Lis));
+    assert!(
+        err.to_string().contains("two different ports") && err.to_string().contains("COM3"),
+        "ошибка объясняет причину и называет порт: {err}"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("папка").count(),
+        0,
+        "журнал не создан"
+    );
+}
+
+/// Линии управления сквозь bytetap не идут: об этом говорит журнал, а не только CLI (М5-В3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_control_flow_warning_is_written_to_the_journal() {
+    let _hook = HOOK.lock().await;
+    let _guard = HookGuard;
+    let dir = tempfile::tempdir().expect("временная папка");
+    let analyzer = analyzer_settings().with_flow(Flow::XonXoff);
+    let lis = lis_settings().with_flow(Flow::RtsCts);
+    let (source, mut ends) =
+        virtual_monitor(analyzer.clone(), lis.clone(), RETRY, 1).expect("хук свободен");
+    let handle = Session::start(
+        SessionConfig::com_monitor(analyzer, lis, RETRY)
+            .with_source(source)
+            .with_log_dir(dir.path()),
+    )
+    .await
+    .expect("сессия прослушки");
+    let path = handle.journal_path().to_path_buf();
+    let mut pair = ends.pop().expect("пара");
+    let _ = send_and_receive(
+        &mut pair.analyzer,
+        &mut pair.lis,
+        b"ENQ",
+        Fragmentation::Whole,
+    )
+    .await;
+    handle.stop().await.expect("остановка");
+
+    let outcome = read_all(&path).expect("журнал читается");
+    let notes: Vec<(&str, &str)> = outcome
+        .lines
+        .iter()
+        .filter_map(|line| match &line.event {
+            Event::Info(info) => Some((
+                info.code.as_deref().unwrap_or_default(),
+                info.message.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let flow: Vec<&&str> = notes
+        .iter()
+        .filter(|(code, _)| *code == "control_flow_not_forwarded")
+        .map(|(_, message)| message)
+        .collect();
+    assert_eq!(flow.len(), 2, "по замечанию на каждый порт: {notes:?}");
+    assert!(
+        flow.iter()
+            .any(|message| message.contains("0x11") && message.contains("COM3")),
+        "XON/XOFF называет байты и порт: {flow:?}"
+    );
+    assert!(
+        flow.iter()
+            .any(|message| message.contains("rtscts") && message.contains("COM4")),
+        "RTS/CTS называет поток и порт: {flow:?}"
+    );
+}
+
+/// Отмена `next` посреди переоткрытия не теряет открытую пару и не даёт лишней ошибки
+/// «открытие порта» (M5-AC13).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_comment_during_the_reopen_does_not_lose_the_pair() {
+    let _hook = HOOK.lock().await;
+    let _guard = HookGuard;
+    let dir = tempfile::tempdir().expect("временная папка");
+    let (handle, mut pairs) = start(dir.path(), 2).await;
+    let path = handle.journal_path().to_path_buf();
+
+    let mut first = pairs.remove(0);
+    let _ = send_and_receive(
+        &mut first.analyzer,
+        &mut first.lis,
+        b"ENQ",
+        Fragmentation::Whole,
+    )
+    .await;
+    drop(first.lis);
+
+    // Окно открытия второй пары: комментарии отменяют `next` посреди него.
+    TEST_MONITOR_OPEN_DELAY_MS.store(300, Ordering::Relaxed);
+    wait_for_closes(&path, 1).await;
+    for _ in 0..30 {
+        let _ = handle.note("переоткрытие");
+        sleep(Duration::from_millis(10)).await;
+    }
+    TEST_MONITOR_OPEN_DELAY_MS.store(0, Ordering::Relaxed);
+
+    wait_for_opens(&path, 2).await;
+    let mut second = pairs.remove(0);
+    let _ = send_and_receive(
+        &mut second.analyzer,
+        &mut second.lis,
+        b"ACK",
+        Fragmentation::Whole,
+    )
+    .await;
+    handle.stop().await.expect("остановка");
+
+    let outcome = read_all(&path).expect("журнал читается");
+    let failures: Vec<&str> = outcome
+        .lines
+        .iter()
+        .filter_map(|line| match &line.event {
+            Event::Error(error) if error.code.as_deref() == Some("serial_open_failed") => {
+                Some(error.message.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "отмена `next` не должна давать отказ открытия: {failures:?}"
+    );
+    let conns: Vec<u32> = outcome
+        .lines
+        .iter()
+        .filter_map(|line| match &line.event {
+            Event::Open(open) => Some(open.conn),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(conns, vec![1, 2], "вторая пара открылась один раз");
 }
