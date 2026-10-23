@@ -37,7 +37,7 @@ use tokio::time::timeout;
 use self::serial::{SerialConnection, SerialSettings};
 use self::tcp::{TcpServer, TcpServerSource};
 
-pub use crate::journal::LinkRole;
+pub use crate::journal::{ClosedBy, LinkRole};
 
 /// Наименьшая пауза переподключения.
 ///
@@ -394,6 +394,14 @@ pub trait ConnectionSource: Send {
         false
     }
 
+    /// Соединение закрылось: кто его закрыл.
+    ///
+    /// Источник прослушки по этой метке запоминает сторону, чей порт отказал, и начинает
+    /// следующую попытку с неё: исправный порт не открывается и не закрывается зря, а его
+    /// DTR/RTS не дёргаются каждый интервал переподключения. Остальным источникам метка
+    /// не нужна — они переподключаются сами и порядок сторон у них ни при чём.
+    fn connection_closed(&mut self, _by: ClosedBy) {}
+
     /// Пауза между закрытием соединения и следующей попыткой.
     ///
     /// Для TCP-клиента и COM-порта это интервал переподключения (FR-2, FR-9): после
@@ -690,6 +698,10 @@ impl Source {
                 // сессию прослушки (M5-AC5).
                 #[cfg(windows)]
                 let timer = TimerResolution::raise();
+                #[cfg(windows)]
+                let notes = monitor_start_notes(analyzer, lis, timer.as_ref());
+                #[cfg(not(windows))]
+                let notes = monitor_start_notes(analyzer, lis);
                 Ok(OpenedSource {
                     // Строка состояния называет порт анализатора: он же `peer` в `open`.
                     local: analyzer.port.clone(),
@@ -703,7 +715,7 @@ impl Source {
                         #[cfg(windows)]
                         _timer: timer,
                     }),
-                    notes: monitor_start_notes(analyzer, lis),
+                    notes,
                 })
             }
         }
@@ -1233,6 +1245,9 @@ async fn open_monitor_ports(
 ) -> Result<MonitorPair, (MonitorSide, io::Error)> {
     #[cfg(feature = "test-hooks")]
     if let Some(pair) = take_virtual_pair() {
+        for side in order {
+            record_attempt(side);
+        }
         let pair = pair.map_err(|error| (MonitorSide::Analyzer, error))?;
         // Окно открытия: тест отменяет `next` посреди него комментарием (M5-AC13).
         test_open_delay().await;
@@ -1242,12 +1257,14 @@ async fn open_monitor_ports(
         .validate()
         .map_err(|error| (MonitorSide::Analyzer, error))?;
     lis.validate().map_err(|error| (MonitorSide::Lis, error))?;
-    if analyzer.port.eq_ignore_ascii_case(&lis.port) {
+    if same_port(&analyzer.port, &lis.port) {
         return Err((MonitorSide::Lis, monitor_same_port_error(&analyzer.port)));
     }
     // Порядок открытия задаёт источник: первой идёт сторона, отказавшая в прошлый раз.
     let mut opened: [Option<Box<dyn Transport>>; 2] = [None, None];
     for side in order {
+        #[cfg(feature = "test-hooks")]
+        record_attempt(side);
         let settings = match side {
             MonitorSide::Analyzer => analyzer,
             MonitorSide::Lis => lis,
@@ -1290,6 +1307,36 @@ async fn test_open_delay() {
     if millis > 0 {
         tokio::time::sleep(Duration::from_millis(millis)).await;
     }
+}
+
+/// Один и тот же порт под разными записями (M5-AC3).
+///
+/// На Windows `\\.\COM3` — та же запись, что `COM3`, а регистр в именах COM не значит
+/// ничего. На Unix `/dev/serial/by-id/...` и `/dev/ttyUSB0` могут быть одной и той же
+/// ссылкой и целью: если оба пути существуют, сравниваются разрешённые ссылки. Несуществующие
+/// пути сравниваются как строки — открывать их всё равно нечего.
+fn same_port(analyzer: &str, lis: &str) -> bool {
+    /// Запись порта без префикса `\\.\` и без учёта регистра.
+    fn normalize(port: &str) -> String {
+        let port = port.trim();
+        port.strip_prefix(r"\\.\")
+            .unwrap_or(port)
+            .to_ascii_lowercase()
+    }
+    if normalize(analyzer) == normalize(lis) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        // `canonicalize` разрешает символические ссылки и относительные пути.
+        if let (Ok(analyzer), Ok(lis)) = (
+            std::fs::canonicalize(analyzer.trim()),
+            std::fs::canonicalize(lis.trim()),
+        ) {
+            return analyzer == lis;
+        }
+    }
+    false
 }
 
 /// Порядок открытия пары портов и память об отказавшей стороне (M5-AC5, NFR-5).
@@ -1385,6 +1432,16 @@ impl ConnectionSource for MonitorSource {
         reconnect_pause(self.retry)
     }
 
+    /// Сторона, чей порт отказал, открывается первой в следующей попытке (M5-AC5).
+    fn connection_closed(&mut self, by: ClosedBy) {
+        match by {
+            ClosedBy::Analyzer => self.order.failed(MonitorSide::Analyzer),
+            ClosedBy::Lis => self.order.failed(MonitorSide::Lis),
+            // Закрыл bytetap («Стоп», отказ журнала): отказ не порта, порядок не меняется.
+            ClosedBy::Bytetap => {}
+        }
+    }
+
     fn next(&mut self) -> Pin<Box<dyn Future<Output = Next> + Send + '_>> {
         Box::pin(async move {
             if let Some(pair) = self.pending.take() {
@@ -1434,7 +1491,7 @@ impl ConnectionSource for MonitorSource {
 /// миллисекунды» здесь не гарантия, а ожидание при поднятом разрешении; подробности — в
 /// дополнении к ADR 0002.
 #[cfg(windows)]
-pub struct TimerResolution;
+pub struct TimerResolution(());
 
 #[cfg(windows)]
 impl TimerResolution {
@@ -1442,11 +1499,50 @@ impl TimerResolution {
     pub const MILLIS: u32 = 1;
 
     /// Поднимает разрешение таймера; `None` — система отказала.
+    ///
+    /// Заодно процесс просит не применять к нему Windows 11 Power Throttling: на Windows 11
+    /// свёрнутое или фоновое окно может игнорировать поднятое разрешение таймера, а прослушка
+    /// работает как раз в фоне — интерфейс свёрнут, окно перекрыто, сессия идёт. Отказ этого
+    /// запроса не отменяет поднятое разрешение: на Windows 10 и на старых сборках вызова
+    /// просто нет, и это не ошибка.
     pub fn raise() -> Option<Self> {
         use windows_sys::Win32::Media::timeBeginPeriod;
 
         // SAFETY: вызов без указателей, `timeEndPeriod` в `Drop` парный этому вызову.
-        (unsafe { timeBeginPeriod(Self::MILLIS) } == 0).then_some(Self)
+        if unsafe { timeBeginPeriod(Self::MILLIS) } != 0 {
+            return None;
+        }
+        Self::ignore_power_throttling();
+        Some(Self(()))
+    }
+
+    /// Просит не глушить разрешение таймера в фоне (Windows 11), ошибку не возвращает.
+    fn ignore_power_throttling() {
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+            ProcessPowerThrottling, SetProcessInformation,
+        };
+
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            StateMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        };
+        // SAFETY: процесс свой, структура заполнена, размер — её собственный.
+        let process: HANDLE = unsafe { GetCurrentProcess() };
+        let size =
+            u32::try_from(std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>()).unwrap_or(0);
+        // SAFETY: `state` живёт до конца вызова; отказ ничего не ломает.
+        unsafe {
+            SetProcessInformation(
+                process,
+                ProcessPowerThrottling,
+                std::ptr::from_ref(&state).cast(),
+                size,
+            );
+        }
     }
 }
 
@@ -1482,17 +1578,25 @@ pub struct StartNote {
 }
 
 /// Замечания прослушки о старте: таймер Windows и линии управления (M5-AC5, М5-В3).
-fn monitor_start_notes(analyzer: &SerialSettings, lis: &SerialSettings) -> Vec<StartNote> {
+fn monitor_start_notes(
+    analyzer: &SerialSettings,
+    lis: &SerialSettings,
+    #[cfg(windows)] timer: Option<&TimerResolution>,
+) -> Vec<StartNote> {
     #[allow(unused_mut)]
     let mut notes = Vec::new();
+    // Замечание пишется только тогда, когда разрешение действительно поднято: иначе
+    // журнал обещал бы то, чего нет, и смоук искал бы ошибку не там.
     #[cfg(windows)]
-    notes.push(StartNote {
-        code: "timer_resolution",
-        message: format!(
-            "the system timer resolution is raised to {} ms for the monitor",
-            TimerResolution::MILLIS
-        ),
-    });
+    if timer.is_some() {
+        notes.push(StartNote {
+            code: "timer_resolution",
+            message: format!(
+                "the system timer resolution is raised to {} ms for the monitor",
+                TimerResolution::MILLIS
+            ),
+        });
+    }
     notes.extend(flow_notes(analyzer, lis));
     notes
 }
@@ -1596,12 +1700,40 @@ pub fn virtual_monitor(
     Ok((source, ends))
 }
 
+/// Порядок попыток открытия: так тест видит, с какой стороны начинается повтор.
+#[cfg(feature = "test-hooks")]
+static VIRTUAL_ATTEMPTS: Mutex<Vec<MonitorSide>> = Mutex::new(Vec::new());
+
 /// Тестовый хук: снимает виртуальные пары при выходе из теста.
 #[cfg(feature = "test-hooks")]
 pub fn reset_virtual_monitor() {
     VIRTUAL_ON.store(false, Ordering::Release);
     if let Ok(mut slot) = VIRTUAL_PAIRS.lock() {
         slot.clear();
+    }
+    if let Ok(mut attempts) = VIRTUAL_ATTEMPTS.lock() {
+        attempts.clear();
+    }
+}
+
+/// Тестовый хук: стороны в порядке попыток открытия пары (M5-AC5).
+///
+/// На виртуальной паре открытие мгновенное и обе стороны открываются всегда, поэтому
+/// порядок иначе не увидеть: по меткам видно, что повтор начался с отказавшей стороны.
+#[cfg(feature = "test-hooks")]
+#[must_use]
+pub fn virtual_monitor_attempts() -> Vec<MonitorSide> {
+    VIRTUAL_ATTEMPTS
+        .lock()
+        .map(|attempts| attempts.clone())
+        .unwrap_or_default()
+}
+
+/// Отмечает попытку открытия стороны.
+#[cfg(feature = "test-hooks")]
+fn record_attempt(side: MonitorSide) {
+    if let Ok(mut attempts) = VIRTUAL_ATTEMPTS.lock() {
+        attempts.push(side);
     }
 }
 
@@ -1649,6 +1781,46 @@ mod tests {
             client.settings("127.0.0.1:5000"),
             serde_json::json!({"connect": "127.0.0.1:5000", "reconnect_sec": 5})
         );
+    }
+
+    /// Записи одного и того же порта: `\\.\\COM3` и `COM3`, регистр, ссылка и цель (M5-AC3).
+    #[test]
+    fn one_port_has_several_spellings() {
+        assert!(same_port("COM3", "COM3"));
+        assert!(
+            same_port("COM3", "com3"),
+            "регистр в именах COM не значит ничего"
+        );
+        assert!(
+            same_port(r"\\.\COM3", "COM3"),
+            "префикс \\.\\ — та же запись порта"
+        );
+        assert!(same_port(" COM3 ", "com3"), "пробелы по краям не порт");
+        assert!(!same_port("COM3", "COM4"));
+        assert!(!same_port("/dev/ttyUSB0", "/dev/ttyUSB1"));
+        assert!(
+            !same_port("/dev/bytetap-no-such-port", "/dev/ttyUSB0"),
+            "несуществующие пути сравниваются как строки"
+        );
+    }
+
+    /// Ссылка и её цель — один порт: на Unix порт часто открывают через `/dev/serial/by-id`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_and_its_target_are_one_port() {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let target = dir.path().join("ttyUSB0");
+        std::fs::write(&target, b"").expect("файл порта");
+        let link = dir.path().join("by-id-port");
+        std::os::unix::fs::symlink(&target, &link).expect("ссылка");
+        assert!(same_port(
+            link.to_str().expect("путь"),
+            target.to_str().expect("путь")
+        ));
+        assert!(!same_port(
+            link.to_str().expect("путь"),
+            dir.path().join("ttyUSB1").to_str().expect("путь")
+        ));
     }
 
     /// Порядок открытия пары: первой идёт сторона, отказавшая в прошлый раз (M5-AC5).

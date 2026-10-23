@@ -53,7 +53,7 @@ use crate::journal::{
 use crate::responder::{Action, ControlIdSource, Now, Responder, ResponderEvent, ResponderKind};
 use crate::transport::{
     Connection, ConnectionSource, Link, Next, ProxyRole, ResetSocket, Source, Stage, Transport,
-    is_monitor_same_port, is_proxy_peer_rejected, is_proxy_target_is_self, rejected_peer,
+    is_proxy_peer_rejected, is_proxy_target_is_self, rejected_peer,
 };
 
 /// Сколько событий держат каналы подписчиков.
@@ -1103,11 +1103,6 @@ fn source_failure_code(mode: Mode, code: &'static str, error: &io::Error) -> &'s
     if is_proxy_target_is_self(error) {
         return "proxy_target_is_self";
     }
-    // Опечатка в настройке прослушки — свой код, а не «порт не поддерживает настройки»
-    // и не «порт занят»: второй `open` того же порта сказал бы именно это (M5-AC3).
-    if is_monitor_same_port(error) {
-        return "monitor_same_port";
-    }
     // Входящее с неразрешённого адреса — не сломанный приём: слушатель в порядке,
     // а отказано тому, кто пришёл (FR-8).
     if is_proxy_peer_rejected(error) {
@@ -1161,7 +1156,9 @@ async fn run(
     mut journal_failed: watch::Receiver<Option<JournalFailureReason>>,
     mut notes: mpsc::UnboundedReceiver<String>,
 ) -> io::Result<Stats> {
-    let mut tasks: JoinSet<()> = JoinSet::new();
+    // Задача соединения говорит, кто закрыл пару: источник прослушки начинает следующую
+    // попытку с отказавшей стороны (M5-AC5).
+    let mut tasks: JoinSet<Option<ClosedBy>> = JoinSet::new();
     let mut source_errors = SourceErrors::default();
     let sequential = source.sequential();
     let mut wait_before_next = false;
@@ -1230,17 +1227,19 @@ async fn run(
                     tasks.spawn(async move {
                         match link {
                             Some(link) => {
-                                serve_pair(
-                                    transport,
-                                    reset,
-                                    link,
-                                    conn,
-                                    shared,
-                                    &mut conn_stop,
-                                    &mut conn_failure,
-                                    close_policy(mode),
+                                Some(
+                                    serve_pair(
+                                        transport,
+                                        reset,
+                                        link,
+                                        conn,
+                                        shared,
+                                        &mut conn_stop,
+                                        &mut conn_failure,
+                                        close_policy(mode),
+                                    )
+                                    .await,
                                 )
-                                .await;
                             }
                             None => {
                                 let mut transport = transport;
@@ -1252,6 +1251,7 @@ async fn run(
                                     &mut conn_failure,
                                 )
                                 .await;
+                                None
                             }
                         }
                     });
@@ -1302,7 +1302,9 @@ async fn run(
                 }
             },
             joined = tasks.join_next(), if !tasks.is_empty() => {
-                let _ = joined;
+                if let Some(Ok(Some(by))) = joined {
+                    source.connection_closed(by);
+                }
                 if tasks.is_empty() && sequential {
                     wait_before_next = true;
                 }
@@ -1554,7 +1556,7 @@ async fn serve_pair(
     stop: &mut watch::Receiver<bool>,
     failure: &mut watch::Receiver<Option<JournalFailureReason>>,
     policy: ClosePolicy,
-) {
+) -> ClosedBy {
     // Принятая сторона — противоположная роли дальнего конца пары (FR-5).
     let accepted_role = link.role.opposite();
     let Link {
@@ -1655,6 +1657,7 @@ async fn serve_pair(
     drop(accepted_reset);
     drop(link_reset);
     shared.close_conn(conn, by, reason);
+    by
 }
 
 /// Итог насоса: кто закрыл пару, с какой причиной и сколько доживает обратное направление.

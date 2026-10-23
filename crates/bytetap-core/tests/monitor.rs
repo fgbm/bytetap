@@ -23,7 +23,7 @@ use bytetap_core::session::{Session, SessionConfig, SessionHandle};
 use bytetap_core::transport::serial::{Flow, SerialFormat, SerialSettings};
 use bytetap_core::transport::{
     MonitorSide, TEST_MONITOR_OPEN_DELAY_MS, VirtualMonitorEnds, is_monitor_same_port,
-    monitor_side, reset_virtual_monitor, virtual_monitor,
+    monitor_side, reset_virtual_monitor, virtual_monitor, virtual_monitor_attempts,
 };
 use bytetap_testkit::emulator::{Fragmentation, fragment_bounds, frame};
 use bytetap_testkit::fixtures_dir;
@@ -677,4 +677,52 @@ async fn a_comment_during_the_reopen_does_not_lose_the_pair() {
         })
         .collect();
     assert_eq!(conns, vec![1, 2], "вторая пара открылась один раз");
+}
+
+/// После разрыва посреди сессии повтор начинается с отказавшей стороны (M5-AC5).
+///
+/// Отказ стороны ЛИС запоминается меткой `close` (`by: lis`), и следующая попытка идёт
+/// с порта ЛИС: исправный порт анализатора не открывается и не закрывается зря, его
+/// DTR/RTS не дёргаются каждый интервал.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reopen_starts_from_the_side_that_failed() {
+    let _hook = HOOK.lock().await;
+    let _guard = HookGuard;
+    let dir = tempfile::tempdir().expect("временная папка");
+    let (handle, mut pairs) = start(dir.path(), 2).await;
+    let path = handle.journal_path().to_path_buf();
+
+    let mut first = pairs.remove(0);
+    let _ = send_and_receive(
+        &mut first.analyzer,
+        &mut first.lis,
+        b"ENQ",
+        Fragmentation::Whole,
+    )
+    .await;
+    assert_eq!(
+        virtual_monitor_attempts(),
+        vec![MonitorSide::Analyzer, MonitorSide::Lis],
+        "старт: анализатор, затем ЛИС"
+    );
+
+    // Отключён адаптер ЛИС: пара закрывается с `by: lis`.
+    drop(first.lis);
+    let closes = wait_for_closes(&path, 1).await;
+    assert_eq!(closes[0].by, ClosedBy::Lis);
+
+    wait_for_opens(&path, 2).await;
+    assert_eq!(
+        virtual_monitor_attempts(),
+        vec![
+            MonitorSide::Analyzer,
+            MonitorSide::Lis,
+            MonitorSide::Lis,
+            MonitorSide::Analyzer,
+        ],
+        "повтор начался с отказавшей стороны ЛИС"
+    );
+    drop(first.analyzer);
+    drop(pairs);
+    handle.stop().await.expect("остановка");
 }
