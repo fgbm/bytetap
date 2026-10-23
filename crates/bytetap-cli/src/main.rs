@@ -175,7 +175,7 @@ struct CaptureArgs {
     )]
     monitor: Option<String>,
     /// Вторая сторона пары: цель прокси `HOST:PORT` или имя порта ЛИС в прослушке
-    #[arg(long, value_name = "HOST:PORT | NAME")]
+    #[arg(long, value_name = "HOST:PORT | NAME", requires = "pair")]
     to: Option<String>,
     /// Топология прокси: `analyzer-client` — анализатор приходит сам,
     /// `analyzer-server` — bytetap подключается к анализатору
@@ -311,7 +311,7 @@ fn monitor_settings(
     args: &CaptureArgs,
     analyzer_port: &str,
     lis_port: &str,
-) -> (SerialSettings, SerialSettings, Flow) {
+) -> (SerialSettings, SerialSettings) {
     let baud = args.baud.unwrap_or(9600);
     let format = args.format.unwrap_or(SerialFormat::EIGHT_N_ONE);
     let flow = args.flow.unwrap_or(Flow::None);
@@ -327,7 +327,55 @@ fn monitor_settings(
     )
     .with_flow(args.to_flow.unwrap_or(flow))
     .with_lines(args.to_dtr.unwrap_or(dtr), args.to_rts.unwrap_or(rts));
-    (analyzer, lis, flow)
+    (analyzer, lis)
+}
+
+/// Строка старта прослушки: параметры обоих портов (M5-AC12).
+///
+/// Если скорость и формат совпадают, они называются один раз — так строка короче и
+/// совпадает с макетом; разные параметры видны у своего порта.
+fn monitor_start_line(analyzer: &SerialSettings, lis: &SerialSettings) -> String {
+    let flow = if analyzer.flow == lis.flow {
+        analyzer.flow.to_string()
+    } else {
+        format!("{} / {}", analyzer.flow, lis.flow)
+    };
+    if analyzer.baud == lis.baud && analyzer.format() == lis.format() {
+        return format!(
+            "Прослушка: {} ⇄ {} ({} {}, поток {flow})",
+            analyzer.port,
+            lis.port,
+            analyzer.baud,
+            analyzer.format()
+        );
+    }
+    format!(
+        "Прослушка: {} ({} {}) ⇄ {} ({} {}), поток {flow}",
+        analyzer.port,
+        analyzer.baud,
+        analyzer.format(),
+        lis.port,
+        lis.baud,
+        lis.format()
+    )
+}
+
+/// Предупреждение о потоке: в разрыве линии управления сквозь bytetap не идут (М5-В3).
+///
+/// Смотрится поток обоих портов, а не только общий: `--to-flow` включает аппаратный или
+/// программный поток второй стороны так же, как `--flow` — первой.
+fn flow_warning(analyzer: &SerialSettings, lis: &SerialSettings) -> Option<String> {
+    let sides: Vec<String> = [analyzer, lis]
+        .into_iter()
+        .filter(|settings| settings.flow != Flow::None)
+        .map(|settings| format!("{} — {}", settings.port, settings.flow))
+        .collect();
+    (!sides.is_empty()).then(|| {
+        format!(
+            "Предупреждение: поток {} сквозь bytetap не передаётся — CTS/DSR/DCD остаются линиями самих портов, а XON/XOFF драйвер съедает из обмена. В разрыве линии поток обычно выключают.",
+            sides.join(", ")
+        )
+    })
 }
 
 /// Ошибка аргументов: `--allow-from` другого семейства, чем `--proxy` (FR-8).
@@ -474,23 +522,16 @@ fn capture(args: CaptureArgs) -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
-            let (analyzer, lis, flow) = monitor_settings(&args, analyzer_port, &lis_port);
+            let (analyzer, lis) = monitor_settings(&args, analyzer_port, &lis_port);
             // Линии управления сквозь bytetap не передаются: поток и линии — свои у каждой
-            // стороны, и об этом надо сказать до записи (М5-В3, M5-AC5).
-            if flow != Flow::None {
-                warn!(
-                    "Предупреждение: поток {flow} не передаётся сквозь bytetap — CTS/DSR/DCD остаются линиями самих портов, а XON/XOFF драйвер съедает из обмена. В разрыве линии поток обычно выключают."
-                );
+            // стороны, и об этом надо сказать до записи (М5-В3, M5-AC5). То же замечание
+            // ядро пишет в журнал событием info с кодом control_flow_not_forwarded.
+            if let Some(problem) = flow_warning(&analyzer, &lis) {
+                warn!("{problem}");
             }
             let retry = Duration::from_secs(args.reconnect_sec.unwrap_or(5));
-            (
-                SessionConfig::com_monitor(analyzer, lis, retry),
-                format!(
-                    "Прослушка: {analyzer_port} ⇄ {lis_port} ({} {}, поток {flow})",
-                    args.baud.unwrap_or(9600),
-                    args.format.unwrap_or(SerialFormat::EIGHT_N_ONE)
-                ),
-            )
+            let line = monitor_start_line(&analyzer, &lis);
+            (SessionConfig::com_monitor(analyzer, lis, retry), line)
         }
         // clap требует ровно один источник: сюда не попадает ни один набор аргументов.
         (listen, connect, serial, proxy, monitor) => {
@@ -1479,15 +1520,21 @@ mod tests {
         assert_eq!(args.monitor.as_deref(), Some("COM3"));
         assert_eq!(args.to.as_deref(), Some("COM4"));
         assert!(args.responder.is_none());
-        let (analyzer, lis, flow) = monitor_settings(&args, "COM3", "COM4");
+        let (analyzer, lis) = monitor_settings(&args, "COM3", "COM4");
         assert_eq!(analyzer.port, "COM3");
         assert_eq!(analyzer.baud, 9600);
         assert_eq!(analyzer.format(), SerialFormat::EIGHT_N_ONE);
-        assert_eq!(flow, Flow::None);
+        assert_eq!(analyzer.flow, Flow::None);
         assert_eq!(lis.port, "COM4", "второй порт повторяет первый");
         assert_eq!(lis.baud, analyzer.baud);
         assert_eq!(lis.format(), analyzer.format());
         assert!(lis.dtr && lis.rts, "DTR и RTS по умолчанию подняты");
+        assert_eq!(
+            monitor_start_line(&analyzer, &lis),
+            "Прослушка: COM3 ⇄ COM4 (9600 8N1, поток none)",
+            "строка старта совпадает с планом, когда параметры общие"
+        );
+        assert_eq!(flow_warning(&analyzer, &lis), None, "потока нет — молчим");
 
         // Второй порт со своими скоростью и форматом: адаптеры бывают разные (М5-В2).
         let parsed = Cli::try_parse_from([
@@ -1514,16 +1561,21 @@ mod tests {
         let Command::Capture(args) = parsed.command else {
             panic!("ожидался capture");
         };
-        let (analyzer, lis, flow) = monitor_settings(&args, "COM3", "COM4");
+        let (analyzer, lis) = monitor_settings(&args, "COM3", "COM4");
         assert_eq!(analyzer.baud, 19200);
         assert_eq!(analyzer.format().to_string(), "7E2");
         assert_eq!(lis.baud, 9600);
         assert_eq!(lis.format().to_string(), "8N1");
-        assert_eq!(flow, Flow::XonXoff, "поток общий");
+        assert_eq!(analyzer.flow, Flow::XonXoff, "поток общий");
         assert_eq!(lis.flow, Flow::XonXoff, "второй порт наследует поток");
         assert!(!analyzer.dtr, "--dtr относится к обоим портам");
         assert!(!lis.dtr);
         assert!(lis.rts);
+        assert_eq!(
+            monitor_start_line(&analyzer, &lis),
+            "Прослушка: COM3 (19200 7E2) ⇄ COM4 (9600 8N1), поток xonxoff",
+            "разные параметры видны у своего порта"
+        );
 
         let config = SessionConfig::com_monitor(analyzer, lis, Duration::from_secs(5));
         assert_eq!(config.header_responder(), Autoresponder::None);
@@ -1540,6 +1592,22 @@ mod tests {
 
         let without_port = Cli::try_parse_from(["bytetap-cli", "capture", "--to", "COM4"]);
         assert!(without_port.is_err(), "--to без источника");
+
+        // `--to` принадлежит паре: у прослушивания и COM-порта второй стороны нет.
+        let listen_with_to = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--listen",
+            "0.0.0.0:5000",
+            "--responder",
+            "auto",
+            "--to",
+            "COM4",
+        ]);
+        assert!(
+            listen_with_to.is_err(),
+            "--to только с --proxy или --monitor"
+        );
 
         // Автоответчика в прослушке нет: `--responder` — ошибка аргументов (M5-AC4).
         let with_responder = Cli::try_parse_from([
@@ -1604,6 +1672,59 @@ mod tests {
             monitor_port(" /dev/ttyUSB1 ").as_deref(),
             Ok("/dev/ttyUSB1")
         );
+    }
+
+    /// Поток второй стороны тоже предупреждается: `--to-flow` действует так же (М5-В3).
+    #[test]
+    fn the_flow_warning_names_both_ports() {
+        let parsed = Cli::try_parse_from([
+            "bytetap-cli",
+            "capture",
+            "--monitor",
+            "COM3",
+            "--to",
+            "COM4",
+            "--to-flow",
+            "rtscts",
+        ])
+        .expect("поток второй стороны");
+        let Command::Capture(args) = parsed.command else {
+            panic!("ожидался capture");
+        };
+        let (analyzer, lis) = monitor_settings(&args, "COM3", "COM4");
+        assert_eq!(analyzer.flow, Flow::None);
+        assert_eq!(
+            lis.flow,
+            Flow::RtsCts,
+            "поток задан только для второго порта"
+        );
+        let warning = flow_warning(&analyzer, &lis).expect("предупреждение о потоке");
+        assert!(
+            warning.contains("COM4") && warning.contains("rtscts"),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains("COM3"),
+            "первый порт без потока: {warning}"
+        );
+        assert_eq!(
+            monitor_start_line(&analyzer, &lis),
+            "Прослушка: COM3 ⇄ COM4 (9600 8N1, поток none / rtscts)",
+            "разный поток виден у обоих портов"
+        );
+
+        // Оба порта с потоком: в предупреждении оба.
+        let both = flow_warning(
+            &port_with_flow("COM3", Flow::XonXoff),
+            &port_with_flow("COM4", Flow::RtsCts),
+        )
+        .expect("два потока");
+        assert!(both.contains("COM3") && both.contains("COM4"), "{both}");
+    }
+
+    /// Настройки порта с заданным потоком: для проверки предупреждения.
+    fn port_with_flow(port: &str, flow: Flow) -> SerialSettings {
+        SerialSettings::new(port, 9600, SerialFormat::EIGHT_N_ONE).with_flow(flow)
     }
 
     #[test]

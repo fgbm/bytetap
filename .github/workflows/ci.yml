@@ -93,13 +93,17 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --no-fail-fast
 
+      # Функциональные pty-тесты: COM «вместо ЛИС» и прослушка двух портов.
+      # Замер задержки (`the_monitor_latency...`) на каждом push не гоняется: пороги
+      # времени на общем раннере дают ложные падения. Он остаётся `#[ignore]` и
+      # запускается вручную (docs/dev/testing.md).
       - name: COM-тесты на pty (socat)
         if: runner.os == 'Linux'
         env:
           BYTETAP_REQUIRE_SOCAT: "1"
         run: |
           cargo test -p bytetap-core --test serial -- --ignored
-          cargo test -p bytetap-core --test monitor_pty -- --ignored
+          cargo test -p bytetap-core --test monitor_pty -- --ignored --skip the_monitor_latency
 
       # Эталоны снимков и, при расхождении, *.new.png и *.diff.png egui_kittest.
       - name: Снимки интерфейса
