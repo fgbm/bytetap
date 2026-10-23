@@ -29,6 +29,7 @@ export default defineConfig({
             { text: "SmartScreen и антивирусы", link: "/guide/smartscreen" },
             { text: "Первый запуск", link: "/guide/first-run" },
             { text: "Режимы работы", link: "/guide/modes" },
+            { text: "Копирование из ленты", link: "/guide/copying" },
             { text: "Запуск из командной строки", link: "/guide/cli" },
             { text: "Брандмауэр", link: "/guide/firewall" },
             { text: "Персональные данные", link: "/guide/personal-data" },

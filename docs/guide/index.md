@@ -6,6 +6,7 @@
 - [SmartScreen и антивирусы](/guide/smartscreen)
 - [Первый запуск](/guide/first-run)
 - [Режимы работы](/guide/modes)
+- [Копирование из ленты](/guide/copying)
 - [Запуск из командной строки](/guide/cli)
 - [Брандмауэр](/guide/firewall)
 - [Персональные данные](/guide/personal-data)
