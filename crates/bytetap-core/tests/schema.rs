@@ -228,6 +228,85 @@ fn a_proxy_pair_validates_against_the_schema() {
 }
 
 #[test]
+fn a_monitor_pair_validates_against_the_schema() {
+    let schema = schema(2);
+    let validator = jsonschema::validator_for(&schema).expect("схема проверяется движком");
+    // Прослушка пишет те же поля, что прокси, только именами портов: новых обязательных
+    // полей нет, версия формата остаётся `/2` (M5-В6, M5-AC6).
+    let header = Session::new(
+        Mode::ComMonitor,
+        Autoresponder::None,
+        json!({
+            "analyzer": {"port": "COM3", "baud": 9600, "format": "8N1", "flow": "none", "dtr": true, "rts": true},
+            "lis": {"port": "COM4", "baud": 9600, "format": "8N1", "flow": "none", "dtr": true, "rts": true},
+        }),
+        Host::current(),
+    );
+    let events = [
+        Event::Session(header),
+        Event::Open(Open {
+            t: bytetap_core::journal::now_rfc3339(),
+            mono_us: 1000,
+            conn: 1,
+            peer: "COM3".to_owned(),
+            local: String::new(),
+            link: Some(Link {
+                role: LinkRole::Lis,
+                peer: "COM4".to_owned(),
+                local: String::new(),
+            }),
+        }),
+        Event::Data(Data::new(
+            bytetap_core::journal::now_rfc3339(),
+            2000,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            b"\x05",
+        )),
+        Event::Data(Data::new(
+            bytetap_core::journal::now_rfc3339(),
+            3000,
+            1,
+            Dir::LisToAnalyzer,
+            false,
+            b"\x06",
+        )),
+        Event::Error(ErrorEvent {
+            t: bytetap_core::journal::now_rfc3339(),
+            mono_us: 4000,
+            conn: Some(1),
+            code: Some("connection_read_failed".to_owned()),
+            peer: None,
+            message: "monitor read failed: serial port COM4 is disconnected (os error 5)"
+                .to_owned(),
+        }),
+        Event::Close(Close {
+            t: bytetap_core::journal::now_rfc3339(),
+            mono_us: 5000,
+            conn: 1,
+            by: ClosedBy::Lis,
+            reason: "error".to_owned(),
+        }),
+        Event::SessionEnd(SessionEnd {
+            t: bytetap_core::journal::now_rfc3339(),
+            mono_us: 6000,
+            stats: Stats {
+                connections: 1,
+                bytes_analyzer_to_lis: 1,
+                bytes_lis_to_analyzer: 1,
+            },
+        }),
+    ];
+    for event in events {
+        let value = serde_json::to_value(&event).expect("сериализация");
+        if let Err(error) = validator.validate(&value) {
+            panic!("событие {} не прошло схему: {error}\n{value}", event.kind());
+        }
+    }
+}
+
+#[test]
 fn the_v1_fixture_reads_and_validates_against_the_v1_schema() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/journal/minimal.jsonl");
