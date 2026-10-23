@@ -210,7 +210,10 @@
     "copyRowsHex": "Скопировать выделенные строки как HEX ({count})",
     "copyRowsBase64": "Скопировать выделенные строки как Base64 ({count})",
     "clearSelection": "Снять выделение",
-    "copyLimited": "в буфер вошло {copied} строк из {total} — предел копирования",
+    "copyLimited": "в буфер вошло {copied} из {total} — предел копирования",
+    "rowsOne": "строка",
+    "rowsFew": "строки",
+    "rowsMany": "строк",
     "openedPair": "#{conn} открыто: {from} → {to}",
     "closedPairLis": "#{conn} ЛИС закрыла соединение",
     "closedPairAnalyzer": "#{conn} анализатор закрыл соединение",
@@ -226,7 +229,8 @@
     "close": "Закрыть панель",
     "field": "Фрагмент",
     "resize": "Высота панели",
-    "hintText": "Выделение мышью внутри фрагмента, Ctrl+C — только выделенное; Ctrl+A — весь фрагмент",
+    "hintText": "Клик по полю — выделение текста; Ctrl+A и Ctrl+C без фокуса в поле работают с лентой",
+    "hintTextFocused": "В поле: Ctrl+A — весь фрагмент, Ctrl+C — выделенное",
     "hintHex": "Клик — строка дампа, Shift+клик — диапазон; Ctrl+C — выделенные строки, Ctrl+A — весь дамп",
     "evicted": "Событие вытеснено из ленты — показан прочитанный текст"
   },
@@ -285,8 +289,7 @@
     "rowPending": "…",
     "rowUnreadable": "Строка не прочитана: страница журнала не читается",
     "copyWaiting": "читаю строки журнала: {count}",
-    "copyDone": "скопировано {copied} из {total} строк",
-    "copySkipped": "скопировано {copied} из {total} строк, не прочитано: {skipped}"
+    "copySkipped": "скопировано {copied} из {total}, не прочитано: {skipped}"
   },
   "trace": {
     "a2l": "анализатор → ЛИС",

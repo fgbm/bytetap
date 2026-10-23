@@ -179,6 +179,11 @@ impl Details {
         self.tab
     }
 
+    /// В дампе HEX что-то выделено: там Ctrl+C принадлежит панели, а не ленте.
+    pub fn has_hex_selection(&self) -> bool {
+        self.hex.is_some()
+    }
+
     pub fn height(&self) -> f32 {
         self.height
     }
@@ -753,10 +758,16 @@ fn body(ui: &mut Ui, p: &Palette, details: &mut Details, panel: &Panel<'_>, plac
         _ => text_body(&mut content_ui, p, details, panel),
     }
     // Подсказка внизу — как в макете; вытеснение из ленты её заменяет (Л-В6).
+    // Подсказка про клавиши зависит от того, кому они сейчас принадлежат: в поле
+    // фокуса Ctrl+A и Ctrl+C работают с фрагментом, а без фокуса — с лентой
+    // (находка m2 ревью шага 2).
+    let field_focused = ui.ctx().memory(|memory| memory.focused()) == Some(field_id());
     let (text, color) = if details.evicted() {
         (t!("details.evicted"), p.warn)
     } else if details.tab == Tab::Hex {
         (t!("details.hintHex"), p.text_faint)
+    } else if field_focused {
+        (t!("details.hintTextFocused"), p.text_faint)
     } else {
         (t!("details.hintText"), p.text_faint)
     };

@@ -314,10 +314,11 @@ impl RecordingView {
     /// соединения: тогда сосед ищется по номеру — первое событие правее или левее его,
     /// а не «следующая строка после несуществующей».
     ///
-    /// `extend` — Shift: к выделению добавляется диапазон от якоря до соседа, а не
-    /// выбирается одна строка (L1, шаг 2).
+    /// `extend` — Shift: диапазон от якоря до соседа заменяет прежний, как в Проводнике
+    /// (L1, шаг 2, решение владельца). Курсор — выбранное событие, а при закрытой панели
+    /// якорь выделения: после Ctrl+A стрелки ходят от него.
     pub fn step_selection(&mut self, step: i32, extend: bool) {
-        let Some(key) = self.details.key() else {
+        let Some(key) = self.details.key().or_else(|| self.selection.anchor()) else {
             return;
         };
         let keys: Vec<u64> = self
@@ -344,12 +345,31 @@ impl RecordingView {
         };
         if extend {
             self.selection.extend(seq);
+            self.narrow_selection();
         } else {
             self.selection.click(seq);
         }
         self.copy_notice = None;
-        self.details.open(seq, event);
+        // Панель переезжает на соседа только когда она открыта: стрелки при закрытой
+        // панели двигают выделение, а не открывают панель под руками.
+        if self.details.is_open() {
+            self.details.open(seq, event);
+        }
         self.jump_row = self.rows.row_of(seq);
+    }
+
+    /// Сужение выделения до строк, которые проходят фильтр соединения.
+    ///
+    /// Shift+клик и Shift+стрелки строят диапазон по номерам событий, а фильтр прячет
+    /// часть строк: спрятанная строка не должна ни считаться выделенной, ни попадать в
+    /// буфер (находка M1 ревью шага 2).
+    fn narrow_selection(&mut self) {
+        let filter = self.filter;
+        let feed = &self.feed;
+        self.selection.retain(|seq| {
+            feed.get(seq)
+                .is_some_and(|event| feed::passes(event, filter))
+        });
     }
 
     /// Снять выбор и выделение, вернуть следование за концом ленты (Esc и «×» панели,
@@ -370,9 +390,18 @@ impl RecordingView {
         self.selection.count()
     }
 
-    /// Строки выделения по порядку: только те, что ещё в кольце.
+    /// Выделение для тестов и смоуков: экран не открывает его само, а проверять
+    /// вытеснение и сужение удобнее без сотни кликов.
+    pub fn selection_mut(&mut self) -> &mut Selection {
+        &mut self.selection
+    }
+
+    /// Строки выделения по порядку: только те, что ещё в кольце и проходят фильтр.
     fn selected_events(&self) -> impl Iterator<Item = &Arc<FeedEvent>> {
-        self.selection.seqs().filter_map(|seq| self.feed.get(seq))
+        self.selection
+            .seqs()
+            .filter_map(|seq| self.feed.get(seq))
+            .filter(|event| feed::passes(event, self.filter))
     }
 
     /// Ctrl+C по выделенным строкам: «время → #1 текст», по строке на событие.
@@ -1508,7 +1537,12 @@ fn feed_list(
     let feed_keys = !ui.ctx().text_edit_focused() && !details::resizer_focused(ui);
     // Ctrl+A и Ctrl+C — те же клавиши у панели: поле забирает их фокусом, вкладка HEX —
     // целиком, потому что там они выделяют и копируют строки дампа (L1-AC5, L1-AC6).
-    let copy_keys = feed_keys && rec.details.tab() != details::Tab::Hex;
+    let hex_panel = rec.details.is_open() && rec.details.tab() == details::Tab::Hex;
+    let select_keys = feed_keys && !hex_panel;
+    // Исключение — блок строк на открытой «HEX»: Ctrl+C отдаётся ленте, если выделено
+    // больше одной строки и в дампе ничего не выделено (находка M2 ревью шага 2).
+    let copy_keys = feed_keys
+        && (!hex_panel || (rec.selection.count() > 1 && !rec.details.has_hex_selection()));
     if feed_keys && (rec.details.is_open() || !rec.selection.is_empty()) {
         let (step, extend) = ui.input_mut(|input| {
             if input.consume_key(Modifiers::SHIFT, Key::ArrowUp) {
@@ -1629,37 +1663,48 @@ fn feed_list(
     });
     rec.offset = output.state.clamped_offset().y;
     rec.max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
-    if copy_keys {
-        // Ctrl+A — видимые строки: выделение за пределы экрана egui не переживает, а
-        // «всё, что я вижу» — предсказуемое действие (Л-В3). Дальше по ленте выделяют
-        // Shift+кликом: выделение живёт в номерах событий и прокрутку переживает.
-        if ui.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::A)) {
-            rec.selection.select_all(visible);
-            rec.copy_notice = None;
-        }
-        // Ctrl+C по выделенным строкам: его забирает лента, и панель этого события уже
-        // не увидит — иначе Ctrl+C положил бы в буфер два разных текста.
-        if !rec.selection.is_empty() && ui.input(|input| input.events.contains(&egui::Event::Copy))
-        {
-            ui.input_mut(|input| {
-                input
-                    .events
-                    .retain(|event| !matches!(event, egui::Event::Copy));
-            });
-            rec.copy_selection(ui, CopyKind::Text, encoding);
-        }
+    // Ctrl+A — видимые строки: выделение за пределы экрана egui не переживает, а
+    // «всё, что я вижу» — предсказуемое действие (Л-В3). Дальше по ленте выделяют
+    // Shift+кликом: выделение живёт в номерах событий и прокрутку переживает.
+    if select_keys && ui.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::A)) {
+        rec.selection.select_all(visible);
+        rec.copy_notice = None;
+    }
+    // Ctrl+C по выделенным строкам: его забирает лента, и панель этого события уже
+    // не увидит — иначе Ctrl+C положил бы в буфер два разных текста.
+    if copy_keys
+        && !rec.selection.is_empty()
+        && ui.input(|input| input.events.contains(&egui::Event::Copy))
+    {
+        ui.input_mut(|input| {
+            input
+                .events
+                .retain(|event| !matches!(event, egui::Event::Copy));
+        });
+        rec.copy_selection(ui, CopyKind::Text, encoding);
     }
     if let Some((seq, event, rect)) = clicked {
         let modifiers = ui.input(|input| input.modifiers);
-        if modifiers.command {
-            // Ctrl+клик: строка отмечается или снимается, панель показывает отмеченную.
+        if modifiers.command && modifiers.shift {
+            // Ctrl+Shift+клик: диапазон от якоря добавляется к уже выделенному.
+            rec.selection.extend_add(seq);
+            rec.narrow_selection();
+            rec.details.open(seq, event);
+            if !was_open {
+                rec.reveal = Some(rect);
+            }
+        } else if modifiers.command {
+            // Ctrl+клик: строка отмечается или снимается, а курсор и панель переезжают
+            // на неё — как в Проводнике, даже когда строку сняли (находка m4).
             rec.selection.toggle(seq);
-            if rec.selection.contains(seq) {
-                rec.details.open(seq, event);
+            rec.details.open(seq, event);
+            if !was_open {
+                rec.reveal = Some(rect);
             }
         } else if modifiers.shift {
-            // Shift+клик: диапазон от якоря, панель показывает последнюю добавленную.
+            // Shift+клик: диапазон от якоря заменяет прежний, база Ctrl-отметок остаётся.
             rec.selection.extend(seq);
+            rec.narrow_selection();
             rec.details.open(seq, event);
             if !was_open {
                 rec.reveal = Some(rect);
