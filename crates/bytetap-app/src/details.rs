@@ -351,10 +351,12 @@ pub fn meta_line(event: &FeedEvent, pair: Pair, encoding: Encoding) -> String {
             let (_, text) = feedrows::row_text(event, pair);
             let mut lead = event.time.clone();
             if let Some(conn) = event.conn {
-                if !lead.is_empty() {
+                // У служебных строк номер соединения уже в тексте: «10:15:03.000 ·
+                // #1 подключился 192.168.1.51:49152», без второго «#1».
+                if !lead.is_empty() && !text.starts_with(&format!("#{conn}")) {
                     lead.push(' ');
+                    lead.push_str(&format!("#{conn}"));
                 }
-                lead.push_str(&format!("#{conn}"));
             }
             if !lead.is_empty() {
                 parts.push(lead);
@@ -1005,7 +1007,7 @@ mod tests {
         };
         assert_eq!(
             meta_line(&open, Pair::None, Encoding::Cp1251),
-            "10:15:03.000 #1 · #1 подключился 192.168.1.51:49152"
+            "10:15:03.000 · #1 подключился 192.168.1.51:49152"
         );
     }
 

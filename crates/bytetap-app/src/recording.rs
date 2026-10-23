@@ -288,6 +288,10 @@ impl RecordingView {
     }
 
     /// Соседнее событие для ↑/↓: по ленте с учётом фильтра соединения.
+    ///
+    /// Выбранное событие могло уйти из ленты (вытеснение) или спрятаться фильтром
+    /// соединения: тогда сосед ищется по номеру — первое событие правее или левее его,
+    /// а не «следующая строка после несуществующей».
     pub fn step_selection(&mut self, step: i32) {
         let Some(key) = self.details.key() else {
             return;
@@ -298,14 +302,19 @@ impl RecordingView {
             .filter(|(_, event)| feed::passes(event, self.filter))
             .map(|(seq, _)| seq)
             .collect();
-        let Some(index) = keys.iter().position(|seq| *seq == key) else {
+        // Первое событие с номером не меньше выбранного: у выбранного это он сам.
+        let at = keys.partition_point(|seq| *seq < key);
+        let next = if step > 0 {
+            at + usize::from(keys.get(at) == Some(&key))
+        } else {
+            let Some(previous) = at.checked_sub(1) else {
+                return;
+            };
+            previous
+        };
+        let Some(&seq) = keys.get(next) else {
             return;
         };
-        let next = index as i64 + i64::from(step);
-        if next < 0 || next as usize >= keys.len() {
-            return;
-        }
-        let seq = keys[next as usize];
         let Some(event) = self.feed.get(seq).cloned() else {
             return;
         };
@@ -1614,6 +1623,31 @@ mod tests {
         live::lock(&shared).push(data(2, 1));
         view.sync(false);
         assert_eq!(view.pending(), 1);
+    }
+
+    /// Выбранное событие спрятал фильтр: ↑/↓ находят соседа по номеру, а не молчат.
+    #[test]
+    fn the_selection_steps_from_a_row_the_filter_hides() {
+        let shared = SharedFeed::default();
+        let mut view = RecordingView::new(
+            Arc::clone(&shared),
+            AppConfig::with_log_dir(""),
+            String::new(),
+        );
+        for conn in [1, 2, 1, 2, 1] {
+            live::lock(&shared).push(data(conn, 1));
+        }
+        view.sync(false);
+        // Выбрано событие 1 (соединение 2), фильтр оставляет только соединение 1.
+        view.details.open(1, data(2, 1));
+        view.set_filter(Some(1));
+        assert_eq!(view.rows(), 3, "в ленте события 0, 2 и 4");
+        view.step_selection(1);
+        assert_eq!(view.details.key(), Some(2), "следующее видимое — 2");
+        view.step_selection(-1);
+        assert_eq!(view.details.key(), Some(0), "предыдущее видимое — 0");
+        view.step_selection(-1);
+        assert_eq!(view.details.key(), Some(0), "левее выбора нет");
     }
 
     #[test]

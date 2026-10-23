@@ -18,7 +18,11 @@ use bytetap_app::background::Interface;
 use bytetap_app::live::{FRAME, FRAME_SLOWEST, Phase};
 use bytetap_app::settings::{SessionMode, Settings};
 use bytetap_app::{BytetapApp, Fixtures, Screen};
-use egui_kittest::{Harness, kittest::Queryable as _};
+use eframe::egui::{self, Key, Modifiers};
+use egui_kittest::{
+    Harness,
+    kittest::{NodeT as _, Queryable as _},
+};
 
 const LOG_DIR: &str = r"C:\Users\operator\Documents\bytetap";
 const WINDOW: (f32, f32) = (1200.0, 800.0);
@@ -249,8 +253,9 @@ fn frame_cost_probe() {
 ///
 /// Запуск руками: `cargo test -p bytetap-app --test performance -- --ignored --nocapture`.
 /// В CI не идёт: время кадра зависит от машины. Панель показывает полный фрагмент, а не
-/// первые 2048 байт, поэтому кадр меряется на вкладке «Текст» (раскладка 10 000 глифов)
-/// и на вкладке «HEX» (1024 строки дампа).
+/// первые 2048 байт, поэтому кадр меряется на вкладке «Текст» и на вкладке «HEX» (1024
+/// строки дампа). Худшее состояние — фокус в поле и Ctrl+A: выделен весь фрагмент; оно
+/// меряется и с чтением дерева AccessKit каждый кадр, как это делает диктор.
 #[test]
 #[ignore = "профиль машины, не проверка"]
 fn details_panel_frame_cost() {
@@ -267,11 +272,20 @@ fn details_panel_frame_cost() {
                 .with_recording_fixture(control_fixture(rows))
         });
     harness.run_steps(6);
-    let measure = |harness: &mut Harness<'static, BytetapApp>, label: &str| {
+    // Чтение дерева AccessKit в каждом кадре: диктор обходит узлы, и это тоже цена кадра.
+    let measure = |harness: &mut Harness<'static, BytetapApp>, label: &str, reader: bool| {
         let mut times = Vec::new();
         for _ in 0..30 {
             let started = Instant::now();
             harness.step();
+            if reader {
+                let nodes: Vec<_> = harness
+                    .root()
+                    .children_recursive()
+                    .map(|node| node.accesskit_node().role())
+                    .collect();
+                std::hint::black_box(nodes);
+            }
             times.push(started.elapsed());
         }
         times.sort_unstable();
@@ -281,20 +295,69 @@ fn details_panel_frame_cost() {
             times[times.len() - 1]
         );
     };
-    measure(&mut harness, "панель закрыта, 10 000 строк");
+    measure(&mut harness, "панель закрыта, 10 000 строк", false);
     let row = harness
         .get_all_by_label_contains("CTRL16K")
         .next()
-        .expect("строка длинного фрагмента");
-    row.click();
+        .expect("строка длинного фрагмента")
+        .rect();
+    click_at(&mut harness, row.center());
     harness.run_steps(4);
+    let text = harness
+        .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+        .next()
+        .expect("поле панели")
+        .accesskit_node()
+        .value()
+        .unwrap_or_default();
+    eprintln!("фрагмент в поле: {} символов", text.chars().count());
     measure(
         &mut harness,
         "панель открыта, «Текст», 16 КБ управляющих байт",
+        false,
+    );
+    // Худшее состояние: фокус в поле и выделен весь фрагмент (Ctrl+A).
+    click_at(&mut harness, row.center());
+    harness.run_steps(2);
+    let field = harness
+        .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+        .next()
+        .expect("поле панели")
+        .rect();
+    click_at(&mut harness, field.center());
+    harness.run_steps(2);
+    harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    harness.run_steps(2);
+    measure(&mut harness, "«Текст», Ctrl+A на всём фрагменте", false);
+    measure(
+        &mut harness,
+        "«Текст», Ctrl+A и чтение дерева AccessKit",
+        true,
     );
     harness.get_by_label("HEX").click();
     harness.run_steps(4);
-    measure(&mut harness, "панель открыта, «HEX», 16 КБ");
+    measure(&mut harness, "панель открыта, «HEX», 16 КБ", false);
+}
+
+/// Клик мышью: указатель сперва встаёт на место, и только следующий кадр нажимает —
+/// иначе прокрутка ленты видит рывок указателя и уезжает по инерции.
+fn click_at(harness: &mut Harness<'static, BytetapApp>, at: egui::Pos2) {
+    harness.event(egui::Event::PointerMoved(at));
+    harness.run_steps(1);
+    harness.event(egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Modifiers::NONE,
+    });
+    harness.run_steps(1);
+    harness.event(egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    harness.run_steps(1);
 }
 
 /// Запись из `rows` событий; последнее — 16 КБ управляющих байтов (худший случай).

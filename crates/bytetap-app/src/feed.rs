@@ -848,16 +848,27 @@ pub fn detect(event: &FeedEvent) -> Option<Detected> {
 /// (MLLP, первый байт `0x0B`) это девятое поле первого сегмента `MSH`, у ASTM и
 /// произвольного текста типа сообщения нет — там `None`, а не догадка.
 ///
-/// Поля HL7 — ASCII, поэтому байты до конца первого сегмента читаются как ASCII без
-/// кодировки: кириллица в MSH-9 не встречается, а декодировать весь фрагмент в панели
-/// незачем.
+/// Разделитель полей берётся из самого сообщения — MSH-1, символ сразу после `MSH`;
+/// стандартный `|` — только его частный случай. Поля HL7 — ASCII, поэтому границы
+/// полей считаются по байтам, и в UTF-8 обязан быть лишь сам MSH-9: кириллица в
+/// данных сегмента подпись не ломает.
 pub fn message_type(data: &DataPayload) -> Option<String> {
     let bytes = data.bytes.strip_prefix(b"\x0b")?;
     let end = bytes.iter().position(|&b| b < 0x20).unwrap_or(bytes.len());
-    let header = std::str::from_utf8(&bytes[..end]).ok()?;
-    let msh = header.strip_prefix("MSH")?;
-    let field = msh.split('|').nth(8)?;
-    let field = field.trim();
+    let segment = &bytes[..end];
+    let msh = segment.strip_prefix(b"MSH")?;
+    let (&separator, fields) = msh.split_first()?;
+    // Девятое поле: MSH-2 … MSH-9, считая от разделителя после `MSH`.
+    let mut rest = fields;
+    for _ in 0..7 {
+        let at = rest.iter().position(|&b| b == separator)?;
+        rest = &rest[at + 1..];
+    }
+    let at = rest
+        .iter()
+        .position(|&b| b == separator)
+        .unwrap_or(rest.len());
+    let field = std::str::from_utf8(&rest[..at]).ok()?.trim();
     (!field.is_empty()).then(|| field.to_owned())
 }
 
@@ -1196,6 +1207,18 @@ mod tests {
         assert_eq!(
             message_type(&data(
                 "\x0bMSH|^~\\&|A|B|C|D|E||ORU^R01|X\rOBX||Глюкоза\r".as_bytes()
+            )),
+            Some("ORU^R01".to_owned())
+        );
+        // Разделитель полей — MSH-1, а не всегда «|»: «#» вместо него тоже годится.
+        assert_eq!(
+            message_type(&data(b"\x0bMSH#^~\\&#A#B#C#D#E##ORU^R01#X\r")),
+            Some("ORU^R01".to_owned())
+        );
+        // Не UTF-8 в данных сегмента подпись не ломает: важно только само MSH-9.
+        assert_eq!(
+            message_type(&data(
+                b"\x0bMSH|^~\\&|A|B|C|D|E||ORU^R01|X\rOBX|1||\xff\xfe\r"
             )),
             Some("ORU^R01".to_owned())
         );
