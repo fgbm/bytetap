@@ -10,7 +10,7 @@
 //! слушает: механика у сторон одна, различаются только `by`, `dir` и адреса (M4-AC5).
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -28,6 +28,12 @@ use tokio::time::{sleep, timeout};
 
 /// Пауза прокси после неудачного подключения к цели.
 const RETRY: Duration = Duration::from_millis(100);
+
+/// Сколько раз тест собирает пару: на общем loopback `connect` изредка получает сброс.
+const PAIR_ATTEMPTS: usize = 5;
+
+/// Сколько тест ждёт `open` пары: он пишется сразу, как обе стороны на месте.
+const OPEN_WAIT: Duration = Duration::from_secs(2);
 
 /// Сколько тест ждёт события или обмена.
 const WAIT: Duration = Duration::from_secs(10);
@@ -138,17 +144,59 @@ fn accepted_role(role: ProxyRole) -> LinkRole {
     role.target_role().opposite()
 }
 
-/// Пара целиком: принятая сторона пришла, прокси подключился к цели.
+/// Сессия с журналом и пара целиком: принятая сторона пришла, прокси подключился к цели.
 ///
-/// Возвращает оба конца пары. Тесту всё равно, анализатор это или ЛИС: он закрывает
-/// сторону по её роли.
-async fn pair(listener: &TcpListener, listen: SocketAddr) -> (TcpStream, TcpStream) {
-    let accepted = TcpStream::connect(listen).await.expect("принятая сторона");
-    let (target, _) = timeout(WAIT, listener.accept())
-        .await
-        .expect("прокси подключился к цели")
-        .expect("приём цели");
-    (accepted, target)
+/// Тесту всё равно, анализатор это или ЛИС: он закрывает сторону по её роли. Признак
+/// собранной пары — `open` в журнале: если подключение к цели не удалось (на общем
+/// loopback `connect` изредка получает сброс — `proxy_connect_failed`), прокси закрывает
+/// принятую сторону и ждёт следующее входящее, а `accept` отдаёт тесту сброшенное
+/// соединение. Такую попытку тест выбрасывает вместе с её сессией и собирает пару заново.
+async fn pair_with_session(
+    role: ProxyRole,
+) -> (
+    tempfile::TempDir,
+    SessionHandle,
+    PathBuf,
+    TcpStream,
+    TcpStream,
+) {
+    for _ in 0..PAIR_ATTEMPTS {
+        let dir = tempfile::tempdir().expect("временная папка");
+        let (listener, target_addr) = target_listener().await;
+        let handle = start(dir.path(), target_addr, role).await;
+        let listen = listen_addr(&handle);
+        let path = handle.journal_path().to_path_buf();
+        let accepted = TcpStream::connect(listen).await.expect("принятая сторона");
+        let Ok(Ok((target, _))) = timeout(WAIT, listener.accept()).await else {
+            panic!("прокси подключился к цели");
+        };
+        // Слушатель цели больше не нужен: соединение уже установлено.
+        drop(listener);
+        if wait_for_open(&path).await {
+            return (dir, handle, path, accepted, target);
+        }
+        drop(target);
+        drop(accepted);
+        let _ = handle.stop().await;
+    }
+    panic!("пара не собралась за {PAIR_ATTEMPTS} попыток: прокси не подключился к цели");
+}
+
+/// Ждёт `open` первой пары: он пишется, когда обе стороны на месте.
+async fn wait_for_open(path: &Path) -> bool {
+    let deadline = Instant::now() + OPEN_WAIT;
+    while Instant::now() <= deadline {
+        let outcome = read_all(path).expect("журнал читается");
+        if outcome
+            .lines
+            .iter()
+            .any(|line| matches!(line.event, Event::Open(_)))
+        {
+            return true;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    false
 }
 
 /// Ждёт событие `close` пары и возвращает его.
@@ -550,13 +598,7 @@ async fn the_other_side_answers_after_the_half_close() {
     let request = fixture("analyzer_qry_q02.hl7");
     let answer = fixture("lis_ack_aa.hl7");
     for role in ROLES {
-        let dir = tempfile::tempdir().expect("временная папка");
-        let (listener, target_addr) = target_listener().await;
-        let handle = start(dir.path(), target_addr, role).await;
-        let listen = listen_addr(&handle);
-        let path = handle.journal_path().to_path_buf();
-
-        let (mut accepted, mut target) = pair(&listener, listen).await;
+        let (_dir, handle, path, mut accepted, mut target) = pair_with_session(role).await;
         accepted.write_all(&request).await.expect("запрос");
         accepted.shutdown().await.expect("FIN принятой стороны");
 
@@ -592,12 +634,7 @@ async fn either_side_closing_is_recorded_as_that_side() {
     // `close` один раз на пару, `by` — сторона, закрывшая первой (M4-AC5).
     for role in ROLES {
         for by_target in [false, true] {
-            let dir = tempfile::tempdir().expect("временная папка");
-            let (listener, target_addr) = target_listener().await;
-            let handle = start(dir.path(), target_addr, role).await;
-            let listen = listen_addr(&handle);
-            let path = handle.journal_path().to_path_buf();
-            let (mut accepted, mut target) = pair(&listener, listen).await;
+            let (_dir, handle, path, mut accepted, mut target) = pair_with_session(role).await;
 
             let closer_role = if by_target {
                 role.target_role()
@@ -636,12 +673,7 @@ async fn a_reset_closes_the_pair_as_the_resetting_side() {
     // `RST` закрывает обе стороны сразу, а `close` называет сторону, сбросившую соединение.
     for role in ROLES {
         for by_target in [false, true] {
-            let dir = tempfile::tempdir().expect("временная папка");
-            let (listener, target_addr) = target_listener().await;
-            let handle = start(dir.path(), target_addr, role).await;
-            let listen = listen_addr(&handle);
-            let path = handle.journal_path().to_path_buf();
-            let (mut accepted, mut target) = pair(&listener, listen).await;
+            let (_dir, handle, path, mut accepted, mut target) = pair_with_session(role).await;
 
             let closer_role = if by_target {
                 role.target_role()
@@ -869,12 +901,7 @@ async fn two_pairs_run_in_parallel_with_their_own_numbers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_stop_closes_the_pair_as_bytetap() {
     for role in ROLES {
-        let dir = tempfile::tempdir().expect("временная папка");
-        let (listener, target_addr) = target_listener().await;
-        let handle = start(dir.path(), target_addr, role).await;
-        let listen = listen_addr(&handle);
-        let path = handle.journal_path().to_path_buf();
-        let (mut accepted, mut target) = pair(&listener, listen).await;
+        let (_dir, handle, path, mut accepted, mut target) = pair_with_session(role).await;
 
         accepted.write_all(b"ORU").await.expect("фрагмент");
         // Даём прокси переслать фрагмент, затем останавливаем сессию: «Стоп» закрывает
@@ -917,12 +944,7 @@ async fn a_stopped_pair_records_exactly_the_bytes_the_target_received() {
     // запись в цель, которая не читает, обязательно оборвётся на середине.
     let payload = vec![b'A'; 16 * 1024 * 1024];
     for role in ROLES {
-        let dir = tempfile::tempdir().expect("временная папка");
-        let (listener, target_addr) = target_listener().await;
-        let handle = start(dir.path(), target_addr, role).await;
-        let listen = listen_addr(&handle);
-        let path = handle.journal_path().to_path_buf();
-        let (mut accepted, mut target) = pair(&listener, listen).await;
+        let (_dir, handle, path, mut accepted, mut target) = pair_with_session(role).await;
 
         // Цель не читает: насос упирается в её буфер, и запись обрывается на середине.
         let sent = payload.clone();
@@ -954,12 +976,7 @@ async fn a_stopped_pair_records_exactly_the_bytes_the_target_received() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_linger_expiry_closes_the_pair_as_bytetap_timeout() {
     for role in ROLES {
-        let dir = tempfile::tempdir().expect("временная папка");
-        let (listener, target_addr) = target_listener().await;
-        let handle = start(dir.path(), target_addr, role).await;
-        let listen = listen_addr(&handle);
-        let path = handle.journal_path().to_path_buf();
-        let (mut accepted, mut target) = pair(&listener, listen).await;
+        let (_dir, handle, path, mut accepted, mut target) = pair_with_session(role).await;
 
         accepted.write_all(b"ORU").await.expect("фрагмент");
         accepted.shutdown().await.expect("FIN принятой стороны");
@@ -992,12 +1009,7 @@ async fn the_linger_expiry_closes_the_pair_as_bytetap_timeout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reset_during_the_linger_is_an_error_and_keeps_the_first_close() {
     for role in ROLES {
-        let dir = tempfile::tempdir().expect("временная папка");
-        let (listener, target_addr) = target_listener().await;
-        let handle = start(dir.path(), target_addr, role).await;
-        let listen = listen_addr(&handle);
-        let path = handle.journal_path().to_path_buf();
-        let (mut accepted, mut target) = pair(&listener, listen).await;
+        let (_dir, handle, path, mut accepted, mut target) = pair_with_session(role).await;
 
         accepted.write_all(b"ORU").await.expect("фрагмент");
         accepted.shutdown().await.expect("FIN принятой стороны");
