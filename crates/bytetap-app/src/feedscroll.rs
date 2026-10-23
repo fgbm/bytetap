@@ -100,11 +100,13 @@ impl FeedScroll {
     ///
     /// `add` рисует строки диапазона в дочернем `Ui`, начало координат которого —
     /// верх видимой области: абсолютные координаты строк не растут с журналом.
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ui: &mut Ui,
         p: &Palette,
         id: Id,
+        list: Id,
         rows: usize,
         row_height: f32,
         add: impl FnOnce(&mut Ui, Range<usize>),
@@ -144,13 +146,15 @@ impl FeedScroll {
         let first = self.first_row(rows);
         let fraction = (self.offset - first as f64) as f32;
         let top = inner.top() - fraction * row_height;
+        // Строки — под узлом списка: диктор читает их как элементы списка ленты.
         let mut child = ui.new_child(
             UiBuilder::new()
                 .max_rect(Rect::from_min_max(
                     pos2(inner.left(), top),
                     pos2(inner.right(), inner.bottom() + row_height),
                 ))
-                .layout(Layout::top_down(Align::Min)),
+                .layout(Layout::top_down(Align::Min))
+                .accessibility_parent(list),
         );
         child.spacing_mut().item_spacing.y = 0.0;
         child.set_clip_rect(ui.clip_rect().intersect(inner));

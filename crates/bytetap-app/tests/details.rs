@@ -234,15 +234,22 @@ fn the_panel_shows_the_whole_long_fragment() {
     assert!(text.chars().count() > LONG, "{}", text.chars().count());
     assert!(!text.ends_with('…'), "без предела показа");
     assert!(text.contains("OBX|1|NM|GLU^Glucose||5.4|mmol/L|3.9-6.1|N|||F"));
-    // В ленте та же строка обрезана: предел строки остался прежним (FR-26).
+    // В ленте та же строка обрезана: предел строки остался прежним (FR-26). Подпись
+    // строки — её начало (U1-AC16), и в неё не попадает хвост фрагмента.
     let row = harness
         .get_all_by_label_contains("MSGLONG")
         .next()
         .expect("строка ленты")
         .accesskit_node()
-        .value()
+        .label()
         .unwrap_or_default();
     assert!(row.ends_with('…'), "строка ленты обрезана: {row}");
+    assert!(
+        row.chars().count() < text.chars().count(),
+        "лента показывает начало фрагмента, панель — весь: {} < {}",
+        row.chars().count(),
+        text.chars().count()
+    );
 }
 
 /// Esc закрывает панель и снимает выбор; строка больше не подсвечена (L1-AC9).
@@ -311,10 +318,17 @@ fn an_open_panel_stops_the_follow() {
 }
 
 /// Ctrl+A выделяет весь фрагмент, Ctrl+C кладёт его в буфер обмена (L1-AC1).
+///
+/// Поле панели забирает Ctrl+A/C, когда фокус в нём: выделение строк ленты живёт в
+/// ленте, и клавиша достаётся тому, с чем сейчас работают (шаг 2, L1-AC6).
 #[test]
 fn ctrl_a_and_ctrl_c_copy_the_whole_fragment() {
     let mut harness = harness();
     click_row(&mut harness, "MSG0001");
+    harness
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .click();
+    harness.run_steps(1);
     let text = panel_text(&harness);
     harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
     harness.run_steps(2);
@@ -962,7 +976,12 @@ fn a_service_row_copies_its_text() {
     harness.get_by_label("Копировать").click();
     harness.run_steps(1);
     assert_eq!(copied_text(&harness).as_deref(), Some(text.as_str()));
-    // Ctrl+A выделяет текст строки и в служебном событии.
+    // Ctrl+A выделяет текст строки и в служебном событии — когда фокус в поле панели:
+    // иначе клавиша принадлежит ленте и выделяет её строки (шаг 2).
+    harness
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .click();
+    harness.run_steps(1);
     harness.key_press_modifiers(Modifiers::COMMAND, Key::A);
     harness.run_steps(1);
     harness.event(egui::Event::Copy);

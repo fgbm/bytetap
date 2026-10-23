@@ -22,6 +22,7 @@ pub mod placement;
 pub mod probe;
 pub mod recording;
 pub mod scenarios;
+pub mod selection;
 pub mod settings;
 mod step;
 pub mod theme;

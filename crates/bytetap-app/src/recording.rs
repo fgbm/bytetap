@@ -28,6 +28,7 @@ use crate::feedrows::{
 };
 use crate::icons::{self, Icon};
 use crate::live::{self, JournalFailure, JournalFailureCode, SharedFeed};
+use crate::selection::{self, CopyKind, MenuAction, Selection};
 use crate::settings::{AppConfig, Encoding, FeedView, ProxyMode, Responder, SessionMode};
 use crate::theme::tokens::{
     RADIUS_CHIP, RADIUS_PANEL, RADIUS_RECORD, SPACE_1, SPACE_2, SPACE_3, SPACE_4, TEXT_2XS,
@@ -156,6 +157,11 @@ pub struct RecordingView {
     reveal_offset: Option<f32>,
     /// Выбранное событие и панель деталей (L1).
     pub(crate) details: Details,
+    /// Выделенные строки блоком: номера событий, переживают прокрутку и приход новых
+    /// строк (L1, шаг 2).
+    pub(crate) selection: Selection,
+    /// Что сказать о последнем копировании: предел строк или байт сработал.
+    copy_notice: Option<String>,
     counters: Option<SessionCounters>,
     fixed_stats: Stats,
     started: Instant,
@@ -204,6 +210,8 @@ impl RecordingView {
             max_offset: 0.0,
             reveal_offset: None,
             details: Details::default(),
+            selection: Selection::default(),
+            copy_notice: None,
             counters: None,
             fixed_stats: Stats::default(),
             started: Instant::now(),
@@ -300,12 +308,15 @@ impl RecordingView {
         self.conns.keys().copied().collect()
     }
 
-    /// Соседнее событие для ↑/↓: по ленте с учётом фильтра соединения.
+    /// Соседнее событие для ↑/↓ и Shift+↑/↓: по ленте с учётом фильтра соединения.
     ///
     /// Выбранное событие могло уйти из ленты (вытеснение) или спрятаться фильтром
     /// соединения: тогда сосед ищется по номеру — первое событие правее или левее его,
     /// а не «следующая строка после несуществующей».
-    pub fn step_selection(&mut self, step: i32) {
+    ///
+    /// `extend` — Shift: к выделению добавляется диапазон от якоря до соседа, а не
+    /// выбирается одна строка (L1, шаг 2).
+    pub fn step_selection(&mut self, step: i32, extend: bool) {
         let Some(key) = self.details.key() else {
             return;
         };
@@ -331,13 +342,22 @@ impl RecordingView {
         let Some(event) = self.feed.get(seq).cloned() else {
             return;
         };
+        if extend {
+            self.selection.extend(seq);
+        } else {
+            self.selection.click(seq);
+        }
+        self.copy_notice = None;
         self.details.open(seq, event);
         self.jump_row = self.rows.row_of(seq);
     }
 
-    /// Снять выбор и вернуть следование за концом ленты (Esc и «×» панели, Л-В9).
+    /// Снять выбор и выделение, вернуть следование за концом ленты (Esc и «×» панели,
+    /// Л-В9; Esc снимает и выделение строк — решение владельца).
     pub fn close_details(&mut self) {
         self.details.close();
+        self.selection.clear();
+        self.copy_notice = None;
         self.follow = true;
         self.pending = 0;
         self.jump_bottom = true;
@@ -345,10 +365,64 @@ impl RecordingView {
         self.reveal_offset = None;
     }
 
+    /// Сколько строк выделено: подпись «выбрано N · Ctrl+C» в панели фильтров.
+    pub fn selection_count(&self) -> usize {
+        self.selection.count()
+    }
+
+    /// Строки выделения по порядку: только те, что ещё в кольце.
+    fn selected_events(&self) -> impl Iterator<Item = &Arc<FeedEvent>> {
+        self.selection.seqs().filter_map(|seq| self.feed.get(seq))
+    }
+
+    /// Ctrl+C по выделенным строкам: «время → #1 текст», по строке на событие.
+    ///
+    /// Строки берутся из кольца, поэтому копирование не зависит от прокрутки и от
+    /// того, что видно на экране.
+    pub fn copy_selection(&mut self, ui: &Ui, kind: CopyKind, encoding: Encoding) {
+        let pair = self.pair();
+        let out = match kind {
+            CopyKind::Text => {
+                selection::copy_rows(self.selected_events().map(|event| &**event), pair, encoding)
+            }
+            CopyKind::Hex => selection::copy_rows_hex(self.selected_events().map(|event| &**event)),
+            CopyKind::Base64 => {
+                selection::copy_rows_base64(self.selected_events().map(|event| &**event))
+            }
+        };
+        if !out.text.is_empty() {
+            ui.ctx().copy_text(out.text);
+        }
+        // Предел копирования: строк вошло меньше, чем выделено, — говорим об этом в
+        // панели фильтров, а не молчим (L1, шаг 2).
+        if out.truncated {
+            let total = self.selection.count();
+            self.copy_notice = Some(t!("feed.copyLimited", copied = out.rows, total = total));
+        }
+    }
+
+    /// Подпись о копировании для панели фильтров: `None` — говорить нечего.
+    pub fn copy_notice(&self) -> Option<&str> {
+        self.copy_notice.as_deref()
+    }
+
+    /// Снять выделение строк, оставив панель как есть (пункт меню «Снять выделение»).
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.copy_notice = None;
+    }
+
     pub fn set_filter(&mut self, filter: Option<u32>) {
         if self.filter != filter {
             self.filter = filter;
             self.rows = RowIndex::rebuild(&self.feed, self.rows.hex, filter);
+            // Спрятанная фильтром строка не выделена и не копируется: иначе Ctrl+C
+            // положил бы в буфер то, чего инженер в ленте не видит.
+            let feed = &self.feed;
+            self.selection.retain(|seq| {
+                feed.get(seq)
+                    .is_some_and(|event| feed::passes(event, filter))
+            });
         }
     }
 
@@ -395,6 +469,14 @@ impl RecordingView {
         // Выбранное событие могло уйти из кольца: панель остаётся с прочитанным текстом
         // и говорит об этом подписью (Л-В6).
         self.details.check_evicted(self.feed.first_seq());
+        // Вытесненные события уходят и из выделения: счётчик «выбрано N» обновляется
+        // (L1, шаг 2).
+        let first = self.feed.first_seq();
+        let before = self.selection.count();
+        self.selection.retain_after(first);
+        if self.selection.count() != before {
+            self.copy_notice = None;
+        }
         if self
             .filter
             .is_some_and(|conn| !self.conns.contains_key(&conn))
@@ -882,8 +964,8 @@ impl BytetapApp {
         {
             rec.close_details();
         }
-        // Esc снимает выбор и возвращает следование (решение владельца, Л-В9).
-        if escape && rec.details.is_open() {
+        // Esc снимает выделение и выбор, возвращает следование (решение владельца, Л-В9).
+        if escape && (rec.details.is_open() || !rec.selection.is_empty()) {
             rec.close_details();
             ui.ctx().request_repaint();
         }
@@ -1277,20 +1359,39 @@ fn feed_bar(
         chips.insert(0, (None, t!("feed.connAll").to_owned()));
     }
     let dropped = (rec.dropped > 0).then(|| t!("feed.dropped", count = rec.dropped));
+    // Счётчик выделения — справа от таблеток соединений, как на макете
+    // `feed-a-rows.html`: «выбрано 3 · Ctrl+C».
+    let selected = rec.selection_count();
+    let counter = (selected > 0).then(|| t!("feed.selectionCount", count = selected));
+    // Что сказать о копировании: в буфер вошло меньше строк, чем выделено.
+    let notice = rec.copy_notice().map(str::to_owned);
     let chips_width: f32 = chips
         .iter()
         .map(|(_, text)| conn_chip_width(ui, text))
         .sum::<f32>()
         + SPACE_1 * chips.len().saturating_sub(1) as f32;
-    let dropped_width = dropped.as_ref().map_or(0.0, |text| {
+    let measure = |text: &str| {
         ui.painter()
-            .layout_no_wrap(text.clone(), theme::sans(TEXT_2XS), p.text_faint)
+            .layout_no_wrap(text.to_owned(), theme::sans(TEXT_2XS), p.text_faint)
             .size()
             .x
-    });
+    };
+    let dropped_width = dropped.as_ref().map_or(0.0, |text| measure(text));
+    let notice_width = notice.as_ref().map_or(0.0, |text| measure(text));
+    let counter_width = counter.as_ref().map_or(0.0, |text| measure(text));
     let width = chips_width
         + if dropped.is_some() {
             SPACE_2 + dropped_width
+        } else {
+            0.0
+        }
+        + if notice.is_some() {
+            SPACE_2 + notice_width
+        } else {
+            0.0
+        }
+        + if counter.is_some() {
+            SPACE_2 + counter_width
         } else {
             0.0
         };
@@ -1303,6 +1404,10 @@ fn feed_bar(
             .layout(Layout::left_to_right(Align::Center)),
     );
     right.spacing_mut().item_spacing.x = SPACE_1;
+    if let Some(text) = notice {
+        right.label(RichText::new(text).size(TEXT_2XS).color(p.warn));
+        right.add_space(SPACE_2 - SPACE_1);
+    }
     if let Some(text) = dropped {
         right.label(RichText::new(text).size(TEXT_2XS).color(p.text_faint));
         // Промежуток до таблеток — `SPACE_2`: `item_spacing` уже отсчитал `SPACE_1`.
@@ -1318,6 +1423,10 @@ fn feed_bar(
         if let Some(value) = chosen {
             rec.set_filter(value);
         }
+    }
+    if let Some(text) = counter {
+        right.add_space(SPACE_2 - SPACE_1);
+        right.label(RichText::new(text).size(TEXT_2XS).color(p.text_muted));
     }
 }
 
@@ -1353,11 +1462,13 @@ fn conn_chip(ui: &mut Ui, p: &Palette, text: &str, on: bool) -> egui::Response {
     response.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-/// Лента: видимые строки через `show_rows`, выбор события, догон и «↓ N новых».
+/// Лента: видимые строки через `show_rows`, выделение строк, выбор события, догон и
+/// «↓ N новых».
 ///
-/// Клик по строке выбирает событие и открывает панель деталей; ↑/↓ ходят по ленте, а
-/// Esc снимает выбор (L1-AC4, L1-AC9). Пока выбор есть, лента не догоняет конец: новые
-/// события копятся в «↓ N новых», а строка остаётся на месте (решение владельца, Л-В9).
+/// Клик выбирает одну строку и открывает панель деталей, Shift+клик добавляет диапазон
+/// от якоря, Ctrl+клик отмечает и снимает строку, Shift+↑/↓ расширяют выделение,
+/// Ctrl+A выделяет видимые строки, Ctrl+C копирует выделенное, Esc снимает выделение
+/// и возвращает следование (L1-AC4, L1-AC9, L1, шаг 2).
 fn feed_list(
     ui: &mut Ui,
     p: &Palette,
@@ -1391,20 +1502,29 @@ fn feed_list(
     let pair = rec.pair();
     // Панель была открыта до этого кадра: клик только меняет выбор, ленту не двигает.
     let was_open = rec.details.is_open();
-    // ↑/↓ — до прокрутки: выбранная строка должна попасть в видимую область в этом же
-    // кадре. В поле панели стрелки принадлежат тексту, а на разделителе — высоте панели.
-    if rec.details.is_open() && !ui.ctx().text_edit_focused() && !details::resizer_focused(ui) {
-        let step = ui.input_mut(|input| {
-            if input.consume_key(Modifiers::NONE, Key::ArrowUp) {
-                -1
+    // Клавиши ленты: ↑/↓ и Shift+↑/↓ ходят по событиям. Поле панели и её разделитель
+    // забирают стрелки себе: там они принадлежат тексту фрагмента и высоте панели
+    // (L1-AC9).
+    let feed_keys = !ui.ctx().text_edit_focused() && !details::resizer_focused(ui);
+    // Ctrl+A и Ctrl+C — те же клавиши у панели: поле забирает их фокусом, вкладка HEX —
+    // целиком, потому что там они выделяют и копируют строки дампа (L1-AC5, L1-AC6).
+    let copy_keys = feed_keys && rec.details.tab() != details::Tab::Hex;
+    if feed_keys && (rec.details.is_open() || !rec.selection.is_empty()) {
+        let (step, extend) = ui.input_mut(|input| {
+            if input.consume_key(Modifiers::SHIFT, Key::ArrowUp) {
+                (-1, true)
+            } else if input.consume_key(Modifiers::SHIFT, Key::ArrowDown) {
+                (1, true)
+            } else if input.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                (-1, false)
             } else if input.consume_key(Modifiers::NONE, Key::ArrowDown) {
-                1
+                (1, false)
             } else {
-                0
+                (0, false)
             }
         });
         if step != 0 {
-            rec.step_selection(step);
+            rec.step_selection(step, extend);
         }
     }
     ui.spacing_mut().item_spacing.y = 0.0;
@@ -1417,8 +1537,19 @@ fn feed_list(
         let rows = place.reveal_rows(rect, row_height);
         if rows > 0 {
             rec.reveal_offset = Some(rec.offset + rows as f32 * row_height);
+            // Сдвиг применяется следующим кадром: без просьбы о кадре строка ждала бы
+            // ближайшего пульса — на программном растре это около секунды.
+            ui.ctx().request_repaint();
         }
     }
+    // Лента — список для диктора: строки под ним помечены выбранными, а сам список
+    // говорит, что выделение множественное (L1, шаг 2).
+    let list = ui.interact(area, Id::unique("bt-feed-list"), Sense::hover());
+    list.widget_info(|| WidgetInfo::labeled(Role::ListBox, true, t!("feed.list")));
+    ui.ctx().accesskit_node_builder(list.id, |builder| {
+        builder.set_multiselectable();
+    });
+    let list_id = list.id;
     // Прилипание к концу — только пока лента догоняет: `stick_to_bottom` перебивает и
     // прокрутку к выбранной строке, и открытую панель, и тогда лента уезжала бы вниз
     // вместе с новыми событиями (Л-В9).
@@ -1438,9 +1569,20 @@ fn feed_list(
     } else if let Some(offset) = reveal {
         scroll = scroll.vertical_scroll_offset(offset.clamp(0.0, rec.max_offset));
     }
-    let selected_key = rec.details.key();
+    let count = rec.selection.count();
+    let mut visible: Vec<u64> = Vec::new();
     let mut clicked = None;
+    let mut action = MenuAction::None;
     let output = scroll.show_rows(ui, row_height, total, |ui, range| {
+        // Строки — в дочернем `Ui` с родителем-списком: так в дереве AccessKit они
+        // лежат под `ListBox`, а не рядом с ним.
+        let mut rows = ui.new_child(
+            UiBuilder::new()
+                .max_rect(ui.max_rect())
+                .layout(*ui.layout())
+                .accessibility_parent(list_id),
+        );
+        rows.spacing_mut().item_spacing.y = 0.0;
         for row in range {
             let Some((seq, line)) = rec.rows.locate(row) else {
                 break;
@@ -1448,12 +1590,38 @@ fn feed_list(
             let Some(event) = rec.feed.get(seq).cloned() else {
                 continue;
             };
-            let selected = selected_key == Some(seq);
+            visible.push(seq);
+            let selected = rec.selection.contains(seq);
+            let mut row_action = MenuAction::None;
             let response = if hex {
-                hex_row(ui, p, &event, line, multi, pair, encoding, selected)
+                hex_row(
+                    &mut rows,
+                    p,
+                    &event,
+                    line,
+                    multi,
+                    pair,
+                    encoding,
+                    selected,
+                    count,
+                    &mut row_action,
+                )
             } else {
-                text_row(ui, p, &event, multi, pair, encoding, selected)
+                text_row(
+                    &mut rows,
+                    p,
+                    &event,
+                    multi,
+                    pair,
+                    encoding,
+                    selected,
+                    count,
+                    &mut row_action,
+                )
             };
+            if row_action != MenuAction::None {
+                action = row_action;
+            }
             if response.clicked() {
                 clicked = Some((seq, event, response.rect));
             }
@@ -1461,26 +1629,77 @@ fn feed_list(
     });
     rec.offset = output.state.clamped_offset().y;
     rec.max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
-    if let Some((seq, event, rect)) = clicked {
-        rec.details.open(seq, event);
-        // Подтягиваем строку только когда панель открылась этим кликом: при уже
-        // открытой панели лента стоит на месте, иначе она дёргалась бы под каждым кликом.
-        if !was_open {
-            rec.reveal = Some(rect);
+    if copy_keys {
+        // Ctrl+A — видимые строки: выделение за пределы экрана egui не переживает, а
+        // «всё, что я вижу» — предсказуемое действие (Л-В3). Дальше по ленте выделяют
+        // Shift+кликом: выделение живёт в номерах событий и прокрутку переживает.
+        if ui.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::A)) {
+            rec.selection.select_all(visible);
+            rec.copy_notice = None;
         }
+        // Ctrl+C по выделенным строкам: его забирает лента, и панель этого события уже
+        // не увидит — иначе Ctrl+C положил бы в буфер два разных текста.
+        if !rec.selection.is_empty() && ui.input(|input| input.events.contains(&egui::Event::Copy))
+        {
+            ui.input_mut(|input| {
+                input
+                    .events
+                    .retain(|event| !matches!(event, egui::Event::Copy));
+            });
+            rec.copy_selection(ui, CopyKind::Text, encoding);
+        }
+    }
+    if let Some((seq, event, rect)) = clicked {
+        let modifiers = ui.input(|input| input.modifiers);
+        if modifiers.command {
+            // Ctrl+клик: строка отмечается или снимается, панель показывает отмеченную.
+            rec.selection.toggle(seq);
+            if rec.selection.contains(seq) {
+                rec.details.open(seq, event);
+            }
+        } else if modifiers.shift {
+            // Shift+клик: диапазон от якоря, панель показывает последнюю добавленную.
+            rec.selection.extend(seq);
+            rec.details.open(seq, event);
+            if !was_open {
+                rec.reveal = Some(rect);
+            }
+        } else {
+            rec.selection.click(seq);
+            rec.details.open(seq, event);
+            // Подтягиваем строку только когда панель открылась этим кликом: при уже
+            // открытой панели лента стоит на месте, иначе она дёргалась бы под каждым
+            // кликом.
+            if !was_open {
+                rec.reveal = Some(rect);
+            }
+        }
+        rec.copy_notice = None;
+    }
+    match action {
+        MenuAction::CopyText | MenuAction::CopyHex | MenuAction::CopyBase64 => {
+            let kind = match action {
+                MenuAction::CopyHex => CopyKind::Hex,
+                MenuAction::CopyBase64 => CopyKind::Base64,
+                _ => CopyKind::Text,
+            };
+            rec.copy_selection(ui, kind, encoding);
+        }
+        MenuAction::Clear => rec.clear_selection(),
+        MenuAction::None => {}
     }
 
     // Догон: внизу — следим; прокрутка вверх выключает догон и копит «новые».
     //
-    // Пока событие выбрано, лента стоит (Л-В9): догон не включается даже у нижнего края,
-    // иначе выбранная строка уезжала бы вверх под руками инженера.
+    // Пока событие выбрано или есть выделение, лента стоит (Л-В9): догон не включается
+    // даже у нижнего края, иначе выбранные строки уезжали бы вверх под руками инженера.
     let max = (output.content_size.y - output.inner_rect.height()).max(0.0);
     let slack = if rec.follow {
         4.0 + added as f32 * row_height
     } else {
         4.0
     };
-    if rec.details.is_open() {
+    if rec.details.is_open() || !rec.selection.is_empty() {
         rec.follow = false;
     } else if output.state.clamped_offset().y >= max - slack {
         rec.follow = true;
@@ -1674,11 +1893,11 @@ mod tests {
         view.details.open(1, data(2, 1));
         view.set_filter(Some(1));
         assert_eq!(view.rows(), 3, "в ленте события 0, 2 и 4");
-        view.step_selection(1);
+        view.step_selection(1, false);
         assert_eq!(view.details.key(), Some(2), "следующее видимое — 2");
-        view.step_selection(-1);
+        view.step_selection(-1, false);
         assert_eq!(view.details.key(), Some(0), "предыдущее видимое — 0");
-        view.step_selection(-1);
+        view.step_selection(-1, false);
         assert_eq!(view.details.key(), Some(0), "левее выбора нет");
     }
 

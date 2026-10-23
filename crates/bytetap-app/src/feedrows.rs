@@ -14,6 +14,7 @@ use eframe::egui::{
 };
 
 use crate::feed::{self, DataPayload, FeedEvent, FeedKind, HexLine, Segment, Segments};
+use crate::selection::MenuAction;
 use crate::settings::{Encoding, ProxyMode, SessionMode};
 use crate::theme::tokens::{SPACE_2, SPACE_3, TEXT_2XS, TEXT_DATA, TEXT_XS};
 use crate::theme::{self, Palette};
@@ -287,8 +288,11 @@ pub fn truncated(ui: &Ui, mut job: LayoutJob, width: f32) -> Arc<egui::Galley> {
     ui.painter().layout_job(job)
 }
 
-/// Строка ленты во всю ширину: выбранная — заливкой `selection`, наведение — фоном
-/// `hover`, роль `label` с текстом строки и признаком выбора для AccessKit (L1-AC8).
+/// Строка ленты во всю ширину: выделенная — заливкой `selection`, наведение — фоном
+/// `hover`, у строки роль элемента списка и признак выбора для AccessKit (L1-AC8).
+///
+/// Роль `ListItem` вместо `Label` шага 1: у ленты появилось выделение строк, и диктор
+/// должен читать «выбрано» у каждой строки, а не только у открытой в панели (Л-В8).
 fn row_frame(
     ui: &mut Ui,
     p: &Palette,
@@ -298,7 +302,11 @@ fn row_frame(
 ) -> (Rect, egui::Response) {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
-    response.widget_info(|| WidgetInfo::selected(Role::Label, true, selected, name));
+    response.widget_info(|| WidgetInfo::labeled(Role::ListItem, true, name));
+    // Выбран ли элемент списка — свойство `selected`, а не `toggled`: `WidgetInfo::
+    // selected` egui переводит в `toggled`, и диктор читал бы строку как переключатель.
+    ui.ctx()
+        .accesskit_node_builder(response.id, |node| node.set_selected(selected));
     if selected {
         ui.painter().rect_filled(rect, 0, p.selection);
     } else if response.hovered() {
@@ -348,8 +356,11 @@ fn data_job(p: &Palette, segments: &Segments, synthetic: bool) -> LayoutJob {
 
 /// Строка «Текст»: время · стрелка · №соединения · данные · «автоответ».
 ///
-/// `selected` — событие открыто в панели деталей: строка подсвечена, а в AccessKit у
-/// неё признак выбора. Возвращается ответ строки: по клику экран выбирает событие.
+/// `selected` — событие выделено блоком: строка залита, а в AccessKit у неё признак
+/// выбора. `count` — сколько строк выделено: правый клик по выделенной строке даёт
+/// меню на всё выделение (L1, шаг 2). Возвращается ответ строки: по клику экран
+/// выбирает событие.
+#[allow(clippy::too_many_arguments)]
 pub fn text_row(
     ui: &mut Ui,
     p: &Palette,
@@ -358,6 +369,8 @@ pub fn text_row(
     pair: Pair,
     encoding: Encoding,
     selected: bool,
+    count: usize,
+    action: &mut MenuAction,
 ) -> egui::Response {
     let (class, text) = row_text(event, pair);
     let segments = event.data().map(|data| data.segments(encoding));
@@ -433,7 +446,9 @@ pub fn text_row(
             }
         }
     }
-    row_menu(&response, p, event, &body, encoding);
+    row_menu(
+        &response, p, event, &body, encoding, selected, count, action,
+    );
     response
 }
 
@@ -451,6 +466,8 @@ pub fn hex_row(
     pair: Pair,
     encoding: Encoding,
     selected: bool,
+    count: usize,
+    action: &mut MenuAction,
 ) -> egui::Response {
     let (class, text) = row_text(event, pair);
     let bytes = event.data().map_or(&[][..], |data| data.bytes.as_slice());
@@ -521,7 +538,9 @@ pub fn hex_row(
     job.append(&dump.ascii, SPACE_2, text_format(font, ascii_color));
     let galley = truncated(ui, job, rect.right() - SPACE_3 - x);
     painter.galley(pos2(x, y), galley, p.text);
-    row_menu(&response, p, event, &text, encoding);
+    row_menu(
+        &response, p, event, &text, encoding, selected, count, action,
+    );
     response
 }
 
@@ -566,15 +585,41 @@ pub fn error_row(ui: &mut Ui, p: &Palette, height: f32) {
 /// Текст для копирования строится по клику и целиком, без предела показа в строке:
 /// строка ленты и её подпись для AccessKit показывают начало фрагмента, а скопировать
 /// инженеру нужно весь фрагмент (U1-AC16).
+///
+/// Правый клик по выделенной строке — меню на всё выделение: «Скопировать N строк» и
+/// те же строки в HEX и Base64. Действие выполняет экран: у него список событий
+/// выделения целиком, а у строки — только она сама (L1, шаг 2).
+#[allow(clippy::too_many_arguments)]
 fn row_menu(
     response: &egui::Response,
     p: &Palette,
     event: &FeedEvent,
     text: &str,
     encoding: Encoding,
+    selected: bool,
+    count: usize,
+    action: &mut MenuAction,
 ) {
     response.context_menu(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
+        if selected && count > 1 {
+            let rows = t!("feed.copyRows", count = count);
+            if widgets::menu_item(ui, p, &rows, true).clicked() {
+                *action = MenuAction::CopyText;
+            }
+            let hex = t!("feed.copyRowsHex", count = count);
+            if widgets::menu_item(ui, p, &hex, true).clicked() {
+                *action = MenuAction::CopyHex;
+            }
+            let base64 = t!("feed.copyRowsBase64", count = count);
+            if widgets::menu_item(ui, p, &base64, true).clicked() {
+                *action = MenuAction::CopyBase64;
+            }
+            if widgets::menu_item(ui, p, t!("feed.clearSelection"), true).clicked() {
+                *action = MenuAction::Clear;
+            }
+            return;
+        }
         if widgets::menu_item(ui, p, t!("feed.copyText"), true).clicked() {
             let copied = match event.data() {
                 Some(data) => data.full_text(encoding),

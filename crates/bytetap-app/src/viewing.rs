@@ -20,6 +20,7 @@ use crate::feed::FeedEvent;
 use crate::feedrows::Pair;
 use crate::feedscroll::FeedScroll;
 use crate::journal::{PAGE_SIZE, PageSource};
+use crate::selection::{CopyKind, Selection};
 use crate::settings::ProxyMode;
 use crate::t;
 use crate::theme::Palette;
@@ -54,6 +55,28 @@ pub struct JournalView {
     /// Выбранное событие и панель деталей (L1): событие берётся копией, поэтому
     /// выгруженная из памяти страница журнала панель не закрывает.
     pub details: Details,
+    /// Выделенные строки блоком: номера событий журнала (L1, шаг 2).
+    pub selection: Selection,
+    /// Копирование выделения, ждущее страниц: строки на незагруженных страницах сперва
+    /// дочитываются, а в буфер уходит уже весь выделенный блок.
+    pub copy_job: Option<CopyJob>,
+    /// Что сказать о последнем копировании: ждём страницы или предел сработал.
+    pub copy_notice: Option<String>,
+}
+
+/// Отложенное копирование выделения в просмотре журнала.
+///
+/// Страницы журнала читаются по видимой области, поэтому выделенный блок может лежать
+/// на страницах, которых ещё нет в памяти. Копирование ждёт их и не кладёт в буфер
+/// половину блока.
+#[derive(Clone, Debug)]
+pub struct CopyJob {
+    /// Номера выделенных событий по возрастанию — уже обрезанные пределом.
+    pub indices: Vec<usize>,
+    /// Сколько строк было выделено: для сообщения о пределе.
+    pub total: usize,
+    /// Что класть в буфер: текст с временем, HEX или Base64.
+    pub kind: CopyKind,
 }
 
 impl JournalView {
@@ -77,6 +100,9 @@ impl JournalView {
             feed_rect: None,
             hex_prefix: None,
             details: Details::default(),
+            selection: Selection::default(),
+            copy_job: None,
+            copy_notice: None,
         }
     }
 

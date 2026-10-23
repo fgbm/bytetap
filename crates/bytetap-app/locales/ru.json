@@ -204,6 +204,13 @@
     "copyText": "Скопировать текст",
     "copyHex": "Скопировать HEX",
     "copyBase64": "Скопировать Base64",
+    "list": "Лента",
+    "selectionCount": "выбрано {count} · Ctrl+C",
+    "copyRows": "Скопировать выделенные строки ({count})",
+    "copyRowsHex": "Скопировать выделенные строки как HEX ({count})",
+    "copyRowsBase64": "Скопировать выделенные строки как Base64 ({count})",
+    "clearSelection": "Снять выделение",
+    "copyLimited": "в буфер вошло {copied} строк из {total} — предел копирования",
     "openedPair": "#{conn} открыто: {from} → {to}",
     "closedPairLis": "#{conn} ЛИС закрыла соединение",
     "closedPairAnalyzer": "#{conn} анализатор закрыл соединение",
@@ -276,7 +283,10 @@
     "noteFailed": "Комментарий не записан: {reason}",
     "noteRereadFailed": "Комментарий записан, но журнал не перечитан: {reason}",
     "rowPending": "…",
-    "rowUnreadable": "Строка не прочитана: страница журнала не читается"
+    "rowUnreadable": "Строка не прочитана: страница журнала не читается",
+    "copyWaiting": "читаю строки журнала: {count}",
+    "copyDone": "скопировано {copied} из {total} строк",
+    "copySkipped": "скопировано {copied} из {total} строк, не прочитано: {skipped}"
   },
   "trace": {
     "a2l": "анализатор → ЛИС",

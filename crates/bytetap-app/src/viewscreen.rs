@@ -16,9 +16,10 @@ use bytetap_core::journal::view::DENSITY_BUCKETS;
 use crate::app::BytetapApp;
 use crate::details;
 use crate::feedrows::{
-    HEX_ROW_HEIGHT, TEXT_ROW_HEIGHT, error_row, hex_row, pending_row, text_row, truncated,
+    HEX_ROW_HEIGHT, Pair, TEXT_ROW_HEIGHT, error_row, hex_row, pending_row, text_row, truncated,
 };
 use crate::icons::{self, Icon};
+use crate::selection::{self, MenuAction};
 use crate::settings::{Encoding, FeedView};
 use crate::theme::tokens::{RADIUS_CHIP, SPACE_2, SPACE_3, TEXT_2XS, TEXT_XS};
 use crate::theme::{self, Palette, radius};
@@ -351,6 +352,44 @@ pub fn bar(app: &mut BytetapApp, ui: &mut Ui) {
             app.set_feed_encoding(chosen_encoding);
         }
     }
+
+    // Счётчик выделения — справа, как при записи: «выбрано 3 · Ctrl+C». Сообщение о
+    // копировании встаёт левее: предел или ожидание страниц журнала.
+    let (count, notice) = app.viewing.as_ref().map_or((0, None), |view| {
+        (view.selection.count(), view.copy_notice.clone())
+    });
+    let counter = (count > 0).then(|| t!("feed.selectionCount", count = count));
+    let measure = |text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), theme::sans(TEXT_2XS), p.text_faint)
+            .size()
+            .x
+    };
+    let counter_width = counter.as_ref().map_or(0.0, |text| measure(text));
+    let notice_width = notice.as_ref().map_or(0.0, |text| measure(text));
+    let width = counter_width
+        + if notice.is_some() {
+            SPACE_2 + notice_width
+        } else {
+            0.0
+        };
+    if counter.is_some() || notice.is_some() {
+        let mut right = ui.new_child(
+            UiBuilder::new()
+                .max_rect(Rect::from_min_max(
+                    pos2(inner.right() - width, inner.top()),
+                    inner.max,
+                ))
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        right.spacing_mut().item_spacing.x = SPACE_2;
+        if let Some(text) = notice {
+            right.label(egui::RichText::new(text).size(TEXT_2XS).color(p.warn));
+        }
+        if let Some(text) = counter {
+            right.label(egui::RichText::new(text).size(TEXT_2XS).color(p.text_muted));
+        }
+    }
 }
 
 /// Кнопка панели: текст 12px и шеврон, как при записи.
@@ -434,20 +473,31 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     view.details.set_default_height(panel_height);
     // Панель была открыта до этого кадра: клик только меняет выбор, ленту не двигает.
     let was_open = view.details.is_open();
-    // ↑/↓ — до прокрутки: выбранная строка подтягивается в видимую область тем же
-    // кадром. В поле панели стрелки принадлежат тексту, а на разделителе — высоте панели.
-    if view.details.is_open() && !ui.ctx().text_edit_focused() && !details::resizer_focused(ui) {
-        let step = ui.input_mut(|input| {
-            if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                -1
+    // Панель деталей: место снизу лента уступает до того, как её нарисовать, а тело
+    // панели идёт после ленты — тогда Tab обходит сначала строки, потом панель.
+    let place = details::reserve(ui, &p, &view.details);
+    // Клавиши ленты: ↑/↓ и Shift+↑/↓ ходят по событиям. Поле панели и её разделитель
+    // забирают стрелки себе: там они принадлежат тексту фрагмента и высоте панели.
+    let feed_keys = !ui.ctx().text_edit_focused() && !details::resizer_focused(ui);
+    // Ctrl+A и Ctrl+C — те же клавиши у панели: поле забирает их фокусом, вкладка HEX —
+    // целиком, потому что там они выделяют и копируют строки дампа (L1-AC5, L1-AC6).
+    let copy_keys = feed_keys && view.details.tab() != details::Tab::Hex;
+    if feed_keys && (view.details.is_open() || !view.selection.is_empty()) {
+        let (step, extend) = ui.input_mut(|input| {
+            if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp) {
+                (-1, true)
+            } else if input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown) {
+                (1, true)
+            } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                (-1, false)
             } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                1
+                (1, false)
             } else {
-                0
+                (0, false)
             }
         });
         if step != 0 {
-            step_selection(view, step);
+            step_selection(view, step, extend);
         }
     }
     if let Some(event) = view.seek.take() {
@@ -455,9 +505,6 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
         let target = if hex { view.hex_row_of(event) } else { event };
         view.scroll.set_top(target);
     }
-    // Панель деталей: место снизу лента уступает до того, как её нарисовать, а тело
-    // панели идёт после ленты — тогда Tab обходит сначала строки, потом панель.
-    let place = details::reserve(ui, &p, &view.details);
     // Строка, по которой кликнули, могла уйти под только что открывшуюся панель: лента
     // поднимается ровно настолько, чтобы низ строки встал на верхнюю границу панели.
     if let Some(rect) = view.reveal.take()
@@ -465,13 +512,25 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     {
         view.scroll.scroll_rows(place.reveal_rows(rect, row_height));
     }
+    // Лента — список для диктора: строки под ним помечены выбранными, а сам список
+    // говорит, что выделение множественное (L1, шаг 2).
+    let area = ui.available_rect_before_wrap();
+    let list = ui.interact(area, Id::unique("bt-journal-list"), egui::Sense::hover());
+    list.widget_info(|| WidgetInfo::labeled(Role::ListBox, true, t!("feed.list")));
+    ui.ctx().accesskit_node_builder(list.id, |builder| {
+        builder.set_multiselectable();
+    });
     // Прокрутка копируется на кадр: замыкание строк держит изменяемую ссылку на журнал.
     let mut scroll = view.scroll;
+    let count = view.selection.count();
+    let mut visible: Vec<u64> = Vec::new();
     let mut clicked = None;
+    let mut action = MenuAction::None;
     let out = scroll.show(
         ui,
         &p,
         Id::unique("bt-journal-feed"),
+        list.id,
         total,
         row_height,
         |ui, range| {
@@ -479,6 +538,10 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
                 let Some((index, line)) = view.event_of_row(row, hex) else {
                     break;
                 };
+                // Строка HEX — кусок события: в видимые номера попадает событие целиком.
+                if visible.last() != Some(&(index as u64)) {
+                    visible.push(index as u64);
+                }
                 // Страница в пути: заполнитель той же высоты — строки не сдвигаются.
                 if view.source.page_has_error(index) {
                     error_row(ui, &p, row_height);
@@ -492,12 +555,37 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
                     pending_row(ui, &p, row_height);
                     continue;
                 };
-                let selected = view.details.key() == Some(index as u64);
+                let selected = view.selection.contains(index as u64);
+                let mut row_action = MenuAction::None;
                 let response = if hex {
-                    hex_row(ui, &p, &event, line, multi, pair, encoding, selected)
+                    hex_row(
+                        ui,
+                        &p,
+                        &event,
+                        line,
+                        multi,
+                        pair,
+                        encoding,
+                        selected,
+                        count,
+                        &mut row_action,
+                    )
                 } else {
-                    text_row(ui, &p, &event, multi, pair, encoding, selected)
+                    text_row(
+                        ui,
+                        &p,
+                        &event,
+                        multi,
+                        pair,
+                        encoding,
+                        selected,
+                        count,
+                        &mut row_action,
+                    )
                 };
+                if row_action != MenuAction::None {
+                    action = row_action;
+                }
                 if response.clicked() {
                     clicked = Some((index, std::sync::Arc::new(event), response.rect));
                 }
@@ -506,21 +594,100 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     );
     view.scroll = scroll;
     view.feed_rect = Some(out.inner);
-    if let Some((index, event, rect)) = clicked {
-        view.details.open(index as u64, event);
-        // Подтягиваем строку только когда панель открылась этим кликом: при уже
-        // открытой панели лента стоит на месте, иначе она дёргалась бы под каждым кликом.
-        if !was_open {
-            view.reveal = Some(rect);
+    if copy_keys {
+        // Ctrl+A — видимые строки: выделять миллион строк журнала, читая его по
+        // страницам, нечего (решение исполнителя, см. L1). Дальше по журналу выделяют
+        // Shift+кликом — выделение живёт в номерах событий.
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+            view.selection.select_all(visible);
+            view.copy_notice = None;
         }
+        // Ctrl+C по выделенным строкам: строки на незагруженных страницах сперва
+        // дочитываются, а в буфер уходит весь выделенный блок.
+        if !view.selection.is_empty() && ui.input(|input| input.events.contains(&egui::Event::Copy))
+        {
+            ui.input_mut(|input| {
+                input
+                    .events
+                    .retain(|event| !matches!(event, egui::Event::Copy));
+            });
+            let indices: Vec<usize> = view
+                .selection
+                .seqs()
+                .map(|seq| seq as usize)
+                .take(selection::COPY_MAX_ROWS)
+                .collect();
+            view.copy_job = Some(crate::viewing::CopyJob {
+                indices,
+                total: view.selection.count(),
+                kind: selection::CopyKind::Text,
+            });
+            view.copy_notice = None;
+            ui.ctx().request_repaint();
+        }
+    }
+    if let Some((index, event, rect)) = clicked {
+        let modifiers = ui.input(|input| input.modifiers);
+        if modifiers.command {
+            view.selection.toggle(index as u64);
+            if view.selection.contains(index as u64) {
+                view.details.open(index as u64, event);
+            }
+        } else if modifiers.shift {
+            view.selection.extend(index as u64);
+            view.details.open(index as u64, event);
+            if !was_open {
+                view.reveal = Some(rect);
+            }
+        } else {
+            view.selection.click(index as u64);
+            view.details.open(index as u64, event);
+            // Подтягиваем строку только когда панель открылась этим кликом: при уже
+            // открытой панели лента стоит на месте, иначе она дёргалась бы под каждым
+            // кликом.
+            if !was_open {
+                view.reveal = Some(rect);
+            }
+        }
+        view.copy_notice = None;
+    }
+    match action {
+        MenuAction::CopyText | MenuAction::CopyHex | MenuAction::CopyBase64 => {
+            let indices: Vec<usize> = view
+                .selection
+                .seqs()
+                .map(|seq| seq as usize)
+                .take(selection::COPY_MAX_ROWS)
+                .collect();
+            let kind = match action {
+                MenuAction::CopyHex => selection::CopyKind::Hex,
+                MenuAction::CopyBase64 => selection::CopyKind::Base64,
+                _ => selection::CopyKind::Text,
+            };
+            view.copy_job = Some(crate::viewing::CopyJob {
+                indices,
+                total: view.selection.count(),
+                kind,
+            });
+            ui.ctx().request_repaint();
+        }
+        MenuAction::Clear => {
+            view.selection.clear();
+            view.copy_notice = None;
+        }
+        MenuAction::None => {}
     }
     if let Some(place) = place
         && details::show(ui, &p, &mut view.details, encoding, pair, place)
     {
         view.details.close();
+        view.selection.clear();
     }
-    if escape && view.details.is_open() {
+    if escape && (view.details.is_open() || !view.selection.is_empty()) {
         view.details.close();
+        view.selection.clear();
+        view.copy_job = None;
+        view.copy_notice = None;
         ui.ctx().request_repaint();
     }
     // Видимая область — рамка на карте сессии; страницы — по событиям, а не по строкам:
@@ -540,6 +707,11 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     app.set_visible(Some((start, end)));
     let ctx = ui.ctx().clone();
     app.request_pages(&ctx, first_event, last_event.max(first_event + 1));
+    // Выделение могло лечь на страницы, которых нет в памяти: их дочитываем и только
+    // потом кладём блок в буфер.
+    if let Some((from, to)) = copy_pending(app, &ctx, encoding, pair) {
+        app.request_pages(&ctx, from, to + 1);
+    }
     if let Some(height) = height {
         app.settings.feed.panel_height = height;
         app.save_settings();
@@ -549,8 +721,82 @@ pub fn feed(app: &mut BytetapApp, ui: &mut Ui, popup_open: bool) {
     }
 }
 
-/// Соседнее событие журнала для ↑/↓: номер события ±1, но не за пределами журнала.
-fn step_selection(view: &mut crate::viewing::JournalView, step: i32) {
+/// Отложенное копирование выделения: дочитать страницы и положить строки в буфер.
+///
+/// Возвращает диапазон событий, страницы которых надо попросить: чтение страниц живёт
+/// в приложении, а экран только говорит, чего не хватает. Копирование не берёт
+/// половину блока: в буфер уходит либо весь выделенный блок, либо ничего и сообщение о
+/// том, что строки ещё читаются.
+fn copy_pending(
+    app: &mut BytetapApp,
+    ctx: &egui::Context,
+    encoding: Encoding,
+    pair: Pair,
+) -> Option<(usize, usize)> {
+    let view = app.viewing.as_mut()?;
+    let job = view.copy_job.take()?;
+    let mut events: Vec<std::sync::Arc<crate::feed::FeedEvent>> =
+        Vec::with_capacity(job.indices.len());
+    let mut first_missing = None;
+    let mut last_missing = 0;
+    let mut skipped = 0;
+    for &index in &job.indices {
+        if view.source.page_has_error(index) {
+            skipped += 1;
+            continue;
+        }
+        match view.source.event(index) {
+            Some(event) => match crate::viewing::feed_event(event) {
+                Some(event) => events.push(std::sync::Arc::new(event)),
+                None => skipped += 1,
+            },
+            None => {
+                first_missing.get_or_insert(index);
+                last_missing = index;
+            }
+        }
+    }
+    if let Some(from) = first_missing {
+        // Страницы ещё едут: выбор не теряем, а говорим, что ждём.
+        view.copy_notice = Some(t!("journal.copyWaiting", count = job.total));
+        view.copy_job = Some(job);
+        return Some((from, last_missing));
+    }
+    let out = match job.kind {
+        crate::selection::CopyKind::Text => {
+            crate::selection::copy_rows(events.iter().map(|event| &**event), pair, encoding)
+        }
+        crate::selection::CopyKind::Hex => {
+            crate::selection::copy_rows_hex(events.iter().map(|event| &**event))
+        }
+        crate::selection::CopyKind::Base64 => {
+            crate::selection::copy_rows_base64(events.iter().map(|event| &**event))
+        }
+    };
+    if !out.text.is_empty() {
+        ctx.copy_text(out.text);
+    }
+    view.copy_notice = (out.rows < job.total).then(|| {
+        if skipped > 0 {
+            t!(
+                "journal.copySkipped",
+                copied = out.rows,
+                total = job.total,
+                skipped = skipped
+            )
+        } else {
+            t!("journal.copyDone", copied = out.rows, total = job.total)
+        }
+    });
+    None
+}
+
+/// Соседнее событие журнала для ↑/↓ и Shift+↑/↓: номер события ±1, но не за пределами
+/// журнала.
+///
+/// `extend` — Shift: к выделению добавляется диапазон от якоря до соседа, а не
+/// выбирается одна строка (L1, шаг 2).
+fn step_selection(view: &mut crate::viewing::JournalView, step: i32, extend: bool) {
     let Some(key) = view.details.key() else {
         return;
     };
@@ -567,6 +813,12 @@ fn step_selection(view: &mut crate::viewing::JournalView, step: i32) {
     let Some(event) = crate::viewing::feed_event(event) else {
         return;
     };
+    if extend {
+        view.selection.extend(index as u64);
+    } else {
+        view.selection.click(index as u64);
+    }
+    view.copy_notice = None;
     view.details.open(index as u64, std::sync::Arc::new(event));
     view.seek = Some(index);
 }

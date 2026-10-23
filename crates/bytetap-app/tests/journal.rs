@@ -14,7 +14,7 @@ use bytetap_app::viewing::JournalView;
 use bytetap_app::{BytetapApp, Fixtures, Screen, theme};
 use bytetap_core::journal::{Autoresponder, Data, Dir, Event, Host, Mode, Open, Session};
 use eframe::egui::{self, Key, accesskit::Role};
-use egui_kittest::{Harness, SnapshotOptions, kittest::Queryable as _};
+use egui_kittest::{Harness, SnapshotOptions, kittest::NodeT as _, kittest::Queryable as _};
 
 /// Рендер-тесты по одному: загрузчик Vulkan (lavapipe) изредка падает с SIGSEGV.
 fn gpu() -> std::sync::MutexGuard<'static, ()> {
@@ -1067,9 +1067,83 @@ fn a_long_journal_shows_the_appended_comment_at_its_end() {
     step_until(&mut harness, "комментарий в ленте", |h| {
         // Та же строка есть и под шапкой, в «…»: строка ленты начинается со времени.
         h.query_all_by_label_contains("перезалили пробу")
-            .filter_map(|node| node.value())
-            .any(|value| !value.starts_with('«'))
+            .filter_map(|node| node.accesskit_node().label())
+            .any(|label| !label.starts_with('«'))
     });
+}
+
+/// Панель деталей забрала низ ленты: строка, по которой кликнули у самого низа,
+/// подтягивается над панелью, а не остаётся под ней (находка контрольного ревью шага 1,
+/// L1-AC4).
+#[test]
+fn the_details_panel_pulls_the_clicked_row_into_view() {
+    let dir = tempfile::tempdir().expect("временная папка");
+    let path = dir.path().join("journal.jsonl");
+    // 600 событий с разными идентификаторами: последнюю строку видно по подписи.
+    let mut header = Session::new(
+        Mode::TcpServer,
+        Autoresponder::None,
+        serde_json::json!({"listen": "127.0.0.1:5000"}),
+        Host {
+            os: "Linux".to_owned(),
+        },
+    );
+    header.analyzer = Some("ANALYZER".to_owned());
+    let mut text = serde_json::to_string(&Event::Session(header)).expect("заголовок");
+    text.push('\n');
+    for index in 0..600 {
+        let event = Event::Data(Data::new(
+            format!(
+                "2026-10-19T10:15:{:02}.{:03}+03:00",
+                index / 1000,
+                index % 1000
+            ),
+            index as u64,
+            1,
+            Dir::AnalyzerToLis,
+            false,
+            format!("\x0bMSH|^~\\&|A|B|C|D|E||ORU^R01|JEV{index:05}|P|2.3.1\r\x1c\r").as_bytes(),
+        ));
+        text.push_str(&serde_json::to_string(&event).expect("событие"));
+        text.push('\n');
+    }
+    std::fs::write(&path, text).expect("журнал");
+    let mut harness = harness_with_journal(&path);
+    step_until(&mut harness, "первая страница", |h| {
+        h.state()
+            .viewing()
+            .is_some_and(|view| view.source.pages_in_memory() > 0)
+    });
+    // Конец журнала: последняя строка у нижнего края ленты, панели ещё нет.
+    harness.key_press(Key::End);
+    step_until(&mut harness, "последняя строка", |h| {
+        h.query_by_label_contains("JEV00599").is_some()
+    });
+    let row = harness.get_by_label_contains("JEV00599").rect().center();
+    harness.event(egui::Event::PointerMoved(row));
+    harness.run_steps(3);
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos: row,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+    }
+    harness.run_steps(3);
+    let after = harness.get_by_label_contains("JEV00599").rect();
+    let panel_top = harness.get_by_label_contains("Детали события").rect().top();
+    assert!(
+        after.bottom() <= panel_top + 0.5,
+        "строка подтянута над панелью: {after:?}, панель с {panel_top}"
+    );
+    let view = harness.state().viewing().expect("журнал открыт");
+    let total = view.summary.events;
+    assert!(
+        view.selection.contains((total - 1) as u64),
+        "строка выделена и открыта в панели"
+    );
 }
 
 /// Комментарий лёг в файл, а перечитать сводку не удалось: диалог закрыт, причина —
