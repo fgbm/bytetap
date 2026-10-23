@@ -36,12 +36,6 @@ const READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// Сколько ждать кадра, который окно просит таймером, а не событием.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Сколько тихих кадров подряд означают, что раскладка установилась.
-const IDLE_QUIET: usize = 10;
-
-/// Сколько ждать установки раскладки перед замером простоя.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Предел окна замера при потоке фрагментов: клиент шлёт 1.5 с, остальное — запас
 /// загруженного раннера.
 const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
@@ -86,30 +80,6 @@ fn repaint_delay(harness: &Harness<'static, BytetapApp>) -> Duration {
 fn tick(harness: &mut Harness<'static, BytetapApp>) {
     harness.step();
     std::thread::sleep(Duration::from_millis(1));
-}
-
-/// Ждёт установки раскладки: [`IDLE_QUIET`] кадров подряд без запроса перерисовки.
-///
-/// Пока грузятся шрифты и значки, виджеты сдвигаются, и egui просит кадр сам
-/// (`Options::repaint_on_widget_change`): на одной платформе это первый кадр, на другой —
-/// далеко не восьмой, и число кадров зависит от набора шрифтов, а не от приложения.
-/// Простой — это когда окно уже не просит кадры; приложение, которое просит их всегда,
-/// сюда не дойдёт и упрётся в [`IDLE_TIMEOUT`].
-fn wait_for_idle(harness: &mut Harness<'static, BytetapApp>) {
-    let deadline = Instant::now() + IDLE_TIMEOUT;
-    let mut quiet = 0;
-    let mut delay = Duration::ZERO;
-    while Instant::now() <= deadline {
-        harness.step();
-        delay = repaint_delay(harness);
-        quiet = if delay == Duration::MAX { quiet + 1 } else { 0 };
-        if quiet >= IDLE_QUIET {
-            return;
-        }
-    }
-    panic!(
-        "окно не перестало просить кадры за {IDLE_TIMEOUT:?}: {delay:?} после {quiet} тихих кадров"
-    );
 }
 
 /// Ждёт, пока запись начнётся и сессия ядра назовёт адрес слушателя.
@@ -167,10 +137,8 @@ fn an_idle_window_asks_for_no_frames() {
             .with_fixtures(fixtures())
             .with_screen(Screen::Scenarios)
     });
-    // Установка раскладки: пока шрифты и значки приходят лениво, виджеты сдвигаются, и
-    // egui сам просит кадр (`repaint_on_widget_change`). Сколько таких кадров — дело
-    // платформы, поэтому ждём тишины, а не восьмого кадра, и только потом меряем.
-    wait_for_idle(&mut harness);
+    // Загрузка шрифтов и иконок догоняет себя сама; дальше — простой.
+    harness.run_steps(8);
     let mut requested = Vec::new();
     for _ in 0..40 {
         harness.step();
@@ -180,10 +148,12 @@ fn an_idle_window_asks_for_no_frames() {
         .iter()
         .filter(|delay| **delay != Duration::MAX)
         .collect();
+    // Кто именно просил кадр, видно по причинам egui: файл, строка и текст запроса.
     assert!(
         asked.is_empty(),
-        "в простое запрошено {} кадров: {asked:?}",
-        asked.len()
+        "в простое запрошено {} кадров: {asked:?}; причины: {:?}",
+        asked.len(),
+        harness.ctx.repaint_causes()
     );
 }
 

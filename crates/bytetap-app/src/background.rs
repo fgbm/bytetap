@@ -16,12 +16,17 @@ pub struct Task<T> {
 
 impl<T: Send + 'static> Task<T> {
     /// Запускает `job` в отдельном потоке; по готовности окно перерисовывается.
+    ///
+    /// Кадр просится только у живого приёмника: задачу могли выгрузить раньше — например,
+    /// экран получил фикстуры вместо опроса системы, — и запрос от выброшенной задачи
+    /// разбудил бы окно в простое (NFR-5).
     pub fn spawn(ctx: &egui::Context, job: impl FnOnce() -> T + Send + 'static) -> Self {
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(job());
-            ctx.request_repaint();
+            if sender.send(job()).is_ok() {
+                ctx.request_repaint();
+            }
         });
         Self { receiver }
     }
@@ -35,8 +40,9 @@ impl<T: Send + 'static> Task<T> {
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         runtime.spawn(async move {
-            let _ = sender.send(future.await);
-            ctx.request_repaint();
+            if sender.send(future.await).is_ok() {
+                ctx.request_repaint();
+            }
         });
         Self { receiver }
     }
@@ -222,5 +228,75 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(loaded.ready(), Some(&42));
+    }
+
+    /// Считает запросы перерисовки: фоновая задача или само окно — неважно, важно число.
+    fn count_repaints(ctx: &egui::Context) -> mpsc::Receiver<()> {
+        let (sender, receiver) = mpsc::channel();
+        ctx.set_repaint_observer(move |_| {
+            let _ = sender.send(());
+        });
+        receiver
+    }
+
+    /// Причины запросов последнего прохода: файл, строка и текст.
+    ///
+    /// Причины копятся между проходами, поэтому перед чтением нужен проход
+    /// (`Context::run`): он переносит их в то, что видит [`egui::Context::repaint_causes`].
+    fn repaint_causes(ctx: &egui::Context) -> Vec<String> {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        // Текстуры шрифтов некому применить: без этого `TexturesDelta` ругается на выходе.
+        output.textures_delta.clear();
+        ctx.repaint_causes()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Готовая задача будит окно: без кадра результат некому показать.
+    #[test]
+    fn a_ready_task_wakes_the_window() {
+        let ctx = egui::Context::default();
+        let requests = count_repaints(&ctx);
+        let task = Task::spawn(&ctx, || 7);
+        requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("готовый результат просит кадр");
+        let causes = repaint_causes(&ctx);
+        assert!(
+            causes.iter().any(|cause| cause.contains("background.rs")),
+            "кадр просит фоновая задача: {causes:?}"
+        );
+        drop(task);
+    }
+
+    /// Выгруженная задача окно не будит: приёмника нет, и результат некому показать.
+    ///
+    /// Так бывает на старте: экран получает фикстуры (снимки, тесты) вместо опроса системы
+    /// и выбрасывает задачу. Запрос от неё разбудил бы окно в простое, а простой без кадров
+    /// и есть требование NFR-5.
+    #[test]
+    fn a_dropped_task_does_not_wake_the_window() {
+        let ctx = egui::Context::default();
+        let requests = count_repaints(&ctx);
+        // Задача ждёт, пока её приёмник выбросят: иначе она успела бы отдать результат.
+        let (gate, gate_rx) = mpsc::channel::<()>();
+        let (done, finished) = mpsc::channel::<()>();
+        let task = Task::spawn(&ctx, move || {
+            let _ = gate_rx.recv();
+            let _ = done.send(());
+        });
+        drop(task);
+        let _ = gate.send(());
+        finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("задача отработала");
+        // Запрос идёт сразу после отправки результата: даём потоку его сделать.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            requests.try_recv().is_err(),
+            "выгруженная задача не просит кадр: {:?}",
+            repaint_causes(&ctx)
+        );
     }
 }
