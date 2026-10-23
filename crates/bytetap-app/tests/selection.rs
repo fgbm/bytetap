@@ -611,32 +611,22 @@ fn a_journal_selection_waits_for_pages_before_copying() {
         "второй страницы нет"
     );
     harness.event(egui::Event::Copy);
+    // Кадр события и следующий за ним: сообщение о ожидании рисует панель фильтров, а
+    // она стоит до ленты.
     harness.run_steps(2);
-    assert!(
-        harness
-            .query_by_label_contains("читаю строки журнала")
-            .is_some(),
-        "пока страницы едут, говорим об этом"
-    );
-    assert!(
-        copied_text(&harness).is_none(),
-        "половину блока не копируем"
-    );
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        harness.step();
-        if let Some(copied) = copied_text(&harness) {
-            assert_eq!(copied.lines().count(), 900, "весь блок");
-            assert!(copied.contains("JEV00000"), "первая строка блока");
-            assert!(copied.contains("JEV00899"), "последняя строка блока");
-            return;
+    let copied = match copied_text(&harness) {
+        // На быстрой машине страницы успевают за эти кадры: блок уже в буфере целиком.
+        Some(copied) => copied,
+        None => {
+            // Пока страницы едут, панель фильтров говорит об этом, а в буфер ничего
+            // не уходит: половина блока там хуже ожидания.
+            harness.get_by_label_contains("читаю строки журнала");
+            wait_for_copy(&mut harness, 900)
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "страницы не дочитались"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    };
+    assert_eq!(copied.lines().count(), 900, "весь блок, а не половина");
+    assert!(copied.contains("JEV00000"), "первая строка блока");
+    assert!(copied.contains("JEV00899"), "последняя строка блока");
 }
 
 /// Кадры до копирования: страницы журнала читает фоновый пул, и строки копятся по
