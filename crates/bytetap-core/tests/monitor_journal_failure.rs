@@ -89,8 +89,10 @@ async fn a_journal_failure_stops_the_monitor_forwarding() {
     .await
     .expect("open первого обмена дошёл до файла");
 
-    // Отказ на ближайшей пачке: `open` и оба `data` первого обмена уже записаны.
-    TEST_FAIL_AFTER_EVENTS.store(test_events_in_batches() + 1, Ordering::Relaxed);
+    // Отказ на ближайшей пачке: `open` и `data` первого обмена уже записаны. Предел —
+    // счётчик уже пропущенного, поэтому падает первая же пачка после взвода хука: сколько
+    // фрагментов соберёт насос в одно чтение, тест не предполагает.
+    TEST_FAIL_AFTER_EVENTS.store(test_events_in_batches(), Ordering::Relaxed);
 
     // Дальше пересылка обязана остановиться; отказ ждём по метке, а не по числу кругов.
     for _ in 0..100 {
