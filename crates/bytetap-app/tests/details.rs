@@ -273,6 +273,20 @@ fn escape_closes_the_panel_and_clears_the_selection() {
     assert_ne!(selected, Some(true), "выбор снят");
 }
 
+/// Подсказка внизу панели говорит о клавишах того, кому они принадлежат: без фокуса в
+/// поле Ctrl+A и Ctrl+C — про ленту, в поле — про фрагмент (находка m2 ревью шага 2).
+#[test]
+fn the_panel_hint_follows_the_focus() {
+    let mut harness = harness();
+    click_row(&mut harness, "MSG0001");
+    harness.get_by_label_contains("Ctrl+A и Ctrl+C без фокуса в поле");
+    harness
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .click();
+    harness.run_steps(2);
+    harness.get_by_label_contains("Ctrl+A — весь фрагмент");
+}
+
 /// «×» панели закрывает её так же, как Esc.
 #[test]
 fn the_close_button_closes_the_panel() {
