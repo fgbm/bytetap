@@ -467,6 +467,29 @@ fn the_panel_works_in_the_journal_view() {
     harness.run_steps(2);
     let text = panel_text(&harness);
     assert!(text.contains("JMSG2"), "{text}");
+    // Поле одно на оба экрана и на все события: выделение, оставшееся от JMSG1, на
+    // JMSG2 не переезжает — после возврата «Копировать» кладёт фрагмент целиком.
+    click_row(&mut harness, "JMSG1");
+    let whole = panel_text(&harness);
+    drag_select(&mut harness);
+    harness.event(egui::Event::Copy);
+    harness.run_steps(1);
+    let part = copied_text(&harness).expect("буфер обмена");
+    assert!(
+        !part.is_empty() && part.len() < whole.len() && whole.contains(part.as_str()),
+        "выделена часть: {} из {}",
+        part.chars().count(),
+        whole.chars().count()
+    );
+    click_row(&mut harness, "JMSG2");
+    click_row(&mut harness, "JMSG1");
+    harness.get_by_label("Копировать").click();
+    harness.run_steps(1);
+    assert_eq!(
+        copied_text(&harness).as_deref(),
+        Some(whole.as_str()),
+        "«Копировать» кладёт весь фрагмент"
+    );
     // Esc закрывает панель и в просмотре.
     harness.key_press(Key::Escape);
     harness.run_steps(2);
@@ -846,6 +869,39 @@ fn the_panel_follows_the_feed_rows_in_the_tab_order() {
         .position(|label| label.contains("BT0001"))
         .unwrap_or_else(|| panic!("вторая строка в обходе: {order:#?}"));
     assert!(second < copy, "панель после строк ленты: {order:#?}");
+}
+
+/// Выделение части фрагмента мышью: тянем по полю панели слева направо.
+fn drag_select(harness: &mut Harness<'static, BytetapApp>) {
+    let field = harness
+        .get_all_by_role(egui::accesskit::Role::MultilineTextInput)
+        .next()
+        .expect("поле панели")
+        .rect();
+    let y = field.top() + 6.0;
+    let from = egui::pos2(field.left() + 40.0, y);
+    let to = egui::pos2(field.right() - 40.0, y);
+    harness.event(egui::Event::PointerMoved(from));
+    harness.run_steps(1);
+    harness.event(egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Modifiers::NONE,
+    });
+    harness.run_steps(1);
+    for step in 1..=4 {
+        let x = from.x + (to.x - from.x) * step as f32 / 4.0;
+        harness.event(egui::Event::PointerMoved(egui::pos2(x, y)));
+        harness.run_steps(1);
+    }
+    harness.event(egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    harness.run_steps(1);
 }
 
 /// Клик мышью в точку с модификатором: так Shift+клик выделяет диапазон строк дампа.
