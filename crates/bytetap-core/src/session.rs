@@ -2026,7 +2026,12 @@ async fn pump(
                     () = wait_for_hangup(&mut hangup) => None,
                     result = &mut write => Some(result),
                 };
-                if outcome.is_none() && shared.mode == Mode::ComMonitor {
+                // Льгота — только «Стопу» и закрытию пары: после отказа журнала обмена
+                // дальше нет, и в порт не уходит ни байта (M4-AC10).
+                if outcome.is_none()
+                    && shared.mode == Mode::ComMonitor
+                    && failure.borrow().is_none()
+                {
                     // У порта байты уже в линии, а отчёт о них идёт потоком писателя:
                     // без короткого срока прослушка потеряла бы из журнала переданное
                     // прямо перед закрытием пары (M4-AC10, M5-AC2).
@@ -2201,11 +2206,13 @@ async fn apply(
                 let sent = AtomicUsize::new(0);
                 let write = write_counted(transport, &payload, &sent);
                 tokio::pin!(write);
-                // `None` — запись прервана сигналом, `Some` — она закончилась сама.
+                // `None` — запись прервана «Стопом», `Some` — она закончилась сама.
                 let outcome = tokio::select! {
                     biased;
                     () = wait_for_stop(stop) => None,
-                    () = wait_for_failure(failure) => None,
+                    // Отказ журнала обрывает ответ сразу, без срока на отчёт: обмена,
+                    // которого нет в записи, дальше не идёт (M4-AC10).
+                    () = wait_for_failure(failure) => return Some((ClosedBy::Bytetap, "stop")),
                     outcome = timeout(WRITE_TIMEOUT, write.as_mut()) => Some(outcome),
                 };
                 let Some(outcome) = outcome else {
@@ -2376,6 +2383,138 @@ mod tests {
             };
             assert_eq!(header.autoresponder, responder);
         }
+    }
+
+    /// `Shared` с живым журналом: проверке нужен только он, без источника.
+    fn shared_with_journal(dir: &tempfile::TempDir, mode: Mode) -> Arc<Shared> {
+        let path = dir.path().join("shared.jsonl");
+        let header = SessionHeader::new(
+            mode,
+            Autoresponder::None,
+            serde_json::json!({}),
+            Host::current(),
+        );
+        let journal = Journal::create(&path, header).expect("журнал");
+        let (failure, failure_rx) = watch::channel(None);
+        // Приёмник жив: без него `Shared::fail_journal` не смог бы сказать об отказе.
+        let _keep_failure = failure_rx;
+        let (events, _) = broadcast::channel(EVENT_BUFFER);
+        Arc::new(Shared {
+            mode,
+            responder: ResponderKind::None,
+            journal,
+            clock: MonoClock::new(),
+            events,
+            ids: ControlIdSource::new(),
+            counters: Arc::new(Counters::default()),
+            failure,
+            open: Mutex::new(HashSet::new()),
+            backlog_warned: AtomicBool::new(false),
+            ends: AtomicU64::new(0),
+        })
+    }
+
+    /// Транспорт, который принимает байты только по разрешению теста.
+    ///
+    /// Нужен проверке отказа журнала: запись ответа должна оставаться незавершённой,
+    /// чтобы увидеть, пишет ли ядро в сокет после отказа (M4-AC10).
+    struct GatedTransport {
+        gate: Arc<AtomicBool>,
+        polled: Option<mpsc::UnboundedSender<()>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncWrite for GatedTransport {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            if let Some(polled) = &self.polled {
+                let _ = polled.send(());
+            }
+            if !self.gate.load(Ordering::Relaxed) {
+                return std::task::Poll::Pending;
+            }
+            if let Ok(mut written) = self.written.lock() {
+                written.extend_from_slice(buf);
+            }
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncRead for GatedTransport {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// После отказа журнала ответ не уходит в сокет ни одним байтом (M4-AC10).
+    ///
+    /// Запись ответа ждёт (транспорт не принимает байты), отказ приходит уже во время
+    /// ожидания, и сразу после него транспорт готов принять: срок на отчёт о записи —
+    /// только для «Стопа», иначе после отказа журнала в линию ушёл бы ответ, которого
+    /// в записи нет.
+    #[tokio::test]
+    async fn a_failed_journal_stops_the_answer_without_the_report_grace() {
+        let dir = temp_dir();
+        let shared = shared_with_journal(&dir, Mode::TcpServer);
+        let gate = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (polled_tx, mut polled_rx) = mpsc::unbounded_channel();
+        let mut transport = GatedTransport {
+            gate: Arc::clone(&gate),
+            polled: Some(polled_tx),
+            written: Arc::clone(&written),
+        };
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        let (journal_tx, mut failure_rx) = watch::channel(None);
+        let actions = vec![Action::Send(b"ACK".to_vec())];
+
+        let mut answering = std::pin::pin!(apply(
+            &shared,
+            1,
+            &mut transport,
+            actions,
+            &mut stop_rx,
+            &mut failure_rx,
+        ));
+        // Ответ упирается в транспорт: запись опрошена и ждёт разрешения.
+        tokio::select! {
+            _ = polled_rx.recv() => {}
+            result = &mut answering => panic!("запись ответа не ждала: {result:?}"),
+        }
+        // Отказ журнала приходит во время ожидания, и сокет тут же готов принять байты.
+        let reason = JournalFailureReason::from_message("диск полон");
+        journal_tx.send(Some(reason)).expect("отказ журнала");
+        gate.store(true, Ordering::Relaxed);
+
+        let outcome = timeout(Duration::from_secs(1), answering)
+            .await
+            .expect("ответ закончился");
+        assert_eq!(outcome, Some((ClosedBy::Bytetap, "stop")));
+        assert!(
+            written.lock().expect("счётчик байт").is_empty(),
+            "после отказа журнала в сокет не уходит ни байта"
+        );
     }
 
     #[tokio::test]
