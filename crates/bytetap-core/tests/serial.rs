@@ -18,9 +18,12 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use bytetap_core::journal::{Autoresponder, ClosedBy, Dir, Event, Mode, read_all};
-use bytetap_core::session::{Session, SessionConfig};
+use bytetap_core::session::{Session, SessionConfig, TEST_STOP_GRACE_ENTERED};
 use bytetap_core::transport::port_open_error;
 use bytetap_core::transport::serial::{SerialFormat, SerialSettings, TEST_HOLD_WRITE_REPORT};
+
+/// Сколько тест ждёт ответа и остановки.
+const WAIT: Duration = Duration::from_secs(10);
 
 /// Пара pty от `socat`; дочерний процесс живёт, пока живёт значение.
 struct Socat {
@@ -310,14 +313,15 @@ impl Pty {
     fn open() -> io::Result<Self> {
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
-        // SAFETY: `openpty` заполняет два дескриптора; termios и размер окна — по умолчанию.
+        // SAFETY: `openpty` заполняет два дескриптора; имя (`name`) не нужно — путь
+        // ведомой стороны даёт `ttyname_r`, termios и размер окна — по умолчанию.
         let rc = unsafe {
             libc::openpty(
                 &mut master,
                 &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
+                std::ptr::null_mut(), // имя не запрашивается
+                std::ptr::null(),     // termios по умолчанию
+                std::ptr::null(),     // размер окна по умолчанию
             )
         };
         if rc != 0 {
@@ -355,7 +359,23 @@ struct HookGuard;
 impl Drop for HookGuard {
     fn drop(&mut self) {
         TEST_HOLD_WRITE_REPORT.store(false, Ordering::Relaxed);
+        TEST_STOP_GRACE_ENTERED.store(0, Ordering::Relaxed);
     }
+}
+
+/// Ждёт, пока ведущая сторона станет читаемой: `false` — срок вышел.
+///
+/// `read_exact` без срока повесил бы тест, если бы `ACK` не пришёл вовсе.
+fn wait_readable(pty: &Pty, wait: Duration) -> bool {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&pty.master);
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: один валидный `pollfd`, срок в миллисекундах.
+    let ready = unsafe { libc::poll(&mut poll, 1, wait.as_millis() as libc::c_int) };
+    ready > 0
 }
 
 /// Ответ, ушедший в линию прямо перед «Стоп», попадает в журнал (M3-AC2, M4-AC10).
@@ -383,17 +403,28 @@ async fn an_answer_sent_before_stop_is_in_the_journal() {
 
     // `ENQ`: автоответчик отвечает `ACK`, и он уходит в линию — отчёт о записи ещё держат.
     pty.master.write_all(&[0x05]).expect("ENQ в линию");
+    assert!(wait_readable(&pty, WAIT), "ACK пришёл в линию за {WAIT:?}");
     let mut ack = [0u8; 1];
     pty.master.read_exact(&mut ack).expect("ACK в линии");
     assert_eq!(ack[0], 0x06, "ACK пришёл в линию");
 
-    // Остановка начинается сейчас, а отчёт отпускается уже во время неё.
+    // Отчёт отпускается только после того, как «Стоп» дошёл до льготы: иначе запись
+    // успела бы закончиться сама, и проверка ничего бы не сказала (M3-AC2).
     let release = std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_millis(20));
+        let deadline = std::time::Instant::now() + WAIT;
+        while TEST_STOP_GRACE_ENTERED.load(Ordering::Relaxed) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         TEST_HOLD_WRITE_REPORT.store(false, Ordering::Relaxed);
     });
     handle.stop().await.expect("остановка");
     release.join().expect("отпускание отчёта");
+    assert!(
+        TEST_STOP_GRACE_ENTERED.load(Ordering::Relaxed) > 0,
+        "остановка дошла до льготы отчёта"
+    );
 
     let outcome = read_all(&path).expect("журнал читается");
     let mut answers = Vec::new();

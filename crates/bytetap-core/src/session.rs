@@ -174,6 +174,13 @@ pub static TEST_PUMP_PANIC_SIDE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "test-hooks")]
 pub static TEST_PUMP_PANIC_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Тестовый хук: входов в льготу отчёта после «Стопа», счётчик.
+///
+/// Появляется только со сборкой feature `test-hooks`: тесту нужно знать, что остановка
+/// уже дошла до ветки льготы, и только потом отпустить отчёт о записи (M3-AC2).
+#[cfg(feature = "test-hooks")]
+pub static TEST_STOP_GRACE_ENTERED: AtomicU64 = AtomicU64::new(0);
+
 /// Тестовый хук: сколько насос не слышит сигнала пары о закрытии, миллисекунды.
 ///
 /// Появляется только со сборкой feature `test-hooks`: так проверяется, что ошибка обмена
@@ -2220,6 +2227,8 @@ async fn apply(
                     // которые порт успел принять, обязаны попасть в журнал — записи даётся
                     // короткий срок отчитаться, иначе ушедший в линию ответ пропадёт
                     // из записи (M3-AC2, M4-AC10).
+                    #[cfg(feature = "test-hooks")]
+                    TEST_STOP_GRACE_ENTERED.fetch_add(1, Ordering::Relaxed);
                     let _ = timeout(WRITE_REPORT_GRACE, write.as_mut()).await;
                     record_answer(shared, conn, &payload, sent.load(Ordering::Relaxed));
                     return Some((ClosedBy::Bytetap, "stop"));
