@@ -322,3 +322,120 @@ async fn the_second_pump_error_after_the_linger_expiry_is_recorded() {
     );
     let _ = handle.stop().await;
 }
+
+/// Падение первого насоса — ошибка пары, а не тишина в журнале (M4-AC5).
+///
+/// Задача падает до того, как какая-либо сторона закрылась штатно: `join_next` отдаёт
+/// `Err`, и пара закрывается ошибкой с кодом.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicked_first_pump_is_an_error() {
+    let _lock = HOOKS.lock().await;
+    let _hooks = HookGuard;
+    TEST_PUMP_PANIC_SIDE.store(1, Ordering::Relaxed);
+
+    let dir = tempfile::tempdir().expect("временная папка");
+    let (listener, target_addr) = target_listener().await;
+    let handle = start(dir.path(), target_addr, ProxyRole::AnalyzerClient).await;
+    let listen = listen_addr(&handle);
+    let path = handle.journal_path().to_path_buf();
+    let (_accepted, _target) = pair(&listener, listen).await;
+
+    let close = wait_for_the_close(&path).await;
+    assert_eq!(
+        close.by,
+        ClosedBy::Bytetap,
+        "насос упал — закрывает bytetap"
+    );
+    assert_eq!(close.reason, "error", "падение насоса — ошибка");
+    assert!(
+        error_codes(&path)
+            .iter()
+            .any(|code| code == "connection_task_failed"),
+        "код ошибки в журнале: {:?}",
+        error_codes(&path)
+    );
+    let _ = handle.stop().await;
+}
+
+/// Падение второго насоса в ветке без дожития — тоже ошибка пары (M4-AC5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicked_second_pump_after_a_reset_is_an_error() {
+    let _lock = HOOKS.lock().await;
+    let _hooks = HookGuard;
+    // Сторона ЛИС падает через 300 мс: анализатор успевает сбросить соединение, и пара
+    // закрывается сразу, без дожития — второй насос ещё не вернулся.
+    TEST_PUMP_PANIC_SIDE.store(2, Ordering::Relaxed);
+    TEST_PUMP_PANIC_MS.store(300, Ordering::Relaxed);
+
+    let dir = tempfile::tempdir().expect("временная папка");
+    let (listener, target_addr) = target_listener().await;
+    let handle = start(dir.path(), target_addr, ProxyRole::AnalyzerClient).await;
+    let listen = listen_addr(&handle);
+    let path = handle.journal_path().to_path_buf();
+    let (mut accepted, mut target) = pair(&listener, listen).await;
+
+    accepted.write_all(b"ORU").await.expect("фрагмент");
+    accepted.set_zero_linger().expect("нулевой linger");
+    drop(accepted);
+    let (_, reset) = drain_to_close(&mut target).await;
+    assert!(reset, "цель увидела сброс");
+
+    let close = wait_for_the_close(&path).await;
+    assert_eq!(
+        close.by,
+        ClosedBy::Bytetap,
+        "насос пропал — закрывает bytetap"
+    );
+    assert_eq!(close.reason, "error", "падение насоса — ошибка");
+    assert!(
+        error_codes(&path)
+            .iter()
+            .any(|code| code == "connection_task_failed"),
+        "код ошибки в журнале: {:?}",
+        error_codes(&path)
+    );
+    let _ = handle.stop().await;
+}
+
+/// Падение второго насоса после срока дожития — ошибка пары, а не `timeout` (M4-AC5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicked_pump_after_the_linger_expiry_is_an_error() {
+    let _lock = HOOKS.lock().await;
+    let _hooks = HookGuard;
+    // Сторона ЛИС падает позже срока дожития: `settle` уже ждёт её после `timeout`.
+    TEST_PUMP_PANIC_SIDE.store(2, Ordering::Relaxed);
+    TEST_PUMP_PANIC_MS.store(5300, Ordering::Relaxed);
+
+    let dir = tempfile::tempdir().expect("временная папка");
+    let (listener, target_addr) = target_listener().await;
+    let handle = start(dir.path(), target_addr, ProxyRole::AnalyzerClient).await;
+    let listen = listen_addr(&handle);
+    let path = handle.journal_path().to_path_buf();
+    let (mut accepted, mut target) = pair(&listener, listen).await;
+
+    accepted.write_all(b"ORU").await.expect("фрагмент");
+    accepted.shutdown().await.expect("FIN анализатора");
+    let mut forwarded = Vec::new();
+    timeout(WAIT, target.read_to_end(&mut forwarded))
+        .await
+        .expect("FIN дошёл до цели")
+        .expect("чтение цели");
+    assert_eq!(forwarded, b"ORU", "фрагмент переслан до закрытия пары");
+
+    sleep(PROXY_LINGER + Duration::from_millis(400)).await;
+    let close = wait_for_the_close(&path).await;
+    assert_eq!(
+        close.by,
+        ClosedBy::Bytetap,
+        "насос пропал — закрывает bytetap"
+    );
+    assert_eq!(close.reason, "error", "падение насоса — ошибка, не timeout");
+    assert!(
+        error_codes(&path)
+            .iter()
+            .any(|code| code == "connection_task_failed"),
+        "код ошибки в журнале: {:?}",
+        error_codes(&path)
+    );
+    let _ = handle.stop().await;
+}

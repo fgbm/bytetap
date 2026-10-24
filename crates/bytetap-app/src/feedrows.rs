@@ -261,6 +261,7 @@ pub fn event_text(
         Some("serial_open_failed") => t!("events.serial_open_failed"),
         Some("connection_read_failed") => t!("events.connection_read_failed"),
         Some("connection_write_failed") => t!("events.connection_write_failed"),
+        Some("connection_task_failed") => t!("events.connection_task_failed"),
         Some("answer_timeout") => t!("events.answer_timeout"),
         Some("journal_failure") => t!("events.journal_failure"),
         // Отказ журнала по переполнению очереди: в ленте та же фраза, что у остальных
