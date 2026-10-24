@@ -152,6 +152,14 @@ fn an_idle_window_asks_for_no_frames() {
             }
         }
     }
+    // Причины последнего прохода: `repaint_causes` показывает их после следующего кадра.
+    harness.step();
+    for cause in harness.ctx.repaint_causes() {
+        let cause = cause.to_string();
+        if !causes.contains(&cause) {
+            causes.push(cause);
+        }
+    }
     let asked: Vec<_> = requested
         .iter()
         .filter(|delay| **delay != Duration::MAX)
